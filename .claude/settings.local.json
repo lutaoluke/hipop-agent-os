@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 *)",
+      "Bash(python3 -c \"import fastapi, uvicorn, jinja2, anthropic; print\\('all ok'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python3 -m pip install jinja2 python-multipart sse-starlette httpx anthropic)",
+      "Bash(python3 *)",
+      "Read(//Users/luke/**)",
+      "Bash(curl -sL https://unpkg.com/htmx.org@1.9.10/dist/htmx.min.js -o hipop/server/static/js/htmx.min.js)",
+      "Bash(curl -sL https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js -o hipop/server/static/js/alpine.min.js)",
+      "Bash(curl -sL https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js -o hipop/server/static/js/chart.min.js)",
+      "Bash(pkill -f \"uvicorn.*server.main\")",
+      "Bash(HIPOP_DB=\"$\\(pwd\\)/hipop.db\" python3 -m uvicorn hipop.server.main:app --host 127.0.0.1 --port 8765)",
+      "Bash(curl -s http://127.0.0.1:8765/health)",
+      "Bash(curl -s http://127.0.0.1:8765/api/today/ksa)",
+      "Bash(curl -s http://127.0.0.1:8765/api/modules/ksa)",
+      "Bash(curl -s -o /tmp/page.html -w \"%{http_code}\\\\n\" http://127.0.0.1:8765/)",
+      "Read(//tmp/**)",
+      "Bash(/usr/bin/curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765__TRACKED_VAR__)",
+      "Bash(/usr/bin/curl -s \"http://127.0.0.1:8765/api/sku-health/ksa?urgency=urgent&limit=3\")",
+      "Bash(/usr/bin/curl -s \"http://127.0.0.1:8765/api/orders/ksa?limit=3\")",
+      "Bash(/usr/bin/curl -s \"http://127.0.0.1:8765/api/cross-store/logistics\")",
+      "Bash(/usr/bin/curl *)",
+      "Bash(export ANTHROPIC_API_KEY=$\\(grep ANTHROPIC_API_KEY /Users/luke/.hermes/.env)"
+    ]
+  }
+}

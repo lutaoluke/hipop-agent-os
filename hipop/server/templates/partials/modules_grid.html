@@ -1,0 +1,39 @@
+<div x-data="modulesGrid()" x-init="init()">
+  <div class="pc-section-title">
+    今日 · 7+1 模块全景
+    <span class="ref">数据 from wf2 / wf3 / wf5 / wf6 + mock</span>
+  </div>
+  <div class="pc-modules-grid">
+    <template x-for="m in modules" :key="m.key">
+      <div class="pc-module-card" :class="m.state">
+        <div class="pc-module-head">
+          <span x-text="m.name"></span>
+          <span class="pc-module-state" :class="m.state" x-text="stateLabel(m.state)"></span>
+        </div>
+        <div class="pc-module-line1" x-text="m.line1"></div>
+        <div class="pc-module-line2" x-text="m.line2"></div>
+        <div class="pc-module-foot">
+          <span x-text="'📎 ' + m.ref"></span>
+          <a class="pc-module-drill"
+             x-show="m.drill"
+             :href="m.drill + '?store={{ store_lower }}'">下钻 →</a>
+        </div>
+      </div>
+    </template>
+  </div>
+</div>
+
+<script>
+function modulesGrid() {
+  return {
+    modules: [],
+    async init() {
+      const r = await fetch('/api/modules/{{ store_lower }}');
+      this.modules = await r.json();
+    },
+    stateLabel(s) {
+      return ({danger:'紧急', warn:'关注', ok:'正常', info:'信息'})[s] || s;
+    },
+  };
+}
+</script>

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 选品 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>选品 + 货源{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 选品 + 货源
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">Agent 内省式归纳 · 数据来自 wf2 + LLM</span>
+</div>
+
+<div x-data="selectionModule()" x-init="init()">
+  <div class="pc-section-title">候选品评估 (3) <span class="ref">基于成功/失败模式 + 类目相似度</span></div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px;">
+    <template x-for="c in candidates" :key="c.candidate">
+      <div class="pc-module-card" :class="c.verdict==='推荐'?'ok':(c.verdict==='不推荐'?'danger':'warn')">
+        <div class="pc-module-head">
+          <span x-text="c.candidate"></span>
+          <span class="pc-module-state"
+                :class="c.verdict==='推荐'?'ok':(c.verdict==='不推荐'?'danger':'warn')"
+                x-text="c.verdict"></span>
+        </div>
+        <div class="pc-module-line1" x-text="c.reason"></div>
+        <div class="pc-module-line2" x-text="c.details"></div>
+        <div class="pc-module-foot">
+          <span x-text="'匹配度: ' + Math.round((c.score||0)*100) + '%'"></span>
+          <span class="pc-module-drill" @click="show(c)">详情 →</span>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <div class="pc-section-title">沉淀策略 (LLM 内省) <span class="ref">/agent_memory/strategies/</span></div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+    <div class="pc-table" style="padding:0;">
+      <div style="padding:10px 14px;font-weight:600;border-bottom:1px solid var(--border-default);">📈 选品_成功模式_v1.md</div>
+      <pre style="padding:12px 14px;font-size:11.5px;line-height:1.55;white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;background:var(--bg-tertiary);max-height:380px;overflow-y:auto;" x-text="strategies['选品_成功模式_v1.md'] || '加载中...'"></pre>
+    </div>
+    <div class="pc-table" style="padding:0;">
+      <div style="padding:10px 14px;font-weight:600;border-bottom:1px solid var(--border-default);">📉 选品_失败模式_v1.md</div>
+      <pre style="padding:12px 14px;font-size:11.5px;line-height:1.55;white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;background:var(--bg-tertiary);max-height:380px;overflow-y:auto;" x-text="strategies['选品_失败模式_v1.md'] || '加载中...'"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+function selectionModule() {
+  return {
+    candidates: [],
+    strategies: {},
+    async init() {
+      const r = await fetch('/api/selection/{{ store_lower }}');
+      const d = await r.json();
+      this.candidates = d.candidates;
+      this.strategies = d.strategies;
+    },
+    show(c) {
+      window.dispatchEvent(new CustomEvent('open-ref', {
+        detail: {
+          title: c.candidate + ' · 评估详情',
+          body: '<div><b>判定:</b> ' + c.verdict + ' (' + Math.round(c.score*100) + '%)</div>'
+              + '<div><b>原因:</b> ' + c.reason + '</div>'
+              + '<div><b>类目分析:</b> ' + c.details + '</div>',
+          refs: [
+            {table: 'wf2_hipop_*_sku', where: 'family LIKE category', as_of_date: '历史 30 天'},
+            {table: '选品_成功模式_v1.md', where: 'agent_memory/strategies/', as_of_date: '今日'},
+          ],
+        }
+      }));
+    },
+  };
+}
+</script>
+{% endblock %}

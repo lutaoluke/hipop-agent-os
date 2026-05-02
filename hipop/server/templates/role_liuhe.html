@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}刘鹤视图 · 跨店物流跟单 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/role/liuhe">职能</a><span class="pc-crumb-sep">/</span>刘鹤 · 跟单 · 跨店{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">刘鹤视图 · 跨店物流跟单
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">所有店铺的物流告警 + 卡单 SKU · 数据来自 wf3 + wf6（跨店聚合）</span>
+</div>
+
+<div x-data="liuheView()" x-init="init()">
+  <div class="pc-health-chips">
+    <div class="pc-health-chip"><span class="pc-dot danger"></span>红色告警 <b><span x-text="totals.alerts_red||0"></span></b></div>
+    <div class="pc-health-chip"><span class="pc-dot warn"></span>待处理 <b><span x-text="totals.alerts_pending||0"></span></b></div>
+    <div class="pc-health-chip">告警合计 <span x-text="totals.alerts_total||0"></span></div>
+    <div class="pc-health-chip">卡单 SKU <span x-text="totals.stuck_count||0"></span></div>
+  </div>
+
+  <div class="pc-section-title">告警 · 优先级队列 <span class="ref">wf6_logistics_alerts</span></div>
+  <div class="pc-table" style="margin-bottom:18px;">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:60px;">告警</th>
+          <th style="width:130px;">货单</th>
+          <th style="width:90px;">阶段</th>
+          <th style="width:80px;text-align:right;">超时</th>
+          <th>SKU</th>
+          <th style="width:100px;">原因</th>
+          <th style="width:90px;">处理状态</th>
+          <th style="width:90px;">归属</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="a in alerts" :key="a.alert_id">
+          <tr>
+            <td><span class="pc-pill" :class="alertClass(a.alert_level)" x-text="a.alert_level"></span></td>
+            <td><b x-text="a.order_no"></b></td>
+            <td x-text="a.stage"></td>
+            <td style="text-align:right;">
+              <span :style="(a.actual_stay_days||0) > (a.history_stage_days||0) ? 'color:var(--text-danger);font-weight:600;' : ''"
+                    x-text="(a.actual_stay_days||0) + 'd / 均 ' + (a.history_stage_days||0) + 'd'"></span>
+            </td>
+            <td>
+              <template x-for="s in (a.skus||[]).slice(0,3)">
+                <span style="display:inline-block;font-size:11px;background:var(--bg-tertiary);padding:1px 5px;border-radius:4px;margin-right:3px;"
+                      x-text="s.sku + '×' + s.qty"></span>
+              </template>
+            </td>
+            <td x-text="a.alert_reason"></td>
+            <td>
+              <span class="pc-pill"
+                    :class="a.ops_status==='待处理'?'warn':(a.ops_status==='已确认丢货'?'danger':'ok')"
+                    x-text="a.ops_status"></span>
+            </td>
+            <td x-text="a.action_owner || '刘鹤'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="pc-section-title">卡单 SKU · 跨店聚合 <span class="ref">wf3_logistics_hub</span></div>
+  <div class="pc-table">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:140px;">SKU</th>
+          <th style="width:90px;text-align:right;">在途总量</th>
+          <th style="width:90px;text-align:right;">在途批次</th>
+          <th>状态标签</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="s in stuck" :key="s.sku">
+          <tr>
+            <td><b x-text="s.sku"></b></td>
+            <td style="text-align:right;" x-text="s.in_transit_total_qty"></td>
+            <td style="text-align:right;" x-text="s.in_transit_batch_count"></td>
+            <td>
+              <span x-show="s.has_stuck_batch" class="pc-pill danger">卡单</span>
+              <span x-show="s.needs_ops_input" class="pc-pill warn" style="margin-left:4px;">待运营</span>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function liuheView() {
+  return {
+    alerts: [], stuck: [], totals: {},
+    async init() {
+      const r = await fetch('/api/cross-store/logistics');
+      const d = await r.json();
+      this.alerts = d.alerts;
+      this.stuck = d.stuck_skus;
+      this.totals = d.totals;
+    },
+    alertClass(l) { return ({'红':'danger','橙':'warn','黄':'warn','蓝':'info'})[l] || ''; },
+  };
+}
+</script>
+{% endblock %}

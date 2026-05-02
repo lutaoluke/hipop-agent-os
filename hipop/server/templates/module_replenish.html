@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 补货决策 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>补货决策{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 补货决策
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">建议补货 SKU · 数据来自 wf5 / wf6</span>
+</div>
+
+<div x-data="replenishModule()" x-init="init()">
+  <div class="pc-health-chips">
+    <div class="pc-health-chip"><span class="pc-dot danger"></span>高紧迫 <span x-text="counts.high||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot warn"></span>中紧迫 <span x-text="counts.mid||0"></span></div>
+    <div class="pc-health-chip">合计建议补货 SKU <span x-text="rows.length"></span></div>
+    <div class="pc-health-chip">合计补货件数 <span x-text="totalQty"></span></div>
+  </div>
+
+  <div x-show="rows.length === 0" style="padding:30px;text-align:center;color:var(--text-tertiary);background:var(--bg-primary);border:1px solid var(--border-default);border-radius:10px;">
+    本周 wf5 + wf6 暂无建议补货 SKU。<br>
+    <span style="font-size:11.5px;">这通常意味着补货决策已被覆盖到此前的批次中（见在途物流卡），或系统正在等待新的销量数据。</span>
+  </div>
+
+  <div x-show="rows.length > 0" class="pc-table">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:140px;">SKU</th>
+          <th>商品</th>
+          <th style="width:80px;">趋势</th>
+          <th style="width:80px;text-align:right;">建议量</th>
+          <th style="width:80px;text-align:right;">7日均销</th>
+          <th style="width:80px;">紧迫度</th>
+          <th>触发原因</th>
+          <th style="width:60px;">📎</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.partner_sku">
+          <tr>
+            <td><b x-text="r.partner_sku"></b></td>
+            <td><div style="max-width:240px;font-size:12px;" x-text="(r.title || '').slice(0, 50)"></div></td>
+            <td><span class="pc-pill" :class="trendClass(r.trend)" x-text="r.trend || '—'"></span></td>
+            <td style="text-align:right;font-weight:600;" x-text="r.qty"></td>
+            <td style="text-align:right;" x-text="r.daily_rate ? r.daily_rate.toFixed(1) : '—'"></td>
+            <td>
+              <span class="pc-pill"
+                    :class="r.urgency_level==='high'?'danger':(r.urgency_level==='mid'?'warn':'ok')"
+                    x-text="r.urgency_level==='high'?'高':(r.urgency_level==='mid'?'中':'低')"></span>
+            </td>
+            <td>
+              <template x-for="reason in (r.trigger_reasons_list || [])">
+                <span style="display:inline-block;font-size:11px;background:var(--bg-tertiary);padding:1px 5px;border-radius:4px;margin-right:3px;"
+                      x-text="reason"></span>
+              </template>
+            </td>
+            <td><a class="pc-log-ref" @click="openRef(r)">📎</a></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div style="margin-top:18px;">
+    <div class="pc-section-title">本周告警 + 处理状态</div>
+    <div class="pc-table">
+      <table>
+        <thead>
+          <tr><th>告警</th><th>货单</th><th style="text-align:right;">超时</th><th>处理</th></tr>
+        </thead>
+        <tbody>
+          <template x-for="a in alerts" :key="a.alert_id">
+            <tr>
+              <td>
+                <span class="pc-pill" :class="alertClass(a.alert_level)" x-text="a.alert_level"></span>
+                <span x-text="' ' + a.alert_reason"></span>
+              </td>
+              <td><b x-text="a.order_no"></b></td>
+              <td style="text-align:right;" x-text="(a.actual_stay_days||0) + 'd / 均 ' + (a.history_stage_days||0) + 'd'"></td>
+              <td>
+                <span class="pc-pill"
+                      :class="a.ops_status==='待处理'?'warn':(a.ops_status==='已确认丢货'?'danger':'ok')"
+                      x-text="a.ops_status"></span>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+function replenishModule() {
+  return {
+    rows: [],
+    counts: {},
+    totalQty: 0,
+    alerts: [],
+    async init() {
+      const [rs, alerts] = await Promise.all([
+        fetch('/api/replenishment/{{ store_lower }}').then(r=>r.json()),
+        fetch('/api/orders/{{ store_lower }}').then(r=>r.json()),
+      ]);
+      this.rows = rs;
+      this.alerts = alerts.filter(o=>o.alert_level);
+      this.counts = {
+        high: rs.filter(r=>r.urgency_level==='high').length,
+        mid: rs.filter(r=>r.urgency_level==='mid').length,
+      };
+      this.totalQty = rs.reduce((s,r)=>s+(r.qty||0), 0);
+    },
+    trendClass(t) { return ({'急速下降':'danger','下降':'warn','加速增长':'info','平稳':'ok','增长':'ok'})[t] || ''; },
+    alertClass(l) { return ({'红':'danger','橙':'warn','黄':'warn','蓝':'info'})[l] || ''; },
+    openRef(r) {
+      window.dispatchEvent(new CustomEvent('open-ref', {
+        detail: {
+          title: r.partner_sku + ' · 补货建议',
+          body: '<div><b>建议补货:</b> ' + r.qty + ' 件</div>'
+              + '<div><b>趋势:</b> ' + (r.trend||'') + '</div>'
+              + '<div><b>建议:</b> ' + (r.ops_advice||'—') + '</div>',
+          refs: [
+            {table: 'wf5_hipop_{{ store_lower }}_sales_cycle', where: "partner_sku='" + r.partner_sku + "'", as_of_date: '今日'},
+            {table: 'wf6_hipop_{{ store_lower }}_replenishment_queue', where: "partner_sku='" + r.partner_sku + "'", as_of_date: '今日'},
+          ],
+        }
+      }));
+    },
+  };
+}
+</script>
+{% endblock %}

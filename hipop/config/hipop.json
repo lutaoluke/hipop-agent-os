@@ -1,0 +1,65 @@
+{
+  "company": "hipop",
+  "platform": {
+    "name": "Noon KSA",
+    "store_keyword": "KSA"
+  },
+  "sales_entities": [
+    {
+      "alias": "hipop_ksa",
+      "country": "SA",
+      "platform": "Noon",
+      "store": "HIPOP-NOON-KSA",
+      "currency": "SAR",
+      "feishu_table_id": "tblQ1FGxIsBbjQAl",
+      "feishu_decisions_table_id": "tblL7Twlt2K7qLhi",
+      "feishu_stock_table_id": "tbltX0Cl6Egum28W"
+    },
+    {
+      "alias": "hipop_uae",
+      "country": "AE",
+      "platform": "Noon",
+      "store": "HIPOP-NOON-UAE",
+      "currency": "AED"
+    }
+  ],
+  "feishu": {
+    "app_id": "cli_a96a395aaafa5cb5",
+    "app_secret": "__REDACTED_FEISHU_APP_SECRET__",
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/__REDACTED_FEISHU_WEBHOOK_TOKEN__",
+    "user_token_file": "/Users/luke/Downloads/点购工作流/feishu_auth/token.json",
+    "bitable": {
+      "base_id": "PFX9bJWdTaSaSEsSwlKc1XaSnEg",
+      "tables": {
+        "main": "tblHtDKI52zJawkV",
+        "alerts": "tblfooSYqDvgh03E",
+        "in_transit": "tblrD1DLSmLgnlRL",
+        "decisions": "tblPVllRk7Aerlva",
+        "warehouse_appt": "tblzHCjW5ZQV5mm8"
+      }
+    }
+  },
+  "db": {
+    "path": "/Users/luke/Downloads/点购工作流/hipop.db"
+  },
+  "noon": {
+    "url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon"
+  },
+  "erp": {
+    "url": "https://www.dbuyerp.com",
+    "username": "__REDACTED_USERNAME__",
+    "password": "__REDACTED_PASSWORD__"
+  },
+  "ziniao_openapi": {
+    "base_url": "https://openapi.ziniao.com",
+    "app_id": "__REDACTED_ZINIAO_APP_ID__",
+    "app_secret": "__REDACTED_ZINIAO_RSA_PRIVATE_KEY__"
+  },
+  "logistics_tracking": {
+    "义特无忧KSA": "http://tracking.nextsls.com/trace?app=61a0c12f69c1d654e75a49e6",
+    "安时达KSA": "https://logistics.ontaskksad2d.com/#/home",
+    "安时达UAE": "https://logistics.ontaskksad2d.com/#/home",
+    "飞坦": "https://tracking.fleetan.com/#/",
+    "维勒": "http://ywwj.rtb56.com/track_query.aspx"
+  }
+}

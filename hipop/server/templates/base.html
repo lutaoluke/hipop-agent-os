@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}点购 Agent OS{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/workspace.css">
+  <script src="/static/js/htmx.min.js"></script>
+  <script defer src="/static/js/alpine.min.js"></script>
+  <script src="/static/js/chart.min.js"></script>
+</head>
+<body>
+
+{% include "partials/topbar.html" %}
+
+<div class="pc-crumb">
+  <a href="/?store={{ store_lower }}">店铺</a>
+  <span class="pc-crumb-sep">/</span>
+  <a href="/?store={{ store_lower }}">{{ store_full }}</a>
+  <span class="pc-crumb-sep">/</span>
+  <span>{% block crumb %}今日总览{% endblock %}</span>
+</div>
+
+<div class="pc-body">
+  {% include "partials/sidebar.html" %}
+  <div class="pc-main">
+    {% block main %}{% endblock %}
+  </div>
+  {% include "partials/chat_panel.html" %}
+</div>
+
+<!-- Reference 弹窗 -->
+<div x-data="{open:false, title:'', body:'', refs:[]}"
+     @open-ref.window="open=true; title=$event.detail.title||'Reference'; body=$event.detail.body||''; refs=$event.detail.refs||[]"
+     x-cloak>
+  <template x-if="open">
+    <div class="pc-modal-bg" @click="open=false">
+      <div class="pc-modal" @click.stop>
+        <button class="pc-modal-close" @click="open=false">×</button>
+        <div class="pc-modal-title" x-text="title"></div>
+        <div class="pc-modal-body">
+          <div x-html="body"></div>
+          <template x-if="refs && refs.length">
+            <div style="margin-top:12px;">
+              <div style="font-weight:600;margin-bottom:6px;">📎 数据出处</div>
+              <template x-for="r in refs">
+                <div style="background:var(--bg-tertiary);padding:8px 10px;border-radius:6px;margin-bottom:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;">
+                  <div><b>表:</b> <span x-text="r.table"></span></div>
+                  <div><b>where:</b> <span x-text="r.where"></span></div>
+                  <div><b>as_of:</b> <span x-text="r.as_of_date || '—'"></span></div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </template>
+</div>
+
+<style>[x-cloak]{display:none !important;}</style>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,72 @@
+<div class="pc-progress-card" x-data="progressCard()" x-init="init()" x-show="visible">
+  <div class="pc-progress-head">
+    <span>⚙️</span>
+    <span class="label" x-text="data.label"></span>
+    <span style="font-size:11px;font-weight:400;color:var(--text-secondary);"
+          x-text="(data.current_step || 0) + '/' + (data.total_steps || 0)"></span>
+  </div>
+  <div class="pc-progress-bar">
+    <template x-for="s in data.steps">
+      <div class="pc-progress-step" :class="s.status"></div>
+    </template>
+  </div>
+  <div class="pc-progress-steps-text">
+    <template x-for="(s, i) in data.steps">
+      <span :style="s.status==='now' ? 'color:var(--text-info);font-weight:600;' : (s.status==='done' ? 'color:var(--text-success);' : 'color:var(--text-tertiary);')">
+        <span x-text="(s.status==='done'?'✓':(s.status==='now'?'▶':'·')) + ' ' + s.name"></span>
+      </span>
+    </template>
+  </div>
+  <div x-show="taskId" style="font-size:11px;color:var(--text-secondary);margin-top:6px;">
+    📡 实时事件流 · task=<span x-text="taskId"></span>
+  </div>
+</div>
+
+<script>
+function progressCard() {
+  return {
+    data: {label: "", steps: [], current_step: 0, total_steps: 0},
+    taskId: null,
+    visible: false,
+    sse: null,
+    async init() {
+      // 拉初始进度
+      const r = await fetch('/api/progress/current');
+      this.data = await r.json();
+      this.visible = (this.data.steps || []).length > 0;
+      // 监听 task-started 事件 → 切换到该 task 的 SSE
+      window.addEventListener('task-started', (e) => {
+        this.startSSE(e.detail.taskId, e.detail.label);
+      });
+    },
+    startSSE(taskId, label) {
+      this.taskId = taskId;
+      this.data = {
+        label: label || ('任务 ' + taskId),
+        steps: [],
+        current_step: 0,
+        total_steps: 6,
+      };
+      this.visible = true;
+      if (this.sse) this.sse.close();
+      this.sse = new EventSource('/api/events/stream/' + taskId);
+      this.sse.onmessage = (msg) => {
+        try {
+          const e = JSON.parse(msg.data);
+          if (e.type === 'connected') return;
+          if (e.type === 'closing') { this.sse.close(); return; }
+          // 把 step 放到对应位置
+          const sn = e.step_no || 0;
+          const sname = e.step_name || '步骤 ' + sn;
+          while (this.data.steps.length < sn) {
+            this.data.steps.push({name: 'step ' + (this.data.steps.length+1), status: 'pending'});
+          }
+          this.data.steps[sn-1] = {name: sname, status: e.status === 'done' ? 'done' : (e.status === 'started' ? 'now' : 'pending')};
+          this.data.current_step = this.data.steps.filter(s=>s.status==='done').length;
+          this.data.total_steps = Math.max(this.data.steps.length, 6);
+        } catch(err) { console.error(err); }
+      };
+    },
+  };
+}
+</script>

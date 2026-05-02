@@ -1,0 +1,56 @@
+<div x-data="workLog()" x-init="init()">
+  <div class="pc-section-title">
+    今日工作日志
+    <span class="ref">飞书消息 + 物流告警 + Agent 操作</span>
+  </div>
+  <div class="pc-work-log">
+    <template x-for="(item, i) in items" :key="i">
+      <div class="pc-log-item">
+        <div class="pc-log-time" x-text="item.time"></div>
+        <span class="pc-log-tag" :class="item.tag" x-text="item.tag || '操作'"></span>
+        <div class="pc-log-who" x-text="item.who"></div>
+        <div class="pc-log-text" x-text="item.text"></div>
+        <span class="pc-log-ref" x-show="item.ref"
+              @click="openRef(item)"
+              x-text="'📎 ' + (item.ref || '')"></span>
+      </div>
+    </template>
+    <div x-show="!items.length" style="padding:14px;color:var(--text-tertiary);font-size:12.5px;">无最近活动</div>
+  </div>
+</div>
+
+<script>
+function workLog() {
+  return {
+    items: [],
+    async init() {
+      const r = await fetch('/api/work-log/{{ store_lower }}');
+      this.items = await r.json();
+    },
+    openRef(item) {
+      // 如果是 agent_actions#xxx → 拉详情
+      const m = (item.ref || "").match(/agent_actions#(\d+)/);
+      if (m) {
+        fetch('/api/agent-actions/' + m[1]).then(r=>r.json()).then(d => {
+          window.dispatchEvent(new CustomEvent('open-ref', {
+            detail: {
+              title: 'Agent 操作 #' + d.id,
+              body: '<div><b>' + (d.judge || d.pill_text || '') + '</b></div>'
+                  + '<div style="color:var(--text-secondary);margin-top:4px;">主题: ' + (d.subject||'—') + ' · 模块: ' + d.module + ' · 状态: ' + d.status + '</div>',
+              refs: d.references || [],
+            }
+          }));
+        });
+      } else {
+        window.dispatchEvent(new CustomEvent('open-ref', {
+          detail: {
+            title: '数据出处',
+            body: '<div>' + (item.text || '') + '</div>',
+            refs: [{table: item.ref, where: '—', as_of_date: ''}],
+          }
+        }));
+      }
+    },
+  };
+}
+</script>

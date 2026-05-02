@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 今日总览 · 点购 Agent OS{% endblock %}
+
+{% block main %}
+
+<div class="pc-page-title">{{ store_full }} · 今日总览
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;margin-left:6px;">
+    Cherry · 运营 · 主理 · 共同空间内 5 同事 + 1 Agent
+  </span>
+</div>
+
+<!-- 上传区 (Day 2) -->
+<div x-data="uploadZone()"
+     class="pc-upload-zone"
+     :class="{drag: dragOver}"
+     @click="$refs.fileInput.click()"
+     @dragover.prevent="dragOver=true"
+     @dragleave.prevent="dragOver=false"
+     @drop.prevent="dragOver=false; handleDrop($event)">
+  <input type="file" x-ref="fileInput" multiple style="display:none" @change="handleSelect($event)">
+  <span x-show="!uploading">📤 点击或拖拽 noon CSV / Inventory CSV 到此（多选）→ Agent 自动 ingest + 重跑 wf3 + wf5</span>
+  <span x-show="uploading" style="color:var(--text-info);font-weight:600;">⏳ 已开始处理，task=<span x-text="taskId"></span>，请关注上方进度条</span>
+</div>
+
+<!-- 处理可见性条 -->
+{% include "partials/progress_card.html" %}
+
+<!-- 7+1 模块卡片 -->
+{% include "partials/modules_grid.html" %}
+
+<!-- 今日工作日志 -->
+{% include "partials/work_log.html" %}
+
+<script>
+function uploadZone() {
+  return {
+    dragOver: false,
+    uploading: false,
+    taskId: null,
+    async upload(files) {
+      if (!files.length) return;
+      const fd = new FormData();
+      for (const f of files) fd.append('files', f);
+      this.uploading = true;
+      try {
+        const r = await fetch('/api/upload', {method:'POST', body: fd});
+        const data = await r.json();
+        this.taskId = data.task_id;
+        // 通知 progress card 切换 SSE
+        window.dispatchEvent(new CustomEvent('task-started', {detail: {taskId: data.task_id, label: 'CSV 上传 + 全管道'}}));
+      } catch(e) { alert('上传失败: ' + e); this.uploading = false; }
+    },
+    handleDrop(ev) {
+      const files = ev.dataTransfer.files;
+      this.upload(files);
+    },
+    handleSelect(ev) {
+      this.upload(ev.target.files);
+    },
+  };
+}
+</script>
+{% endblock %}

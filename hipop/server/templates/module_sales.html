@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 销售 / 库存 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>销售 / 库存{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 销售 / 库存
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">SKU 健康详情 · 数据来自 wf2 / wf5 / wf3</span>
+</div>
+
+<div x-data="salesModule()" x-init="init()">
+  <div class="pc-health-chips">
+    <div class="pc-health-chip"><span class="pc-dot danger"></span>急速下降 <span x-text="counts.急速下降||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot warn"></span>下降 <span x-text="counts.下降||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot info"></span>加速增长 <span x-text="counts.加速增长||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot ok"></span>平稳 <span x-text="counts.平稳||0"></span></div>
+    <div class="pc-health-chip">利润 < 10% <span x-text="counts.lowMargin||0"></span></div>
+    <div class="pc-health-chip">库存 < 14 天 <span x-text="counts.lowDays||0"></span></div>
+  </div>
+
+  <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;">
+    <span style="font-size:12px;color:var(--text-secondary);">筛选:</span>
+    <button class="pc-chip" :class="{'active': filter==='all'}" @click="filter='all'">全部</button>
+    <button class="pc-chip" :class="{'active': filter==='urgent'}" @click="filter='urgent'">立即处理</button>
+    <button class="pc-chip" :class="{'active': filter==='lowmargin'}" @click="filter='lowmargin'">低利润</button>
+    <button class="pc-chip" :class="{'active': filter==='stuck'}" @click="filter='stuck'">在途异常</button>
+  </div>
+
+  <div class="pc-table">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:140px;">SKU</th>
+          <th>商品</th>
+          <th style="width:80px;">趋势</th>
+          <th style="width:80px;text-align:right;">利润率</th>
+          <th style="width:80px;text-align:right;">7日均销</th>
+          <th style="width:90px;text-align:right;">可撑天数</th>
+          <th style="width:80px;text-align:right;">在途</th>
+          <th style="width:300px;">建议</th>
+          <th style="width:60px;">📎</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="r in filtered()" :key="r.partner_sku">
+          <tr>
+            <td><b x-text="r.partner_sku"></b><br><span style="font-size:10px;color:var(--text-tertiary);" x-text="r.sales_grade || ''"></span></td>
+            <td><div style="max-width:240px;font-size:12px;" x-text="(r.title || '').slice(0, 50)"></div></td>
+            <td>
+              <span class="pc-pill" :class="trendClass(r.trend)" x-text="r.trend || '—'"></span>
+            </td>
+            <td style="text-align:right;">
+              <span :style="r.profit_rate < 10 ? 'color:var(--text-danger);font-weight:600;' : ''"
+                    x-text="r.profit_rate !== null ? (r.profit_rate.toFixed(1) + '%') : '—'"></span>
+            </td>
+            <td style="text-align:right;" x-text="r.daily_rate !== null ? r.daily_rate.toFixed(1) : '—'"></td>
+            <td style="text-align:right;">
+              <span :class="(r.days_left !== null && r.days_left < 14 && r.days_left > 0) ? 'pc-pill warn' : ''"
+                    x-text="r.days_left !== null ? (r.days_left + 'd') : '—'"></span>
+            </td>
+            <td style="text-align:right;">
+              <span x-text="r.in_transit_total_qty || 0"></span>
+              <span x-show="r.has_stuck_batch" class="pc-pill danger" style="margin-left:3px;">卡</span>
+            </td>
+            <td>
+              <span style="font-size:12px;" x-text="(r.ops_advice || '—').slice(0, 60)"></span>
+            </td>
+            <td>
+              <a class="pc-log-ref" @click="openRef(r)">📎</a>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+  <div x-show="!rows.length" style="text-align:center;color:var(--text-tertiary);padding:20px;">加载中…</div>
+</div>
+
+<script>
+function salesModule() {
+  return {
+    rows: [],
+    counts: {},
+    filter: 'urgent',
+    async init() {
+      const r = await fetch('/api/sku-health/{{ store_lower }}?urgency=all&limit=200');
+      this.rows = await r.json();
+      this.counts = {
+        '急速下降': this.rows.filter(r=>r.trend==='急速下降').length,
+        '下降': this.rows.filter(r=>r.trend==='下降').length,
+        '加速增长': this.rows.filter(r=>r.trend==='加速增长').length,
+        '平稳': this.rows.filter(r=>r.trend==='平稳').length,
+        'lowMargin': this.rows.filter(r=>r.profit_rate !== null && r.profit_rate < 10).length,
+        'lowDays': this.rows.filter(r=>r.days_left !== null && r.days_left < 14 && r.days_left > 0).length,
+      };
+    },
+    trendClass(t) {
+      return ({'急速下降':'danger','下降':'warn','加速增长':'info','平稳':'ok','增长':'ok','无销量':''})[t] || '';
+    },
+    filtered() {
+      if (this.filter === 'all') return this.rows.slice(0, 50);
+      if (this.filter === 'urgent') return this.rows.filter(r=>['急速下降','下降'].includes(r.trend)).slice(0, 50);
+      if (this.filter === 'lowmargin') return this.rows.filter(r=>r.profit_rate !== null && r.profit_rate < 10).slice(0, 50);
+      if (this.filter === 'stuck') return this.rows.filter(r=>r.has_stuck_batch).slice(0, 50);
+      return this.rows.slice(0, 50);
+    },
+    openRef(r) {
+      window.dispatchEvent(new CustomEvent('open-ref', {
+        detail: {
+          title: r.partner_sku + ' · 数据出处',
+          body: '<div style="font-size:12px;color:var(--text-secondary);">' + (r.title||'') + '</div>'
+              + '<div style="margin-top:6px;"><b>判断:</b> ' + (r.trend||'') + ' · ' + (r.risk_label||'') + '</div>'
+              + '<div><b>建议:</b> ' + (r.ops_advice||'—') + '</div>',
+          refs: [
+            {table: 'wf2_hipop_{{ store_lower }}_sku', where: "partner_sku='" + r.partner_sku + "'", as_of_date: '今日'},
+            {table: 'wf5_hipop_{{ store_lower }}_sales_cycle', where: "partner_sku='" + r.partner_sku + "'", as_of_date: '今日'},
+            {table: 'wf3_logistics_hub', where: "sku='" + r.partner_sku + "'", as_of_date: '今日'},
+          ],
+        }
+      }));
+    },
+  };
+}
+</script>
+{% endblock %}

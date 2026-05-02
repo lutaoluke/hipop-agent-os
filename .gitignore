@@ -1,0 +1,8 @@
+.DS_Store
+.~*
+*.xlsx
+*.numbers
+*.db
+*.db.backup-*
+inbox/
+logs/

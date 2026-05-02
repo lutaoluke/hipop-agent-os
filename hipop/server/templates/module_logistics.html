@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 在途物流 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>在途物流{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 在途物流
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">货单 + 告警 · 数据来自 wf3 / wf6</span>
+</div>
+
+<div x-data="logisticsModule()" x-init="init()">
+  <div class="pc-health-chips">
+    <div class="pc-health-chip"><span class="pc-dot danger"></span>红色告警 <span x-text="counts.red||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot warn"></span>橙黄告警 <span x-text="counts.orange||0"></span></div>
+    <div class="pc-health-chip"><span class="pc-dot info"></span>蓝色 (清关) <span x-text="counts.blue||0"></span></div>
+    <div class="pc-health-chip">总在途货单 <span x-text="rows.length"></span></div>
+    <div class="pc-health-chip">待处理 <span x-text="counts.pending||0"></span></div>
+  </div>
+
+  <div class="pc-table">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:130px;">货单号</th>
+          <th style="width:90px;">货代</th>
+          <th style="width:90px;">阶段</th>
+          <th style="width:80px;text-align:right;">停留</th>
+          <th style="width:80px;text-align:right;">历史均</th>
+          <th style="width:80px;">告警</th>
+          <th>涉及 SKU</th>
+          <th style="width:90px;">状态</th>
+          <th style="width:60px;">📎</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="o in rows" :key="o.order_no">
+          <tr>
+            <td><b x-text="o.order_no"></b></td>
+            <td x-text="o.carrier"></td>
+            <td x-text="o.stage"></td>
+            <td style="text-align:right;">
+              <span :style="o.is_stuck ? 'color:var(--text-danger);font-weight:600;' : ''"
+                    x-text="(o.actual_stay_days || o.stay_days || 0) + 'd'"></span>
+            </td>
+            <td style="text-align:right;color:var(--text-tertiary);"
+                x-text="(o.history_stage_days || 0) + 'd'"></td>
+            <td>
+              <span class="pc-pill" :class="alertClass(o.alert_level)" x-text="o.alert_level || '—'"></span>
+              <div style="font-size:10.5px;color:var(--text-tertiary);" x-text="o.alert_reason || ''"></div>
+            </td>
+            <td>
+              <template x-for="s in (o.skus || []).slice(0,3)">
+                <span style="display:inline-block;font-size:11px;background:var(--bg-tertiary);padding:1px 5px;border-radius:4px;margin-right:3px;"
+                      x-text="s.sku + '×' + s.qty"></span>
+              </template>
+              <span x-show="(o.skus||[]).length>3" style="font-size:11px;color:var(--text-tertiary);"
+                    x-text="'+' + ((o.skus||[]).length-3)"></span>
+            </td>
+            <td>
+              <span class="pc-pill"
+                    :class="o.ops_status==='待处理' ? 'warn' : (o.ops_status==='已确认丢货' ? 'danger' : 'ok')"
+                    x-text="o.ops_status || '—'"></span>
+            </td>
+            <td><a class="pc-log-ref" @click="openRef(o)">📎</a></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function logisticsModule() {
+  return {
+    rows: [],
+    counts: {},
+    async init() {
+      const r = await fetch('/api/orders/{{ store_lower }}?limit=100');
+      this.rows = await r.json();
+      this.counts = {
+        red: this.rows.filter(o=>o.alert_level==='红').length,
+        orange: this.rows.filter(o=>['橙','黄'].includes(o.alert_level)).length,
+        blue: this.rows.filter(o=>o.alert_level==='蓝').length,
+        pending: this.rows.filter(o=>o.ops_status==='待处理').length,
+      };
+    },
+    alertClass(l) { return ({'红':'danger','橙':'warn','黄':'warn','蓝':'info'})[l] || ''; },
+    openRef(o) {
+      window.dispatchEvent(new CustomEvent('open-ref', {
+        detail: {
+          title: o.order_no + ' · 数据出处',
+          body: '<div><b>告警:</b> ' + (o.alert_level||'') + ' ' + (o.alert_reason||'') + '</div>'
+              + '<div><b>停留:</b> ' + (o.actual_stay_days||0) + ' 天 / 历史均 ' + (o.history_stage_days||0) + ' 天</div>'
+              + '<div><b>状态:</b> ' + (o.ops_status||'—') + '</div>',
+          refs: [
+            {table: 'wf3_logistics_hub', where: "groups_json LIKE '%" + o.order_no + "%'", as_of_date: '今日'},
+            {table: 'wf6_logistics_alerts', where: "order_no='" + o.order_no + "'", as_of_date: '今日'},
+          ],
+        }
+      }));
+    },
+  };
+}
+</script>
+{% endblock %}

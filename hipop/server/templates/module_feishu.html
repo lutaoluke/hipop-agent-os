@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 飞书沉淀 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>飞书沉淀{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 飞书沉淀
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">运营/跟单沟通 → LLM 提炼 → 写入 feishu_digest 表</span>
+</div>
+
+<div x-data="feishuModule()" x-init="init()">
+  <div class="pc-table">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:120px;">时间</th>
+          <th style="width:80px;">类型</th>
+          <th style="width:80px;">来源</th>
+          <th>提炼摘要</th>
+          <th>原文</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td x-text="(r.source_time || r.digest_at || '').slice(0,16)"></td>
+            <td><span class="pc-pill" :class="catClass(r.category)" x-text="r.category"></span></td>
+            <td x-text="r.who || '—'"></td>
+            <td><b x-text="r.text"></b></td>
+            <td><div style="max-width:280px;font-size:11px;color:var(--text-secondary);" x-text="(r.raw_text || '').slice(0, 120)"></div></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div x-show="!rows.length" style="padding:30px;text-align:center;color:var(--text-tertiary);">
+      暂无飞书沉淀记录。<br>
+      <span style="font-size:11.5px;">运行 <code>python3 -m hipop.scripts.feishu_digest</code> 抽取最近群消息。</span>
+    </div>
+  </div>
+</div>
+
+<script>
+function feishuModule() {
+  return {
+    rows: [],
+    async init() {
+      const r = await fetch('/api/feishu-digest');
+      this.rows = await r.json();
+    },
+    catClass(c) {
+      return ({'操作':'info','决策':'warn','反馈':'ok','其他':''})[c] || '';
+    },
+  };
+}
+</script>
+{% endblock %}

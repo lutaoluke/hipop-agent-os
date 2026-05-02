@@ -1,0 +1,129 @@
+<div class="pc-chat" x-data="chatPanel()" x-init="init()">
+  <div class="pc-chat-header">
+    <div style="font-weight:600;">店铺协作 · Agent <span style="color:var(--text-tertiary);font-weight:400;">· {{ store_full or 'HIPOP-NOON-KSA' }}</span></div>
+    <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px;">Cherry · 王小明 · 刘鹤 · 张组长 · 李总监 + Agent</div>
+    <div class="pc-chat-team">
+      <template x-for="m in team" :key="m.name">
+        <div class="pc-team-avatar"
+             :class="{'online': m.online, 'me': m.is_me}"
+             :title="m.name + ' · ' + m.role + (m.online ? ' · 在线' : ' · 离线')"
+             x-text="m.avatar"></div>
+      </template>
+      <div class="pc-team-avatar agent online" title="Agent · 在岗">A</div>
+      <button class="pc-team-invite" title="邀请同事">+</button>
+      <span style="font-size:11px;color:var(--text-tertiary);margin-left:8px;" x-text="onlineCount + '/' + (team.length+1) + ' 在线'"></span>
+    </div>
+  </div>
+
+  <div class="pc-chat-msgs" id="chatMsgs">
+    <template x-for="(m, idx) in messages" :key="idx">
+      <div class="pc-chat-msg" :class="m.role">
+        <div class="pc-team-avatar"
+             :class="{'agent': m.role==='agent', 'me': m.who==='Cherry'}"
+             style="flex-shrink:0;"
+             x-text="m.who && m.who[0] || 'A'"></div>
+        <div style="flex:1;">
+          <div class="pc-chat-meta">
+            <span x-text="m.who"></span>
+            <span x-show="m.tag" class="pc-chat-tag" x-text="m.tag"></span>
+            <span style="margin-left:6px;" x-text="m.time"></span>
+          </div>
+          <div class="pc-chat-bubble">
+            <span x-html="formatContent(m.content)"></span>
+            <template x-if="m.references && m.references.length">
+              <div style="margin-top:4px;">
+                <template x-for="r in m.references">
+                  <span style="display:inline-block;font-size:10.5px;color:var(--text-info);background:var(--bg-info);padding:1px 6px;border-radius:4px;margin-right:4px;cursor:pointer;"
+                        @click="$dispatch('open-ref',{title:'数据出处',body:'',refs:m.references})"
+                        x-text="'📎 ' + r.table"></span>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </template>
+    <div x-show="loading" style="font-size:11.5px;color:var(--text-tertiary);padding:0 6px;">Agent 思考中…</div>
+  </div>
+
+  <div class="pc-chat-input-wrap">
+    <div class="pc-chat-quick">
+      <template x-for="q in quickCommands">
+        <button class="pc-chat-quick-btn" @click="input=q;send()" x-text="q"></button>
+      </template>
+    </div>
+    <div class="pc-chat-input">
+      <textarea x-model="input"
+                @keydown.ctrl.enter="send()"
+                @keydown.meta.enter="send()"
+                placeholder="@ 同事 / 问 Agent / 上传 CSV…"></textarea>
+      <button @click="send()" :disabled="loading">发送</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function chatPanel() {
+  return {
+    team: [],
+    messages: [],
+    quickCommands: [],
+    input: "",
+    loading: false,
+    onlineCount: 0,
+    async init() {
+      const [team, history] = await Promise.all([
+        fetch('/api/team/{{ store_lower or "ksa" }}').then(r=>r.json()),
+        fetch('/api/chat-history/{{ store_lower or "ksa" }}').then(r=>r.json()),
+      ]);
+      this.team = team;
+      this.onlineCount = team.filter(m=>m.online).length + 1;  // +1 agent
+      this.messages = history;
+      this.quickCommands = ["上传 noon CSV", "查 SKU 健康", "看 KSA 卡单", "本周补货建议", "选品候选评估"];
+      this.scroll();
+    },
+    formatContent(s) {
+      return (s || '').replace(/\n/g, '<br>');
+    },
+    scroll() {
+      this.$nextTick(() => {
+        const el = document.getElementById('chatMsgs');
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+    async send() {
+      const text = (this.input || "").trim();
+      if (!text || this.loading) return;
+      this.messages.push({who: "Cherry", role: "user", time: new Date().toTimeString().slice(0,5), content: text, tag: ""});
+      this.input = "";
+      this.loading = true;
+      this.scroll();
+      try {
+        const r = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            messages: this.messages.filter(m=>m.role!=='system').map(m => ({
+              role: m.role === 'agent' ? 'assistant' : 'user',
+              content: m.content,
+            })),
+            scope: {store: "{{ store }}", current_user: "Cherry", current_role: "运营"},
+          })
+        });
+        const data = await r.json();
+        this.messages.push({
+          who: "Agent", role: "agent",
+          time: new Date().toTimeString().slice(0,5),
+          content: data.reply || "(无回复)",
+          tag: data.tag || "",
+          references: data.references || [],
+        });
+      } catch(e) {
+        this.messages.push({who: "Agent", role: "agent", time: new Date().toTimeString().slice(0,5), content: "⚠️ 连接错误: " + e, tag: ""});
+      }
+      this.loading = false;
+      this.scroll();
+    },
+  };
+}
+</script>

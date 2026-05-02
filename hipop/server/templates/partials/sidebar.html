@@ -1,0 +1,43 @@
+<div class="pc-sidebar" x-data="{loaded:false, modules:[]}" x-init="
+  fetch('/api/modules/{{ store_lower or 'ksa' }}').then(r=>r.json()).then(d=>{modules=d;loaded=true;})
+">
+  <div class="pc-sidebar-section">店铺工作流</div>
+  <div class="pc-nav-item {% if page=='overview' %}active{% endif %}" onclick="location='/?store={{ store_lower or 'ksa' }}'">
+    <span class="pc-nav-icon">📊</span>
+    <span>今日总览</span>
+  </div>
+
+  <template x-for="m in modules" :key="m.key">
+    <div class="pc-nav-item"
+         :class="{'active': '{{ page }}' === m.key}"
+         @click="if (m.drill) location.href = m.drill + '?store={{ store_lower or 'ksa' }}'">
+      <span class="pc-nav-icon" x-text="({data:'📦',sales:'📈',logistics:'🚚',replenish:'📦',traffic:'📣',selection:'🎯',marketing:'🎁',feishu:'💬'})[m.key] || '·'"></span>
+      <span x-text="m.name"></span>
+      <span class="pc-nav-badge"
+            :class="m.state"
+            x-show="m.state==='danger' || m.state==='warn'"
+            x-text="m.state==='danger'?'!':(m.state==='warn'?'·':'')"></span>
+    </div>
+  </template>
+
+  <div class="pc-sidebar-section" style="margin-top:16px;">职能视图</div>
+  <div class="pc-nav-item {% if page=='liuhe' %}active{% endif %}" onclick="location='/role/liuhe'">
+    <span class="pc-nav-icon">🚚</span>
+    <span>跟单 · 跨店</span>
+  </div>
+  <div class="pc-nav-item">
+    <span class="pc-nav-icon">📈</span>
+    <span>组长视图</span>
+    <span class="pc-nav-badge">待开发</span>
+  </div>
+
+  <div class="pc-sidebar-section" style="margin-top:16px;">系统</div>
+  <div class="pc-nav-item">
+    <span class="pc-nav-icon">📜</span>
+    <span>Agent 操作记录</span>
+  </div>
+  <div class="pc-nav-item">
+    <span class="pc-nav-icon">🧠</span>
+    <span>策略沉淀</span>
+  </div>
+</div>

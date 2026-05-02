@@ -1,0 +1,68 @@
+<div class="pc-topbar">
+  <div class="pc-logo">
+    <div class="pc-logo-mark">点</div>
+    <span>点购 Agent OS</span>
+  </div>
+
+  <div class="pc-mode-chips">
+    <span class="pc-chip {% if not page or page=='overview' or page in ['sales','logistics','replenish','selection','feishu'] %}active{% endif %}"
+          onclick="location='/?store={{ store_lower or 'ksa' }}'">店铺</span>
+    <span class="pc-chip {% if page=='liuhe' %}active{% endif %}"
+          onclick="location='/role/liuhe'">职能</span>
+    <span class="pc-chip">团队</span>
+    <span class="pc-chip">全公司</span>
+  </div>
+
+  {% if page != 'liuhe' %}
+  <select class="pc-store-select" onchange="location=this.value">
+    {% for s in available_stores %}
+      <option value="/?store={{ s.code|lower }}" {% if s.code == store %}selected{% endif %}>
+        {{ s.name }}
+      </option>
+    {% endfor %}
+  </select>
+  {% endif %}
+
+  <div class="pc-data-chip" id="dataChip" hx-get="/api/data-health/{{ store_lower or 'ksa' }}" hx-trigger="load" hx-swap="innerHTML">
+    <span class="pc-dot info"></span>
+    <span>数据 检查中...</span>
+  </div>
+
+  <div class="pc-spacer"></div>
+
+  <div class="pc-agent-status">
+    <span class="pc-dot ok"></span>
+    <span>Agent · 在岗</span>
+  </div>
+
+  <button class="pc-icon-btn" title="通知">
+    🔔
+    <span class="pc-badge">3</span>
+  </button>
+  <button class="pc-icon-btn" title="设置">⚙️</button>
+  <div class="pc-avatar" title="{{ current_user }} · {{ current_role }}">
+    {{ current_user[0]|upper }}
+  </div>
+</div>
+
+<script>
+// 美化数据健康 chip
+htmx.on('htmx:afterSwap', function(e) {
+  if (e.detail.elt.id !== 'dataChip') return;
+  try {
+    var d = JSON.parse(e.detail.xhr.responseText);
+    var html = '';
+    var states = [
+      ['ERP', d.erp], ['noon-sales', d.noon_sales],
+      ['noon-inv', d.noon_inv], ['飞书', d.feishu]
+    ];
+    states.forEach(function(p) {
+      html += '<span style="margin-right:6px;"><span class="pc-dot ' + p[1] + '"></span> ' + p[0] + '</span>';
+    });
+    html += '<span style="color:var(--text-tertiary);">| ' + (d.as_of_date || '') + '</span>';
+    e.detail.elt.innerHTML = html;
+  } catch(err) {
+    e.detail.elt.innerHTML = '<span class="pc-dot warn"></span><span>数据状态获取失败</span>';
+  }
+});
+</script>
