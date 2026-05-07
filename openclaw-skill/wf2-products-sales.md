@@ -13,12 +13,14 @@ tags: [ecommerce, sales, products, noon, erp, hub, multi-tenant, hipop]
 
 针对使用 **dbuyerp ERP + noon** 的跨境卖家，每个**销售主体**（国别×平台×店铺）独立一张主表 + 一张订单明细表，自动完成：
 
-1. **商品库覆盖**：ERP 全量商品（含未动销、未上架），按 `platform_sku_ids` 绑定到对应销售主体
+1. **商品库覆盖**：每个销售主体独立调 ERP `/admin/product?store_ids=<entity.store_id>`，对齐 ERP 后台筛选店铺时的视图（含上架+未上架+草稿+组合品全部 product/SKU）
 2. **价格利润率**：ERP `/product-order-statistics` 拉最新售价 / 平均售价 / 利润率
 3. **订单明细累加**：扫 inbox 目录的 noon 后台 CSV 增量入库（`(partner_sku, item_nr)` 去重）
 4. **时间窗销量**：sales_10d / 30d / 60d / 90d / 120d / 180d 全部从订单粒度按"当前时刻 - N 天"动态算
 5. **异常对比**：noon 视角 vs ERP 视角，差异写到 `anomalies_json`（`no_noon_orders` / `price_mismatch`）
-6. **派生字段**：`is_listed`（上架且有动销）、`sales_grade` ABCD、`forecast_10d/30d`
+6. **派生字段**：`is_listed`（= 是否绑定 noon platform_sku_id，由 ingest 直接写入）、`sales_grade` ABCD、`forecast_10d/30d`
+
+> **归属判定（v2，2026-05-07）**：旧版按 `sku.platform_sku_ids` 数组判，会漏掉所有未挂 noon platform SKU id 的草稿/未上架商品（约 600+ 条/店铺）。v2 改成"按 entity 独立 fetch + ERP API store_ids 过滤"，与 ERP 后台口径完全一致。
 
 ---
 
@@ -43,6 +45,7 @@ playwright install chromium
       "country":  "SA",
       "platform": "Noon",
       "store":    "HIPOP-NOON-KSA",
+      "store_id": 85,
       "currency": "SAR"
     }
   ]
@@ -50,6 +53,8 @@ playwright install chromium
 ```
 
 **新增销售主体只需添加一行 config**——脚本会自动建对应数据库表，无需改代码。
+
+> **`store_id` 必填**（v2 起）：ERP API 用它做服务端过滤（`/admin/product?store_ids=<id>`），与 ERP 后台筛选店铺时的视图完全一致。怎么拿：在 ERP 后台筛选某店铺，DevTools Network 看 `/admin/product` 请求 query 里的 `store_ids` 值。
 
 ---
 
@@ -99,7 +104,7 @@ latest_order_date, as_of_date, erp_created_at,
 product_choose_admin,
 
 -- 派生
-is_listed,                                   -- 1=上架且有动销
+is_listed,                                   -- 1=已绑定 noon platform_sku_id（在线上能搜到/可下单），0=草稿/未上架/未绑定
 sales_grade,                                 -- A/B/C/D
 forecast_10d, forecast_30d,
 anomalies_json,                              -- noon vs ERP 差异 JSON
@@ -123,8 +128,9 @@ raw_json                                     -- 留底原始 CSV 行
 ## 数据流（顺序）
 
 ```
-[1] ERP /admin/product             → ingest_erp_products.py
-                                     按 sales_entities 白名单路由 → wf2_<alias>_sku 商品基础
+[1] ERP /admin/product?store_ids=<entity.store_id>  → ingest_erp_products.py
+                                     每个 entity 独立 fetch，过滤参数对齐 ERP 后台口径
+                                     → wf2_<alias>_sku 商品基础（含未上架）+ is_listed
 
 [2] ERP /product-order-statistics  → ingest_erp_sales.py
                                      6 时间窗逐个拉，写 sales_<N>d / 价格 / 利润率
@@ -134,8 +140,21 @@ raw_json                                     -- 留底原始 CSV 行
 
 [4]                                → wf_sales_static.py
                                      从 orders 重算 noon 视角销量（按 "now - N days" 滚动窗）
-                                     评级 + 预测 + 异常 + is_listed
+                                     评级 + 预测 + 异常（不再覆写 is_listed）
 ```
+
+### wf2 是上游 SKU 池 (重要)
+
+`wf2_<alias>_sku` 是整个工作流体系的**唯一 SKU 真源**, 下游 wf1 / wf3 / wf5 / wf6 都以它为基准:
+
+| 下游 | 怎么用 wf2 |
+|---|---|
+| **wf1** | `ingest_erp_stock` 以 wf2 SKU 池为 baseline, 仓库 0 库存也写 0 行; `ingest_noon_stock_csv` 过滤掉不在 wf2 的 SKU |
+| **wf3** | `wf_logistics_status --entities <alias>` 默认从 wf2_<alias>_sku 拉全量 SKU 跑物流追踪 |
+| **wf5** | `wf_sales_cycle` per-entity loop, 对 wf2_<alias>_sku 每个 SKU 算补货决策 |
+| **wf6** | 告警按 forwarder 推 entity, 写入 wf6_<alias>_replenishment_queue, 这些 SKU 必在 wf2_<alias>_sku |
+
+**约束**: 这些下游不能"自由生长"出 wf2 没有的 SKU. 之前 sa_main 时代曾出现 wf1 / wf3 收到 wf2 没的 SKU, 已通过巡检 agent 的 "SKU 池跨表漂移" invariant 拦截.
 
 ---
 

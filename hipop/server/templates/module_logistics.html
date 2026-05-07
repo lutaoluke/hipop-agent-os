@@ -74,6 +74,12 @@ function logisticsModule() {
     rows: [],
     counts: {},
     async init() {
+      await this.refresh();
+      window.addEventListener('workflow-done', (e) => {
+        if ((e.detail.affected_modules || []).includes('logistics')) this.refresh();
+      });
+    },
+    async refresh() {
       const r = await fetch('/api/orders/{{ store_lower }}?limit=100');
       this.rows = await r.json();
       this.counts = {

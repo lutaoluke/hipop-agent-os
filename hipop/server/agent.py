@@ -25,14 +25,11 @@ sys.path.insert(0, PROJECT_ROOT)
 from . import data as _data
 
 import anthropic
-_client = None
+from . import _auth
 
 
 def _get_client():
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic()
-    return _client
+    return _auth.get_client()
 
 
 # ── 工具定义（Anthropic tool schema）────────────────────
@@ -112,6 +109,53 @@ TOOLS = [
             "type": "object",
             "properties": {"store": {"type": "string", "enum": ["KSA", "UAE"]}},
             "required": ["store"],
+        },
+    },
+    {
+        "name": "list_products",
+        "description": (
+            "列出店铺商品。返回两个维度的统计：summary_products（product 维度，与 ERP 后台数字一致）+ "
+            "summary_skus（SKU 维度，含变体）。"
+            "用户问『商品/产品总数』时优先报 summary_products.total（这是 ERP 后台筛店铺看到的数字）。"
+            "用户问『SKU 总数』或『变体』时报 summary_skus.total。"
+            "is_listed=1 = 已绑定 noon 平台 SKU id（在线上能搜到/可下单）；is_listed=0 = 草稿/未挂平台。"
+            "listing='listed'/'unlisted'/'all' 控制示例返回；sales_only=true 仅含 sales_180d>0；limit=0 时不返示例。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "store": {"type": "string", "enum": ["KSA", "UAE"]},
+                "listing": {"type": "string", "enum": ["all", "listed", "unlisted"], "default": "all"},
+                "sales_only": {"type": "boolean", "default": False, "description": "true=仅含 180 天内有销量"},
+                "limit": {"type": "integer", "default": 0, "description": "返回示例 SKU 行数，0=只要聚合"},
+            },
+            "required": ["store"],
+        },
+    },
+    {
+        "name": "run_workflow",
+        "description": (
+            "异步触发后台工作流（每个 workflow 都是耗时操作，立即返回 task_id 让前端订阅 SSE 进度）。\n"
+            "可选 workflow:\n"
+            "- wf1_stock：拉 ERP 6 仓 + noon Inventory 库存 + 飞书同步\n"
+            "- wf2_sales：拉商品库 + ERP 销量 + noon CSV 累加 + 聚合销量评级 + 飞书同步\n"
+            "- wf3_logistics：扫所有 entity 物流货单 + 写 hub + 飞书同步\n"
+            "- wf5_sales_cycle：销售周期 + 补货决策 + 飞书 sync_decisions\n"
+            "- wf6_alerts：生成物流告警 + 飞书 alerts/warehouse_appt\n"
+            "- daily：每日例行（wf3 + wf6 + 推日报卡片）\n"
+            "- weekly：每周例行全链路（wf1 + wf2 + wf3 + wf6 + wf5 + 周报卡片）\n"
+            "用户说『跑一下/重新算/刷新/同步』销售周期/物流/补货/库存等，应当调本工具。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workflow": {
+                    "type": "string",
+                    "enum": ["wf1_stock", "wf2_sales", "wf3_logistics",
+                             "wf5_sales_cycle", "wf6_alerts", "daily", "weekly"],
+                },
+            },
+            "required": ["workflow"],
         },
     },
 ]
@@ -283,6 +327,106 @@ def tool_data_health_check(store: str) -> Dict:
     }
 
 
+def tool_list_products(store: str, listing: str = "all",
+                       sales_only: bool = False, limit: int = 0) -> Dict:
+    s = store.lower()
+    tbl = f"wf2_hipop_{s}_sku"
+    # 聚合 — SKU 维度
+    agg = _data._fetch(f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN is_listed=1 THEN 1 ELSE 0 END) AS listed,
+          SUM(CASE WHEN is_listed=0 OR is_listed IS NULL THEN 1 ELSE 0 END) AS unlisted,
+          SUM(CASE WHEN COALESCE(sales_180d,0) > 0 THEN 1 ELSE 0 END) AS ever_sold,
+          SUM(CASE WHEN COALESCE(sales_30d,0) > 0 THEN 1 ELSE 0 END) AS sold_recent_30d
+        FROM {tbl}
+    """)[0]
+    # 聚合 — product 维度（与 ERP 后台视图一致）
+    prod_agg = _data._fetch(f"""
+        SELECT
+          COUNT(DISTINCT product_id) AS product_total,
+          COUNT(DISTINCT CASE WHEN is_listed=1 THEN product_id END) AS product_listed,
+          COUNT(DISTINCT CASE WHEN is_listed=0 OR is_listed IS NULL THEN product_id END) AS product_unlisted
+        FROM {tbl} WHERE product_id IS NOT NULL AND product_id != ''
+    """)[0]
+
+    where = []
+    if listing == "listed":   where.append("is_listed=1")
+    elif listing == "unlisted": where.append("(is_listed=0 OR is_listed IS NULL)")
+    if sales_only: where.append("COALESCE(sales_180d,0) > 0")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    filtered_count = _data._scalar(f"SELECT COUNT(*) FROM {tbl} {where_sql}") or 0
+
+    items = []
+    if limit and limit > 0:
+        rows = _data._fetch(f"""
+            SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price
+            FROM {tbl} {where_sql}
+            ORDER BY COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC
+            LIMIT ?
+        """, (int(limit),))
+        items = [{
+            "sku": r["partner_sku"], "title": r["title"],
+            "is_listed": bool(r["is_listed"]),
+            "sales_30d": r["sales_30d"] or 0,
+            "sales_180d": r["sales_180d"] or 0,
+            "price": r["latest_price"],
+        } for r in rows]
+
+    return {
+        "store": store,
+        "summary_products": {
+            # ERP 后台视图（product 维度，与运营直觉对齐）— 1 product 可能含多个 SKU 变体
+            "total":     prod_agg["product_total"],
+            "listed":    prod_agg["product_listed"],
+            "unlisted":  prod_agg["product_unlisted"],
+            "_dim": "product (= ERP 后台筛选店铺时显示的总数)"
+        },
+        "summary_skus": {
+            # SKU 维度（含变体）
+            "total":           agg["total"],
+            "listed":          agg["listed"],     # 已绑定 noon platform_sku_id
+            "unlisted":        agg["unlisted"],   # 未绑定 noon = 草稿/未上架
+            "ever_sold_180d":  agg["ever_sold"],
+            "sold_recent_30d": agg["sold_recent_30d"],
+            "_dim": "sku (含每个 product 下的颜色/尺寸变体)"
+        },
+        "filter": {"listing": listing, "sales_only": sales_only},
+        "filtered_count": filtered_count,
+        "items": items,
+        "references": [
+            {"table": tbl, "where": where_sql or "(全表)", "as_of_date": "today"},
+        ],
+    }
+
+
+def tool_run_workflow(workflow: str) -> Dict:
+    """触发后台工作流。直接复用 api._run_workflow + uuid 生成 task_id，不走 HTTP 自调用。"""
+    from uuid import uuid4
+    import threading
+    from . import api as _api
+
+    if workflow not in _api.WORKFLOW_REGISTRY:
+        return {"ok": False, "error": f"unknown workflow: {workflow}",
+                "valid": list(_api.WORKFLOW_REGISTRY)}
+    label, steps, affected = _api.WORKFLOW_REGISTRY[workflow]
+    task_id = uuid4().hex[:8]
+    # 后台线程跑（避免阻塞 chat tool-use 循环）
+    threading.Thread(
+        target=_api._run_workflow, args=(task_id, workflow), daemon=True,
+    ).start()
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "workflow": workflow,
+        "label": label,
+        "total_steps": len(steps),
+        "affected_modules": affected,
+        "hint": f"已启动后台任务 {task_id}（{label}），前端将订阅 SSE 推送进度，完成后自动刷新 {affected}。",
+    }
+
+
 # ── Tool 派发 ─────────────────────────────────────────
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
@@ -292,6 +436,8 @@ TOOL_FUNCS = {
     "compute_replenishment": tool_compute_replenishment,
     "compute_air_freight_roi": tool_compute_air_freight_roi,
     "data_health_check": tool_data_health_check,
+    "list_products": tool_list_products,
+    "run_workflow": tool_run_workflow,
 }
 
 
@@ -321,6 +467,12 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent，工作在共同
 - 给出判断（趋势 / 紧迫度）+ 简明建议（量化, 可执行）
 - 中文，简洁，2-4 句一段，不要罗列冗长字段
 - 不知道时直说，不要瞎编。涉及更新的操作（update_alert_status）需要用户确认意图后再调用
+
+工作流触发（run_workflow）使用规则:
+- 用户说『跑一下/重新算/刷新/同步』销售周期、物流、补货、库存、销量等 → 调 run_workflow
+- 工具是异步的，立即返回 task_id；不要等结果，直接告诉用户"已启动后台任务 <task_id>（<label>），完成后会自动刷新 <affected_modules> 页面"
+- run_workflow 不需要用户二次确认，直接调（页面已实时显示进度）
+- 调完不要再去 query 数据，因为还没跑完
 """
 
 
@@ -346,15 +498,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     refs_collected = []
     tool_log = []
     final_text = ""
+    workflow_task = None  # 若调了 run_workflow，记录最近一次的 task 信息透回前端
+    _retried_after_auth_error = False
 
+    # 模型可通过 ANTHROPIC_CHAT_MODEL 覆盖；默认 haiku-4-5（OAuth 订阅 sonnet 配额易耗尽时回退）
+    model = os.environ.get("ANTHROPIC_CHAT_MODEL", "claude-haiku-4-5-20251001")
     for hop in range(6):  # 最多 6 轮 tool-use
-        resp = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            system=sys_text,
-            messages=msgs,
-            tools=TOOLS,
-            max_tokens=2048,
-        )
+        try:
+            resp = client.messages.create(
+                model=model,
+                system=sys_text,
+                messages=msgs,
+                tools=TOOLS,
+                max_tokens=2048,
+            )
+        except anthropic.AuthenticationError:
+            # keychain token 被 /login 轮换了；丢缓存重读一次
+            if _retried_after_auth_error:
+                raise
+            _retried_after_auth_error = True
+            _auth.reset()
+            client = _get_client()
+            continue
         # 累积 assistant 内容
         msgs.append({"role": "assistant", "content": resp.content})
 
@@ -376,6 +541,14 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                 result = _exec_tool(tool_name, tool_args)
                 if isinstance(result, dict) and "references" in result:
                     refs_collected.extend(result["references"])
+                if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):
+                    workflow_task = {
+                        "task_id": result["task_id"],
+                        "workflow": result["workflow"],
+                        "label": result["label"],
+                        "total_steps": result["total_steps"],
+                        "affected_modules": result["affected_modules"],
+                    }
                 tool_log.append({"name": tool_name, "args": tool_args, "result_keys": list(result.keys()) if isinstance(result, dict) else None})
                 tool_results.append({
                     "type": "tool_result",
@@ -410,6 +583,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "action_id": action_id,
         "tools_used": [t["name"] for t in tool_log],
         "tag": "执行" if tool_log else None,
+        "workflow_task": workflow_task,
     }
 
 

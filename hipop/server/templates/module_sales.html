@@ -82,6 +82,12 @@ function salesModule() {
     counts: {},
     filter: 'urgent',
     async init() {
+      await this.refresh();
+      window.addEventListener('workflow-done', (e) => {
+        if ((e.detail.affected_modules || []).includes('sales')) this.refresh();
+      });
+    },
+    async refresh() {
       const r = await fetch('/api/sku-health/{{ store_lower }}?urgency=all&limit=200');
       this.rows = await r.json();
       this.counts = {

@@ -6,7 +6,7 @@
   2. noon vs ERP 差异写到 anomalies_json
   3. 评级 ABCD（占位规则）
   4. 预测 10/30 天（线性占位）
-  5. is_listed = 1 if sales_180d > 0 or valid_orders > 0 else 0
+  5. is_listed 由 ingest_erp_products 决定（= 是否绑定 noon platform_sku_id），本脚本不再覆写
   6. 收集订单号集合 → order_item_nrs_json
 
 CLI:
@@ -173,8 +173,8 @@ def run_entity(conn, ent, only_sku=None):
         grade = grade_sku(merged)
         fc = forecast(merged)
         item_nrs = order_item_nrs(sub_cur, ord_tbl, partner_sku)
-        is_listed = 1 if (merged.get("sales_180d") or 0) > 0 \
-                       or (merged.get("valid_orders") or 0) > 0 else 0
+        # is_listed 由 ingest_erp_products 写入（= 是否绑定 noon platform_sku_id），
+        # 这里不再覆盖；wf2_<alias>_sku 全表含 1418 条 SKU，has noon binding=1 的为已上架。
 
         upd_cur.execute(f"""
             UPDATE {sku_tbl}
@@ -198,7 +198,6 @@ def run_entity(conn, ent, only_sku=None):
                 sales_grade    = ?,
                 forecast_10d   = ?,
                 forecast_30d   = ?,
-                is_listed      = ?,
                 anomalies_json = ?,
                 order_item_nrs_json = ?
             WHERE partner_sku=?
@@ -211,7 +210,7 @@ def run_entity(conn, ent, only_sku=None):
             merged.get("latest_price"), merged.get("avg_price"),
             merged.get("latest_profit_rate"),
             merged.get("total_revenue"), merged.get("latest_order_date"),
-            grade, fc["forecast_10d"], fc["forecast_30d"], is_listed,
+            grade, fc["forecast_10d"], fc["forecast_30d"],
             json.dumps(anomalies, ensure_ascii=False) if anomalies else None,
             json.dumps(item_nrs, ensure_ascii=False) if item_nrs else None,
             partner_sku,

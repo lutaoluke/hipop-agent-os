@@ -97,6 +97,12 @@ function replenishModule() {
     totalQty: 0,
     alerts: [],
     async init() {
+      await this.refresh();
+      window.addEventListener('workflow-done', (e) => {
+        if ((e.detail.affected_modules || []).includes('replenish')) this.refresh();
+      });
+    },
+    async refresh() {
       const [rs, alerts] = await Promise.all([
         fetch('/api/replenishment/{{ store_lower }}').then(r=>r.json()),
         fetch('/api/orders/{{ store_lower }}').then(r=>r.json()),

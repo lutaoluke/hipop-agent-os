@@ -53,10 +53,14 @@ def erp_get(token, path, params=None, retries=6):
     raise RuntimeError("erp_get exhausted retries")
 
 
-def fetch_products(token, page_size=50, max_pages=None):
+def fetch_products(token, page_size=50, max_pages=None, store_id=None):
+    """拉 /admin/product 列表。store_id 给定时按 ERP 后台口径过滤（store_ids=<id>）。"""
     page = 1
     while True:
-        data = erp_get(token, "/product", {"keyword_type": 1, "page": page, "limit": page_size})
+        params = {"keyword_type": 1, "page": page, "limit": page_size}
+        if store_id is not None:
+            params["store_ids"] = store_id
+        data = erp_get(token, "/product", params)
         if data.get("code") != 200:
             raise RuntimeError(f"ERP product list error: {data.get('msg')} page={page}")
         items = data.get("data") or []
@@ -90,46 +94,59 @@ def run(max_pages=None):
 
     # alias -> [rec, ...]
     by_entity = {e["alias"]: [] for e in entities}
-    seen_skus = 0
-    bound_skus = 0
 
-    for product in fetch_products(token, max_pages=max_pages):
-        product_id = product.get("product_id")
-        title      = product.get("name") or ""
-        brand_obj  = product.get("brand") or {}
-        brand      = brand_obj.get("name")
-        cat_detail = product.get("product_category_detail")
-        admin_obj  = product.get("product_choose_admin") or {}
-        admin      = admin_obj.get("username")
-        created_at = product.get("created_at")
-        imgs = product.get("images") or product.get("noon_images") or []
-        main_image = imgs[0] if imgs else None
+    # 按 entity 独立拉取（带 store_ids 过滤，对齐 ERP 后台筛选店铺时的口径）
+    for ent in entities:
+        alias = ent["alias"]
+        store_id = ent.get("store_id")
+        if not store_id:
+            print(f"[{alias}] WARNING: 没配 store_id，跳过 (在 hipop.json sales_entities 加 store_id)",
+                  file=sys.stderr)
+            continue
+        print(f"\n[entity {alias}] fetch store_ids={store_id}...", file=sys.stderr)
 
-        for sku in product.get("skus") or []:
-            seen_skus += 1
-            sku_id    = sku.get("sku_id")  # =PSKU
-            sku_image = sku.get("sku_image") or main_image
-            cost      = sku.get("cost_price")
-            try:
-                cost = float(cost) if cost is not None else None
-            except (TypeError, ValueError):
-                cost = None
+        seen_skus = 0
+        bound_skus = 0
+        for product in fetch_products(token, max_pages=max_pages, store_id=store_id):
+            product_id = product.get("product_id")
+            title      = product.get("name") or ""
+            brand_obj  = product.get("brand") or {}
+            brand      = brand_obj.get("name")
+            cat_detail = product.get("product_category_detail")
+            admin_obj  = product.get("product_choose_admin") or {}
+            admin      = admin_obj.get("username")
+            created_at = product.get("created_at")
+            imgs = product.get("images") or product.get("noon_images") or []
+            main_image = imgs[0] if imgs else None
 
-            sku_bound_to_any = False
-            for psk in sku.get("platform_sku_ids") or []:
-                store_obj = psk.get("store") or {}
-                plat_obj  = psk.get("platform") or {}
-                if plat_obj.get("id") != NOON_PLATFORM_ID:
-                    continue
-                country = NATION_BY_ID.get(store_obj.get("nation_id"))
-                store   = store_obj.get("name")
-                ent = entity_for(country=country, store=store)
-                if not ent:
-                    continue   # 不在 sales_entities 白名单里
-                by_entity[ent["alias"]].append({
+            for sku in product.get("skus") or []:
+                seen_skus += 1
+                sku_id    = sku.get("sku_id")  # =PSKU
+                sku_image = sku.get("sku_image") or main_image
+                cost      = sku.get("cost_price")
+                try:
+                    cost = float(cost) if cost is not None else None
+                except (TypeError, ValueError):
+                    cost = None
+
+                # 找该 SKU 在本 entity 下的 noon platform_sku_id（可能没有 = 草稿/未上架）
+                noon_sku = None
+                for psk in sku.get("platform_sku_ids") or []:
+                    plat_obj  = psk.get("platform") or {}
+                    if plat_obj.get("id") != NOON_PLATFORM_ID:
+                        continue
+                    store_obj = psk.get("store") or {}
+                    if store_obj.get("name") != ent.get("store"):
+                        continue
+                    noon_sku = psk.get("platform_sku_id")
+                    break
+                if noon_sku:
+                    bound_skus += 1
+
+                by_entity[alias].append({
                     "partner_sku": sku_id,
                     "erp_sku_id":  sku_id,
-                    "noon_sku":    psk.get("platform_sku_id"),
+                    "noon_sku":    noon_sku,
                     "product_id":  product_id,
                     "title":       title,
                     "image_url":   sku_image,
@@ -139,13 +156,11 @@ def run(max_pages=None):
                     "erp_created_at":         created_at,
                     "product_choose_admin":   admin,
                     "currency":    ent.get("currency"),
+                    "is_listed":   1 if noon_sku else 0,  # 是否已绑定 noon 平台 SKU
                 })
-                sku_bound_to_any = True
-            if sku_bound_to_any:
-                bound_skus += 1
 
-    print(f"[fetch done] seen {seen_skus} skus, {bound_skus} bound to a configured entity",
-          file=sys.stderr)
+        print(f"[{alias}] seen {seen_skus} skus, {bound_skus} bound to noon platform",
+              file=sys.stderr)
 
     # 写库：每个主体一张表
     cur = conn.cursor()
@@ -153,6 +168,7 @@ def run(max_pages=None):
         "partner_sku", "erp_sku_id", "noon_sku", "product_id",
         "title", "image_url", "brand", "product_category_detail",
         "cost_price", "erp_created_at", "product_choose_admin", "currency",
+        "is_listed",
     ]
     placeholders = ",".join(["?"] * len(cols))
     update_set = ",".join(f"{c}=COALESCE(excluded.{c},{c})"

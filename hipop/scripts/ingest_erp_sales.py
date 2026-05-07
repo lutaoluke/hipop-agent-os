@@ -27,14 +27,92 @@ WINDOWS = [10, 30, 60, 90, 120, 180]
 
 
 # ── token 获取 ────────────────────────────────────────────────────────
-def get_token_via_page():
+def _get_token_via_cdp_raw():
+    """直接走 Chrome DevTools Protocol websocket，绕开 playwright 的 attach 全 context 行为
+    （连接多 tab 的 chrome 时 playwright connect_over_cdp 经常 180s 超时）。
+
+    在 ERP tab 里 evaluate localStorage / cookie 拿 token 字符串。
+    """
+    try:
+        import json as _json, websocket, requests as _req
+    except ImportError:
+        return None
+    try:
+        # 必须绕开系统代理：本机 chrome devtools 直连
+        sess = _req.Session(); sess.trust_env = False
+        r = sess.get("http://127.0.0.1:9222/json", timeout=3,
+                     proxies={"http": None, "https": None},
+                     headers={"Connection": "close"})
+        tabs = r.json()
+    except Exception as e:
+        print(f"[token via cdp] /json fail: {e}", file=sys.stderr)
+        return None
+    erp_tab = next((t for t in tabs
+                    if t.get("type") == "page"
+                    and "dbuyerp.com" in t.get("url", "")
+                    and "/login" not in t.get("url", "")),
+                   None)
+    if not erp_tab:
+        print("[token via cdp] no logged-in dbuyerp tab", file=sys.stderr)
+        return None
+    ws_url = erp_tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return None
+    # 一次性 evaluate：从 localStorage / sessionStorage / cookie 找 token
+    js = """
+    (function () {
+      function isJwt(v) {
+        return typeof v === 'string'
+            && v.length > 200
+            && (v.indexOf('eyJ') === 0 || v.indexOf('Bearer eyJ') === 0);
+      }
+      function scanStorage(s) {
+        for (var i=0; i<s.length; i++) {
+          var k=s.key(i); var v=s.getItem(k);
+          if (!v) continue;
+          if (isJwt(v)) return v;
+          try { var o=JSON.parse(v);
+            for (var kk in o) { if (isJwt(o[kk])) return o[kk]; }
+          } catch(e) {}
+        }
+        return null;
+      }
+      var t = scanStorage(localStorage) || scanStorage(sessionStorage);
+      if (t) return t;
+      // cookie 后备
+      var m = document.cookie.match(/(?:^|; )(?:token|access_token|Authorization)=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    })();
+    """
+    try:
+        # chrome 默认拒绝 127.0.0.1:9222 origin 的 ws 连接，必须显式给个干净的 Origin
+        ws = websocket.create_connection(ws_url, timeout=5,
+                                         origin="http://localhost",
+                                         header=["Host: localhost"])
+        ws.send(_json.dumps({"id": 1, "method": "Runtime.evaluate",
+                             "params": {"expression": js, "returnByValue": True}}))
+        resp = _json.loads(ws.recv())
+        ws.close()
+        val = (((resp.get("result") or {}).get("result") or {}).get("value"))
+        if val and isinstance(val, str):
+            tok = val.replace("Bearer ", "").strip()
+            if tok.startswith("eyJ") and len(tok) > 200:
+                return tok
+        print(f"[token via cdp] no token in storage; got: {str(val)[:80]}", file=sys.stderr)
+    except Exception as e:
+        print(f"[token via cdp] ws fail: {e}", file=sys.stderr)
+    return None
+
+
+def _get_token_via_playwright():
+    """Playwright fallback（chrome 多 tab 时容易超时，所以放第二位）。"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222", timeout=15000)
             ctx = browser.contexts[0]
             erp = next((pg for pg in ctx.pages if "dbuyerp.com" in pg.url), None)
             if not erp:
@@ -46,17 +124,21 @@ def get_token_via_page():
                 if a and "erp-api" in req.url and not auth["v"]:
                     auth["v"] = a
             erp.on("request", grab)
-            target = "https://www.dbuyerp.com/data-statistics/product"
-            if "data-statistics/product" not in erp.url:
-                erp.goto(target, wait_until="load", timeout=20000)
-            else:
-                erp.reload(wait_until="load", timeout=20000)
-            erp.wait_for_timeout(4000)
+            try:
+                erp.goto("https://www.dbuyerp.com/product/list",
+                         wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            erp.wait_for_timeout(5000)
             if auth["v"]:
                 return auth["v"].replace("Bearer ", "").strip()
     except Exception as e:
-        print(f"[token via page] failed: {e}", file=sys.stderr)
+        print(f"[token via playwright] failed: {e}", file=sys.stderr)
     return None
+
+
+def get_token_via_page():
+    return _get_token_via_cdp_raw() or _get_token_via_playwright()
 
 
 def get_token():

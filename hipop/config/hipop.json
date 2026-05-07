@@ -10,6 +10,7 @@
       "country": "SA",
       "platform": "Noon",
       "store": "HIPOP-NOON-KSA",
+      "store_id": 85,
       "currency": "SAR",
       "feishu_table_id": "tblQ1FGxIsBbjQAl",
       "feishu_decisions_table_id": "tblL7Twlt2K7qLhi",
@@ -20,6 +21,7 @@
       "country": "AE",
       "platform": "Noon",
       "store": "HIPOP-NOON-UAE",
+      "store_id": 42,
       "currency": "AED"
     }
   ],
@@ -54,6 +56,13 @@
     "base_url": "https://openapi.ziniao.com",
     "app_id": "__REDACTED_ZINIAO_APP_ID__",
     "app_secret": "__REDACTED_ZINIAO_RSA_PRIVATE_KEY__"
+  },
+  "ziniao_client": {
+    "company": "点购优品跨境",
+    "username": "__REDACTED_USERNAME__",
+    "password": "__REDACTED_PASSWORD__",
+    "web_driver_port": 18080,
+    "debug_port_default": 9223
   },
   "logistics_tracking": {
     "义特无忧KSA": "http://tracking.nextsls.com/trace?app=61a0c12f69c1d654e75a49e6",

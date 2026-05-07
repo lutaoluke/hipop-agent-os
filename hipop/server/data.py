@@ -281,7 +281,38 @@ def get_module_summaries(store: str) -> List[Dict]:
             "ref": "feishu_digest",
             "drill": "/module/feishu",
         },
+        _audit_module_summary(store),
     ]
+
+
+def _audit_module_summary(store: str) -> Dict:
+    """巡检 agent 模块卡 — 10 invariants 健康度"""
+    try:
+        from . import audit
+        s = audit.get_summary(store)
+        c = s["counts"]
+        line1_msg = f"{c['ok']} 通过"
+        if c.get("warn"): line1_msg += f" · {c['warn']} 警告"
+        if c.get("danger"): line1_msg += f" · {c['danger']} 严重"
+        # 取最严重的 1 条放 line2
+        worst = next((r for r in s["checks"] if r["status"] == "danger"),
+                     next((r for r in s["checks"] if r["status"] == "warn"), None))
+        line2 = worst["check"] + ": " + (worst["message"][:40] + "...") if worst else "全部 invariant 通过"
+        return {
+            "key": "audit",
+            "name": "数据巡检",
+            "state": s["overall"],
+            "line1": line1_msg,
+            "line2": line2,
+            "ref": "audit/10 invariants",
+            "drill": "/module/audit",
+        }
+    except Exception as e:
+        return {
+            "key": "audit", "name": "数据巡检", "state": "warn",
+            "line1": "巡检脚本异常", "line2": str(e)[:50],
+            "ref": "audit", "drill": "/module/audit",
+        }
 
 
 # ── 工作日志（飞书 + agent 操作 + 物流告警）────────────
@@ -325,6 +356,23 @@ def get_work_log(store: str) -> List[Dict]:
             "ref": "feishu_digest",
             "tag": d.get("category") or "飞书",
         })
+
+    # 巡检 agent 异常 → 推到工作日志 (warn / danger 项)
+    try:
+        from . import audit
+        s = audit.get_summary(store)
+        now = datetime.datetime.now().strftime("%H:%M")
+        for r in s["checks"]:
+            if r["status"] in ("warn", "danger"):
+                items.append({
+                    "time": now,
+                    "who": "巡检 Agent",
+                    "text": f"[{r['status'].upper()}] {r['check']}: {r['message'][:80]}",
+                    "ref": "audit",
+                    "tag": "巡检",
+                })
+    except Exception:
+        pass
 
     # mock 飞书（保底）
     from . import mock as _mock
@@ -428,6 +476,70 @@ def get_progress_current() -> Dict:
         "total_steps": len(steps),
         "steps": steps,
     }
+
+
+# ── Chat 消息持久化 ───────────────────────────────────────
+def _ensure_chat_table():
+    with conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                role TEXT NOT NULL,            -- 'user' | 'agent'
+                who TEXT,                       -- 'Cherry' / 'Agent' / ...
+                content TEXT NOT NULL,
+                tag TEXT,
+                references_json TEXT,           -- JSON array
+                task_json TEXT,                 -- workflow_task JSON（仅 agent 触发工作流时）
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_chat_store_time ON chat_messages(store, id)")
+        c.commit()
+
+
+def write_chat_message(store: str, role: str, who: Optional[str], content: str,
+                       tag: Optional[str] = None,
+                       references: Optional[List[Dict]] = None,
+                       task: Optional[Dict] = None) -> int:
+    _ensure_chat_table()
+    with conn() as c:
+        cur = c.execute("""
+            INSERT INTO chat_messages (store, role, who, content, tag, references_json, task_json)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            store.upper(), role, who, content, tag,
+            json.dumps(references or [], ensure_ascii=False) if references else None,
+            json.dumps(task, ensure_ascii=False) if task else None,
+        ))
+        c.commit()
+        return cur.lastrowid
+
+
+def get_chat_messages(store: str, limit: int = 50) -> List[Dict]:
+    _ensure_chat_table()
+    rows = _fetch("""
+        SELECT id, role, who, content, tag, references_json, task_json, created_at
+        FROM chat_messages WHERE store=? ORDER BY id DESC LIMIT ?
+    """, (store.upper(), limit))
+    rows.reverse()  # 时间正序
+    out = []
+    for r in rows:
+        m = {
+            "who": r["who"] or ("Cherry" if r["role"] == "user" else "Agent"),
+            "role": r["role"],
+            "time": (r["created_at"] or "")[-8:-3],  # 'HH:MM'
+            "content": r["content"],
+            "tag": r["tag"] or "",
+        }
+        if r.get("references_json"):
+            try: m["references"] = json.loads(r["references_json"])
+            except Exception: m["references"] = []
+        if r.get("task_json"):
+            try: m["task"] = json.loads(r["task_json"])
+            except Exception: m["task"] = None
+        out.append(m)
+    return out
 
 
 # ── Agent Actions（reference 系统）────────────────────────

@@ -30,6 +30,25 @@
           </div>
           <div class="pc-chat-bubble">
             <span x-html="formatContent(m.content)"></span>
+            <template x-if="m.task">
+              <div style="margin-top:6px;padding:6px 8px;background:var(--bg-tertiary);border-radius:6px;font-size:11.5px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+                  <span style="font-weight:600;">⚙️ <span x-text="m.task.label"></span></span>
+                  <span style="color:var(--text-tertiary);" x-text="m.task.done_count + '/' + m.task.total_steps + (m.task.finished ? (m.task.ok ? ' ✓' : ' ✗') : ' …')"></span>
+                </div>
+                <template x-for="(s, i) in m.task.steps" :key="i">
+                  <div style="font-family:ui-monospace,Menlo,monospace;font-size:10.5px;line-height:1.5;"
+                       :style="s.status==='done' ? 'color:var(--text-success);' : (s.status==='started' ? 'color:var(--text-info);font-weight:600;' : (s.status==='error' ? 'color:var(--text-danger);' : 'color:var(--text-tertiary);'))">
+                    <span x-text="(s.status==='done'?'✓':(s.status==='started'?'▶':(s.status==='error'?'✗':(s.status==='skipped'?'·':' '))))"></span>
+                    <span x-text="' ' + s.name"></span>
+                  </div>
+                </template>
+                <div x-show="m.task.finished && m.task.ok && m.task.affected_modules && m.task.affected_modules.length"
+                     style="margin-top:4px;color:var(--text-success);font-size:10.5px;">
+                  ✓ 已完成 · 已刷新页面：<span x-text="(m.task.affected_modules||[]).join(' / ')"></span>
+                </div>
+              </div>
+            </template>
             <template x-if="m.references && m.references.length">
               <div style="margin-top:4px;">
                 <template x-for="r in m.references">
@@ -78,7 +97,16 @@ function chatPanel() {
       ]);
       this.team = team;
       this.onlineCount = team.filter(m=>m.online).length + 1;  // +1 agent
-      this.messages = history;
+      // 标准化历史消息：DB 中的 task 仅含 metadata，标记为已完成态以便正确渲染
+      this.messages = (history || []).map(m => {
+        if (m.task && m.task.task_id) {
+          m.task = Object.assign({
+            steps: [], done_count: m.task.total_steps || 0,
+            finished: true, ok: true,
+          }, m.task);
+        }
+        return m;
+      });
       this.quickCommands = ["上传 noon CSV", "查 SKU 健康", "看 KSA 卡单", "本周补货建议", "选品候选评估"];
       this.scroll();
     },
@@ -111,18 +139,81 @@ function chatPanel() {
           })
         });
         const data = await r.json();
-        this.messages.push({
+        const msg = {
           who: "Agent", role: "agent",
           time: new Date().toTimeString().slice(0,5),
           content: data.reply || "(无回复)",
           tag: data.tag || "",
           references: data.references || [],
-        });
+          task: null,
+        };
+        this.messages.push(msg);
+        if (data.workflow_task) {
+          this.attachTask(msg, data.workflow_task);
+        }
       } catch(e) {
         this.messages.push({who: "Agent", role: "agent", time: new Date().toTimeString().slice(0,5), content: "⚠️ 连接错误: " + e, tag: ""});
       }
       this.loading = false;
       this.scroll();
+    },
+    attachTask(msg, t) {
+      // 初始化 inline 进度状态
+      msg.task = {
+        task_id: t.task_id,
+        workflow: t.workflow,
+        label: t.label,
+        total_steps: t.total_steps,
+        affected_modules: t.affected_modules || [],
+        steps: [],         // [{name, status}]
+        done_count: 0,
+        finished: false,
+        ok: false,
+      };
+      // 通知顶部 progress_card 也跟进
+      window.dispatchEvent(new CustomEvent('task-started', {
+        detail: {taskId: t.task_id, label: t.label}
+      }));
+      // 订阅 SSE
+      const sse = new EventSource('/api/events/stream/' + t.task_id);
+      sse.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.type === 'connected') return;
+          if (ev.type === 'closing') { sse.close(); return; }
+          this.applyEvent(msg, ev, sse);
+          this.scroll();
+        } catch (err) { console.error(err); }
+      };
+      sse.onerror = () => { sse.close(); };
+    },
+    applyEvent(msg, ev, sse) {
+      const sn = ev.step_no, name = ev.step_name, st = ev.status;
+      // step_no=0 是 init（已在 attachTask 设了 total_steps），跳过
+      if (sn === 0) return;
+      // step_no=99 是终结事件
+      if (sn === 99) {
+        msg.task.finished = true;
+        msg.task.ok = (st === 'done');
+        sse.close();
+        if (msg.task.ok) {
+          // 通知模块页刷新
+          window.dispatchEvent(new CustomEvent('workflow-done', {
+            detail: {
+              workflow: msg.task.workflow,
+              task_id: msg.task.task_id,
+              affected_modules: msg.task.affected_modules,
+            }
+          }));
+        }
+        return;
+      }
+      // 普通 step：保证 steps 数组长度 ≥ sn
+      while (msg.task.steps.length < sn) {
+        msg.task.steps.push({name: '步骤 ' + (msg.task.steps.length+1), status: 'pending'});
+      }
+      msg.task.steps[sn-1] = {name: name || ('步骤 ' + sn), status: st};
+      msg.task.done_count = msg.task.steps.filter(s => s.status === 'done').length;
     },
   };
 }

@@ -3,9 +3,7 @@
 """
 import os
 import json
-import anthropic
-
-client = anthropic.Anthropic()  # 自动读取 ANTHROPIC_API_KEY 环境变量
+from . import _auth
 
 SYSTEM_PROMPT = """你是 HIPOP 跨境电商运营系统的意图识别模块。
 根据用户消息，判断要执行哪个工作流（skill），并提取参数。
@@ -28,7 +26,7 @@ def parse_intent(user_message: str) -> dict:
     输入用户消息，返回 {"skill": str, "skus": list, "reason": str}
     """
     try:
-        msg = client.messages.create(
+        msg = _auth.get_client().messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
             system=SYSTEM_PROMPT,
