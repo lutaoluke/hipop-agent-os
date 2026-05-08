@@ -427,6 +427,22 @@ def get_data_health(store: str) -> Dict:
         "wf6_alerts":    {"latest": latest_alerts,      "stale_days": _stale_days(latest_alerts),      "automation": "auto",      "workflow": "wf6_alerts"},
     }
 
+    # 问题意图 → 依赖的数据源 list（Agent 用这个判断"用户问的这种问题，我要看哪些源新鲜")
+    # 顺序很重要：列上游在前，下游在后；Agent 应该按这个顺序串行刷新（先 ERP 再 wf3 再 wf5）
+    dependency_groups = {
+        "replenishment":   ["erp_sales", "erp_stock", "noon_orders", "noon_stock", "wf3_logistics", "wf5_replenish"],  # 我该补货吗 / 哪些要补
+        "sku_health":      ["erp_sales", "noon_orders", "wf3_logistics", "wf5_replenish"],  # SKU 卖得怎么样 / 趋势 / 库存可撑
+        "logistics_track": ["wf3_logistics"],                                  # 在途 / 物流追踪
+        "alerts":          ["wf3_logistics", "wf6_alerts"],                    # 告警 / 卡单 / 红色货单
+        "air_freight_roi": ["erp_sales", "noon_orders", "wf5_replenish"],      # 海空运 ROI 决策
+        "products_count":  ["erp_products"],                                   # 商品总数 / 多少 SKU
+        "stock":           ["erp_stock", "noon_stock"],                        # 库存够不够
+        "overview":        ["erp_sales", "wf3_logistics", "wf5_replenish", "wf6_alerts"],  # 店铺概览 / 整体怎么样
+        "sales_only":      ["erp_sales", "noon_orders"],                       # 销量数字（不含库存/物流）
+    }
+    # 默认陈旧度阈值
+    stale_threshold_days = 1
+
     # 旧字段保留兼容前端 chip
     return {
         "erp": "ok" if latest_w2_imported == today else "warn",
@@ -443,6 +459,8 @@ def get_data_health(store: str) -> Dict:
             "noon_stock_date":  latest_noon_stock,
         },
         "sources": sources,  # Agent data_health_check tool 用这个
+        "dependency_groups": dependency_groups,  # 用户意图 → 该看哪些源
+        "stale_threshold_days": stale_threshold_days,
     }
 
 
