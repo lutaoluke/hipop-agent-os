@@ -119,10 +119,12 @@ function chatPanel() {
         if (el) el.scrollTop = el.scrollHeight;
       });
     },
-    async send() {
+    async send(opts) {
+      opts = opts || {};
       const text = (this.input || "").trim();
       if (!text || this.loading) return;
-      this.messages.push({who: "Cherry", role: "user", time: new Date().toTimeString().slice(0,5), content: text, tag: ""});
+      const tag = opts.autoFollowup ? "auto-续问" : "";
+      this.messages.push({who: "Cherry", role: "user", time: new Date().toTimeString().slice(0,5), content: text, tag: tag});
       this.input = "";
       this.loading = true;
       this.scroll();
@@ -165,6 +167,7 @@ function chatPanel() {
         label: t.label,
         total_steps: t.total_steps,
         affected_modules: t.affected_modules || [],
+        followup_prompt: t.followup_prompt || null,
         steps: [],         // [{name, status}]
         done_count: 0,
         finished: false,
@@ -205,6 +208,16 @@ function chatPanel() {
               affected_modules: msg.task.affected_modules,
             }
           }));
+          // 自动 follow-up：把用户原始问题作为新一轮 user 消息重发，
+          // Agent 此时数据已新鲜，直接给最终答案。
+          if (msg.task.followup_prompt) {
+            const fp = msg.task.followup_prompt;
+            msg.task.followup_prompt = null;  // 防止重复触发
+            setTimeout(() => {
+              this.input = fp;
+              this.send({autoFollowup: true});
+            }, 800);
+          }
         }
         return;
       }

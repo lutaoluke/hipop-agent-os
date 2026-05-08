@@ -144,7 +144,10 @@ TOOLS = [
             "- wf6_alerts：生成物流告警 + 飞书 alerts/warehouse_appt\n"
             "- daily：每日例行（wf3 + wf6 + 推日报卡片）\n"
             "- weekly：每周例行全链路（wf1 + wf2 + wf3 + wf6 + wf5 + 周报卡片）\n"
-            "用户说『跑一下/重新算/刷新/同步』销售周期/物流/补货/库存等，应当调本工具。"
+            "数据陈旧或用户说『跑/刷新/重新算/同步』时调本工具。\n"
+            "**重要**：如果用户原始问题需要等数据跑完才能答（例如『我该补货吗』而 wf5 数据陈旧），"
+            "在 followup_prompt 字段填上『需要等工作流跑完后接续答的问题』，前端会在 task 完成后自动重新发起一轮 chat，"
+            "你那时再用最新数据答最终结论。"
         ),
         "input_schema": {
             "type": "object",
@@ -153,6 +156,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["wf1_stock", "wf2_sales", "wf3_logistics",
                              "wf5_sales_cycle", "wf6_alerts", "daily", "weekly"],
+                },
+                "followup_prompt": {
+                    "type": "string",
+                    "description": "工作流跑完后前端会自动作为新一轮 user 消息重发。一般填用户的原始问题（如『我该补货吗』）。不需要等的纯触发场景留空。",
                 },
             },
             "required": ["workflow"],
@@ -401,7 +408,7 @@ def tool_list_products(store: str, listing: str = "all",
     }
 
 
-def tool_run_workflow(workflow: str) -> Dict:
+def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     """触发后台工作流。直接复用 api._run_workflow + uuid 生成 task_id，不走 HTTP 自调用。"""
     from uuid import uuid4
     import threading
@@ -423,7 +430,12 @@ def tool_run_workflow(workflow: str) -> Dict:
         "label": label,
         "total_steps": len(steps),
         "affected_modules": affected,
-        "hint": f"已启动后台任务 {task_id}（{label}），前端将订阅 SSE 推送进度，完成后自动刷新 {affected}。",
+        "followup_prompt": followup_prompt or None,
+        "hint": (
+            f"已启动后台任务 {task_id}（{label}），前端将订阅 SSE 推送进度，"
+            f"完成后自动刷新 {affected}。"
+            + (f" 跑完后会自动重发『{followup_prompt}』给你接续答用户。" if followup_prompt else "")
+        ),
     }
 
 
@@ -459,20 +471,50 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent，工作在共同
 2. 任务泛化：用户可以问任何问题，你应当首选用工具拿到真实数据，再回答。
 3. 自主决策：你应该主动给出判断 + 建议（不只是数字），并提供数据出处。
 
+**用户原则**: 用户不应该在终端跑任何脚本。所有数据更新/查询都通过 chat 工具完成。
+- 用户问问题 → 你先看现有数据是否够答
+- 数据不够新 → 你自动 run_workflow 触发更新（带 followup_prompt 等跑完接续答），不要让用户去跑
+- 数据够新 → 直接答 + 给数据出处
+
 当前 scope（参考）:
 {scope}
 
-回答要求:
-- 优先调用工具拿真数据（query_sku / query_order / scope_overview / compute_replenishment / data_health_check / compute_air_freight_roi / update_alert_status）
-- 给出判断（趋势 / 紧迫度）+ 简明建议（量化, 可执行）
-- 中文，简洁，2-4 句一段，不要罗列冗长字段
-- 不知道时直说，不要瞎编。涉及更新的操作（update_alert_status）需要用户确认意图后再调用
+## 问题 → 工具映射（必须遵守）
 
-工作流触发（run_workflow）使用规则:
-- 用户说『跑一下/重新算/刷新/同步』销售周期、物流、补货、库存、销量等 → 调 run_workflow
-- 工具是异步的，立即返回 task_id；不要等结果，直接告诉用户"已启动后台任务 <task_id>（<label>），完成后会自动刷新 <affected_modules> 页面"
-- run_workflow 不需要用户二次确认，直接调（页面已实时显示进度）
-- 调完不要再去 query 数据，因为还没跑完
+| 用户问 | 你调的 tool |
+|---|---|
+| 我该补货吗 / 哪些货要补 / 补多少 / 本周必补 | compute_replenishment |
+| <SKU> 卖得怎么样 / 库存够不够 / 趋势 | query_sku |
+| 单 <SKU> 海空运怎么选 / 海运合算还是空运 | compute_air_freight_roi |
+| 这单 <PDxxx> 怎么样 / 卡了几天 / 到哪了 | query_order |
+| <PDxxx> 已确认丢货 / 已约仓 / 已结案 | update_alert_status |
+| 店铺总共多少商品 / 多少 SKU / 多少未上架 | list_products |
+| 店铺整体怎么样 / 概览 / 红色告警 | scope_overview |
+| 数据是什么时候更新的 / 数据新鲜吗 | data_health_check |
+| 跑一下 / 刷新 / 重算 X | run_workflow |
+
+## 数据新鲜度自动判断（关键）
+
+用户问销售/补货/物流/告警相关，你**必须**先估算数据新鲜度。判定法：
+- 看 query 工具返回里的 as_of_date 或 updated_at；若与今日相差 ≥ 1 天 = 不新鲜
+- 不新鲜时：先调 run_workflow 触发对应 workflow，**带上 followup_prompt = 用户原始问题**，前端会在跑完后自动重发这条消息让你接续答
+- 新鲜时：直接调对应查询 tool 答，给数据出处
+
+不同问题对应的 workflow:
+- 补货 / 销售周期：wf5_sales_cycle（耗时短）
+- 销量 / SKU 健康：wf2_sales（耗时长，5-10 分钟）
+- 物流 / 卡单：wf3_logistics（耗时中）
+- 库存：wf1_stock
+- 全部刷新：weekly
+
+## 回答风格
+
+- 中文，简洁，2-4 句一段，不要罗列冗长字段
+- 给判断（趋势 / 紧迫度）+ 简明建议（量化、可执行）
+- 不知道时直说，不要瞎编
+- 涉及写入（update_alert_status）需要用户确认意图后再调用
+- run_workflow 不需要二次确认（页面有进度条），直接调
+- 触发 run_workflow 后**不要再 query 数据**，等 followup_prompt 自动接续
 """
 
 
@@ -548,6 +590,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                         "label": result["label"],
                         "total_steps": result["total_steps"],
                         "affected_modules": result["affected_modules"],
+                        "followup_prompt": result.get("followup_prompt"),
                     }
                 tool_log.append({"name": tool_name, "args": tool_args, "result_keys": list(result.keys()) if isinstance(result, dict) else None})
                 tool_results.append({
