@@ -37,9 +37,10 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
 
 
 def get_provider() -> str:
-    """当前生效的 provider 名。默认 anthropic（长对话稳定性 + 拒绝 hallucinate 优于 Qwen）。
-    阶段 1 alpha 用 Anthropic + OAuth 订阅；多租户上线后切 Qwen。"""
-    return os.environ.get("LLM_PROVIDER", "anthropic").lower()
+    """当前生效的 provider 名。默认 qwen（性价比 ¥18/万次 + 国内直连 + ICP 备案过 + 与产品化路线对齐）。
+    实测 3 层防护（prompt 硬约束 + 3 stub tool 门控 + _safety 后处理）对 Qwen 长对话 hallucinate 全部生效。
+    本地无 QWEN_API_KEY 时显式 LLM_PROVIDER=anthropic 走 OAuth keychain。"""
+    return os.environ.get("LLM_PROVIDER", "qwen").lower()
 
 
 def chat_with_tools(
