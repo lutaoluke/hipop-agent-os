@@ -37,8 +37,9 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
 
 
 def get_provider() -> str:
-    """当前生效的 provider 名"""
-    return os.environ.get("LLM_PROVIDER", "qwen").lower()
+    """当前生效的 provider 名。默认 anthropic（长对话稳定性 + 拒绝 hallucinate 优于 Qwen）。
+    阶段 1 alpha 用 Anthropic + OAuth 订阅；多租户上线后切 Qwen。"""
+    return os.environ.get("LLM_PROVIDER", "anthropic").lower()
 
 
 def chat_with_tools(

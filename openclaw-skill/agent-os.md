@@ -43,21 +43,36 @@ hipop/server/
    └─ partials/chat_panel.html  右侧 chat（订阅 SSE + dispatch workflow-done）
 ```
 
-## chat 协作 Agent — 8 个 tool
+## chat 协作 Agent — 11 个 tool
 
-定义在 `server/agent.py:TOOLS`，由 Claude `messages.create(tools=...)` 自动选用。
+定义在 `server/agent.py:TOOLS`。
+
+**查询/计算类**（数据回答）:
 
 | tool | 用途 | 写库 |
 |---|---|---|
 | `query_sku` | 查 SKU 健康（趋势/利润/库存可撑天/在途/告警），最多 3 个 SKU | 否 |
 | `query_order` | 查货单告警 + 涉及 SKU + 处理状态 | 否 |
-| `update_alert_status` | 反馈货单告警状态（已确认丢货 / 已约仓 ...）| ✅ wf6_logistics_alerts |
 | `scope_overview` | 店铺概览（在售 SKU 数 / 急速下降 / 在途 / 红色告警）| 否 |
 | `compute_replenishment` | 列当前店铺补货建议（来自 wf5）| 否 |
 | `compute_air_freight_roi` | 单 SKU 海空运 ROI 估算 | 否 |
-| `data_health_check` | 各表最新写入时间 | 否 |
-| `list_products` | **双维度统计**（product 维度对齐 ERP 后台 + SKU 维度含变体），用户问"商品总数"时优先报 product | 否 |
-| `run_workflow` | **异步触发后台工作流**，立即返回 task_id；前端订阅 SSE 显示 inline 进度 + 完成后自动刷新模块页 | ✅ agent_events |
+| `data_health_check` | 各表最新写入时间 + 自动度 + 依赖图 | 否 |
+| `list_products` | **双维度统计**（product 维度对齐 ERP 后台 + SKU 维度含变体）| 否 |
+
+**触发/写入类**:
+
+| tool | 用途 | 写库 |
+|---|---|---|
+| `update_alert_status` | 反馈货单告警状态 | ✅ wf6_logistics_alerts |
+| `run_workflow` | **异步触发后台工作流**，立即返回 task_id；前端订阅 SSE 显示进度 + 完成后自动刷新模块页 | ✅ agent_events |
+
+**反 hallucinate 门控类**（2026-05-08 加，拦 Qwen 类幻觉）:
+
+| tool | 用途 | 必调场景 |
+|---|---|---|
+| `export_table` | 用户问"导出/Excel/给我表格" | 当前 stub 引导浏览器另存。**严禁绕过自己宣称"已生成 Excel"** |
+| `navigate_user_to` | 用户问"打开 X 页面" | 返回真实 `localhost:8765/module/<name>` 路径。**严禁编造虚构域名** |
+| `notify_via_feishu` | 用户问"发飞书/通知同事" | stub 返回"只读集成"。**严禁宣称"已发到飞书"** |
 
 **调用规则**（写在 SYSTEM_PROMPT 里）：
 - 优先调工具拿真数据再回答

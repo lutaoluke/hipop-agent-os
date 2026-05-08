@@ -410,6 +410,14 @@ async def api_chat(body: dict):
         data.write_chat_message(store, "agent", "Agent", err, tag="error")
         return JSONResponse({"reply": err, "references": [], "action_id": None}, status_code=200)
 
+    # Layer 3 hallucinate 后处理验证
+    from . import _safety
+    sanitized, hallu_warnings = _safety.sanitize_reply(out.get("reply") or "", out.get("tools_used") or [])
+    if hallu_warnings:
+        out["reply"] = sanitized
+        out["hallucination_warnings"] = hallu_warnings
+        out["tag"] = "hallucinate"
+
     # 持久化 agent 回复
     try:
         data.write_chat_message(

@@ -133,6 +133,57 @@ TOOLS = [
         },
     },
     {
+        "name": "export_table",
+        "description": (
+            "用户要求『导出/下载/给我表格/Excel』时调本工具。"
+            "本系统目前 **没有 Excel 导出能力**——本工具仅返回 stub 引导用户去模块页用浏览器内置导出，或自行复制。"
+            "\n严禁不调本 tool 自行宣称『已导出』『生成了下载链接』；那是事故。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "description": "用户想导什么：replenish / sales / logistics / sku_health / orders 等"},
+                "format": {"type": "string", "enum": ["excel", "csv", "feishu"]},
+                "filter_desc": {"type": "string", "description": "用户筛选条件描述（可选）"},
+            },
+            "required": ["view"],
+        },
+    },
+    {
+        "name": "navigate_user_to",
+        "description": (
+            "用户要求『打开 X 页面/进 X 模块/看 X 看板』时调本工具，返回**真实**的工作台模块路径。"
+            "\n严禁编造 URL（如 agent.diangou.ai 这种虚构域名）；模块路径只能是 localhost:8765/module/<name>。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "module": {
+                    "type": "string",
+                    "enum": ["overview", "sales", "logistics", "replenish", "selection", "feishu", "audit", "role_liuhe"],
+                },
+                "store": {"type": "string", "enum": ["KSA", "UAE"]},
+            },
+            "required": ["module"],
+        },
+    },
+    {
+        "name": "notify_via_feishu",
+        "description": (
+            "用户说『发到飞书 / 通知刘鹤 / 推到群里 / @同事』时调本工具。"
+            "\n本系统飞书推送当前为只读集成（拉取告警/补货决策同步），**不能主动发消息**。"
+            "\n严禁不调本 tool 直接说『已发到飞书』。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "飞书群 / 个人 / @某同事"},
+                "message_summary": {"type": "string"},
+            },
+            "required": ["message_summary"],
+        },
+    },
+    {
         "name": "run_workflow",
         "description": (
             "异步触发后台工作流（每个 workflow 都是耗时操作，立即返回 task_id 让前端订阅 SSE 进度）。\n"
@@ -408,6 +459,65 @@ def tool_list_products(store: str, listing: str = "all",
     }
 
 
+def tool_export_table(view: str, format: str = "excel", filter_desc: str = "") -> Dict:
+    """stub — 没真 export 能力，引导用户去模块页用浏览器导出。"""
+    module_map = {
+        "replenish": "/module/replenish",
+        "sales": "/module/sales",
+        "sku_health": "/module/sales",
+        "logistics": "/module/logistics",
+        "orders": "/module/logistics",
+    }
+    path = module_map.get(view, f"/module/{view}")
+    return {
+        "ok": False,
+        "supported": False,
+        "view": view,
+        "format": format,
+        "message": (
+            f"系统目前没有内建 export 能力。请去工作台 {path} 页面，"
+            f"用浏览器右键『另存为』或选中表格复制到 Excel/飞书。"
+            "如需自动化导出，是产品化阶段 2 的功能。"
+        ),
+        "navigate_to": path,
+    }
+
+
+def tool_navigate_user_to(module: str, store: str = "KSA") -> Dict:
+    """返回真实模块路径，禁止 Agent 编造虚构域名。"""
+    valid = ["overview", "sales", "logistics", "replenish", "selection", "feishu", "audit", "role_liuhe"]
+    if module not in valid:
+        return {"ok": False, "error": f"模块 {module} 不存在；有效模块: {valid}"}
+    if module == "overview":
+        path = f"/?store={store.lower()}"
+    elif module == "role_liuhe":
+        path = "/role/liuhe"
+    else:
+        path = f"/module/{module}?store={store.lower()}"
+    full_url = f"http://localhost:8765{path}"
+    return {
+        "ok": True,
+        "module": module,
+        "path": path,
+        "url": full_url,
+        "hint": f"工作台模块入口：{full_url}（左侧 sidebar 也能直接点）",
+    }
+
+
+def tool_notify_via_feishu(message_summary: str, channel: str = "") -> Dict:
+    """stub — 飞书 push 当前只读集成。"""
+    return {
+        "ok": False,
+        "supported": False,
+        "channel": channel,
+        "message": (
+            "本系统飞书集成当前是只读：从飞书拉取告警状态、补货决策反馈，"
+            "不能主动推送消息到飞书群/同事。"
+            "\n如需通知，请用户在飞书 app 内手动转发，或 wf6_alerts 飞书表会被运营/跟单看到。"
+        ),
+    }
+
+
 def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     """触发后台工作流。直接复用 api._run_workflow + uuid 生成 task_id，不走 HTTP 自调用。"""
     from uuid import uuid4
@@ -449,6 +559,9 @@ TOOL_FUNCS = {
     "compute_air_freight_roi": tool_compute_air_freight_roi,
     "data_health_check": tool_data_health_check,
     "list_products": tool_list_products,
+    "export_table": tool_export_table,
+    "navigate_user_to": tool_navigate_user_to,
+    "notify_via_feishu": tool_notify_via_feishu,
     "run_workflow": tool_run_workflow,
 }
 
@@ -492,17 +605,47 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent，工作在共同
 | 店铺整体怎么样 / 概览 / 红色告警 | scope_overview |
 | 数据是什么时候更新的 / 数据新鲜吗 | data_health_check |
 | 跑一下 / 刷新 / 重算 X | run_workflow |
+| **导出 / 下载 / 给我 Excel / 给我表格** | **export_table**（必调，不要自己编"已生成 Excel"）|
+| **打开 X 页面 / 进 X 模块 / 看 X 看板** | **navigate_user_to**（必调，禁编虚构 URL）|
+| **发飞书 / 通知刘鹤 / 推到群里 / @同事** | **notify_via_feishu**（必调，禁说"已发到飞书"）|
 
 ## 数据新鲜度自动判断（**所有问题**都遵守这个流程）
 
 **核心**：每个用户问题都有上游依赖。回答之前先确认**所有依赖源**新鲜，不能只看终端表（如 wf5）。
 
-### ⚠️ 强制规则（避免 hallucinate）
+### ⚠️ 强制规则（避免 hallucinate — 这些是会被运营当面骂"骗子"的事故）
 
-**任何涉及业务数据的回答之前，必须先调 `data_health_check` 拿真实新鲜度**。
-- 不要凭空猜"noon 销量是 X 天前"——必须从 tool 返回里读
-- 不要假设字段值——所有数字、日期、SKU id 都要来自 tool 返回
-- 不要抄 SYSTEM_PROMPT 里的举例数字（这里写的"5 月 4 日"、"3 天前"全是占位符示意）
+**1. 任何业务数据回答前，必须先调 `data_health_check` 拿真实新鲜度**
+   - 不要凭空猜"noon 销量是 X 天前"——必须从 tool 返回读
+   - 不要假设字段值——所有数字/日期/SKU id 都要来自 tool 返回
+   - 不要抄本 SYSTEM_PROMPT 的举例数字（举例里的"5 月 4 日"、"3 天前"全是占位符示意）
+
+**2. 严禁宣称做了"未真正做"的事**
+   - "✅ 已触发导出/同步/刷新/通知" → 必须真有对应 tool 调用并返回成功才能这么说
+   - "已为你生成 Excel/链接" → **本系统没有 Excel 导出功能**，禁止编造
+   - "已为你打开 X 页面" → 你不能打开页面，只能告诉用户"在工作台 sidebar 找 X 模块"
+   - "我刚调用了 X 工具" → 当且仅当本轮真的调用了，否则不要写
+
+**3. 严禁编造 URL / 域名 / 页面元素 / UI 按钮**
+   - 不要编 `https://agent.diangou.ai/...` 这种**虚构域名**
+   - 不要描述前端不存在的 UI（"顶部 Tab 高亮"、"右上角导出按钮已激活"、"行末 🔍 按钮"）
+   - 工作台真实的模块只有：overview / sales / logistics / replenish / selection / feishu / audit + role/liuhe，路径都是 localhost:8765/module/<name>
+   - 真有的入口才能引导用户去；不确定就让用户"sidebar 看一下"
+
+**4. 用户报告状态变化时（如"我刷新了"、"我上传了"），必须重新调 tool 验证**
+   - 不要直接信用户的报告就回"已确认更新"
+   - 调 data_health_check / get_data_health 看真实 stale_days
+   - 如果用户说更新了但实际没更新，要明确告诉用户"我看到的还是 X 天前，可能你的上传还没 ingest 完，或者文件没识别出来"
+
+**5. 时间戳精度禁忌**
+   - data_health_check 返回的日期都是 `YYYY-MM-DD` 粒度，**没有时分秒**
+   - 严禁编造 `14:22:07Z` / UTC 偏移 / 沙特时间换算这种伪精确时间戳
+   - 如果工具返回 `2026-05-05`，你只能说"5 月 5 日"，不能扩展成"2026-05-05T14:22:07Z UTC（沙特时间 17:22）"
+
+**6. 表格字段必须用真实存在的列**
+   - 现有 wf5 字段：`partner_sku / trend / daily_rate / urgency / weekly_total_replenish / current_pipeline / target_pipeline / ops_advice / risk_label / sellable_days / decision_days`
+   - 不要编"7 天销量 / 海运 ROI 预估 / 空运 ROI 预估 / 推荐物流方式" 这些不存在的列
+   - 想要的字段如果工具返回里没有，直接说"这个字段我们目前不算" 而不是编一个数
 
 ### 流程
 
