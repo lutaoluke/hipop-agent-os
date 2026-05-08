@@ -108,6 +108,21 @@ function chatPanel() {
         return m;
       });
       this.quickCommands = ["上传 noon CSV", "查 SKU 健康", "看 KSA 卡单", "本周补货建议", "选品候选评估"];
+      // 上传也走 chat 进度气泡（含 followup 自动续问）
+      window.addEventListener('chat-attach-task', (e) => {
+        const t = e.detail || {};
+        const msg = {
+          who: "Agent", role: "agent",
+          time: new Date().toTimeString().slice(0,5),
+          content: (t.source === "upload"
+            ? `已收到上传文件，开始处理 ${t.label || '管道'}...`
+            : `任务已启动: ${t.label || ''}`),
+          tag: "执行", references: [], task: null,
+        };
+        this.messages.push(msg);
+        this.attachTask(msg, t);
+        this.scroll();
+      });
       this.scroll();
     },
     formatContent(s) {

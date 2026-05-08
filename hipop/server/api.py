@@ -131,7 +131,12 @@ def api_feishu_digest(limit: int = 20):
 
 # ── 上传 + 真触发 ingest + wf3/wf5 ─────────────────────
 @router.post("/upload")
-async def api_upload(background_tasks: BackgroundTasks, files: list[UploadFile] = File(...)):
+async def api_upload(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    followup_prompt: Optional[str] = None,
+    store: Optional[str] = None,
+):
     task_id = uuid4().hex[:8]
     inbox = os.path.join(PROJECT_ROOT, "inbox")
     os.makedirs(inbox, exist_ok=True)
@@ -142,13 +147,36 @@ async def api_upload(background_tasks: BackgroundTasks, files: list[UploadFile] 
             shutil.copyfileobj(f.file, out)
         saved.append(fp)
 
+    affected_modules = ["sales", "replenish", "logistics"]
+    label = f"CSV 上传 + 全管道（{len(saved)} 个文件）"
+
+    # step_no=0 init（与 run_workflow 对齐，让前端 attachTask 能拿到 metadata）
+    data.write_event(task_id, 0, "初始化", "done", json.dumps({
+        "workflow": "upload_pipeline",
+        "label": label,
+        "affected_modules": affected_modules,
+        "total_steps": 5,
+        "followup_prompt": followup_prompt,
+    }, ensure_ascii=False))
     data.write_event(task_id, 1, "上传文件", "done", f"已保存 {len(saved)} 个文件")
-    background_tasks.add_task(_run_pipeline, task_id, saved)
-    return {"task_id": task_id, "files": [os.path.basename(s) for s in saved]}
+    background_tasks.add_task(_run_pipeline, task_id, saved, followup_prompt, affected_modules)
+    return {
+        "task_id": task_id,
+        "files": [os.path.basename(s) for s in saved],
+        "label": label,
+        "affected_modules": affected_modules,
+        "followup_prompt": followup_prompt,
+        "total_steps": 5,
+        "workflow": "upload_pipeline",
+    }
 
 
-def _run_pipeline(task_id: str, file_paths: list):
-    """串行: 校验 → ingest_noon_csv.process_csv → wf3 → wf5"""
+def _run_pipeline(task_id: str, file_paths: list,
+                  followup_prompt: Optional[str] = None,
+                  affected_modules: Optional[list] = None):
+    """串行: 校验 → ingest_noon_csv.process_csv → wf5 → wf3 + 告警"""
+    affected_modules = affected_modules or ["sales", "replenish", "logistics"]
+    failed = False
     try:
         data.write_event(task_id, 2, "校验格式", "started")
         for p in file_paths:
@@ -172,39 +200,42 @@ def _run_pipeline(task_id: str, file_paths: list):
                     total += n or 0
                 except Exception as e:
                     data.write_event(task_id, 3, "解析 + 入库 wf2", "error", f"{os.path.basename(p)}: {e}")
+                    failed = True
             conn.close()
-            data.write_event(task_id, 3, "解析 + 入库 wf2", "done", f"累计 {total} 行")
+            if not failed:
+                data.write_event(task_id, 3, "解析 + 入库 wf2", "done", f"累计 {total} 行")
         except Exception as e:
             data.write_event(task_id, 3, "解析 + 入库 wf2", "error", str(e))
-            return
+            failed = True
 
-        data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "started")
-        try:
-            from workflows import wf_sales_cycle as _w5
+        if not failed:
+            data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "started")
             try:
+                from workflows import wf_sales_cycle as _w5
                 _w5.run(verbose=False)
+                data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "done")
             except Exception as e:
                 data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "error", str(e)[:200])
-            else:
-                data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "done")
-        except Exception as e:
-            data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "error", str(e)[:200])
 
-        data.write_event(task_id, 5, "重跑 wf3 + 告警", "started")
-        try:
-            from workflows import wf_logistics_alerts
+            data.write_event(task_id, 5, "重跑 wf3 + 告警", "started")
             try:
+                from workflows import wf_logistics_alerts
                 wf_logistics_alerts.generate_alerts(verbose=False)
+                data.write_event(task_id, 5, "重跑 wf3 + 告警", "done")
             except Exception as e:
                 data.write_event(task_id, 5, "重跑 wf3 + 告警", "error", str(e)[:200])
-            else:
-                data.write_event(task_id, 5, "重跑 wf3 + 告警", "done")
-        except Exception as e:
-            data.write_event(task_id, 5, "重跑 wf3 + 告警", "error", str(e)[:200])
 
-        data.write_event(task_id, 6, "管道完成", "done", "可刷新查看新数据")
+        # step_no=99 终结，前端用它 dispatch workflow-done + 触发 followup
+        data.write_event(task_id, 99, "管道完成",
+                         "error" if failed else "done",
+                         json.dumps({
+                             "workflow": "upload_pipeline",
+                             "affected_modules": affected_modules,
+                             "ok": not failed,
+                             "followup_prompt": followup_prompt,
+                         }, ensure_ascii=False))
     except Exception as e:
-        data.write_event(task_id, 9, "管道异常", "error", traceback.format_exc()[:500])
+        data.write_event(task_id, 99, "管道异常", "error", traceback.format_exc()[:500])
 
 
 # ── 真 SSE ────────────────────────────────────────────

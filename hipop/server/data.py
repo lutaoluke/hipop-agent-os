@@ -383,24 +383,66 @@ def get_work_log(store: str) -> List[Dict]:
     return items[:8]
 
 
-# ── 数据健康（顶部 chip）─────────────────────────────────
+# ── 数据健康（顶部 chip + Agent data_health_check tool 共用）─────
 def get_data_health(store: str) -> Dict:
+    """返回当前店铺各数据源的最新写入时间 + 自动度标签。
+
+    自动度（automation）:
+      - "auto"         脚本完全自动跑，Agent 可调 run_workflow 直接刷新
+      - "needs_csv"    依赖人工导出 CSV 上传到 inbox/，Agent 不能代跑，需引导用户上传
+    """
     s = store.lower()
     today = datetime.date.today().isoformat()
-    latest_w2 = (_scalar(f"SELECT MAX(imported_at) FROM wf2_hipop_{s}_sku") or "")[:10]
-    latest_w5 = (_scalar(f"SELECT MAX(updated_at) FROM wf5_hipop_{s}_sales_cycle") or "")[:10]
-    latest_hub = (_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub") or "")[:10]
+    latest_w1_imported = (_scalar(f"SELECT MAX(imported_at) FROM wf1_hipop_{s}_stock") or "")[:10]
+    latest_w2_imported = (_scalar(f"SELECT MAX(imported_at) FROM wf2_hipop_{s}_sku") or "")[:10]
+    latest_w5_updated  = (_scalar(f"SELECT MAX(updated_at) FROM wf5_hipop_{s}_sales_cycle") or "")[:10]
+    latest_hub_updated = (_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub") or "")[:10]
+    latest_alerts      = (_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts") or "")[:10]
+
+    # noon orders 最新订单日期（关键：补货问答的真实数据新鲜度依赖这个）
+    latest_noon_order = (_scalar(
+        f"SELECT MAX(order_date) FROM wf2_hipop_{s}_orders"
+    ) or "")[:10]
+    # noon stock 最新导入时间（依赖人工 Inventory CSV）
+    latest_noon_stock = (_scalar(
+        f"SELECT MAX(imported_at) FROM wf1_hipop_{s}_stock WHERE noon_total_qty IS NOT NULL"
+    ) or "")[:10]
+
+    def _stale_days(date_str):
+        if not date_str: return None
+        try:
+            d = datetime.date.fromisoformat(date_str[:10])
+            return (datetime.date.fromisoformat(today) - d).days
+        except Exception:
+            return None
+
+    sources = {
+        "erp_products":  {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
+        "erp_sales":     {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
+        "erp_stock":     {"latest": latest_w1_imported, "stale_days": _stale_days(latest_w1_imported), "automation": "auto",      "workflow": "wf1_stock"},
+        "noon_orders":   {"latest": latest_noon_order,  "stale_days": _stale_days(latest_noon_order),  "automation": "needs_csv", "workflow": "wf2_sales", "csv_pattern": f"sales_noon_*_{s.upper()}_*.csv", "where": "紫鸟 noon 后台 → sales 页面 → export 最近 180 天 CSV"},
+        "noon_stock":    {"latest": latest_noon_stock,  "stale_days": _stale_days(latest_noon_stock),  "automation": "needs_csv", "workflow": "wf1_stock", "csv_pattern": f"Inventory*{s.upper()}*.csv",   "where": "紫鸟 noon 后台 → my inventory → export"},
+        "wf3_logistics": {"latest": latest_hub_updated, "stale_days": _stale_days(latest_hub_updated), "automation": "auto",      "workflow": "wf3_logistics"},
+        "wf5_replenish": {"latest": latest_w5_updated,  "stale_days": _stale_days(latest_w5_updated),  "automation": "auto",      "workflow": "wf5_sales_cycle"},
+        "wf6_alerts":    {"latest": latest_alerts,      "stale_days": _stale_days(latest_alerts),      "automation": "auto",      "workflow": "wf6_alerts"},
+    }
+
+    # 旧字段保留兼容前端 chip
     return {
-        "erp": "ok" if latest_w2 == today else "warn",
-        "noon_sales": "ok" if latest_w5 == today else "warn",
-        "noon_inv": "ok" if latest_w2 == today else "warn",
+        "erp": "ok" if latest_w2_imported == today else "warn",
+        "noon_sales": "ok" if latest_noon_order == today else "warn",
+        "noon_inv": "ok" if latest_noon_stock == today else "warn",
         "feishu": "ok",
         "as_of_date": today,
         "details": {
-            "wf2_imported_at": latest_w2,
-            "wf5_updated_at": latest_w5,
-            "wf3_updated_at": latest_hub,
+            "wf1_imported_at":  latest_w1_imported,
+            "wf2_imported_at":  latest_w2_imported,
+            "wf5_updated_at":   latest_w5_updated,
+            "wf3_updated_at":   latest_hub_updated,
+            "noon_order_date":  latest_noon_order,
+            "noon_stock_date":  latest_noon_stock,
         },
+        "sources": sources,  # Agent data_health_check tool 用这个
     }
 
 

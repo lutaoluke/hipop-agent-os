@@ -37,17 +37,30 @@ function uploadZone() {
     dragOver: false,
     uploading: false,
     taskId: null,
+    pendingFollowup: null,  // chat 引导上传时由 chat_panel 提前注入
     async upload(files) {
       if (!files.length) return;
       const fd = new FormData();
       for (const f of files) fd.append('files', f);
+      // 若 chat 之前已注入 followup（用户问"我该补货吗" → Agent 让上传 → 跑完续答）
+      if (this.pendingFollowup) fd.append('followup_prompt', this.pendingFollowup);
+      fd.append('store', '{{ store }}');
       this.uploading = true;
       try {
         const r = await fetch('/api/upload', {method:'POST', body: fd});
         const data = await r.json();
         this.taskId = data.task_id;
-        // 通知 progress card 切换 SSE
-        window.dispatchEvent(new CustomEvent('task-started', {detail: {taskId: data.task_id, label: 'CSV 上传 + 全管道'}}));
+        // 通知 progress card 顶部进度
+        window.dispatchEvent(new CustomEvent('task-started', {detail: {taskId: data.task_id, label: data.label || 'CSV 上传 + 全管道'}}));
+        // 通知 chat_panel 把这次上传 attach 成 chat 里的进度气泡（含 followup 自动续问）
+        window.dispatchEvent(new CustomEvent('chat-attach-task', {detail: {
+          task_id: data.task_id, workflow: data.workflow,
+          label: data.label, total_steps: data.total_steps,
+          affected_modules: data.affected_modules,
+          followup_prompt: data.followup_prompt,
+          source: "upload",
+        }}));
+        this.pendingFollowup = null;
       } catch(e) { alert('上传失败: ' + e); this.uploading = false; }
     },
     handleDrop(ev) {
