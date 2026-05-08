@@ -20,7 +20,10 @@ python3 -m uvicorn hipop.server.main:app --host 0.0.0.0 --port 8765
 
 打开 http://localhost:8765 看工作台。
 
-**不需要 ANTHROPIC_API_KEY**：`server/_auth.py` 优先读 keychain 里 Claude Code 的 OAuth token（macOS `security find-generic-password -s "Claude Code-credentials"`），加 `anthropic-beta: oauth-2025-04-20` header 走 claude.ai 订阅配额。`/login` 后 token 轮换会自动重读（agent.py 捕获 `AuthenticationError` 后调 `_auth.reset()` 重试一次）。
+**LLM provider 切换**：`LLM_PROVIDER=anthropic|qwen|deepseek|doubao`，默认 anthropic（本地）。
+- **anthropic**：`server/_auth.py` 优先 `ANTHROPIC_API_KEY`，回退 macOS keychain Claude Code OAuth token（免费走订阅）；`/login` 后 token 轮换自动重读（捕 `AuthenticationError` 后 `_auth.reset()` 重试一次）。
+- **qwen / deepseek / doubao**：走 OpenAI 协议（`server/_provider_openai.py`），只换 `base_url + api_key + model`。生产推荐 **qwen-plus**（¥18/万次 + 阿里云内网集成 + ICP 备案过）。
+- 抽象在 `server/_provider.py:chat_with_tools()`，统一返回 `{reply, tool_log, refs_collected, workflow_task}`。
 
 ## 架构
 

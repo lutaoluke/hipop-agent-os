@@ -1,0 +1,20 @@
+# 点购 Agent OS 依赖
+fastapi>=0.110
+uvicorn[standard]>=0.27
+jinja2>=3.1
+python-multipart>=0.0.9     # FastAPI form / file upload
+requests>=2.31
+websocket-client>=1.7        # ERP token 抓取（绕开 playwright）
+playwright>=1.40             # ERP token 兜底路径
+
+# LLM providers — 按需安装
+anthropic>=0.40              # Anthropic / Claude（本地 OAuth keychain）
+openai>=1.50                 # Qwen / DeepSeek / 豆包 OpenAI 协议兼容
+
+# DB（阶段 1 W1 后启用 PG）
+# psycopg2-binary>=2.9
+# sqlalchemy>=2.0
+
+# Auth（阶段 1 W2 启用）
+# python-jose[cryptography]>=3.3
+# passlib[bcrypt]>=1.7

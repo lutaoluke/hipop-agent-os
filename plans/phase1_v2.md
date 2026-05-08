@@ -19,25 +19,31 @@
 
 ## W1：模型抽象 + DB 切换
 
-### Task 1.1 — provider 抽象（half-day）
+### Task 1.1 — provider 抽象 ✅（已完成 2026-05-08）
 
-**目标**：`server/_provider.py` 统一 chat 接口，`LLM_PROVIDER` env 切换 anthropic / deepseek。
+**目标**：`server/_provider.py` 统一 chat 接口，`LLM_PROVIDER` env 切换 anthropic / qwen / deepseek / doubao。
 
-**交付**：
-- 新增 `server/_provider.py`：`def chat_with_tools(messages, system, tools, tool_funcs) → ChatResult`
-- 实现两个版本：`_anthropic.py`（沿用现有 tool_use loop）+ `_openai_compat.py`（覆盖 DeepSeek / 通义 / Kimi 三家）
-- `agent.py:chat()` 重构成调 `_provider.chat_with_tools(...)`，不再直接 anthropic SDK
-- `requirements.txt` 加 `openai`
-- env: `LLM_PROVIDER=anthropic|deepseek`，`DEEPSEEK_API_KEY`
+**生产默认**：**Qwen-Plus**（性价比最高 ¥18/万次 + 阿里云内网集成 + ICP 备案过）。
+本地开发：anthropic（OAuth keychain 免费）。
 
-**验证**：
-- `LLM_PROVIDER=anthropic curl /api/chat` ✅（现有行为不变）
-- `LLM_PROVIDER=deepseek DEEPSEEK_API_KEY=xxx curl /api/chat`，返回符合预期，所有 9 个 tool 都能被正确调用
+**交付**（已实现）：
+- `server/_provider.py`：`chat_with_tools(messages, system, tools, tool_funcs, scope) → ChatResult`
+- `_provider_anthropic.py`：Anthropic tool_use loop（含 OAuth 401 自动重读 keychain）
+- `_provider_openai.py`：OpenAI 协议兼容 — Qwen/DeepSeek/豆包 三家共一份代码，只换 base_url + key + model
+- `agent.py:chat()` 重构走抽象层，response 加 `provider` 字段
+- `requirements.txt` 加 `openai>=1.50`
+- `.env.example` 模板
 
-**坑**：
-- DeepSeek 偶尔不调 tool 直接答 → SYSTEM_PROMPT 加"必须先调 tool 拿数据"硬约束
-- tool_calls 字段名差异：Anthropic `tool_use_id` vs OpenAI `tool_call_id`
-- 多轮 stop 条件不同：`stop_reason=tool_use` vs `finish_reason=tool_calls`
+**验收**:
+- ✅ `LLM_PROVIDER=anthropic curl /api/chat` 现有行为不变（实测 scope_overview tool 正确）
+- ✅ `LLM_PROVIDER=qwen curl /api/chat`（缺 key fail-fast 正确报错）
+- ⏳ Qwen 实测命中率（要 Luke 提供 QWEN_API_KEY 后跑）
+
+**实现要点（坑已踩）**:
+- DeepSeek/Qwen 偶尔不调 tool 直接答 → SYSTEM_PROMPT 已写"必须先调 tool 拿数据"硬约束
+- tool_calls 字段名差异：Anthropic `tool_use_id` vs OpenAI `tool_call_id` — 已在 _provider_openai 中处理
+- 多轮 stop 条件不同：`stop_reason=tool_use` vs `finish_reason=tool_calls` — 已分别判断
+- assistant 历史含 mixed content blocks（text + tool_use）→ openai 风格转换时只取 text，tool_result 转成 'tool' role 消息
 
 ### Task 1.2 — Postgres 迁移（1 day）
 

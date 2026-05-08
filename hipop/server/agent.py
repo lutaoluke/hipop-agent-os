@@ -593,83 +593,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
     scope: {store, current_user, current_role, ...}
-    返回: {reply, references, action_id, tag}
+    返回: {reply, references, action_id, tag, workflow_task, tools_used, provider}
+
+    走 _provider 抽象层，通过 LLM_PROVIDER env 切换 anthropic / qwen / deepseek / doubao。
     """
-    client = _get_client()
+    from . import _provider
+
     sys_text = SYSTEM_PROMPT.format(scope=json.dumps(scope, ensure_ascii=False))
-
-    # 截断 history（最近 8 轮）
-    hist = messages[-16:]
-    msgs = []
-    for m in hist:
-        c = m.get("content")
-        if isinstance(c, str):
-            msgs.append({"role": m["role"], "content": c})
-        else:
-            msgs.append({"role": m["role"], "content": c})
-
-    refs_collected = []
-    tool_log = []
-    final_text = ""
-    workflow_task = None  # 若调了 run_workflow，记录最近一次的 task 信息透回前端
-    _retried_after_auth_error = False
-
-    # 模型可通过 ANTHROPIC_CHAT_MODEL 覆盖；默认 haiku-4-5（OAuth 订阅 sonnet 配额易耗尽时回退）
-    model = os.environ.get("ANTHROPIC_CHAT_MODEL", "claude-haiku-4-5-20251001")
-    for hop in range(6):  # 最多 6 轮 tool-use
-        try:
-            resp = client.messages.create(
-                model=model,
-                system=sys_text,
-                messages=msgs,
-                tools=TOOLS,
-                max_tokens=2048,
-            )
-        except anthropic.AuthenticationError:
-            # keychain token 被 /login 轮换了；丢缓存重读一次
-            if _retried_after_auth_error:
-                raise
-            _retried_after_auth_error = True
-            _auth.reset()
-            client = _get_client()
-            continue
-        # 累积 assistant 内容
-        msgs.append({"role": "assistant", "content": resp.content})
-
-        if resp.stop_reason != "tool_use":
-            # 取最终文本
-            for block in resp.content:
-                if getattr(block, "type", None) == "text":
-                    final_text += block.text
-            break
-
-        # 收集 tool_use blocks
-        tool_results = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                final_text += block.text + "\n"
-            elif getattr(block, "type", None) == "tool_use":
-                tool_name = block.name
-                tool_args = block.input or {}
-                result = _exec_tool(tool_name, tool_args)
-                if isinstance(result, dict) and "references" in result:
-                    refs_collected.extend(result["references"])
-                if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):
-                    workflow_task = {
-                        "task_id": result["task_id"],
-                        "workflow": result["workflow"],
-                        "label": result["label"],
-                        "total_steps": result["total_steps"],
-                        "affected_modules": result["affected_modules"],
-                        "followup_prompt": result.get("followup_prompt"),
-                    }
-                tool_log.append({"name": tool_name, "args": tool_args, "result_keys": list(result.keys()) if isinstance(result, dict) else None})
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
-                })
-        msgs.append({"role": "user", "content": tool_results})
+    result = _provider.chat_with_tools(
+        messages=messages,
+        system=sys_text,
+        tools=TOOLS,
+        tool_funcs=TOOL_FUNCS,
+        scope=scope,
+    )
+    final_text   = result["reply"]
+    tool_log     = result["tool_log"]
+    refs_collected = result["refs_collected"]
+    workflow_task  = result.get("workflow_task")
 
     # 写入 agent_actions（reference 系统）
     action_id = None
@@ -698,6 +639,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "tools_used": [t["name"] for t in tool_log],
         "tag": "执行" if tool_log else None,
         "workflow_task": workflow_task,
+        "provider": _provider.get_provider(),
     }
 
 

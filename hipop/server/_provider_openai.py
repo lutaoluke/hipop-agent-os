@@ -1,0 +1,191 @@
+"""OpenAI 兼容协议实现 — 覆盖 Qwen / DeepSeek / 豆包。
+
+三家都走同一个 `openai` SDK，仅 base_url + api_key + model 不同。
+推荐生产环境用 Qwen-Plus（性价比最高 + 阿里云内网集成）。
+
+env:
+  LLM_PROVIDER=qwen|deepseek|doubao
+  QWEN_API_KEY=...           DASHSCOPE_API_KEY 同义；阿里云灵积控制台拿
+  DEEPSEEK_API_KEY=...
+  DOUBAO_API_KEY=...         火山引擎控制台拿
+  <PROVIDER>_MODEL=...       覆盖默认模型
+"""
+from __future__ import annotations
+
+import os
+import json
+from typing import Any, Callable, Dict, List
+
+# 协议规格：每个 provider → (base_url, default_model, api_key_env)
+PROVIDERS = {
+    "qwen": (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "qwen-plus",
+        ["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+    ),
+    "deepseek": (
+        "https://api.deepseek.com/v1",
+        "deepseek-chat",
+        ["DEEPSEEK_API_KEY"],
+    ),
+    "doubao": (
+        "https://ark.cn-beijing.volces.com/api/v3",
+        # 豆包要 endpoint id（用户控制台创建模型 endpoint），用 DOUBAO_MODEL 覆盖
+        "doubao-pro-32k",
+        ["DOUBAO_API_KEY", "ARK_API_KEY"],
+    ),
+}
+
+
+def _get_client_and_model(provider: str):
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("openai SDK 未安装：pip install openai")
+    base_url, default_model, key_envs = PROVIDERS[provider]
+    api_key = None
+    for k in key_envs:
+        if os.environ.get(k):
+            api_key = os.environ[k]
+            break
+    if not api_key:
+        raise RuntimeError(
+            f"{provider} 凭据缺失：请 export {' 或 '.join(key_envs)}"
+        )
+    model = os.environ.get(f"{provider.upper()}_MODEL", default_model)
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    return client, model
+
+
+def _anthropic_tools_to_openai(tools: List[Dict]) -> List[Dict]:
+    """Anthropic schema → OpenAI function calling schema"""
+    out = []
+    for t in tools:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+def _exec_tool(tool_funcs: Dict[str, Callable], name: str, args_str: str) -> dict:
+    try:
+        args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+    except Exception:
+        return {"error": f"invalid tool arguments JSON: {args_str[:200]}"}
+    try:
+        fn = tool_funcs[name]
+        return fn(**args)
+    except KeyError:
+        return {"error": f"unknown tool: {name}"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def run(messages: List[Dict], system: str, tools: List[Dict],
+        tool_funcs: Dict[str, Callable], scope: dict, provider: str) -> dict:
+    client, model = _get_client_and_model(provider)
+    oai_tools = _anthropic_tools_to_openai(tools)
+
+    # OpenAI 协议要求 system 单独一条（位置 0）；user/assistant/tool 分别单独消息
+    # 把 anthropic 风格的 messages（含 list content）转成 openai 风格 string content
+    msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            msgs.append({"role": m["role"], "content": c})
+        elif isinstance(c, list):
+            # anthropic 的 assistant 历史里可能含 content blocks（text+tool_use 混合）
+            # 简化：取所有 text 块拼起来；tool_use / tool_result 在新的循环里通过 OpenAI tool_calls 协议处理
+            text_parts = []
+            for blk in c:
+                if isinstance(blk, dict):
+                    if blk.get("type") == "text":
+                        text_parts.append(blk.get("text", ""))
+                    elif blk.get("type") == "tool_result":
+                        # 历史里的 tool_result，转成 openai 的 'tool' role 消息
+                        msgs.append({
+                            "role": "tool",
+                            "tool_call_id": blk.get("tool_use_id", ""),
+                            "content": blk.get("content", ""),
+                        })
+            if text_parts:
+                msgs.append({"role": m["role"], "content": "\n".join(text_parts)})
+        else:
+            msgs.append({"role": m["role"], "content": str(c)})
+
+    refs_collected: list = []
+    tool_log: list = []
+    final_text = ""
+    workflow_task = None
+
+    for hop in range(6):
+        resp = client.chat.completions.create(
+            model=model,
+            messages=msgs,
+            tools=oai_tools,
+            tool_choice="auto",
+            max_tokens=2048,
+        )
+        choice = resp.choices[0]
+        msg = choice.message
+
+        # OpenAI 协议：finish_reason in {stop, tool_calls, length, content_filter}
+        if choice.finish_reason != "tool_calls" or not msg.tool_calls:
+            if msg.content:
+                final_text += msg.content
+            break
+
+        # 累计 assistant 这条（含 tool_calls）回到对话历史
+        msgs.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ],
+        })
+        if msg.content:
+            final_text += msg.content + "\n"
+
+        # 执行所有 tool_call，结果作为 tool 消息追加
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            tool_args_raw = tc.function.arguments
+            result = _exec_tool(tool_funcs, tool_name, tool_args_raw)
+            if isinstance(result, dict) and "references" in result:
+                refs_collected.extend(result["references"])
+            if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):
+                workflow_task = {
+                    "task_id": result["task_id"],
+                    "workflow": result["workflow"],
+                    "label": result["label"],
+                    "total_steps": result["total_steps"],
+                    "affected_modules": result["affected_modules"],
+                    "followup_prompt": result.get("followup_prompt"),
+                }
+            tool_log.append({
+                "name": tool_name,
+                "args": tool_args_raw,
+                "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+            })
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            })
+
+    return {
+        "reply": final_text.strip() or "(无回复)",
+        "tool_log": tool_log,
+        "refs_collected": refs_collected,
+        "workflow_task": workflow_task,
+    }
