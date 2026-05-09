@@ -1,10 +1,20 @@
 """
-工作流零：物流周期计算 & 在途商品数量
-输出四个字段：
+工作流零 (DEPRECATED v1)：物流周期计算 & 在途商品数量
+
+⚠️ 已被 wf_logistics_status.py + wf3_logistics_hub 取代:
+  - 老版从 sa_main 读全量 SKU 池, 写 sa_main."发货在途"
+  - 新版从 wf2_<alias>_sku UNION 读, 写 wf3_logistics_hub.in_transit_total_qty
+保留此文件仅供历史回溯, 不再被链路调用 (server/skills.py 已切到新 worker)。
+
+老逻辑保留功能:
   1. 在途库存及其数量
   2. 平均物流时长
   3. SKU 最快到货个数及时间估算
   4. SKU 剩余商品到货时间估算
+
+复用项:
+  - get_erp_token / erp_get / get_order_detail_qty 等底层 ERP API 函数
+    被 wf_logistics_status import 复用 (这部分仍然活的, 不受 deprecation 影响)
 """
 
 import sys
@@ -97,8 +107,12 @@ def get_erp_token():
         ) if r.headers.get("authorization", "").startswith("Bearer ")
             and "erp-api" in r.url else None)
         page.goto("https://www.dbuyerp.com", wait_until="networkidle", timeout=15000)
-        page.fill('input[placeholder="Username"]', "__REDACTED_USERNAME__")
-        page.fill('input[placeholder="Password"]', "__REDACTED_PASSWORD__")
+        _erp_user = os.environ.get("ERP_USERNAME") or ""
+        _erp_pw   = os.environ.get("ERP_PASSWORD") or ""
+        if not (_erp_user and _erp_pw):
+            raise RuntimeError("ERP_USERNAME / ERP_PASSWORD env 未设，无法登录 ERP")
+        page.fill('input[placeholder="Username"]', _erp_user)
+        page.fill('input[placeholder="Password"]', _erp_pw)
         page.keyboard.press("Enter")
         page.wait_for_timeout(3000)
         page.goto("https://www.dbuyerp.com/#/system/delivery/list",
@@ -114,13 +128,24 @@ ERP_API = "https://erp-api.dbuyerp.com/admin"
 
 def erp_get(path, params=None, token=None):
     token = token or get_erp_token()
-    resp = requests.get(
-        f"{ERP_API}{path}",
-        params=params,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=15
-    )
-    return resp.json()
+    # ERP API 偶发 SSL EOF / 超时, 加 3 次指数退避重试
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                f"{ERP_API}{path}",
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15
+            )
+            return resp.json()
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_exc = e
+            import time
+            time.sleep(0.5 * (2 ** attempt))  # 0.5, 1, 2 秒
+    raise last_exc
 
 _forwarder_avg_cache = {}   # 模块级缓存，同一进程内只扫一次
 
@@ -710,8 +735,8 @@ BITABLE_TABLE_ID = "tbl1ffNbzU3WtNC9"
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                           "feishu_auth", "token.json")
 
-FS_APP_ID     = "cli_a96a395aaafa5cb5"
-FS_APP_SECRET = "__REDACTED_FEISHU_APP_SECRET__"
+FS_APP_ID     = os.environ.get("FEISHU_APP_ID")     or "cli_a96a395aaafa5cb5"
+FS_APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or ""
 
 def _get_app_access_token():
     resp = requests.post(
@@ -889,47 +914,9 @@ def write_to_bitable(all_results):
 
     print(f"\n✓ 多维表格写回完成｜成功:{ok}  失败/跳过:{fail}")
 
-def write_transit_to_db(all_results):
-    """
-    把在途数量写回本地 SQLite（sa_main."发货在途"），
-    供工作流三（销售周期）读取含在途的可售月数。
-    """
-    import sqlite3
-    db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "hipop.db")
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-
-    # 确保列存在
-    try:
-        cur.execute('ALTER TABLE sa_main ADD COLUMN "发货在途" REAL')
-    except Exception:
-        pass  # 列已存在
-
-    ok = 0
-    for r in all_results:
-        if r.get("error"):
-            continue
-        cur.execute(
-            'UPDATE sa_main SET "发货在途" = ? WHERE "ERP-SKU" = ?',
-            (r["total_transit_qty"], r["sku"])
-        )
-        ok += 1
-
-    conn.commit()
-    conn.close()
-    print(f"✓ 本地数据库写回完成｜{ok} 个 SKU 的发货在途已更新")
-
-# ── 入口 ─────────────────────────────────────────────────
-def get_skus_from_db():
-    """从数据库 sa_main 读取所有有效 ERP-SKU"""
-    import sqlite3
-    db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "hipop.db")
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-    cur.execute('SELECT "ERP-SKU" FROM sa_main WHERE "ERP-SKU" IS NOT NULL AND "ERP-SKU" != "" ORDER BY "ERP-SKU"')
-    skus = [r[0] for r in cur.fetchall()]
-    conn.close()
-    return skus
+# 注: write_transit_to_db / get_skus_from_db (写读 sa_main) 已删除 (2026-05-03).
+#     新版 wf3 hub 由 wf_logistics_status.py 直接写 wf3_logistics_hub 表;
+#     SKU 池来自 wf2_<alias>_sku UNION (per-entity loop).
 
 def scan_in_transit_skus(all_skus, token):
     """
@@ -955,46 +942,10 @@ def scan_in_transit_skus(all_skus, token):
     return result
 
 if __name__ == "__main__":
-    import json
-    args = sys.argv[1:]
-
-    # --all 模式：从数据库读取全量 SKU
-    if not args or args == ["--all"]:
-        print("模式：全量扫描数据库所有 SKU")
-        token    = get_erp_token()
-        all_skus = get_skus_from_db()
-
-        # 第一阶段：快速过滤有在途的 SKU
-        transit_skus = scan_in_transit_skus(all_skus, token)
-
-        if not transit_skus:
-            print("当前无任何 SKU 有在途库存，无需更新。")
-            sys.exit(0)
-
-        # 第二阶段：对有在途的 SKU 做完整分析（查物流网站）
-        print(f"第二阶段：对 {len(transit_skus)} 个在途 SKU 做物流追踪分析...")
-        all_results = []
-        for sku, _, _ in transit_skus:
-            r = analyze_sku(sku, verbose=True)
-            push_result(r)
-            all_results.append(r)
-
-        if len(all_results) > 1:
-            push_summary(all_results)
-
-    else:
-        # 指定 SKU 模式
-        print(f"模式：指定 SKU — {args}")
-        all_results = []
-        for sku in args:
-            r = analyze_sku(sku, verbose=True)
-            push_result(r)
-            all_results.append(r)
-        if len(args) > 1:
-            push_summary(all_results)
-
-    print("\n正在写回本地数据库...")
-    write_transit_to_db(all_results)
-
-    print("\n正在写回飞书多维表格...")
-    write_to_bitable(all_results)
+    # CLI 入口已退役 (DEPRECATED). 老版 main 块从 sa_main 拉全量 SKU + 写回 sa_main."发货在途",
+    # 已被 wf_logistics_status.py 整体取代 (per-entity, 写 wf3_logistics_hub).
+    print("⚠️  wf0_logistics.py CLI 已退役.")
+    print("    新链路: python3 -m hipop.workflows.wf_logistics_status --entities hipop_ksa")
+    print("    本文件仅保留底层 ERP API helper (get_erp_token / erp_get / get_order_detail_qty / analyze_sku)")
+    print("    供 wf_logistics_status import 复用.")
+    sys.exit(1)

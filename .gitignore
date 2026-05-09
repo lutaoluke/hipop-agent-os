@@ -15,3 +15,9 @@ logs/
 .env
 .env.local
 .env.production
+
+# 飞书 OAuth token / 任何凭据文件
+feishu_auth/token.json
+feishu_auth/*.json
+*.token
+*.credentials.json

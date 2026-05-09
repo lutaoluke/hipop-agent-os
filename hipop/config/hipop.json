@@ -26,10 +26,11 @@
     }
   ],
   "feishu": {
-    "app_id": "cli_a96a395aaafa5cb5",
-    "app_secret": "__REDACTED_FEISHU_APP_SECRET__",
-    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/__REDACTED_FEISHU_WEBHOOK_TOKEN__",
-    "user_token_file": "/Users/luke/Downloads/点购工作流/feishu_auth/token.json",
+    "_NOTE": "secret 改读 env：FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_WEBHOOK / FEISHU_USER_TOKEN_FILE",
+    "app_id": "${FEISHU_APP_ID}",
+    "app_secret": "${FEISHU_APP_SECRET}",
+    "webhook": "${FEISHU_WEBHOOK}",
+    "user_token_file": "${FEISHU_USER_TOKEN_FILE:-./feishu_auth/token.json}",
     "bitable": {
       "base_id": "PFX9bJWdTaSaSEsSwlKc1XaSnEg",
       "tables": {
@@ -49,18 +50,18 @@
   },
   "erp": {
     "url": "https://www.dbuyerp.com",
-    "username": "__REDACTED_USERNAME__",
-    "password": "__REDACTED_PASSWORD__"
+    "username": "${ERP_USERNAME}",
+    "password": "${ERP_PASSWORD}"
   },
   "ziniao_openapi": {
     "base_url": "https://openapi.ziniao.com",
-    "app_id": "__REDACTED_ZINIAO_APP_ID__",
-    "app_secret": "__REDACTED_ZINIAO_RSA_PRIVATE_KEY__"
+    "app_id": "${ZINIAO_APP_ID}",
+    "app_secret": "${ZINIAO_APP_SECRET}"
   },
   "ziniao_client": {
-    "company": "点购优品跨境",
-    "username": "__REDACTED_USERNAME__",
-    "password": "__REDACTED_PASSWORD__",
+    "company": "${ZINIAO_COMPANY:-点购优品跨境}",
+    "username": "${ZINIAO_USERNAME}",
+    "password": "${ZINIAO_PASSWORD}",
     "web_driver_port": 18080,
     "debug_port_default": 9223
   },

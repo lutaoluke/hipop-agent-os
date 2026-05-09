@@ -23,8 +23,11 @@ CARD_COLORS = {"red", "orange", "yellow", "green", "blue", "purple", "grey", "in
 
 class FeishuBridge:
     def __init__(self, config_path: str = CONFIG_PATH):
-        with open(config_path, encoding="utf-8") as f:
-            cfg = json.load(f)
+        # 走 _config.load_config 自动展开 env 占位符
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _config import load_config as _load_expanded
+        cfg = _load_expanded(config_path)
         fs = cfg["feishu"]
         self.app_id = fs["app_id"]
         self.app_secret = fs["app_secret"]

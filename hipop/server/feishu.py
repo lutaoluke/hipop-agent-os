@@ -16,8 +16,11 @@ _cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "
 with open(_cfg_path) as f:
     _cfg = _json.load(f)
 
-APP_ID     = "cli_a96a395aaafa5cb5"
-APP_SECRET = "__REDACTED_FEISHU_APP_SECRET__"
+APP_ID     = os.environ.get("FEISHU_APP_ID")     or "cli_a96a395aaafa5cb5"
+APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or ""
+if not APP_SECRET:
+    import warnings
+    warnings.warn("FEISHU_APP_SECRET env 未设，飞书集成将不可用")
 
 # ── 获取 tenant_access_token（用于发消息）──────────────────
 _tat_cache = {}

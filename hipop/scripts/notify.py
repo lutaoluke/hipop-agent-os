@@ -2,13 +2,17 @@
 飞书通知工具 - 所有工作流共用
 """
 import json
+import os
 import requests
 
+# 走 _config.load_config，自动展开 ${ENV} 占位符
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _config import load_config as _load_expanded
+
 def load_config(company="hipop"):
-    import os
-    config_path = os.path.join(os.path.dirname(__file__), f"../config/{company}.json")
-    with open(config_path) as f:
-        return json.load(f)
+    # company 参数兼容旧 API；当前只有 hipop.json
+    return _load_expanded()
 
 def send_text(msg, company="hipop"):
     cfg = load_config(company)
