@@ -1,7 +1,7 @@
 """
 HIPOP 工作台 - JSON API (read-only Day 1 + 上传/SSE/chat Day 2-3)
 """
-from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 from uuid import uuid4
@@ -16,6 +16,57 @@ sys.path.insert(0, HIPOP_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
 router = APIRouter()
+
+
+# ── Auth: register / login / logout / me ─────────────────
+from . import auth as _auth_mod
+from fastapi import Cookie, Depends
+
+
+@router.post("/auth/register")
+def api_register(body: dict, response: Response = None):  # type: ignore
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    tenant_name = body.get("tenant_name") or ""
+    display_name = body.get("display_name") or ""
+    if not email or not password:
+        raise HTTPException(400, "email 和 password 必填")
+    if len(password) < 6:
+        raise HTTPException(400, "密码至少 6 位")
+    info = _auth_mod.register(email, password, tenant_name=tenant_name, display_name=display_name)
+    # 注册后自动登录
+    out = _auth_mod.login(email, password)
+    if response is not None:
+        _auth_mod.set_session_cookie(response, out["token"])
+    return {"ok": True, "user": out["user"], "token": out["token"]}
+
+
+@router.post("/auth/login")
+def api_login(body: dict, response: Response = None):  # type: ignore
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    out = _auth_mod.login(email, password)
+    if response is not None:
+        _auth_mod.set_session_cookie(response, out["token"])
+    return {"ok": True, "user": out["user"], "token": out["token"]}
+
+
+@router.post("/auth/logout")
+def api_logout(response: Response):
+    _auth_mod.clear_session_cookie(response)
+    return {"ok": True}
+
+
+@router.get("/auth/me")
+def api_me(user: dict = Depends(_auth_mod.get_current_user)):
+    return {"user": user}
+
+
+@router.get("/auth/permissions")
+def api_permissions(user: dict = Depends(_auth_mod.get_current_user)):
+    """前端按角色隐藏 / 灰显入口。"""
+    from . import rbac as _rbac
+    return {"role": user.get("role"), "permissions": _rbac.get_my_permissions(user)}
 
 
 @router.get("/today/{store}")
@@ -386,16 +437,27 @@ async def api_run_workflow(body: dict, background_tasks: BackgroundTasks):
 
 # ── Chat (LLM) ────────────────────────────────────────
 @router.post("/chat")
-async def api_chat(body: dict):
+async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
     """
     body = {messages: [...], scope: {store, module, current_user, current_role}}
     返回 {reply: '...', references: [...], action_id: int|null}
+
+    user 自动从 cookie/JWT 注入；未登录时是 DEFAULT_USER（Cherry, owner, tenant=1）
+    body.scope 仅用 store/module；user_name/role 从 token 派生（不接受前端冒充）
     """
     from . import agent
     messages = body.get("messages") or []
-    scope = body.get("scope") or {"store": "KSA", "module": None, "current_user": "Cherry", "current_role": "运营"}
-    store = (scope.get("store") or "KSA")
-    user_name = scope.get("current_user") or "Cherry"
+    body_scope = body.get("scope") or {}
+    scope = {
+        "store": body_scope.get("store") or "KSA",
+        "module": body_scope.get("module"),
+        "current_user": user.get("display_name") or user.get("email") or "Cherry",
+        "current_role": user.get("role") or "ops",
+        "tenant_id": user.get("tenant_id"),
+        "user_id": user.get("id"),
+    }
+    store = scope["store"]
+    user_name = scope["current_user"]
 
     # 持久化：保存最后一条 user 消息（仅当尾部确实是 user 时；避免 retry 重复落库）
     if messages and messages[-1].get("role") == "user":

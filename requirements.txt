@@ -15,6 +15,6 @@ openai>=1.50                 # Qwen / DeepSeek / 豆包 OpenAI 协议兼容
 psycopg2-binary>=2.9      # Postgres（DB_URL 设置时启用）
 # sqlalchemy>=2.0          # 暂未使用，留给阶段 2 任务队列
 
-# Auth（阶段 1 W2 启用）
-# python-jose[cryptography]>=3.3
-# passlib[bcrypt]>=1.7
+# Auth (W2) — 用 pbkdf2 而非 bcrypt（bcrypt 5.x 与 passlib 不兼容）
+python-jose[cryptography]>=3.3
+passlib>=1.7

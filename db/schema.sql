@@ -2,6 +2,44 @@
 -- 由 docker-compose.yml 在 PG 容器初始化时自动执行
 -- 阶段 1 W2 起每张表会加 tenant_id 列；当前是 single-tenant 版本
 
+-- ============ 多租户 + 用户 + 角色（W2 加，2026-05-09）============
+
+CREATE TABLE IF NOT EXISTS tenants (
+  id           BIGSERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  plan         TEXT NOT NULL DEFAULT 'free',  -- free / starter / pro / enterprise
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id              BIGSERIAL PRIMARY KEY,
+  tenant_id       BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  email           TEXT NOT NULL,
+  display_name    TEXT,
+  password_hash   TEXT NOT NULL,
+  role            TEXT NOT NULL DEFAULT 'ops',  -- owner / manager / ops / forwarder
+  active          BOOLEAN NOT NULL DEFAULT TRUE,
+  last_active_at  TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id           BIGSERIAL PRIMARY KEY,
+  user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash   TEXT NOT NULL,
+  expires_at   TIMESTAMPTZ NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  revoked_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
+
+-- 单租户兜底 seed（已有数据归到 tenant_id=1）
+INSERT INTO tenants (id, name, plan)
+VALUES (1, 'HIPOP', 'enterprise')
+ON CONFLICT (id) DO NOTHING;
+
 -- ============ Agent OS server 内部表 ============
 
 CREATE TABLE IF NOT EXISTS agent_events (
@@ -232,3 +270,53 @@ CREATE TABLE IF NOT EXISTS sa_main (
   total_stock       INT,
   updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
+
+
+-- ============ 多租户：所有业务表加 tenant_id + RLS（W2 Task 2.2，2026-05-09）============
+--
+-- 阶段 1 单租户兜底：所有现有数据归到 tenant_id=1（HIPOP）
+-- 阶段 2 多租户上线后，每个客户独立 tenant_id
+
+DO $$
+DECLARE
+  t TEXT;
+  business_tables TEXT[] := ARRAY[
+    'wf2_hipop_ksa_sku', 'wf2_hipop_ksa_orders',
+    'wf2_hipop_uae_sku', 'wf2_hipop_uae_orders',
+    'wf1_hipop_ksa_stock', 'wf1_hipop_uae_stock',
+    'wf3_logistics_hub',
+    'wf5_hipop_ksa_sales_cycle', 'wf5_hipop_uae_sales_cycle',
+    'wf6_logistics_alerts',
+    'wf6_hipop_ksa_replenishment_queue', 'wf6_hipop_uae_replenishment_queue',
+    'sa_main',
+    'agent_actions', 'agent_events', 'chat_messages', 'feishu_digest'
+  ];
+BEGIN
+  FOREACH t IN ARRAY business_tables LOOP
+    -- 1. 加 tenant_id 列（DEFAULT 1 让旧数据自动归属 HIPOP 租户）
+    EXECUTE format(
+      'ALTER TABLE %I ADD COLUMN IF NOT EXISTS tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id) ON DELETE CASCADE',
+      t
+    );
+    -- 2. 索引（多数 query 会先按 tenant 过滤）
+    EXECUTE format(
+      'CREATE INDEX IF NOT EXISTS idx_%I_tenant ON %I(tenant_id)',
+      t, t
+    );
+    -- 3. 启用 RLS
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    -- 4. policy: tenant_id 必须等于当前 session 的 app.current_tenant
+    EXECUTE format(
+      'DROP POLICY IF EXISTS tenant_isolation ON %I',
+      t
+    );
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON %I '
+      'USING (tenant_id = current_setting(''app.current_tenant'', true)::BIGINT) '
+      'WITH CHECK (tenant_id = current_setting(''app.current_tenant'', true)::BIGINT)',
+      t
+    );
+  END LOOP;
+END $$;
+
+-- users / sessions / tenants 不开 RLS（auth 层主动用 tenant_id 过滤）

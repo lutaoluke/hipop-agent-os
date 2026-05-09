@@ -72,12 +72,19 @@ def _anthropic_tools_to_openai(tools: List[Dict]) -> List[Dict]:
     return out
 
 
-def _exec_tool(tool_funcs: Dict[str, Callable], name: str, args_str: str) -> dict:
+def _exec_tool(tool_funcs: Dict[str, Callable], name: str, args_str: str, user: dict = None) -> dict:
     try:
         args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
     except Exception:
         return {"error": f"invalid tool arguments JSON: {args_str[:200]}"}
     try:
+        from . import rbac as _rbac
+        if user and not _rbac.tool_allowed(user, name):
+            return {
+                "error": "permission_denied",
+                "tool": name, "user_role": user.get("role"),
+                "message": f"当前角色 {user.get('role')} 不能调用 {name}",
+            }
         fn = tool_funcs[name]
         return fn(**args)
     except KeyError:
@@ -160,7 +167,7 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
         for tc in msg.tool_calls:
             tool_name = tc.function.name
             tool_args_raw = tc.function.arguments
-            result = _exec_tool(tool_funcs, tool_name, tool_args_raw)
+            result = _exec_tool(tool_funcs, tool_name, tool_args_raw, user=scope)
             if isinstance(result, dict) and "references" in result:
                 refs_collected.extend(result["references"])
             if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):

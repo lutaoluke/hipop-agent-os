@@ -19,6 +19,18 @@ from server.skills import dispatch
 
 app = FastAPI(title="HIPOP Skill Server + Agent OS")
 
+
+# ── 多租户 middleware：每个请求自动 set tenant context（PG RLS 用）─────
+@app.middleware("http")
+async def tenant_context_middleware(request, call_next):
+    from server import auth as _auth_mod, data as _data
+    try:
+        user = _auth_mod.get_current_user(request)
+        _data.set_current_tenant(user.get("tenant_id") or 1)
+    except Exception:
+        _data.set_current_tenant(1)  # 默认 HIPOP 租户
+    return await call_next(request)
+
 # ── Phase 1: 工作台 UI + JSON API ─────────────────────────
 _SERVER_DIR = os.path.dirname(__file__)
 app.mount("/static", StaticFiles(directory=os.path.join(_SERVER_DIR, "static")), name="static")

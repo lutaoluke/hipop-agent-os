@@ -566,8 +566,17 @@ TOOL_FUNCS = {
 }
 
 
-def _exec_tool(name: str, args: dict) -> dict:
+def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
+    """tool 执行前先过 RBAC（user.role → 是否允许这个 tool）。"""
     try:
+        from . import rbac as _rbac
+        if user and not _rbac.tool_allowed(user, name):
+            return {
+                "error": "permission_denied",
+                "tool": name,
+                "user_role": user.get("role"),
+                "message": f"当前角色 {user.get('role')} 不能调用 {name}（请向 owner/manager 申请权限）",
+            }
         fn = TOOL_FUNCS[name]
         return fn(**args)
     except KeyError:

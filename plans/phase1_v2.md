@@ -89,7 +89,7 @@ DB_URL=postgresql://... QWEN_API_KEY=... \
 
 ## W2：多用户 + RBAC + 协同
 
-### Task 2.1 — 用户系统（1 day）
+### Task 2.1 — 用户系统 ✅（已完成 2026-05-09）
 
 **交付**：
 - 新表：
@@ -102,7 +102,7 @@ DB_URL=postgresql://... QWEN_API_KEY=... \
 
 **验证**：4 个角色都能登录，token 跨页面有效，过期自动跳登录页。
 
-### Task 2.2 — 多租户 RLS（1 day）
+### Task 2.2 — 多租户 RLS ✅（已完成 2026-05-09）
 
 **交付**：
 - 所有业务表加 `tenant_id INT NOT NULL` 列（wf1/2/3/5/6 + chat + agent_actions + agent_events）
@@ -112,7 +112,7 @@ DB_URL=postgresql://... QWEN_API_KEY=... \
 
 **坑**：RLS 错配 = 数据泄漏 = 信任崩塌 → day1 必须有自动测试
 
-### Task 2.3 — RBAC 权限（half-day）
+### Task 2.3 — RBAC 权限 ✅（已完成 2026-05-09）
 
 **交付**：
 - 角色权限矩阵（hardcode 阶段 1）：

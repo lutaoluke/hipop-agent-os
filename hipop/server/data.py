@@ -14,6 +14,22 @@ from typing import List, Dict, Optional, Any
 DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
 DB_URL  = os.environ.get("DB_URL")  # 设置时走 PG，否则 SQLite
 
+# 多租户：connection 拿到时 SET app.current_tenant = <tid>，让 PG RLS 自动过滤。
+# 通过 contextvars 在请求链路里传 — chat / api 端点设置后，conn() 自动注入。
+import contextvars
+_current_tenant: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "current_tenant", default=None
+)
+
+
+def set_current_tenant(tenant_id: Optional[int]):
+    """FastAPI middleware / endpoint 在拿到 user 后调一下，影响后续所有 conn()。"""
+    _current_tenant.set(tenant_id)
+
+
+def get_current_tenant() -> Optional[int]:
+    return _current_tenant.get()
+
 
 def is_postgres() -> bool:
     return bool(DB_URL and DB_URL.startswith(("postgresql://", "postgres://")))
@@ -67,11 +83,19 @@ class _PGConnWrapper:
 
 
 def conn():
-    """主连接入口 — 按 DB_URL 分派 SQLite/PG。"""
+    """主连接入口 — 按 DB_URL 分派 SQLite/PG。
+
+    PG 模式下自动 SET app.current_tenant（让 RLS 生效）；SQLite 不支持 RLS，
+    多租户隔离靠 ORM 层显式 WHERE tenant_id=（阶段 2 在 _fetch 里包装）。
+    """
     if is_postgres():
         import psycopg2
         from psycopg2.extras import RealDictCursor
         raw = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+        # 注入 tenant context（不设时 RLS policy 会拒绝所有查询，所以默认 1）
+        tid = get_current_tenant() or 1
+        with raw.cursor() as cur:
+            cur.execute("SET app.current_tenant = %s", (str(tid),))
         return _PGConnWrapper(raw)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
