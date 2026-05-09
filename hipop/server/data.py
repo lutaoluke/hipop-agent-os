@@ -467,11 +467,7 @@ def get_work_log(store: str) -> List[Dict]:
     except Exception:
         pass
 
-    # mock 飞书（保底）
-    from . import mock as _mock
-    if not [i for i in items if i.get("tag") == "飞书" or i.get("who") == "飞书"]:
-        items.extend(_mock.WORK_LOG_MOCK_FEISHU)
-
+    # 不再掺 mock（真飞书摘要从 feishu_digest 拿；空就空）
     items.sort(key=lambda i: i.get("time", ""), reverse=True)
     return items[:8]
 
@@ -601,8 +597,8 @@ def get_progress_current() -> Dict:
         LIMIT 1
     """)
     if not rows:
-        from . import mock as _mock
-        return _mock.PROGRESS_MOCK
+        # 无任何任务：返回空，前端不显示进度卡
+        return {"task_id": None, "label": "", "current_step": 0, "total_steps": 0, "steps": []}
     task_id = rows[0]["task_id"]
     events = _fetch("""
         SELECT step_no, step_name, status, message, created_at

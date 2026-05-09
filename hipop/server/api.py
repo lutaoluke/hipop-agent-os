@@ -183,27 +183,61 @@ def api_data_health(store: str):
 
 
 @router.get("/team/{store}")
-def api_team(store: str):
-    return mock.TEAM_MEMBERS
+def api_team(store: str, user: dict = Depends(_auth_mod.get_current_user)):
+    """返回当前 tenant 下所有真实 user。未登录 fallback 显示 default + 一条 hint。"""
+    tenant_id = user.get("tenant_id") or 1
+    rows = data._fetch(
+        "SELECT id, email, display_name, role, last_active_at FROM users "
+        "WHERE tenant_id=? AND active=1 ORDER BY id",
+        (tenant_id,),
+    )
+    me_id = user.get("id")
+    out = []
+    for r in rows:
+        name = r.get("display_name") or (r.get("email") or "").split("@")[0] or "?"
+        out.append({
+            "name": name,
+            "role": {"owner": "店主", "manager": "主管", "ops": "运营", "forwarder": "跟单"}.get(r["role"], r["role"]),
+            "online": True,  # 在线状态阶段 2 接 ws presence；当前都标 online
+            "tasks": 0,
+            "is_me": (r["id"] == me_id),
+            "avatar": name[0].upper() if name else "?",
+        })
+    if not out:
+        # users 表空（未注册过任何用户）→ 显示当前默认 user
+        u = user
+        nm = u.get("display_name") or "Cherry"
+        out = [{"name": nm, "role": "店主", "online": True, "tasks": 0, "is_me": True, "avatar": nm[0].upper()}]
+    return out
 
 
 @router.get("/traffic/{store}")
 def api_traffic(store: str):
-    return mock.TRAFFIC_MOCK
+    """noon 流量 API 未接，阶段 2 上线。"""
+    return {
+        "_status": "not_implemented",
+        "message": "noon 流量数据接入计划在阶段 2（接 noon 后台 API）",
+    }
 
 
 @router.get("/selection/{store}")
 def api_selection(store: str):
-    out = {
-        "candidates": mock.SELECTION_MOCK,
+    """选品候选评估功能未上线（计算逻辑还在工程化）。"""
+    return {
+        "_status": "not_implemented",
+        "candidates": [],
         "strategies": data.get_selection_strategies(),
+        "message": "选品 Agent 在工程化中（见 plans/productization.md 阶段 2）",
     }
-    return out
 
 
 @router.get("/marketing/{store}")
 def api_marketing(store: str):
-    return mock.MARKETING_MOCK
+    """营销分析功能未上线。"""
+    return {
+        "_status": "not_implemented",
+        "message": "营销数据接入计划在阶段 2",
+    }
 
 
 @router.get("/progress/current")
@@ -213,11 +247,8 @@ def api_progress():
 
 @router.get("/chat-history/{store}")
 def api_chat_history(store: str, limit: int = 100):
-    """读取持久化的聊天记录；空库时回退 mock seed（首次使用时给点示例）。"""
-    rows = data.get_chat_messages(store, limit=limit)
-    if not rows:
-        return mock.CHAT_HISTORY_MOCK
-    return rows
+    """读取持久化的聊天记录；空库直接返空（前端显示引导语，不掺示例对话）。"""
+    return data.get_chat_messages(store, limit=limit)
 
 
 @router.get("/cross-store/logistics")
