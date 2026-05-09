@@ -10,15 +10,27 @@ tags: [agent-os, fastapi, claude-tool-use, sse, chat, hipop]
 
 工作目录：/Users/luke/Downloads/点购工作流
 
-## 启动
+## 启动（三种模式）
 
+**dev 最简（SQLite + 不强制登录）**:
 ```bash
-cd /Users/luke/Downloads/点购工作流
-python3 -m uvicorn hipop.server.main:app --host 0.0.0.0 --port 8765
-# 或 ./start_server.sh（带 cloudflared 隧道公网暴露）
+QWEN_API_KEY=sk-... python -m uvicorn hipop.server.main:app --port 8765
 ```
 
-打开 http://localhost:8765 看工作台。
+**完整（PG + Auth + 多租户 RLS）**:
+```bash
+docker compose up -d postgres redis
+DB_URL=postgresql://hipop:hipop_dev_password@localhost:5432/hipop \
+  python scripts/migrate_sqlite_to_pg.py    # 一次性迁
+docker compose up -d app                    # 起整套
+```
+
+**部署到 Zeabur**: 看 `DEPLOY.md`。`zeabur.json` 已配，import git 仓库 + 加内置 PG + 配 `QWEN_API_KEY` / `JWT_SECRET` 即可。
+
+## 健康检查
+
+- `GET /health` — liveness（进程在跑就 200）
+- `GET /ready` — readiness（DB 连得上 200，否则 503，让 LB 摘流量）
 
 **LLM provider 切换**：`LLM_PROVIDER=qwen|anthropic|deepseek|doubao`，**默认 qwen**（与产品化国内栈对齐：¥18/万次 + 阿里云内网 + ICP 备案过 + 实测防护下不 hallucinate）。
 - **qwen / deepseek / doubao**：走 OpenAI 协议（`server/_provider_openai.py`），只换 `base_url + api_key + model`。

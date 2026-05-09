@@ -142,7 +142,7 @@ DB_URL=postgresql://... QWEN_API_KEY=... \
 
 ## W3：部署 + 备案
 
-### Task 3.1 — Dockerize（half-day）
+### Task 3.1 — Dockerize ✅（已完成 2026-05-09）
 
 **交付**：
 - `Dockerfile`：python:3.11-slim + 依赖 + 启动 uvicorn
@@ -150,7 +150,7 @@ DB_URL=postgresql://... QWEN_API_KEY=... \
 - `.dockerignore`：排 `inbox/` / `logs/` / `*.db`
 - 健康检查 endpoint：`/health` 已经有，加 `/ready`（检查 DB 连接）
 
-### Task 3.2 — Zeabur 部署（half-day）
+### Task 3.2 — Zeabur 部署配置 ✅（已完成 2026-05-09，待真部署）
 
 **交付**：
 - `zeabur.json`：包含 build / start / env 引用

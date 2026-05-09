@@ -1,4 +1,28 @@
 services:
+  app:
+    build: .
+    container_name: hipop-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DB_URL: ${DB_URL:-postgresql://hipop:hipop_dev_password@postgres:5432/hipop}
+      LLM_PROVIDER: ${LLM_PROVIDER:-qwen}
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      FEISHU_APP_ID: ${FEISHU_APP_ID}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET}
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK}
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./inbox:/app/inbox
+      - ./logs:/app/logs
+
   postgres:
     image: postgres:16-alpine
     container_name: hipop-pg

@@ -1,0 +1,27 @@
+{
+  "name": "hipop-agent-os",
+  "build": {
+    "type": "dockerfile"
+  },
+  "start": {
+    "command": "python -m uvicorn hipop.server.main:app --host 0.0.0.0 --port 8765"
+  },
+  "ports": [
+    {"id": "web", "port": 8765, "type": "HTTP"}
+  ],
+  "healthcheck": {
+    "path": "/ready",
+    "interval": 30,
+    "timeout": 10
+  },
+  "env": [
+    {"key": "DB_URL", "required": true, "description": "Zeabur 内置 PG 注入；或外接阿里云 RDS"},
+    {"key": "LLM_PROVIDER", "default": "qwen"},
+    {"key": "QWEN_API_KEY", "required": true, "secret": true},
+    {"key": "JWT_SECRET", "required": true, "secret": true, "description": "openssl rand -hex 32"},
+    {"key": "FEISHU_APP_ID", "required": false},
+    {"key": "FEISHU_APP_SECRET", "required": false, "secret": true},
+    {"key": "FEISHU_WEBHOOK", "required": false},
+    {"key": "ANTHROPIC_API_KEY", "required": false, "secret": true, "description": "可选 fallback"}
+  ]
+}

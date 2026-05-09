@@ -46,7 +46,24 @@ _processed = set()
 # ── 健康检查 ─────────────────────────────────────────────
 @app.get("/health")
 def health():
+    """liveness — 进程在跑就 200。容器编排用。"""
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """readiness — DB 连得上才 200，否则 503（让 LB 别打流量）。"""
+    from server import data as _data
+    try:
+        with _data.conn() as c:
+            c.execute("SELECT 1").fetchone()
+        return {"status": "ready", "db": "ok",
+                "mode": "postgres" if _data.is_postgres() else "sqlite"}
+    except Exception as e:
+        return JSONResponse(
+            {"status": "not_ready", "db": "fail", "error": str(e)[:200]},
+            status_code=503,
+        )
 
 # ── 飞书 Webhook ──────────────────────────────────────────
 @app.post("/feishu/webhook")
