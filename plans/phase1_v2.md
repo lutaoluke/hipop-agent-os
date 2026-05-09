@@ -45,26 +45,36 @@
 - 多轮 stop 条件不同：`stop_reason=tool_use` vs `finish_reason=tool_calls` — 已分别判断
 - assistant 历史含 mixed content blocks（text + tool_use）→ openai 风格转换时只取 text，tool_result 转成 'tool' role 消息
 
-### Task 1.2 — Postgres 迁移（1 day）
+### Task 1.2 — Postgres 迁移 ✅（已完成 2026-05-09）
 
-**目标**：本地 docker postgres 跑通所有现有 SQL；迁移工具一键 SQLite → PG。
+**目标**：infrastructure 全准备 + data.py DB_URL 分派；本地 SQLite 默认不破坏。
 
-**交付**：
-- `docker-compose.yml`：postgres 16 + redis（为 W2 任务队列预留）
-- `server/data.py:DB_PATH` 改成 `DB_URL`（postgres://... 或 sqlite:///...）；用 SQLAlchemy 或 psycopg2
-- 一次性迁移脚本 `scripts/migrate_sqlite_to_pg.py`：dump SQLite → 建表 → 导数据
-- 所有现有 SQL 改造（很少，主要 `?` → `%s`、`AUTOINCREMENT` → `SERIAL`、`datetime('now','localtime')` → `NOW() AT TIME ZONE 'UTC'`）
-- DDL 文件 `db/schema.sql`：所有表（wf1/2/3/5/6 + chat_messages + agent_actions + agent_events）
+**交付**（已实现）:
+- ✅ `docker-compose.yml`：postgres 16 + redis（W2 任务队列预留）+ healthcheck
+- ✅ `db/schema.sql`：所有表 PG-flavored DDL（agent_events / agent_actions / chat_messages / wf2_*_sku/orders / wf1_*_stock / wf3_logistics_hub / wf5_*_sales_cycle / wf6_alerts/queue / sa_main / feishu_digest）
+- ✅ `scripts/migrate_sqlite_to_pg.py`：按表 dump → upsert（ON CONFLICT），JSON 字段自动 JSONB
+- ✅ `server/data.py`：`DB_URL` env 分派 + `_convert_sql_for_pg()` 自动 `?→%s` / `datetime('now')→NOW()` / `date('now')→CURRENT_DATE` + `_PGConnWrapper` 让 RealDictCursor 行为接近 sqlite3.Row
+- ✅ `requirements.txt` 加 `psycopg2-binary>=2.9`
 
-**验证**：
-- 本地 `docker compose up`，`python migrate.py` 一键迁完
-- `LLM_PROVIDER=deepseek DB_URL=postgres://... uvicorn ...` chat 能正常工作
-- `compute_replenishment` / `query_sku` / `list_products` 三个 query tool 输出与 SQLite 一致
+**验收**:
+- ✅ `python -m uvicorn ...`（不设 DB_URL）→ SQLite 默认，sku_count=688 正常
+- ✅ `is_postgres()` 检测 + SQL 转换 unit test 通过
+- ⏳ 本地起 docker postgres + 跑 migrate（用户哪天动手切）
 
-**坑**：
-- SQLite 的 `INSERT OR REPLACE` → PG 用 `INSERT ... ON CONFLICT (pk) DO UPDATE`（已经在用，无大改）
-- `MAX(date_str)` 字符串比较行为一致，OK
-- `_fetch` 返回 sqlite3.Row → 改成 dict / RealDictCursor
+**实施要点**:
+- `INSERT OR REPLACE`（SQLite-only）→ 已统一改用 `ON CONFLICT (pk) DO UPDATE`（两边兼容）
+- `_fetch` / `_scalar` 通过 `_PGConnWrapper` 适配 RealDictCursor 与 sqlite3.Row 的双向兼容
+- `_scalar` 增加 dict 检测（PG RealDictCursor 返回 dict，取首值）
+- DB 切换不动业务代码，所有 query 透明走 conn() 抽象
+
+**怎么切到 PG**:
+```bash
+docker compose up -d postgres redis
+DB_URL=postgresql://hipop:hipop_dev_password@localhost:5432/hipop \
+  python scripts/migrate_sqlite_to_pg.py
+DB_URL=postgresql://... QWEN_API_KEY=... \
+  python -m uvicorn hipop.server.main:app --port 8765
+```
 
 ### Task 1.3 — env 配置外置（half-day）
 

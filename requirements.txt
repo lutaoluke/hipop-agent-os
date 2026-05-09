@@ -11,9 +11,9 @@ playwright>=1.40             # ERP token 兜底路径
 anthropic>=0.40              # Anthropic / Claude（本地 OAuth keychain）
 openai>=1.50                 # Qwen / DeepSeek / 豆包 OpenAI 协议兼容
 
-# DB（阶段 1 W1 后启用 PG）
-# psycopg2-binary>=2.9
-# sqlalchemy>=2.0
+# DB
+psycopg2-binary>=2.9      # Postgres（DB_URL 设置时启用）
+# sqlalchemy>=2.0          # 暂未使用，留给阶段 2 任务队列
 
 # Auth（阶段 1 W2 启用）
 # python-jose[cryptography]>=3.3

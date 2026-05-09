@@ -190,14 +190,35 @@ hipop/server/
 
 每次 tool 调用如果带 `references` 字段会被去重写入 `agent_actions` 表，前端气泡里点 📎 弹窗显示数据出处（哪张表 / where 子句 / as_of_date）。这是给运营透明性的关键 — chat 给的每个数字都能溯源到 SQL。
 
+## DB 分派（SQLite ↔ Postgres）
+
+`server/data.py:conn()` 按 `DB_URL` env 分派：
+- 不设 → 本地 SQLite at `HIPOP_DB`（默认 `hipop.db`），dev 模式
+- `DB_URL=postgresql://...` → 生产 PG，`_PGConnWrapper` 包 `psycopg2 + RealDictCursor` 让 SQL 行为透明
+- `_convert_sql_for_pg()` 自动转换：`?→%s` / `datetime('now','localtime')→NOW()` / `date('now')→CURRENT_DATE`
+- 所有业务代码透明（`_fetch` / `_scalar` 不变）
+
+**切到 PG 的步骤**:
+```bash
+docker compose up -d postgres redis     # 起 PG + Redis（schema.sql 自动执行）
+DB_URL=postgresql://hipop:hipop_dev_password@localhost:5432/hipop \
+  python scripts/migrate_sqlite_to_pg.py   # 一次性迁数据
+DB_URL=postgresql://... QWEN_API_KEY=... \
+  python -m uvicorn hipop.server.main:app --port 8765
+```
+
+infrastructure 文件: `docker-compose.yml` / `db/schema.sql` / `scripts/migrate_sqlite_to_pg.py`
+
 ## 关键依赖
 
 ```
 fastapi uvicorn jinja2          # web
-anthropic                       # chat tool-use
-sqlite3                         # 内置
-playwright (chromium)           # ERP token（少数路径，多数走 CDP raw）
-websocket-client                # CDP raw 抓 ERP token
+anthropic                       # chat tool-use（fallback）
+openai                          # qwen / deepseek / 豆包（默认）
+psycopg2-binary                 # PG（DB_URL 设置时）
+sqlite3                         # 内置（默认）
+playwright (chromium)           # ERP token 兜底
+websocket-client                # ERP token 主路径（CDP raw）
 ```
 
 ## 已知 gotcha

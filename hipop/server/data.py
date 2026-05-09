@@ -1,13 +1,78 @@
 """
-HIPOP 工作台数据访问层 - 统一从 hipop.db 读取
+HIPOP 工作台数据访问层
+
+DB 分派（按 env）:
+  - DB_URL=postgresql://...  → 生产/部署，PG（schema 由 db/schema.sql 建）
+  - 否则                     → 本地开发，SQLite at HIPOP_DB
+
+PG 模式下 SQL 占位符自动 ? → %s；datetime('now','localtime') → NOW()。
+不要用 SQLite 独有的 INSERT OR REPLACE，统一用 ON CONFLICT DO UPDATE（两边都支持）。
 """
-import sqlite3, os, json, datetime
+import sqlite3, os, json, datetime, re
 from typing import List, Dict, Optional, Any
 
 DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
+DB_URL  = os.environ.get("DB_URL")  # 设置时走 PG，否则 SQLite
+
+
+def is_postgres() -> bool:
+    return bool(DB_URL and DB_URL.startswith(("postgresql://", "postgres://")))
+
+
+def _convert_sql_for_pg(sql: str) -> str:
+    """sqlite SQL → pg SQL 兼容化（最小改动）。"""
+    # ? 占位符 → %s
+    sql = re.sub(r"(?<![\w'])\?(?![\w'])", "%s", sql)
+    # datetime('now','localtime') → NOW()
+    sql = re.sub(r"datetime\(\s*'now'\s*,\s*'localtime'\s*\)", "NOW()", sql)
+    sql = re.sub(r"datetime\(\s*'now'\s*\)", "NOW()", sql)
+    # date('now','localtime') → CURRENT_DATE
+    sql = re.sub(r"date\(\s*'now'\s*,\s*'localtime'\s*\)", "CURRENT_DATE", sql)
+    return sql
+
+
+class _PGCursorWrapper:
+    """让 psycopg2 cursor 行为接近 sqlite3，让 _fetch / _scalar 不用改。
+    主要差异：sqlite3 row 支持 dict-like，pg 用 RealDictCursor 也支持。"""
+    def __init__(self, cur):
+        self._cur = cur
+    def execute(self, sql, params=()):
+        self._cur.execute(_convert_sql_for_pg(sql), params)
+        return self
+    def fetchall(self): return self._cur.fetchall()
+    def fetchone(self): return self._cur.fetchone()
+    @property
+    def description(self): return self._cur.description
+    def __iter__(self): return iter(self._cur)
+
+
+class _PGConnWrapper:
+    def __init__(self, raw):
+        self._raw = raw
+    def execute(self, sql, params=()):
+        cur = self._raw.cursor()
+        cur.execute(_convert_sql_for_pg(sql), params)
+        return _PGCursorWrapper(cur)
+    def commit(self): self._raw.commit()
+    def rollback(self): self._raw.rollback()
+    def close(self): self._raw.close()
+    def cursor(self): return _PGCursorWrapper(self._raw.cursor())
+    def __enter__(self): return self
+    def __exit__(self, exc_type, *_):
+        if exc_type:
+            self._raw.rollback()
+        else:
+            self._raw.commit()
+        self._raw.close()
 
 
 def conn():
+    """主连接入口 — 按 DB_URL 分派 SQLite/PG。"""
+    if is_postgres():
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        raw = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+        return _PGConnWrapper(raw)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     return c
@@ -22,7 +87,11 @@ def _fetch(sql: str, params: tuple = ()) -> List[Dict]:
 def _scalar(sql: str, params: tuple = ()):
     with conn() as c:
         r = c.execute(sql, params).fetchone()
-        return r[0] if r else None
+        if r is None: return None
+        # PG RealDictCursor 返回 dict；SQLite Row 支持 r[0]
+        if isinstance(r, dict):
+            return next(iter(r.values()))
+        return r[0]
 
 
 def _feishu_today_count() -> int:
