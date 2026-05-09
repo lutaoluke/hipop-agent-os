@@ -69,10 +69,10 @@ def api_permissions(user: dict = Depends(_auth_mod.get_current_user)):
     return {"role": user.get("role"), "permissions": _rbac.get_my_permissions(user)}
 
 
-# ── Onboarding（客户引导，W4）─────────────────────────────
+# ── Onboarding（客户引导，W4 + Phase C）──────────────────
 @router.post("/onboarding/erp-verify")
 def api_onboarding_erp_verify(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
-    """alpha 阶段简化：只检查字段非空 + 长度合理。真验需要后端代登 ERP（W4 后期）。"""
+    """alpha 阶段：格式校验。真连验证留到下次 ingest。"""
     if user.get("is_default"):
         raise HTTPException(401, "请先登录")
     username = (body or {}).get("username", "").strip()
@@ -83,40 +83,82 @@ def api_onboarding_erp_verify(body: dict, user: dict = Depends(_auth_mod.get_cur
         return {"ok": False, "message": "密码看起来太短，请确认"}
     return {
         "ok": True,
-        "message": f"凭据格式 OK（{username}）。alpha 阶段不做真连测试，下次跑 ingest 时会真试。",
+        "message": f"凭据格式 OK（{username}）。下次跑 ingest 时会真连测试。",
     }
 
 
 @router.post("/onboarding/finish")
 def api_onboarding_finish(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
-    """提交完整接入信息：写到 tenant 配置 + 邀请同事。"""
+    """提交完整接入信息：真存 sales_entities + ERP 凭据加密 + 邀请同事。"""
     if user.get("is_default"):
         raise HTTPException(401, "请先登录")
     tenant_id = user.get("tenant_id")
     if not tenant_id:
         raise HTTPException(400, "user 没有 tenant_id")
 
+    from . import auth as _a
+    from . import _crypto
+    from hipop.scripts import sales_entity_v2 as _sev2  # type: ignore
+
     entities = (body or {}).get("entities", [])
     erp      = (body or {}).get("erp", {})
     feishu   = (body or {}).get("feishu", {})
     invites  = (body or {}).get("invites", [])
 
+    # 1. sales_entities → DB 真落
     saved_entities = []
     for e in entities:
-        if not e.get("alias") or not e.get("store"):
+        alias = (e.get("alias") or "").strip()
+        store = (e.get("store") or "").strip()
+        if not alias or not store:
             continue
-        saved_entities.append({
-            "alias": e["alias"], "country": e.get("country"), "platform": e.get("platform"),
-            "store": e["store"], "store_id": e.get("store_id"),
-            "currency": e.get("currency"),
-        })
+        eid = _sev2.upsert_entity(
+            tenant_id=tenant_id,
+            alias=alias,
+            country=(e.get("country") or "SA").upper(),
+            platform=(e.get("platform") or "Noon"),
+            store_name=store,
+            store_id=e.get("store_id"),
+            currency=e.get("currency"),
+        )
+        saved_entities.append({"id": eid, "alias": alias, "store": store,
+                                "country": e.get("country"), "store_id": e.get("store_id")})
 
-    erp_configured = bool(erp.get("username") and erp.get("password"))
-    feishu_configured = bool(feishu.get("base_id") or feishu.get("webhook"))
+    # 2. ERP 凭据加密存
+    erp_configured = False
+    if erp.get("username") and erp.get("password"):
+        with data.conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO tenant_erp_credentials "
+                "(tenant_id, erp_kind, erp_url, username_enc, password_enc, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                (tenant_id, erp.get("kind", "dbuyerp"),
+                 erp.get("url", "https://www.dbuyerp.com"),
+                 _crypto.encrypt(erp["username"]),
+                 _crypto.encrypt(erp["password"])),
+            )
+            c.commit()
+        erp_configured = True
 
+    # 3. 飞书凭据
+    feishu_configured = False
+    if feishu.get("webhook") or feishu.get("app_secret") or feishu.get("base_id"):
+        with data.conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO tenant_feishu_credentials "
+                "(tenant_id, app_id, app_secret_enc, webhook_enc, bitable_base_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                (tenant_id, feishu.get("app_id"),
+                 _crypto.encrypt(feishu.get("app_secret")),
+                 _crypto.encrypt(feishu.get("webhook")),
+                 feishu.get("base_id")),
+            )
+            c.commit()
+        feishu_configured = True
+
+    # 4. 邀请同事
     invited_users = []
     failed_invites = []
-    from . import auth as _a
     for u in invites:
         email = (u.get("email") or "").strip().lower()
         role  = u.get("role", "ops")
