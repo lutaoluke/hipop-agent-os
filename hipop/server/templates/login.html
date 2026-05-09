@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% if mode == 'register' %}注册{% else %}登录{% endif %} · 点购 Agent OS</title>
+  <link rel="stylesheet" href="/static/css/workspace.css">
+  <script defer src="/static/js/alpine.min.js"></script>
+  <style>
+    body { background: var(--bg-secondary); }
+    .auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .auth-card { width: 100%; max-width: 420px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 12px; padding: 32px; box-shadow: 0 4px 20px rgba(0,0,0,0.04); }
+    .auth-title { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+    .auth-sub { font-size: 13px; color: var(--text-secondary); margin-bottom: 24px; }
+    .auth-field { margin-bottom: 14px; }
+    .auth-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
+    .auth-field input { width: 100%; padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; font-size: 14px; box-sizing: border-box; }
+    .auth-field input:focus { outline: none; border-color: var(--text-info); }
+    .auth-btn { width: 100%; padding: 12px; background: #000; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .auth-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .auth-foot { margin-top: 16px; font-size: 12.5px; text-align: center; color: var(--text-secondary); }
+    .auth-foot a { color: var(--text-info); text-decoration: none; }
+    .auth-err { padding: 10px 12px; background: var(--bg-danger); color: var(--text-danger); border-radius: 8px; font-size: 12.5px; margin-bottom: 14px; }
+  </style>
+</head>
+<body>
+<div class="auth-wrap">
+  <div class="auth-card" x-data="authForm('{{ mode }}')">
+    <div class="auth-title" x-text="isRegister ? '创建账户' : '登录'"></div>
+    <div class="auth-sub" x-text="isRegister ? '建立你的店铺工作空间，3 分钟接入 ERP' : '点购 Agent OS · 共同空间'"></div>
+
+    <div x-show="err" class="auth-err" x-text="err"></div>
+
+    <template x-if="isRegister">
+      <div class="auth-field">
+        <label>公司 / 团队名称</label>
+        <input type="text" x-model="tenant_name" placeholder="如 HIPOP">
+      </div>
+    </template>
+
+    <template x-if="isRegister">
+      <div class="auth-field">
+        <label>你的姓名</label>
+        <input type="text" x-model="display_name" placeholder="如 Luke">
+      </div>
+    </template>
+
+    <div class="auth-field">
+      <label>邮箱</label>
+      <input type="email" x-model="email" placeholder="you@company.com" autocomplete="email">
+    </div>
+
+    <div class="auth-field">
+      <label>密码（≥ 6 位）</label>
+      <input type="password" x-model="password" autocomplete="current-password">
+    </div>
+
+    <button class="auth-btn" :disabled="loading || !email || !password" @click="submit()">
+      <span x-text="loading ? '...' : (isRegister ? '注册并接入' : '登录')"></span>
+    </button>
+
+    <div class="auth-foot">
+      <template x-if="isRegister">
+        <span>已有账户？<a href="/login">登录</a></span>
+      </template>
+      <template x-if="!isRegister">
+        <span>还没账户？<a href="/register">注册新工作空间</a></span>
+      </template>
+    </div>
+  </div>
+</div>
+
+<script>
+function authForm(mode) {
+  return {
+    isRegister: mode === 'register',
+    email: '', password: '', tenant_name: '', display_name: '',
+    loading: false, err: '',
+    async submit() {
+      if (!this.email || !this.password) return;
+      if (this.isRegister && this.password.length < 6) {
+        this.err = '密码至少 6 位'; return;
+      }
+      this.loading = true; this.err = '';
+      const url = this.isRegister ? '/api/auth/register' : '/api/auth/login';
+      const body = this.isRegister
+        ? {email: this.email, password: this.password, tenant_name: this.tenant_name, display_name: this.display_name}
+        : {email: this.email, password: this.password};
+      try {
+        const r = await fetch(url, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body), credentials: 'include',
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          this.err = data.detail || data.error || (r.status + ' ' + r.statusText);
+        } else {
+          // 注册后跳 onboarding；登录直接进工作台
+          window.location.href = this.isRegister ? '/onboarding' : '/?store=ksa';
+        }
+      } catch (e) {
+        this.err = '网络错误：' + e.message;
+      }
+      this.loading = false;
+    },
+  };
+}
+</script>
+</body>
+</html>

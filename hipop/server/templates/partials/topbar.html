@@ -40,10 +40,33 @@
     <span class="pc-badge">3</span>
   </button>
   <button class="pc-icon-btn" title="设置">⚙️</button>
-  <div class="pc-avatar" title="{{ current_user }} · {{ current_role }}">
-    {{ current_user[0]|upper }}
+  <div x-data="{open: false}" style="position: relative;">
+    <div class="pc-avatar" title="{{ current_user }} · {{ current_role }}{% if is_default_user %} · 未登录{% endif %}"
+         @click="open = !open" style="cursor: pointer;">
+      {{ current_user[0]|upper }}
+    </div>
+    <div x-show="open" @click.outside="open = false" x-cloak
+         style="position: absolute; right: 0; top: calc(100% + 6px); background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px; min-width: 200px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); padding: 8px 0; z-index: 100; font-size: 13px;">
+      <div style="padding: 8px 14px; border-bottom: 1px solid var(--border-default);">
+        <div style="font-weight: 600;">{{ current_user }}</div>
+        <div style="font-size: 11.5px; color: var(--text-tertiary);">{{ current_role }}{% if is_default_user %} · 未登录（默认账户）{% endif %}</div>
+      </div>
+      {% if is_default_user %}
+      <a href="/login" style="display: block; padding: 8px 14px; color: var(--text-info); text-decoration: none;">登录</a>
+      <a href="/register" style="display: block; padding: 8px 14px; color: var(--text-info); text-decoration: none;">注册新工作空间</a>
+      {% else %}
+      <a href="/onboarding" style="display: block; padding: 8px 14px; color: var(--text-primary); text-decoration: none;">⚙️ 接入向导</a>
+      <button @click="logout()" style="display: block; width: 100%; text-align: left; padding: 8px 14px; background: none; border: none; color: var(--text-danger); cursor: pointer; font-size: 13px;">退出登录</button>
+      {% endif %}
+    </div>
   </div>
 </div>
+<script>
+async function logout() {
+  await fetch('/api/auth/logout', {method: 'POST', credentials: 'include'});
+  window.location.href = '/login';
+}
+</script>
 
 <script>
 // 美化数据健康 chip

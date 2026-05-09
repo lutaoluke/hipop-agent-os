@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>接入向导 · 点购 Agent OS</title>
+  <link rel="stylesheet" href="/static/css/workspace.css">
+  <script defer src="/static/js/alpine.min.js"></script>
+  <style>
+    body { background: var(--bg-secondary); }
+    .ob-wrap { max-width: 720px; margin: 40px auto; padding: 0 20px; }
+    .ob-card { background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 12px; padding: 32px; margin-bottom: 18px; }
+    .ob-step-tag { display: inline-block; padding: 2px 8px; background: var(--bg-info); color: var(--text-info); border-radius: 4px; font-size: 11px; font-weight: 600; margin-bottom: 8px; }
+    .ob-title { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    .ob-sub { font-size: 13px; color: var(--text-secondary); margin-bottom: 18px; }
+    .ob-field { margin-bottom: 14px; }
+    .ob-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
+    .ob-field input, .ob-field select { width: 100%; padding: 10px 12px; border: 1px solid var(--border-default); border-radius: 8px; font-size: 14px; box-sizing: border-box; }
+    .ob-row { display: flex; gap: 10px; }
+    .ob-row > .ob-field { flex: 1; }
+    .ob-btn { padding: 10px 18px; background: #000; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .ob-btn-secondary { padding: 10px 18px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 8px; font-size: 13px; cursor: pointer; }
+    .ob-btn-row { display: flex; gap: 10px; margin-top: 8px; }
+    .ob-msg-ok { padding: 10px; background: var(--bg-success); color: var(--text-success); border-radius: 8px; font-size: 12.5px; margin-bottom: 12px; }
+    .ob-msg-warn { padding: 10px; background: var(--bg-warn); color: var(--text-warn); border-radius: 8px; font-size: 12.5px; margin-bottom: 12px; }
+    .ob-invite-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; font-size: 12.5px; }
+  </style>
+</head>
+<body>
+<div class="ob-wrap" x-data="onboarding()">
+  <h1 style="font-size: 24px; font-weight: 700; margin: 0 0 20px;">欢迎，<span x-text="$el.dataset.user || 'Luke'"></span> · 让我们 3 分钟接入</h1>
+
+  <!-- Step 1: 销售主体 -->
+  <div class="ob-card">
+    <div class="ob-step-tag">Step 1</div>
+    <div class="ob-title">告诉我你的销售主体</div>
+    <div class="ob-sub">每个店铺一个 sales_entity，含国别 + 平台 + 店铺名 + 平台 store_id（在 ERP 后台筛选店铺时 URL 里的 store_ids 值）。</div>
+
+    <template x-for="(ent, i) in entities" :key="i">
+      <div style="border: 1px solid var(--border-default); border-radius: 8px; padding: 14px; margin-bottom: 10px;">
+        <div class="ob-row">
+          <div class="ob-field"><label>简称（alias）</label><input type="text" x-model="ent.alias" placeholder="如 hipop_ksa"></div>
+          <div class="ob-field"><label>国别</label><select x-model="ent.country"><option value="SA">SA 沙特</option><option value="AE">AE 阿联酋</option></select></div>
+        </div>
+        <div class="ob-row">
+          <div class="ob-field"><label>平台</label><select x-model="ent.platform"><option value="Noon">Noon</option><option value="Amazon">Amazon</option></select></div>
+          <div class="ob-field"><label>店铺名</label><input type="text" x-model="ent.store" placeholder="HIPOP-NOON-KSA"></div>
+        </div>
+        <div class="ob-row">
+          <div class="ob-field"><label>ERP store_id</label><input type="number" x-model.number="ent.store_id" placeholder="85"></div>
+          <div class="ob-field"><label>币种</label><select x-model="ent.currency"><option>SAR</option><option>AED</option><option>USD</option></select></div>
+        </div>
+      </div>
+    </template>
+    <button class="ob-btn-secondary" @click="addEntity()">+ 加一个店铺</button>
+  </div>
+
+  <!-- Step 2: ERP 凭据 -->
+  <div class="ob-card">
+    <div class="ob-step-tag">Step 2</div>
+    <div class="ob-title">接入 ERP（dbuyerp）</div>
+    <div class="ob-sub">用来自动拉商品库 + 销量。账号信息只存你的 tenant 凭据库，不外传。</div>
+    <div class="ob-field"><label>ERP 用户名</label><input type="text" x-model="erp.username" placeholder="dbuyerp 登录账号"></div>
+    <div class="ob-field"><label>ERP 密码</label><input type="password" x-model="erp.password"></div>
+    <div class="ob-btn-row">
+      <button class="ob-btn-secondary" @click="testErp()" :disabled="testingErp">
+        <span x-text="testingErp ? '测试中...' : '测试连接'"></span>
+      </button>
+      <span x-show="erpResult" :class="erpResult.ok ? 'ob-msg-ok' : 'ob-msg-warn'" style="margin: 0; padding: 6px 10px;" x-text="erpResult ? erpResult.message : ''"></span>
+    </div>
+  </div>
+
+  <!-- Step 3: 飞书（可选） -->
+  <div class="ob-card">
+    <div class="ob-step-tag">Step 3 · 可选</div>
+    <div class="ob-title">飞书集成（推送告警/补货决策同步）</div>
+    <div class="ob-sub">不接也能跑，缺失只丢失飞书表协作功能。</div>
+    <div class="ob-field"><label>飞书多维表格 base_id</label><input type="text" x-model="feishu.base_id" placeholder="可空"></div>
+    <div class="ob-field"><label>飞书 webhook URL</label><input type="text" x-model="feishu.webhook" placeholder="可空"></div>
+  </div>
+
+  <!-- Step 4: 邀请同事 -->
+  <div class="ob-card">
+    <div class="ob-step-tag">Step 4 · 可选</div>
+    <div class="ob-title">邀请同事</div>
+    <div class="ob-sub">先填邮箱 + 角色，alpha 阶段我们直接帮你建账户（生产改邀请邮件）。</div>
+    <template x-for="(u, i) in invites" :key="i">
+      <div class="ob-invite-row">
+        <input type="email" x-model="u.email" placeholder="同事邮箱" style="flex:1;padding:8px 10px;border:1px solid var(--border-default);border-radius:6px;">
+        <select x-model="u.role" style="padding:8px 10px;border:1px solid var(--border-default);border-radius:6px;">
+          <option value="manager">主管 manager</option>
+          <option value="ops">运营 ops</option>
+          <option value="forwarder">跟单 forwarder</option>
+        </select>
+        <button class="ob-btn-secondary" @click="invites.splice(i,1)" style="padding:6px 10px;">×</button>
+      </div>
+    </template>
+    <button class="ob-btn-secondary" @click="invites.push({email:'',role:'ops'})">+ 加一个同事</button>
+  </div>
+
+  <!-- 完成 -->
+  <div style="margin-top: 24px; display: flex; justify-content: flex-end; gap: 10px;">
+    <button class="ob-btn-secondary" @click="skip()">先跳过，进工作台</button>
+    <button class="ob-btn" @click="finish()" :disabled="loading">
+      <span x-text="loading ? '提交中...' : '完成接入 → 进工作台'"></span>
+    </button>
+  </div>
+</div>
+
+<script>
+function onboarding() {
+  return {
+    entities: [{alias: 'hipop_ksa', country: 'SA', platform: 'Noon', store: 'HIPOP-NOON-KSA', store_id: 85, currency: 'SAR'}],
+    erp: {username: '', password: ''},
+    feishu: {base_id: '', webhook: ''},
+    invites: [],
+    testingErp: false, erpResult: null, loading: false,
+    addEntity() { this.entities.push({alias: '', country: 'SA', platform: 'Noon', store: '', store_id: null, currency: 'SAR'}); },
+    async testErp() {
+      this.testingErp = true; this.erpResult = null;
+      try {
+        const r = await fetch('/api/onboarding/erp-verify', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, credentials: 'include',
+          body: JSON.stringify(this.erp),
+        });
+        this.erpResult = await r.json();
+      } catch (e) {
+        this.erpResult = {ok: false, message: '请求失败：' + e.message};
+      }
+      this.testingErp = false;
+    },
+    skip() { window.location.href = '/?store=ksa'; },
+    async finish() {
+      this.loading = true;
+      try {
+        const r = await fetch('/api/onboarding/finish', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, credentials: 'include',
+          body: JSON.stringify({
+            entities: this.entities.filter(e => e.alias && e.store),
+            erp: this.erp, feishu: this.feishu,
+            invites: this.invites.filter(u => u.email),
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          window.location.href = '/?store=' + (this.entities[0]?.country === 'AE' ? 'uae' : 'ksa');
+        } else {
+          alert('接入失败：' + (data.error || ''));
+        }
+      } catch (e) { alert('网络错误：' + e.message); }
+      this.loading = false;
+    },
+  };
+}
+</script>
+</body>
+</html>

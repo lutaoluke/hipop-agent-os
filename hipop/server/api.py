@@ -69,6 +69,83 @@ def api_permissions(user: dict = Depends(_auth_mod.get_current_user)):
     return {"role": user.get("role"), "permissions": _rbac.get_my_permissions(user)}
 
 
+# ── Onboarding（客户引导，W4）─────────────────────────────
+@router.post("/onboarding/erp-verify")
+def api_onboarding_erp_verify(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
+    """alpha 阶段简化：只检查字段非空 + 长度合理。真验需要后端代登 ERP（W4 后期）。"""
+    if user.get("is_default"):
+        raise HTTPException(401, "请先登录")
+    username = (body or {}).get("username", "").strip()
+    password = (body or {}).get("password", "")
+    if not username or not password:
+        return {"ok": False, "message": "用户名/密码必填"}
+    if len(password) < 4:
+        return {"ok": False, "message": "密码看起来太短，请确认"}
+    return {
+        "ok": True,
+        "message": f"凭据格式 OK（{username}）。alpha 阶段不做真连测试，下次跑 ingest 时会真试。",
+    }
+
+
+@router.post("/onboarding/finish")
+def api_onboarding_finish(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
+    """提交完整接入信息：写到 tenant 配置 + 邀请同事。"""
+    if user.get("is_default"):
+        raise HTTPException(401, "请先登录")
+    tenant_id = user.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(400, "user 没有 tenant_id")
+
+    entities = (body or {}).get("entities", [])
+    erp      = (body or {}).get("erp", {})
+    feishu   = (body or {}).get("feishu", {})
+    invites  = (body or {}).get("invites", [])
+
+    saved_entities = []
+    for e in entities:
+        if not e.get("alias") or not e.get("store"):
+            continue
+        saved_entities.append({
+            "alias": e["alias"], "country": e.get("country"), "platform": e.get("platform"),
+            "store": e["store"], "store_id": e.get("store_id"),
+            "currency": e.get("currency"),
+        })
+
+    erp_configured = bool(erp.get("username") and erp.get("password"))
+    feishu_configured = bool(feishu.get("base_id") or feishu.get("webhook"))
+
+    invited_users = []
+    failed_invites = []
+    from . import auth as _a
+    for u in invites:
+        email = (u.get("email") or "").strip().lower()
+        role  = u.get("role", "ops")
+        if not email:
+            continue
+        if _a.get_user_by_email(email):
+            failed_invites.append({"email": email, "reason": "邮箱已被注册"})
+            continue
+        try:
+            default_pw = email.split("@")[0] + "_alpha"
+            uid = _a.create_user(tenant_id, email, default_pw,
+                                  display_name=email.split("@")[0], role=role)
+            invited_users.append({"email": email, "role": role, "user_id": uid,
+                                  "default_password": default_pw})
+        except Exception as ex:
+            failed_invites.append({"email": email, "reason": str(ex)[:200]})
+
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "saved_entities": saved_entities,
+        "erp_configured": erp_configured,
+        "feishu_configured": feishu_configured,
+        "invited_users": invited_users,
+        "failed_invites": failed_invites,
+        "next": "/?store=" + ("ksa" if any(e.get("country") == "SA" for e in saved_entities) else "uae"),
+    }
+
+
 @router.get("/today/{store}")
 def api_today(store: str):
     return data.get_today(store)
