@@ -330,16 +330,20 @@ def api_feishu_digest(limit: int = 20):
     return data._fetch("SELECT * FROM feishu_digest ORDER BY digest_at DESC LIMIT ?", (limit,))
 
 
-# ── 上传 + 真触发 ingest + wf3/wf5 ─────────────────────
+# ── 上传 + 真触发 ingest（按 tenant 隔离 + v2 表）──────────
 @router.post("/upload")
 async def api_upload(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     followup_prompt: Optional[str] = None,
     store: Optional[str] = None,
+    user: dict = Depends(_auth_mod.get_current_user),
 ):
+    """CSV 上传：按 tenant_id 隔离存储路径 + 调 v2 ingest（写 wf2_orders/wf2_sku v2 表）。"""
     task_id = uuid4().hex[:8]
-    inbox = os.path.join(PROJECT_ROOT, "inbox")
+    tenant_id = user.get("tenant_id") or 1
+    # tenant 隔离：inbox/<tenant_id>/<filename>
+    inbox = os.path.join(PROJECT_ROOT, "inbox", str(tenant_id))
     os.makedirs(inbox, exist_ok=True)
     saved = []
     for f in files:
@@ -349,33 +353,36 @@ async def api_upload(
         saved.append(fp)
 
     affected_modules = ["sales", "replenish", "logistics"]
-    label = f"CSV 上传 + 全管道（{len(saved)} 个文件）"
+    label = f"CSV 上传 + ingest（{len(saved)} 个文件）"
 
-    # step_no=0 init（与 run_workflow 对齐，让前端 attachTask 能拿到 metadata）
     data.write_event(task_id, 0, "初始化", "done", json.dumps({
         "workflow": "upload_pipeline",
         "label": label,
         "affected_modules": affected_modules,
-        "total_steps": 5,
+        "total_steps": 4,
         "followup_prompt": followup_prompt,
+        "tenant_id": tenant_id,
     }, ensure_ascii=False))
-    data.write_event(task_id, 1, "上传文件", "done", f"已保存 {len(saved)} 个文件")
-    background_tasks.add_task(_run_pipeline, task_id, saved, followup_prompt, affected_modules)
+    data.write_event(task_id, 1, "上传文件", "done",
+                     f"已保存 {len(saved)} 个文件到 tenant {tenant_id}")
+    background_tasks.add_task(_run_pipeline_v2, task_id, saved, tenant_id,
+                               followup_prompt, affected_modules)
     return {
         "task_id": task_id,
+        "tenant_id": tenant_id,
         "files": [os.path.basename(s) for s in saved],
         "label": label,
         "affected_modules": affected_modules,
         "followup_prompt": followup_prompt,
-        "total_steps": 5,
+        "total_steps": 4,
         "workflow": "upload_pipeline",
     }
 
 
-def _run_pipeline(task_id: str, file_paths: list,
-                  followup_prompt: Optional[str] = None,
-                  affected_modules: Optional[list] = None):
-    """串行: 校验 → ingest_noon_csv.process_csv → wf5 → wf3 + 告警"""
+def _run_pipeline_v2(task_id: str, file_paths: list, tenant_id: int,
+                     followup_prompt: Optional[str] = None,
+                     affected_modules: Optional[list] = None):
+    """v2 多租户 pipeline: 校验 → ingest_noon_csv_v2（写 v2 表）→ 聚合销量"""
     affected_modules = affected_modules or ["sales", "replenish", "logistics"]
     failed = False
     try:
@@ -385,48 +392,54 @@ def _run_pipeline(task_id: str, file_paths: list,
                 raise RuntimeError(f"文件不存在: {p}")
         data.write_event(task_id, 2, "校验格式", "done", f"{len(file_paths)} 个文件就绪")
 
-        data.write_event(task_id, 3, "解析 + 入库 wf2", "started")
+        data.write_event(task_id, 3, f"解析 + 入库 (tenant={tenant_id})", "started")
         try:
-            from scripts import ingest_noon_csv
+            # 设 tenant context（PG RLS 用；SQLite 也无害）
+            data.set_current_tenant(tenant_id)
+            from scripts import ingest_noon_csv_v2
             import sqlite3
-            db = data.DB_PATH
-            conn = sqlite3.connect(db)
+            conn = sqlite3.connect(data.DB_PATH)
             total = 0
             for p in file_paths:
                 if "Inventory" in os.path.basename(p):
-                    # 跳过 inventory CSV（wf1 范围）
-                    continue
+                    continue  # noon Inventory CSV 走 wf1（暂未 v2 化）
                 try:
-                    n = ingest_noon_csv.process_csv(p, conn, dry_run=False)
+                    n = ingest_noon_csv_v2.process_csv_v2(tenant_id, p, conn)
                     total += n or 0
                 except Exception as e:
-                    data.write_event(task_id, 3, "解析 + 入库 wf2", "error", f"{os.path.basename(p)}: {e}")
+                    data.write_event(task_id, 3, "解析 + 入库", "error",
+                                     f"{os.path.basename(p)}: {e}")
                     failed = True
             conn.close()
             if not failed:
-                data.write_event(task_id, 3, "解析 + 入库 wf2", "done", f"累计 {total} 行")
+                data.write_event(task_id, 3, f"解析 + 入库", "done",
+                                 f"累计 {total} 行 (tenant={tenant_id})")
         except Exception as e:
-            data.write_event(task_id, 3, "解析 + 入库 wf2", "error", str(e))
+            data.write_event(task_id, 3, "解析 + 入库", "error", str(e))
             failed = True
 
         if not failed:
-            data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "started")
+            # 聚合销量到 wf2_sku.sales_*
+            data.write_event(task_id, 4, "聚合销量窗口", "started")
             try:
-                from workflows import wf_sales_cycle as _w5
-                _w5.run(verbose=False)
-                data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "done")
+                import sqlite3
+                conn = sqlite3.connect(data.DB_PATH)
+                # 拿该 tenant 的所有 entity_alias
+                aliases = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT entity_alias FROM wf2_orders WHERE tenant_id=?",
+                    (tenant_id,)
+                ).fetchall()]
+                from scripts.ingest_noon_csv_v2 import aggregate_sales_v2
+                total_skus = 0
+                for alias in aliases:
+                    n = aggregate_sales_v2(tenant_id, alias, conn)
+                    total_skus += n
+                conn.close()
+                data.write_event(task_id, 4, "聚合销量窗口", "done",
+                                 f"刷新 {total_skus} 个 SKU 的 sales_*d")
             except Exception as e:
-                data.write_event(task_id, 4, "重跑 wf5 (销售周期)", "error", str(e)[:200])
+                data.write_event(task_id, 4, "聚合销量窗口", "error", str(e)[:200])
 
-            data.write_event(task_id, 5, "重跑 wf3 + 告警", "started")
-            try:
-                from workflows import wf_logistics_alerts
-                wf_logistics_alerts.generate_alerts(verbose=False)
-                data.write_event(task_id, 5, "重跑 wf3 + 告警", "done")
-            except Exception as e:
-                data.write_event(task_id, 5, "重跑 wf3 + 告警", "error", str(e)[:200])
-
-        # step_no=99 终结，前端用它 dispatch workflow-done + 触发 followup
         data.write_event(task_id, 99, "管道完成",
                          "error" if failed else "done",
                          json.dumps({
@@ -434,9 +447,11 @@ def _run_pipeline(task_id: str, file_paths: list,
                              "affected_modules": affected_modules,
                              "ok": not failed,
                              "followup_prompt": followup_prompt,
+                             "tenant_id": tenant_id,
                          }, ensure_ascii=False))
     except Exception as e:
-        data.write_event(task_id, 99, "管道异常", "error", traceback.format_exc()[:500])
+        data.write_event(task_id, 99, "管道异常", "error",
+                         traceback.format_exc()[:500])
 
 
 # ── 真 SSE ────────────────────────────────────────────
