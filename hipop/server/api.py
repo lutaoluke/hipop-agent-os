@@ -503,6 +503,13 @@ WORKFLOW_REGISTRY = {
         [(1, "商品库 + 销量 + noon CSV + 聚合 + 飞书", "scripts.weekly_run:step_wf2")],
         ["sales"],
     ),
+    # v2 多租户版：按 tenant_id 跑（用 onboarding 配的 ERP 凭据 headless 登录）
+    "wf2_products_v2": (
+        "ERP 商品库（自动拉，per-tenant）",
+        [(1, "headless 登 ERP + 拉商品 + 写 wf2_sku v2",
+          "scripts.ingest_erp_products_v2:run_v2")],
+        ["sales"],
+    ),
     "wf3_logistics": (
         "wf3 物流采集",
         [(1, "全 entity 扫单 + 写 hub + 飞书", "scripts.weekly_run:step_wf3")],
@@ -550,17 +557,22 @@ def _resolve_callable(path: str):
     return getattr(mod, fn_name)
 
 
-def _run_workflow(task_id: str, workflow: str):
-    """串行执行 WORKFLOW_REGISTRY 中定义的所有 step，写入 agent_events。"""
+def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1):
+    """串行执行 WORKFLOW_REGISTRY 中定义的所有 step，写入 agent_events。
+
+    tenant_id：v2 step 函数（接受 tenant_id 参数的）会传入。老 step 不受影响（callable 不接受 kw 时落回无参调用）。
+    """
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
-    # step_no=0 写 init（携带 affected_modules，前端用来定向刷新）
     data.write_event(
         task_id, 0, "初始化",
         "done",
         json.dumps({"workflow": workflow, "label": label,
-                    "affected_modules": affected, "total_steps": len(steps)},
+                    "affected_modules": affected, "total_steps": len(steps),
+                    "tenant_id": tenant_id},
                    ensure_ascii=False),
     )
+    # 后台线程：必须 set tenant context（middleware 不在这条线程上）
+    data.set_current_tenant(tenant_id)
     failed = False
     for step_no, step_name, path in steps:
         if failed:
@@ -569,7 +581,13 @@ def _run_workflow(task_id: str, workflow: str):
         data.write_event(task_id, step_no, step_name, "started")
         try:
             fn = _resolve_callable(path)
-            fn()
+            # 探测函数是否接受 tenant_id（v2 step 是 fn(tenant_id)，老 step 是 fn()）
+            import inspect
+            sig = inspect.signature(fn)
+            if "tenant_id" in sig.parameters:
+                fn(tenant_id=tenant_id)
+            else:
+                fn()
             data.write_event(task_id, step_no, step_name, "done")
         except Exception as e:
             data.write_event(task_id, step_no, step_name, "error", traceback.format_exc()[-500:])
@@ -578,24 +596,27 @@ def _run_workflow(task_id: str, workflow: str):
     data.write_event(
         task_id, 99, "管道完成", final_status,
         json.dumps({"workflow": workflow, "affected_modules": affected,
-                    "ok": not failed}, ensure_ascii=False),
+                    "ok": not failed, "tenant_id": tenant_id}, ensure_ascii=False),
     )
 
 
 @router.post("/run-workflow")
-async def api_run_workflow(body: dict, background_tasks: BackgroundTasks):
+async def api_run_workflow(body: dict, background_tasks: BackgroundTasks,
+                            user: dict = Depends(_auth_mod.get_current_user)):
     workflow = (body or {}).get("workflow")
     if workflow not in WORKFLOW_REGISTRY:
         raise HTTPException(400, f"unknown workflow: {workflow}. valid: {list(WORKFLOW_REGISTRY)}")
+    tenant_id = user.get("tenant_id") or 1
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
     task_id = uuid4().hex[:8]
-    background_tasks.add_task(_run_workflow, task_id, workflow)
+    background_tasks.add_task(_run_workflow, task_id, workflow, tenant_id)
     return {
         "task_id": task_id,
         "workflow": workflow,
         "label": label,
         "total_steps": len(steps),
         "affected_modules": affected,
+        "tenant_id": tenant_id,
         "status": "started",
     }
 

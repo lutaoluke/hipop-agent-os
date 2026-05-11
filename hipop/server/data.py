@@ -634,11 +634,12 @@ def get_today(store: str) -> Dict:
 
 # ── Agent 处理事件流（SSE 数据源）────────────────────────
 def write_event(task_id: str, step_no: int, step_name: str, status: str, message: str = ""):
+    tid = get_current_tenant() or 1
     with conn() as c:
         c.execute("""
-            INSERT INTO agent_events (task_id, step_no, step_name, status, message)
-            VALUES (?, ?, ?, ?, ?)
-        """, (task_id, step_no, step_name, status, message))
+            INSERT INTO agent_events (tenant_id, task_id, step_no, step_name, status, message)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (tid, task_id, step_no, step_name, status, message))
         c.commit()
 
 
@@ -781,6 +782,23 @@ def write_agent_action(
     references: Optional[List[Dict]] = None,
     owner: Optional[str] = None,
 ) -> int:
+    tid = get_current_tenant() or 1
+    if is_postgres():
+        with conn() as c:
+            cur = c.execute("""
+                INSERT INTO agent_actions
+                (tenant_id, store, module, action_type, subject, pill, pill_text, judge, confidence,
+                 options_json, references_json, owner)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id
+            """, (
+                tid, store.upper(), module, action_type, subject, pill, pill_text, judge, confidence,
+                json.dumps(options or [], ensure_ascii=False),
+                json.dumps(references or [], ensure_ascii=False),
+                owner,
+            ))
+            row = cur.fetchone()
+            c.commit()
+            return row["id"] if isinstance(row, dict) else row[0]
     with conn() as c:
         cur = c.execute("""
             INSERT INTO agent_actions
@@ -794,7 +812,7 @@ def write_agent_action(
             owner,
         ))
         c.commit()
-        return cur.lastrowid
+        return cur._cur.lastrowid if hasattr(cur, "_cur") else cur.lastrowid
 
 
 def get_agent_action(action_id: int) -> Optional[Dict]:

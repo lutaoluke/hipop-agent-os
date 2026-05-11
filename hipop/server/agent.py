@@ -232,7 +232,8 @@ TOOLS = [
                 "workflow": {
                     "type": "string",
                     "enum": ["wf1_stock", "wf2_sales", "wf3_logistics",
-                             "wf5_sales_cycle", "wf6_alerts", "daily", "weekly"],
+                             "wf5_sales_cycle", "wf6_alerts", "daily", "weekly",
+                             "wf2_products_v2"],
                 },
                 "followup_prompt": {
                     "type": "string",
@@ -573,9 +574,10 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
                 "valid": list(_api.WORKFLOW_REGISTRY)}
     label, steps, affected = _api.WORKFLOW_REGISTRY[workflow]
     task_id = uuid4().hex[:8]
-    # 后台线程跑（避免阻塞 chat tool-use 循环）
+    # 拿当前 chat 的 tenant_id（contextvars 注入），传给后台线程
+    tid = _get_tenant()
     threading.Thread(
-        target=_api._run_workflow, args=(task_id, workflow), daemon=True,
+        target=_api._run_workflow, args=(task_id, workflow, tid), daemon=True,
     ).start()
     return {
         "ok": True,
