@@ -73,17 +73,18 @@ CASES: List[Case] = [
         must_contain=[r"1[,，]?418", r"1[,，]?788"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（容忍 SKU 维度 688 或 product 维度 655）",
+        name="商品总数 + 上架未上架细分（SKU 维度 1046/742 或 product 维度 950/488）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?418", r"688|655|1[,，]?100"],
+        # 1418 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
+        must_contain=[r"1[,，]?418", r"1[,，]?046|742|950|488"],
     ),
     # ─── 概览类 ───
     Case(
-        name="店铺整体（在售 SKU + 红色告警）",
+        name="店铺整体（在售 SKU 1046 + 红色告警）",
         question="我的店里有多少货 哪些需要我关注",
         must_use_tools=["scope_overview"],
-        must_contain=["688"],
+        must_contain=[r"1[,，]?046"],
     ),
     Case(
         name="红色告警（要真数 2）",

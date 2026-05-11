@@ -1,11 +1,3 @@
----
-name: agent-os
-display_name: 点购 Agent OS — 工作台 + 协作 Agent + 工作流触发
-version: 0.1.0
-author: hipop
-description: FastAPI + Jinja2 + Alpine 的本地工作台，右侧 chat 通过 Anthropic tool-use 调用 8 个 tool；用户在 chat 触发后台工作流后，进度实时推到气泡 + 完成后受影响模块页自动刷新。OAuth 走 macOS keychain 不需要 ANTHROPIC_API_KEY。chat 历史落 sqlite。
-tags: [agent-os, fastapi, claude-tool-use, sse, chat, hipop]
----
 点购 Agent OS — 工作台 + 协作 Agent + 工作流触发（hipop/server）：FastAPI + Jinja2 + Alpine 的本地工作台，右侧 chat 通过 Anthropic tool-use 调用 7 个 tool；触发工作流后实时进度推到气泡 + 模块页自动刷新。
 
 工作目录：/Users/luke/Downloads/点购工作流
@@ -247,11 +239,28 @@ hipop/server/
 
 ## chat 持久化
 
-- 表：`chat_messages(id, store, role, who, content, tag, references_json, task_json, created_at)`
-- 写入：`/api/chat` 端点保存 user 最后一条 + agent 回复（含 references / workflow_task）
+- 表：`chat_messages(id, tenant_id, store, role, who, content, tag, references_json, task_json, created_at)`
+- 写入：`/api/chat` 端点保存 user 最后一条 + agent 回复（含 references / workflow_task）。PG 模式下 INSERT 必须显式带 tenant_id（RLS WITH CHECK 要求）
 - 读取：`/api/chat-history/<store>` 默认 100 条，空库时回退 `mock.CHAT_HISTORY_MOCK` 当 seed
 - 自动建表：`data._ensure_chat_table()` 在首次 write/get 时调用
 - 历史里的 task 在前端被 normalize 为"已完成"态（避免历史触发记录看似还在跑）
+
+### 切页面继承（chat continuity）
+
+切模块页（overview/sales/logistics/replenish/profit）时 chat panel 通过 `base.html` 的 include 重新渲染，Alpine `x-data="chatPanel()"` 每次执行 `init()` 重新拉历史：
+
+```
+切页 → chat_panel.html init() → Promise.all([
+   GET /api/team/<store>,
+   GET /api/chat-history/<store>,    ← 关键
+]) → messages 重新铺到 DOM
+```
+
+**关键失败模式**：`/api/chat-history` 一旦返 500，`Promise.all` reject → `init()` 抛错 → Alpine 整个 chat panel 组件 init 失败 → 表现为"切页面无法继承聊天记录"（用户从外部看不到任何 traceback，只见 chat 框空白或上一会话的残影）。
+
+**已踩坑**：PG 模式下 `created_at` 是 `datetime` 对象，旧代码 `(r["created_at"] or "")[-8:-3]` 抛 `TypeError: 'datetime.datetime' object is not subscriptable`。修于 commit `2b265dc`：所有 datetime 字段渲染必走 `data._hhmm(v)` / `data._date10(v)` helper，禁止 inline slice。
+
+**防回归**：`tests/smoke_chat.py` 的 `check_chat_history_endpoint(base_url)` 作为前置 case 跑——任何对 chat_messages 渲染链路的改动，必须保证它 200 且 `time` 字段格式为 `'HH:MM'`。
 
 ## reference 系统（agent_actions 表）
 
