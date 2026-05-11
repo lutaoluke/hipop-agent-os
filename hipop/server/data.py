@@ -655,12 +655,13 @@ def write_chat_message(store: str, role: str, who: Optional[str], content: str,
                        references: Optional[List[Dict]] = None,
                        task: Optional[Dict] = None) -> int:
     _ensure_chat_table()
+    tid = get_current_tenant() or 1
     if is_postgres():
-        sql = ("INSERT INTO chat_messages (store, role, who, content, tag, references_json, task_json) "
-               "VALUES (?,?,?,?,?,?,?) RETURNING id")
+        sql = ("INSERT INTO chat_messages (tenant_id, store, role, who, content, tag, references_json, task_json) "
+               "VALUES (?,?,?,?,?,?,?,?) RETURNING id")
         with conn() as c:
             cur = c.execute(sql, (
-                store.upper(), role, who, content, tag,
+                tid, store.upper(), role, who, content, tag,
                 json.dumps(references or [], ensure_ascii=False) if references else None,
                 json.dumps(task, ensure_ascii=False) if task else None,
             ))
