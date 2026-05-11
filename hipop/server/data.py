@@ -108,6 +108,21 @@ def _fetch(sql: str, params: tuple = ()) -> List[Dict]:
         return [dict(r) for r in rows]
 
 
+def _hhmm(v) -> str:
+    """统一渲染时间为 'HH:MM'。SQLite 给字符串 'YYYY-MM-DD HH:MM:SS'，PG 给 datetime/带 tz。"""
+    if v is None: return ""
+    if hasattr(v, "strftime"):
+        try: return v.strftime("%H:%M")
+        except Exception: pass
+    s = str(v)
+    # 字符串形如 '2026-05-11 18:24:17' 或 ISO '2026-05-11T18:24:17'
+    if "T" in s and " " not in s:
+        s = s.replace("T", " ", 1)
+    if len(s) >= 16 and s[10] == " ":
+        return s[11:16]
+    return ""
+
+
 def _scalar(sql: str, params: tuple = ()):
     with conn() as c:
         r = c.execute(sql, params).fetchone()
@@ -462,7 +477,7 @@ def get_work_log(store: str) -> List[Dict]:
         a["updated_at"] = a.get("created_at")  # 兼容下面取字段
         sku_list = json.loads(a["sku_list_json"] or "[]")
         sku_str = ", ".join(s["sku"] for s in sku_list[:3])
-        t = (a["updated_at"] or a["created_at"] or "")[-8:-3]
+        t = _hhmm(a["updated_at"] or a["created_at"])
         items.append({
             "time": t or "00:00",
             "who": a.get("action_owner") or "刘鹤",
@@ -476,7 +491,7 @@ def get_work_log(store: str) -> List[Dict]:
         FROM agent_actions WHERE store=? ORDER BY created_at DESC LIMIT 5
     """, (store.upper(),)):
         items.append({
-            "time": (act["created_at"] or "")[-8:-3] or "00:00",
+            "time": _hhmm(act["created_at"]) or "00:00",
             "who": "Agent",
             "text": f"{act['judge'] or act['pill_text']}（{act['subject'] or '—'}）",
             "ref": f"agent_actions#{act['id']}",
@@ -758,7 +773,7 @@ def get_chat_messages(store: str, limit: int = 50) -> List[Dict]:
         m = {
             "who": r["who"] or ("Cherry" if r["role"] == "user" else "Agent"),
             "role": r["role"],
-            "time": (r["created_at"] or "")[-8:-3],  # 'HH:MM'
+            "time": _hhmm(r["created_at"]),  # 'HH:MM'
             "content": r["content"],
             "tag": r["tag"] or "",
         }

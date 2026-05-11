@@ -17,20 +17,75 @@ tags: [agent-os, fastapi, claude-tool-use, sse, chat, hipop]
 QWEN_API_KEY=sk-... python -m uvicorn hipop.server.main:app --port 8765
 ```
 
-**完整（PG + Auth + 多租户 RLS）**:
+**生产同款（PG + 多租户 RLS）— 当前 alpha 跑这套**:
 ```bash
-docker compose up -d postgres redis
+brew services start postgresql@16   # 或 docker compose up -d postgres
 DB_URL=postgresql://hipop:hipop_dev_password@localhost:5432/hipop \
-  python scripts/migrate_sqlite_to_pg.py    # 一次性迁
-docker compose up -d app                    # 起整套
+  JWT_SECRET=hipop_alpha_stable_secret_keep_this \
+  LLM_PROVIDER=deepseek \
+  DEEPSEEK_API_KEY=sk-... \
+  python -m uvicorn hipop.server.main:app --port 8765
+# 公网暴露：cloudflared tunnel --url http://localhost:8765（拿临时 trycloudflare.com URL）
 ```
 
-**部署到 Zeabur**: 看 `DEPLOY.md`。`zeabur.json` 已配，import git 仓库 + 加内置 PG + 配 `QWEN_API_KEY` / `JWT_SECRET` 即可。
+**部署到 Zeabur**: 看 `DEPLOY.md`。`zeabur.json` 已配。
 
 ## 健康检查
 
 - `GET /health` — liveness（进程在跑就 200）
-- `GET /ready` — readiness（DB 连得上 200，否则 503，让 LB 摘流量）
+- `GET /ready` — readiness（DB 连得上 200，附 mode: postgres|sqlite）
+
+## 真多租户 v2 链路（Phase A-E，2026-05-09→11）
+
+**业务表全部列存化**：`wf2_sku / wf2_orders / wf1_stock / wf5_sales_cycle / wf3_logistics_hub_v2 / wf6_logistics_alerts_v2 / wf6_replenishment_queue_v2`，主键 `(tenant_id, entity_alias, partner_sku)`，**老物理切表 wf2_hipop_<a>_sku 等保留作为 hipop 老 cron 用**。
+
+**PG RLS 真隔离**: 所有 v2 表 `ENABLE + FORCE ROW LEVEL SECURITY`（`FORCE` 关键，否则 owner bypass）+ policy `tenant_id = current_setting('app.current_tenant')::BIGINT`。SQLite 不支持 RLS，靠应用层 WHERE 过滤。
+
+**ERP 凭据加密**: `tenant_erp_credentials` 表 + `_crypto.py` Fernet 对称加密（key 派生自 JWT_SECRET）。新公司 onboarding 填密码即加密存。
+
+**ERP 后端登录**: `_erp_auth.get_erp_token_for_tenant(tid)` — 解密凭据 + playwright headless 登 dbuyerp + 拦截 erp-api 请求拿 Bearer + 缓存 20 min。**不再依赖本机 chrome 9222**，server 自给。
+
+**v2 ingest pipeline**（per-tenant，从 onboarding 配的 ERP 自动拉）:
+- `ingest_erp_products_v2.run_v2(tenant_id)` → wf2_sku
+- `ingest_erp_sales_v2.run_v2(tenant_id)` → wf2_sku 销量字段（10/30/60/90/120/180d）
+- `ingest_erp_stock_v2.run_v2(tenant_id)` → wf1_stock
+- `ingest_noon_csv_v2.process_csv_v2(tenant_id, path)` → wf2_orders（用户上传 noon CSV）
+- `wf_sales_cycle.run_v2(tenant_id)` → wf5_sales_cycle（销售周期算法）
+
+**WORKFLOW_REGISTRY 加 5 个 v2 workflow**（chat 可触发 / API 可调）:
+| name | 内容 |
+|---|---|
+| `wf2_products_v2` | 商品库（per-tenant ERP 拉 + 写 v2） |
+| `wf2_sales_v2` | 商品 + 销量价格 6 时间窗 |
+| `wf1_stock_v2` | 6 仓库存 |
+| `wf5_sales_cycle_v2` | 销售周期 + 补货决策（v2 算法） |
+| **`refresh_all_v2`** | 4 步全套（一键刷新）|
+
+**`_run_workflow(task_id, workflow, tenant_id)`** background 线程显式 `set_current_tenant(tid)`（middleware 不覆盖线程）+ `inspect.signature` 探测 fn 是否接 `tenant_id` 参数自动注入。
+
+## 多租户用户体验
+
+```
+新公司 → /register → 自动建 tenant
+       → /onboarding → 配 sales_entities (alias / country / store_id) + ERP 加密凭据
+       → chat "我该补货吗"
+       → Agent → data_health_check 看陈旧 → run_workflow("refresh_all_v2")
+       → server 解密凭据 → headless 登他们 ERP → 按 store_id 拉数据 → 写自己 tenant v2 表
+       → step_no=99 完成 → 前端自动续问 followup_prompt
+       → Agent 用最新数据答最终结论
+```
+
+**实测隔离**：tenant=1 (HIPOP) 看到自己 1788+1787 SKU；tenant=6 (ACME) 看到自己 219；tenant=999 (假) 看 0 行。SQL injection 也无法跨租户读（PG RLS 强制）。
+
+## smoke test（commit 前必跑）
+
+```
+bash tests/run_smoke.sh
+```
+
+12 case 覆盖：数据新鲜度 / 商品总数 / 概览 / 红色告警 / 补货 / SKU 查询 / 3 个门控 tool / 用户拒绝刷新 / 时间戳精度。每 case 验 4 件事（HTTP / tool 调用 / 关键词 / 反 hallucinate 黑名单）。
+
+实测三家 LLM 都 12/12: Anthropic Haiku-4-5 / Qwen-Plus / DeepSeek-V3。
 
 **LLM provider 切换**：`LLM_PROVIDER=qwen|anthropic|deepseek|doubao`，**默认 qwen**（与产品化国内栈对齐：¥18/万次 + 阿里云内网 + ICP 备案过 + 实测防护下不 hallucinate）。
 - **qwen / deepseek / doubao**：走 OpenAI 协议（`server/_provider_openai.py`），只换 `base_url + api_key + model`。

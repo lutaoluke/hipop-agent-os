@@ -208,6 +208,29 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     return (len(reasons) == 0), reasons
 
 
+def check_chat_history_endpoint(base_url: str) -> Optional[str]:
+    """GET /api/chat-history/<store> — 防 PG datetime[-8:-3] 之类的崩溃回归。
+    切页面时 chat panel init() 会拿这个 endpoint；它一旦 500，整个 chat panel
+    Alpine init 抛错，前端表现为'切页面无法继承聊天记录'。返回 None 为通过。"""
+    for store in ("ksa", "uae"):
+        req = urllib.request.Request(f"{base_url}/api/chat-history/{store}?limit=3")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
+        except Exception as e:
+            return f"/api/chat-history/{store} {type(e).__name__}: {e}"
+        if not isinstance(body, list):
+            return f"/api/chat-history/{store} 返回非 list: {str(body)[:200]}"
+        for m in body:
+            t = m.get("time")
+            # 'HH:MM' 或 ''；不允许出现 datetime 转 str 后的 '+08:0' / 'T18:2' 之类
+            if t and not re.match(r"^\d{2}:\d{2}$", t):
+                return f"/api/chat-history/{store} time 字段格式异常: {t!r}（应 'HH:MM' 或 ''）"
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
@@ -217,6 +240,12 @@ def main():
 
     print(f"=== hipop-agent-os smoke test ===")
     print(f"URL: {args.url}")
+    err = check_chat_history_endpoint(args.url)
+    if err:
+        print(f"\n✗ chat-history endpoint 检查失败：{err}")
+        print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
+        sys.exit(1)
+    print(f"chat-history endpoint: ✓")
     print(f"Cases: {len(CASES)}\n")
 
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
