@@ -305,6 +305,8 @@ BEGIN
     );
     -- 3. 启用 RLS
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    -- 关键：FORCE 让 RLS 对 owner 也生效（默认 owner bypass，多租户场景必须 FORCE）
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     -- 4. policy: tenant_id 必须等于当前 session 的 app.current_tenant
     EXECUTE format(
       'DROP POLICY IF EXISTS tenant_isolation ON %I',

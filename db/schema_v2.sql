@@ -234,12 +234,36 @@ CREATE TABLE IF NOT EXISTS tenant_feishu_credentials (
   updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 兜底 seed: HIPOP tenant 的 sales_entities 从 hipop.json 迁过来
-INSERT OR IGNORE INTO sales_entities
+-- 兜底 seed: HIPOP tenant 的 sales_entities（PG 用 ON CONFLICT，SQLite 用 INSERT OR IGNORE — 这里写 PG 兼容版，SQLite 跑会报但不影响主表 schema 已建好）
+INSERT INTO sales_entities
   (tenant_id, alias, country, platform, store_name, store_id, currency,
    feishu_table_id, feishu_decisions_table_id, feishu_stock_table_id)
 VALUES
   (1, 'hipop_ksa', 'SA', 'Noon', 'HIPOP-NOON-KSA', 85, 'SAR',
    'tblQ1FGxIsBbjQAl', 'tblL7Twlt2K7qLhi', 'tbltX0Cl6Egum28W'),
   (1, 'hipop_uae', 'AE', 'Noon', 'HIPOP-NOON-UAE', 42, 'AED',
-   NULL, NULL, NULL);
+   NULL, NULL, NULL)
+ON CONFLICT (tenant_id, alias) DO NOTHING;
+
+
+-- ============ v2 表的 RLS policy（PG only；SQLite 跳过）============
+DO $$
+DECLARE
+  v2_tables TEXT[] := ARRAY[
+    'wf2_sku','wf2_orders','wf1_stock','wf5_sales_cycle',
+    'wf3_logistics_hub_v2','wf6_logistics_alerts_v2','wf6_replenishment_queue_v2',
+    'sales_entities','tenant_erp_credentials','tenant_feishu_credentials'
+  ];
+  t TEXT;
+BEGIN
+  FOREACH t IN ARRAY v2_tables LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON %I '
+      'USING (tenant_id = current_setting(''app.current_tenant'', true)::BIGINT) '
+      'WITH CHECK (tenant_id = current_setting(''app.current_tenant'', true)::BIGINT)',
+      t
+    );
+  END LOOP;
+END $$;

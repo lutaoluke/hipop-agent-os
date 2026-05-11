@@ -629,17 +629,20 @@ def get_progress_current() -> Dict:
 
 # ── Chat 消息持久化 ───────────────────────────────────────
 def _ensure_chat_table():
+    """PG 模式下表已由 db/schema.sql 建好，跳过；SQLite 才动态建。"""
+    if is_postgres():
+        return
     with conn() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 store TEXT NOT NULL,
-                role TEXT NOT NULL,            -- 'user' | 'agent'
-                who TEXT,                       -- 'Cherry' / 'Agent' / ...
+                role TEXT NOT NULL,
+                who TEXT,
                 content TEXT NOT NULL,
                 tag TEXT,
-                references_json TEXT,           -- JSON array
-                task_json TEXT,                 -- workflow_task JSON（仅 agent 触发工作流时）
+                references_json TEXT,
+                task_json TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             )
         """)
@@ -652,6 +655,18 @@ def write_chat_message(store: str, role: str, who: Optional[str], content: str,
                        references: Optional[List[Dict]] = None,
                        task: Optional[Dict] = None) -> int:
     _ensure_chat_table()
+    if is_postgres():
+        sql = ("INSERT INTO chat_messages (store, role, who, content, tag, references_json, task_json) "
+               "VALUES (?,?,?,?,?,?,?) RETURNING id")
+        with conn() as c:
+            cur = c.execute(sql, (
+                store.upper(), role, who, content, tag,
+                json.dumps(references or [], ensure_ascii=False) if references else None,
+                json.dumps(task, ensure_ascii=False) if task else None,
+            ))
+            row = cur.fetchone()
+            c.commit()
+            return row["id"] if isinstance(row, dict) else row[0]
     with conn() as c:
         cur = c.execute("""
             INSERT INTO chat_messages (store, role, who, content, tag, references_json, task_json)
@@ -662,7 +677,7 @@ def write_chat_message(store: str, role: str, who: Optional[str], content: str,
             json.dumps(task, ensure_ascii=False) if task else None,
         ))
         c.commit()
-        return cur.lastrowid
+        return cur._cur.lastrowid if hasattr(cur, "_cur") else cur.lastrowid
 
 
 def get_chat_messages(store: str, limit: int = 50) -> List[Dict]:
