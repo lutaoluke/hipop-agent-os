@@ -525,23 +525,27 @@ def get_data_health(store: str) -> Dict:
     """
     s = store.lower()
     today = datetime.date.today().isoformat()
-    tid_h, alias_h = _resolve_entity_for_store(store)
-    latest_w1_imported = (_scalar("SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
-    latest_w2_imported = (_scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
-    latest_w5_updated  = (_scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
-    latest_hub_updated = (_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid_h,)) or "")[:10]
-    latest_alerts      = (_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid_h,)) or "")[:10]
+    def _date10(v):
+        """SQLite 返回 'YYYY-MM-DD HH:MM:SS' 字符串；PG 返回 datetime/date 对象，统一裁成 'YYYY-MM-DD'"""
+        if v is None: return ""
+        if hasattr(v, "isoformat"): return v.isoformat()[:10]
+        return str(v)[:10]
 
-    # noon orders 最新订单日期（v2）
-    latest_noon_order = (_scalar(
+    tid_h, alias_h = _resolve_entity_for_store(store)
+    latest_w1_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
+    latest_w2_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
+    latest_w5_updated  = _date10(_scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
+    latest_hub_updated = _date10(_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid_h,)))
+    latest_alerts      = _date10(_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid_h,)))
+
+    latest_noon_order = _date10(_scalar(
         "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
         (tid_h, alias_h),
-    ) or "")[:10]
-    # noon stock 最新导入时间
-    latest_noon_stock = (_scalar(
+    ))
+    latest_noon_stock = _date10(_scalar(
         "SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=? AND noon_total_qty IS NOT NULL",
         (tid_h, alias_h),
-    ) or "")[:10]
+    ))
 
     def _stale_days(date_str):
         if not date_str: return None

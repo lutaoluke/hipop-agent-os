@@ -285,9 +285,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "has_stuck_batch": bool(r["has_stuck_batch"]),
             "weekly_replenish": r["weekly_total_replenish"],
         })
-        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "as_of_date": "today"})
-        refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "as_of_date": "today"})
-        refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'", "as_of_date": "today"})
+        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
+        refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
+        refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'"})
     return {"items": out, "references": refs}
 
 
@@ -307,7 +307,7 @@ def tool_query_order(order_no: str) -> Dict:
     return {
         "order_no": order_no,
         "alerts": rows,
-        "references": [{"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND order_no='{order_no}'", "as_of_date": "today"}],
+        "references": [{"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND order_no='{order_no}'"}],
     }
 
 
@@ -336,7 +336,7 @@ def tool_update_alert_status(order_no: str, status: str, note: str = "") -> Dict
         "order_no": order_no,
         "updated_alerts": affected,
         "new_status": status,
-        "references": [{"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND order_no='{order_no}' (写入)", "as_of_date": "now"}],
+        "references": [{"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND order_no='{order_no}' (写入)"}],
     }
 
 
@@ -347,10 +347,10 @@ def tool_scope_overview(store: str) -> Dict:
     return {
         **o,
         "references": [
-            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND is_listed=1", "as_of_date": "today"},
-            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}'", "as_of_date": "today"},
-            {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid}", "as_of_date": "today"},
-            {"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND ops_status='待处理'", "as_of_date": "today"},
+            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND is_listed=1"},
+            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
+            {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid}"},
+            {"table": "wf6_logistics_alerts_v2", "where": f"tenant_id={tid} AND ops_status='待处理'"},
         ],
     }
 
@@ -367,8 +367,8 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     return {
         "store": store, "count": len(items), "items": items,
         "references": [
-            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0", "as_of_date": "today"},
-            {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'", "as_of_date": "today"},
+            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0"},
+            {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
         ],
     }
 
@@ -407,8 +407,8 @@ def tool_compute_air_freight_roi(sku: str, store: str, qty: int = 100) -> Dict:
         "recommendation": rec,
         "assumptions": "海运 0.4 USD/件, 空运 2.5 USD/件, 时长差 20 天",
         "references": [
-            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "as_of_date": "today"},
-            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "as_of_date": "today"},
+            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"},
+            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"},
         ],
     }
 
@@ -420,9 +420,9 @@ def tool_data_health_check(store: str) -> Dict:
     return {
         **h,
         "references": [
-            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' MAX(imported_at)", "as_of_date": "now"},
-            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' MAX(updated_at)", "as_of_date": "now"},
-            {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} MAX(updated_at)", "as_of_date": "now"},
+            {"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' MAX(imported_at)"},
+            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' MAX(updated_at)"},
+            {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} MAX(updated_at)"},
         ],
     }
 
@@ -498,7 +498,7 @@ def tool_list_products(store: str, listing: str = "all",
         "filtered_count": filtered_count,
         "items": items,
         "references": [
-            {"table": tbl, "where": where_sql or "(全表)", "as_of_date": "today"},
+            {"table": tbl, "where": where_sql or "(全表)"},
         ],
     }
 
