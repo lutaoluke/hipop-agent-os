@@ -123,11 +123,25 @@ def _feishu_today_count() -> int:
     return _scalar(sql) or 0
 
 
+# ── store → entity_alias 解析（用于 HTTP API 把 KSA/UAE 转成 entity_alias） ──
+def _resolve_entity_for_store(store: str) -> tuple:
+    """返回 (tenant_id, entity_alias)。tenant_id 从 contextvars 拿，store 推 country 查 sales_entities。"""
+    tid = get_current_tenant() or 1
+    country = {"KSA": "SA", "UAE": "AE"}.get((store or "").upper())
+    if not country:
+        return tid, ""
+    rows = _fetch(
+        "SELECT alias FROM sales_entities WHERE tenant_id=? AND country=? AND active=1 LIMIT 1",
+        (tid, country),
+    )
+    return tid, (rows[0]["alias"] if rows else "")
+
+
 # ── SKU 健康（销售/库存模块）────────────────────────────────
 def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30) -> List[Dict]:
-    """读 wf2 + wf5 + wf3，按紧急程度排序，返回每个 SKU 的健康详情"""
-    s = store.lower()
-    sql = f"""
+    """读 wf2_sku + wf5_sales_cycle + wf3_logistics_hub_v2，按 tenant_id+entity 过滤"""
+    tid, alias = _resolve_entity_for_store(store)
+    sql = """
     SELECT
       w2.partner_sku, w2.title, w2.image_url,
       w2.sales_30d, w2.sales_10d, w2.latest_price, w2.latest_profit_rate,
@@ -135,12 +149,15 @@ def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30) -
       w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
       w5.current_pipeline, w5.target_pipeline, w5.wf5_replenish_qty,
       h.in_transit_total_qty, h.has_stuck_batch
-    FROM wf2_hipop_{s}_sku w2
-    LEFT JOIN wf5_hipop_{s}_sales_cycle w5 ON w2.partner_sku = w5.partner_sku
-    LEFT JOIN wf3_logistics_hub h ON w2.partner_sku = h.sku
-    WHERE w2.is_listed = 1
+    FROM wf2_sku w2
+    LEFT JOIN wf5_sales_cycle w5
+      ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
+      AND w2.partner_sku=w5.partner_sku
+    LEFT JOIN wf3_logistics_hub_v2 h
+      ON w2.tenant_id=h.tenant_id AND w2.partner_sku=h.sku
+    WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.is_listed=1
     """
-    rows = _fetch(sql)
+    rows = _fetch(sql, (tid, alias))
     for r in rows:
         # 计算 days_left（库存可撑天数）
         if r.get("daily_rate") and r["daily_rate"] > 0:
@@ -173,8 +190,12 @@ def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30) -
 
 # ── 订单（在途物流）───────────────────────────────────────
 def get_orders(store: str, limit: int = 50) -> List[Dict]:
-    """从 hub 的 groups_json 解出每个货单的状态"""
-    rows = _fetch("SELECT sku, groups_json, has_stuck_batch FROM wf3_logistics_hub")
+    """从 hub_v2 的 groups_json 解出每个货单的状态（按 tenant 隔离）"""
+    tid, _ = _resolve_entity_for_store(store)
+    rows = _fetch(
+        "SELECT sku, groups_json, has_stuck_batch FROM wf3_logistics_hub_v2 WHERE tenant_id=?",
+        (tid,),
+    )
     orders_by_no = {}
     for r in rows:
         groups = json.loads(r["groups_json"] or "[]")
@@ -200,12 +221,12 @@ def get_orders(store: str, limit: int = 50) -> List[Dict]:
                     "qty": b.get("qty", b.get("in_transit_qty", 0)),
                 })
 
-    # 合并 wf6_logistics_alerts 状态
+    # 合并 wf6_logistics_alerts_v2 状态
     alerts = _fetch("""
         SELECT order_no, alert_level, alert_reason, ops_status, stage,
                actual_stay_days, history_stage_days, sku_list_json
-        FROM wf6_logistics_alerts
-    """)
+        FROM wf6_logistics_alerts_v2 WHERE tenant_id=?
+    """, (tid,))
     for a in alerts:
         ono = a["order_no"]
         if ono not in orders_by_no:
@@ -237,18 +258,21 @@ def get_orders(store: str, limit: int = 50) -> List[Dict]:
 
 # ── 补货建议（补货决策）──────────────────────────────────
 def get_replenishment(store: str, limit: int = 50) -> List[Dict]:
-    """补货建议：从 wf5 sales_cycle 的 wf5_replenish_qty + lost_replenish_qty + 紧迫度推导"""
-    s = store.lower()
-    rows = _fetch(f"""
+    """补货建议：v2 表 wf2_sku + wf5_sales_cycle 按 tenant_id+entity_alias"""
+    tid, alias = _resolve_entity_for_store(store)
+    rows = _fetch("""
         SELECT w2.partner_sku, w2.title, w2.image_url, w2.sales_30d, w2.latest_price,
                w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                w5.wf5_replenish_qty, w5.lost_replenish_qty, w5.weekly_total_replenish,
                w5.trigger_reasons, w5.current_pipeline, w5.target_pipeline
-        FROM wf2_hipop_{s}_sku w2
-        LEFT JOIN wf5_hipop_{s}_sales_cycle w5 ON w2.partner_sku = w5.partner_sku
-        WHERE w2.is_listed = 1 AND w5.weekly_total_replenish > 0
+        FROM wf2_sku w2
+        LEFT JOIN wf5_sales_cycle w5
+          ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
+          AND w2.partner_sku=w5.partner_sku
+        WHERE w2.tenant_id=? AND w2.entity_alias=?
+          AND w2.is_listed=1 AND w5.weekly_total_replenish > 0
         ORDER BY w5.weekly_total_replenish DESC
-    """)
+    """, (tid, alias))
     for r in rows:
         # 紧迫度评级
         if r.get("trend") == "急速下降":
@@ -268,45 +292,62 @@ def get_replenishment(store: str, limit: int = 50) -> List[Dict]:
 
 # ── 模块今日重点（7+1 模块卡片）──────────────────────────
 def get_module_summaries(store: str) -> List[Dict]:
-    """聚合所有模块的'今日重点'"""
-    s = store.lower()
-    sku_count = _scalar(f"SELECT COUNT(*) FROM wf2_hipop_{s}_sku WHERE is_listed=1") or 0
-    urgent_count = _scalar(f"""
-        SELECT COUNT(*) FROM wf5_hipop_{s}_sales_cycle
-        WHERE trend IN ('急速下降', '下降')
-    """) or 0
-    low_margin_count = _scalar(f"""
-        SELECT COUNT(*) FROM wf2_hipop_{s}_sku
-        WHERE is_listed=1 AND latest_profit_rate IS NOT NULL AND latest_profit_rate < 0.10
-    """) or 0
-    in_transit_total = _scalar("SELECT SUM(in_transit_total_qty) FROM wf3_logistics_hub") or 0
-    in_transit_orders = _scalar("""
-        SELECT SUM(in_transit_batch_count) FROM wf3_logistics_hub
-    """) or 0
-    stuck_skus = _scalar("SELECT COUNT(*) FROM wf3_logistics_hub WHERE has_stuck_batch=1") or 0
-    needs_ops = _scalar("SELECT COUNT(*) FROM wf3_logistics_hub WHERE needs_ops_input=1") or 0
-    alerts_pending = _scalar("SELECT COUNT(*) FROM wf6_logistics_alerts WHERE ops_status='待处理'") or 0
-    alerts_red = _scalar("SELECT COUNT(*) FROM wf6_logistics_alerts WHERE alert_level='红' AND ops_status='待处理'") or 0
-    replenish_count = _scalar(f"""
-        SELECT COUNT(*) FROM wf5_hipop_{s}_sales_cycle WHERE weekly_total_replenish > 0
-    """) or 0
+    """聚合所有模块的'今日重点'（v2 表 + tenant 隔离）"""
+    tid, alias = _resolve_entity_for_store(store)
+    sku_count = _scalar(
+        "SELECT COUNT(*) FROM wf2_sku WHERE tenant_id=? AND entity_alias=? AND is_listed=1",
+        (tid, alias),
+    ) or 0
+    urgent_count = _scalar(
+        "SELECT COUNT(*) FROM wf5_sales_cycle "
+        "WHERE tenant_id=? AND entity_alias=? AND trend IN ('急速下降','下降')",
+        (tid, alias),
+    ) or 0
+    low_margin_count = _scalar(
+        "SELECT COUNT(*) FROM wf2_sku WHERE tenant_id=? AND entity_alias=? "
+        "AND is_listed=1 AND latest_profit_rate IS NOT NULL AND latest_profit_rate < 0.10",
+        (tid, alias),
+    ) or 0
+    in_transit_total = _scalar(
+        "SELECT SUM(in_transit_total_qty) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid,)
+    ) or 0
+    in_transit_orders = 0  # batch_count 字段在 v2 没建，简化
+    stuck_skus = _scalar(
+        "SELECT COUNT(*) FROM wf3_logistics_hub_v2 WHERE tenant_id=? AND has_stuck_batch=1", (tid,)
+    ) or 0
+    needs_ops = _scalar(
+        "SELECT COUNT(*) FROM wf3_logistics_hub_v2 WHERE tenant_id=? AND needs_ops_input=1", (tid,)
+    ) or 0
+    alerts_pending = _scalar(
+        "SELECT COUNT(*) FROM wf6_logistics_alerts_v2 WHERE tenant_id=? AND ops_status='待处理'", (tid,)
+    ) or 0
+    alerts_red = _scalar(
+        "SELECT COUNT(*) FROM wf6_logistics_alerts_v2 "
+        "WHERE tenant_id=? AND alert_level='红' AND ops_status='待处理'", (tid,)
+    ) or 0
+    replenish_count = _scalar(
+        "SELECT COUNT(*) FROM wf5_sales_cycle "
+        "WHERE tenant_id=? AND entity_alias=? AND weekly_total_replenish > 0",
+        (tid, alias),
+    ) or 0
 
-    # 数据更新时间
-    latest_w2 = _scalar(f"SELECT MAX(imported_at) FROM wf2_hipop_{s}_sku") or "未知"
-    latest_w5 = _scalar(f"SELECT MAX(updated_at) FROM wf5_hipop_{s}_sales_cycle") or "未知"
-    latest_hub = _scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub") or "未知"
-    latest_alerts = _scalar("SELECT MAX(updated_at) FROM wf6_logistics_alerts") or "未知"
+    # 数据更新时间（v2）
+    latest_w2 = _scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid, alias)) or "未知"
+    latest_w5 = _scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid, alias)) or "未知"
+    latest_hub = _scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid,)) or "未知"
+    latest_alerts = _scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid,)) or "未知"
 
     # 数据获取健康度
     today_str = datetime.date.today().isoformat()
     noon_fresh = "warn" if (latest_w5 or "")[:10] != today_str else "ok"
+    cycle_rows = _scalar("SELECT COUNT(*) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid, alias)) or 0
 
     return [
         {
             "key": "data",
             "name": "数据获取",
             "state": noon_fresh,
-            "line1": f"商品库 {sku_count} SKU · 销量周期 {_scalar(f'SELECT COUNT(*) FROM wf5_hipop_{s}_sales_cycle')} 行",
+            "line1": f"商品库 {sku_count} SKU · 销量周期 {cycle_rows} 行",
             "line2": f"上次同步: {(latest_w5 or '—')[:16]}",
             "ref": "wf2 / wf5",
             "drill": None,
@@ -410,13 +451,15 @@ def _audit_module_summary(store: str) -> Dict:
 
 # ── 工作日志（飞书 + agent 操作 + 物流告警）────────────
 def get_work_log(store: str) -> List[Dict]:
-    """混合：真 wf6 告警 + mock 飞书 + 真 agent_actions"""
+    """混合：真 wf6 告警 + 真 agent_actions（v2 表 + tenant 隔离）"""
     items = []
+    tid_w, _ = _resolve_entity_for_store(store)
     for a in _fetch("""
         SELECT alert_id, alert_level, alert_reason, order_no, sku_list_json,
-               ops_status, action_owner, updated_at, created_at
-        FROM wf6_logistics_alerts ORDER BY updated_at DESC LIMIT 5
-    """):
+               ops_status, action_owner, created_at
+        FROM wf6_logistics_alerts_v2 WHERE tenant_id=? ORDER BY created_at DESC LIMIT 5
+    """, (tid_w,)):
+        a["updated_at"] = a.get("created_at")  # 兼容下面取字段
         sku_list = json.loads(a["sku_list_json"] or "[]")
         sku_str = ", ".join(s["sku"] for s in sku_list[:3])
         t = (a["updated_at"] or a["created_at"] or "")[-8:-3]
@@ -482,19 +525,22 @@ def get_data_health(store: str) -> Dict:
     """
     s = store.lower()
     today = datetime.date.today().isoformat()
-    latest_w1_imported = (_scalar(f"SELECT MAX(imported_at) FROM wf1_hipop_{s}_stock") or "")[:10]
-    latest_w2_imported = (_scalar(f"SELECT MAX(imported_at) FROM wf2_hipop_{s}_sku") or "")[:10]
-    latest_w5_updated  = (_scalar(f"SELECT MAX(updated_at) FROM wf5_hipop_{s}_sales_cycle") or "")[:10]
-    latest_hub_updated = (_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub") or "")[:10]
-    latest_alerts      = (_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts") or "")[:10]
+    tid_h, alias_h = _resolve_entity_for_store(store)
+    latest_w1_imported = (_scalar("SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
+    latest_w2_imported = (_scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
+    latest_w5_updated  = (_scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)) or "")[:10]
+    latest_hub_updated = (_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid_h,)) or "")[:10]
+    latest_alerts      = (_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid_h,)) or "")[:10]
 
-    # noon orders 最新订单日期（关键：补货问答的真实数据新鲜度依赖这个）
+    # noon orders 最新订单日期（v2）
     latest_noon_order = (_scalar(
-        f"SELECT MAX(order_date) FROM wf2_hipop_{s}_orders"
+        "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
+        (tid_h, alias_h),
     ) or "")[:10]
-    # noon stock 最新导入时间（依赖人工 Inventory CSV）
+    # noon stock 最新导入时间
     latest_noon_stock = (_scalar(
-        f"SELECT MAX(imported_at) FROM wf1_hipop_{s}_stock WHERE noon_total_qty IS NOT NULL"
+        "SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=? AND noon_total_qty IS NOT NULL",
+        (tid_h, alias_h),
     ) or "")[:10]
 
     def _stale_days(date_str):
@@ -555,16 +601,30 @@ def get_data_health(store: str) -> Dict:
 
 # ── 今日总览（顶部数据）──────────────────────────────────
 def get_today(store: str) -> Dict:
-    s = store.lower()
+    tid, alias = _resolve_entity_for_store(store)
     return {
         "date": datetime.date.today().isoformat(),
         "store": store.upper(),
         "store_full": f"HIPOP-NOON-{store.upper()}",
-        "sku_count": _scalar(f"SELECT COUNT(*) FROM wf2_hipop_{s}_sku WHERE is_listed=1") or 0,
-        "urgent_count": _scalar(f"""SELECT COUNT(*) FROM wf5_hipop_{s}_sales_cycle WHERE trend IN ('急速下降','下降')""") or 0,
-        "in_transit_qty": _scalar("SELECT SUM(in_transit_total_qty) FROM wf3_logistics_hub") or 0,
-        "alerts_red": _scalar("SELECT COUNT(*) FROM wf6_logistics_alerts WHERE alert_level='红' AND ops_status='待处理'") or 0,
-        "alerts_pending": _scalar("SELECT COUNT(*) FROM wf6_logistics_alerts WHERE ops_status='待处理'") or 0,
+        "sku_count": _scalar(
+            "SELECT COUNT(*) FROM wf2_sku WHERE tenant_id=? AND entity_alias=? AND is_listed=1",
+            (tid, alias),
+        ) or 0,
+        "urgent_count": _scalar(
+            "SELECT COUNT(*) FROM wf5_sales_cycle "
+            "WHERE tenant_id=? AND entity_alias=? AND trend IN ('急速下降','下降')",
+            (tid, alias),
+        ) or 0,
+        "in_transit_qty": _scalar(
+            "SELECT SUM(in_transit_total_qty) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid,)
+        ) or 0,
+        "alerts_red": _scalar(
+            "SELECT COUNT(*) FROM wf6_logistics_alerts_v2 "
+            "WHERE tenant_id=? AND alert_level='红' AND ops_status='待处理'", (tid,)
+        ) or 0,
+        "alerts_pending": _scalar(
+            "SELECT COUNT(*) FROM wf6_logistics_alerts_v2 WHERE tenant_id=? AND ops_status='待处理'", (tid,)
+        ) or 0,
     }
 
 
@@ -783,16 +843,17 @@ def get_selection_strategies() -> Dict[str, str]:
 
 # ── 跨店聚合（刘鹤视图：跟单 · 跨店）─────────────────────
 def get_cross_store_logistics() -> Dict:
-    """所有店铺的物流告警 + 卡单 SKU 聚合"""
+    """所有店铺的物流告警 + 卡单 SKU 聚合（v2 表 + tenant 隔离）"""
+    tid_x = get_current_tenant() or 1
     rows_alerts = _fetch("""
         SELECT alert_id, alert_level, alert_reason, order_no, ops_status,
                sku_list_json, action_owner, actual_stay_days, history_stage_days,
-               stage, created_at, updated_at
-        FROM wf6_logistics_alerts
+               stage, created_at
+        FROM wf6_logistics_alerts_v2 WHERE tenant_id=?
         ORDER BY CASE alert_level
             WHEN '红' THEN 1 WHEN '橙' THEN 2 WHEN '黄' THEN 3 WHEN '蓝' THEN 4 ELSE 9
-        END, updated_at DESC
-    """)
+        END, created_at DESC
+    """, (tid_x,))
     for a in rows_alerts:
         try:
             a["skus"] = json.loads(a.get("sku_list_json") or "[]")
@@ -800,11 +861,11 @@ def get_cross_store_logistics() -> Dict:
             a["skus"] = []
 
     hub_rows = _fetch("""
-        SELECT sku, in_transit_total_qty, in_transit_batch_count,
+        SELECT sku, in_transit_total_qty,
                has_stuck_batch, needs_ops_input, groups_json
-        FROM wf3_logistics_hub
-        WHERE has_stuck_batch=1 OR needs_ops_input=1
-    """)
+        FROM wf3_logistics_hub_v2
+        WHERE tenant_id=? AND (has_stuck_batch=1 OR needs_ops_input=1)
+    """, (tid_x,))
     return {
         "alerts": rows_alerts,
         "stuck_skus": hub_rows,
