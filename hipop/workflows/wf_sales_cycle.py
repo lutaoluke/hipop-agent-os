@@ -620,5 +620,345 @@ def main():
             print(f"  ⚠️ sync 失败: {e}")
 
 
+# ============================================================
+# v2 多租户版 — 跑 v2 表（wf2_sku / wf1_stock / wf3_logistics_hub_v2 / wf5_sales_cycle）
+# 旧 read_*/analyze_one/run() 完全不动（hipop 老 cron 还用着）
+# ============================================================
+
+def _g(row, key, idx):
+    """row 是 sqlite tuple 或 PG RealDictRow，统一取值"""
+    if row is None: return None
+    if isinstance(row, dict): return row.get(key)
+    return row[idx]
+
+
+def read_sales_v2(tenant_id, alias, partner_sku, conn):
+    """v2 版：读 wf2_sku（销量+利润）+ wf1_stock（库存）。"""
+    row = conn.execute(
+        "SELECT sales_10d, sales_30d, sales_60d, sales_180d, latest_profit_rate "
+        "FROM wf2_sku WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (tenant_id, alias, partner_sku),
+    ).fetchone()
+    if not row:
+        return None
+    s10 = _g(row, "sales_10d", 0); s30 = _g(row, "sales_30d", 1)
+    s60 = _g(row, "sales_60d", 2); s180 = _g(row, "sales_180d", 3)
+    profit = _g(row, "latest_profit_rate", 4)
+    immediate = transfer = domestic = 0.0
+    try:
+        st = conn.execute(
+            "SELECT noon_saleable_qty, pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty "
+            "FROM wf1_stock WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+            (tenant_id, alias, partner_sku),
+        ).fetchone()
+    except Exception:
+        st = None
+    if st:
+        immediate = safe_float(_g(st, "noon_saleable_qty", 0)) + safe_float(_g(st, "pending_inbound_qty", 1))
+        transfer = safe_float(_g(st, "overseas_total_qty", 2))
+        domestic = safe_float(_g(st, "yiwu_qty", 3)) + safe_float(_g(st, "dongguan_qty", 4))
+    return {
+        "d10": safe_float(s10), "d30": safe_float(s30),
+        "d60": safe_float(s60), "d180": safe_float(s180),
+        "immediate": immediate, "transfer": transfer, "domestic": domestic,
+        "profit_rate": safe_float(profit),
+    }
+
+
+def read_hub_v2(tenant_id, country, partner_sku, conn):
+    """v2 版：读 wf3_logistics_hub_v2，按 tenant + country 过滤 groups_json。"""
+    hub_country = COUNTRY_HUB_KEY.get(country, country)
+    row = conn.execute(
+        "SELECT in_transit_total_qty, groups_json FROM wf3_logistics_hub_v2 "
+        "WHERE tenant_id=? AND sku=?",
+        (tenant_id, partner_sku),
+    ).fetchone()
+    if not row:
+        return None
+    _total_all = _g(row, "in_transit_total_qty", 0)
+    gj = _g(row, "groups_json", 1)
+    all_groups = json.loads(gj or "[]") if isinstance(gj, str) else (gj or [])
+    groups = [g for g in all_groups if g.get("country") == hub_country]
+    country_transit = sum(g.get("in_transit_qty", 0) for g in groups)
+    fw_avgs = [g["completed_avg_total_days"] for g in groups if g.get("completed_avg_total_days")]
+    avg_transit = round(sum(fw_avgs) / len(fw_avgs)) if fw_avgs else None
+    transit_batches = []
+    hist_qtys = []
+    today = datetime.now().date()
+    for g in groups:
+        fw = g.get("forwarder", "?")
+        for b in g.get("in_transit_batches") or []:
+            qty = b.get("qty", 0)
+            if not qty: continue
+            hist_qtys.append(qty)
+            eta_days = b.get("eta_days_remaining")
+            if eta_days is None and g.get("completed_avg_total_days"):
+                shipped_days = b.get("days_shipped") or 0
+                eta_days = max(0, g["completed_avg_total_days"] - shipped_days)
+            transit_batches.append({
+                "qty": qty, "eta_days": eta_days or 0,
+                "forwarder": fw, "stage": b.get("stage"),
+            })
+        for b in g.get("completed_batches") or []:
+            if b.get("qty"):
+                hist_qtys.append(b["qty"])
+    return {
+        "total_transit_qty": country_transit,
+        "avg_transit_days": avg_transit,
+        "transit_batches": transit_batches,
+        "hist_qtys": hist_qtys,
+        "groups": groups,
+    }
+
+
+def read_lost_qty_v2(tenant_id, alias, partner_sku, conn):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(lost_qty), 0) AS lost FROM wf6_replenishment_queue_v2 "
+        "WHERE tenant_id=? AND entity_alias=? AND partner_sku=? AND consumed_at IS NULL",
+        (tenant_id, alias, partner_sku),
+    ).fetchone()
+    if not row: return 0
+    v = _g(row, "lost", 0)
+    return int(v or 0)
+
+
+def analyze_one_v2(tenant_id, ent, partner_sku, conn):
+    """v2 版 analyze_one — 跟 analyze_one 算法一致，只换 read_*_v2"""
+    alias = ent["alias"]
+    country = ent["country"]
+    sales = read_sales_v2(tenant_id, alias, partner_sku, conn)
+    if not sales:
+        return None
+    hub = read_hub_v2(tenant_id, country, partner_sku, conn) or {
+        "total_transit_qty": 0, "avg_transit_days": None,
+        "transit_batches": [], "hist_qtys": [], "groups": []
+    }
+    lost = read_lost_qty_v2(tenant_id, alias, partner_sku, conn)
+
+    # 借用旧 analyze_one 的核心算法（从 sales/hub 算 trend/risk/replenish）
+    # 简化做法：构造一个 fake "ent" + 让 analyze_one 跑核心，但 analyze_one 调 read_* 是 alias 版……
+    # 因此把核心算法手动复制（保留与 analyze_one 同步）：
+    trend, daily_rate, fc10, fc30 = calc_trend_forecast(
+        sales["d10"], sales["d30"], sales["d60"], sales["d180"]
+    )
+    is_slow_d30 = sales["d30"] < 10
+    is_growth_trend = trend in ("加速增长", "增长", "波动")
+    low_margin = sales["profit_rate"] is not None and 0 < sales["profit_rate"] < 0.20
+    margin = sales["profit_rate"] or 0
+    immediate = sales["immediate"]
+    transfer_qty = sales["transfer"]
+    domestic_qty = sales["domestic"]
+    total_transit = hub["total_transit_qty"]
+    avg_transit_days = hub["avg_transit_days"]
+    transit_batches = hub.get("transit_batches", [])
+    hist_qtys = hub.get("hist_qtys", [])
+    current_pipeline = immediate + transfer_qty + total_transit + domestic_qty
+    is_pipeline_safe = bool(
+        avg_transit_days and daily_rate > 0
+        and (current_pipeline / daily_rate) >= (avg_transit_days + ORDER_CYCLE)
+    )
+    slow_mover = is_slow_d30 and (not is_growth_trend) and is_pipeline_safe
+
+    sellable_days, timeline, gaps = simulate_sellable_days(
+        immediate, transfer_qty, transit_batches, daily_rate
+    )
+    gaps_during = [g for g in gaps if g["type"] == "在途期间"]
+    if avg_transit_days and daily_rate > 0 and sellable_days < 9999:
+        decision_days = sellable_days - avg_transit_days
+    else:
+        decision_days = None
+    if daily_rate <= 0:
+        risk = "无"
+    elif avg_transit_days and (immediate + transfer_qty) / daily_rate < avg_transit_days:
+        risk = "在途断货"
+    elif avg_transit_days and sellable_days < avg_transit_days + ORDER_CYCLE:
+        risk = "到齐后断货"
+    else:
+        risk = "无"
+
+    if avg_transit_days and daily_rate > 0:
+        pipeline_target = (avg_transit_days + ORDER_CYCLE) * daily_rate
+        total_shortfall = max(0, round(pipeline_target - current_pipeline))
+        weekly_rate = max(1, round(ORDER_CYCLE * daily_rate))
+        if hist_qtys:
+            sorted_q = sorted(hist_qtys)
+            hist_med = sorted_q[len(sorted_q) // 2]
+        else:
+            hist_med = None
+        batch_suggest = hist_med if hist_med else weekly_rate
+        if total_shortfall <= 0:
+            replenish_qty = 0; batches_needed = 0
+            replenish_note = f"目标管道 {pipeline_target:.0f} 件, 当前 {current_pipeline:.0f}, 充足"
+        else:
+            replenish_qty = batch_suggest
+            batches_needed = max(1, -(-total_shortfall // batch_suggest))
+            replenish_note = (
+                f"管道缺口 {total_shortfall} 件, 按历史批量 {batch_suggest} 件下单, "
+                f"约 {batches_needed} 批追平 (目标 {pipeline_target:.0f} / 当前 {current_pipeline:.0f})"
+            )
+    else:
+        pipeline_target = 0; total_shortfall = 0; replenish_qty = 0
+        hist_med = None; batches_needed = 0
+        replenish_note = "数据不足 (无历史物流均值或日销=0)"
+
+    if slow_mover:
+        replenish_qty = 0
+        replenish_note = (f"慢销品 (30 天 {sales['d30']:.0f} 件), 暂不补货, 建议评估 EOL")
+    elif low_margin:
+        replenish_qty = 0
+        replenish_note = f"利润率 {margin:.0%} 偏低 (<20%), 暂缓补货, 建议调价或 EOL"
+
+    if daily_rate == 0:
+        status_ops = "⚪ 无销量"
+    elif immediate == 0 and total_transit == 0:
+        status_ops = "⛔ 零库存, 立即停止广告"
+    elif gaps_during:
+        total_gap = sum(g["gap_days"] for g in gaps_during)
+        status_ops = (f"🔴 在途期间断货 {total_gap} 天, 立即调价控流"
+                      if total_gap else "🟡 库存极紧, 控流 / 适当调价保利润")
+    elif trend in ("急速下降", "下降") and sellable_days > 180:
+        status_ops = "⚠️ 滞销积压, 考虑降价促销"
+    elif trend in ("加速增长", "增长"):
+        status_ops = "🟢 销量上涨, 保持运营 / 可适当提价测试"
+    else:
+        status_ops = "🟢 正常运营, 维持现状"
+
+    if slow_mover:
+        status_buy = f"⚪ 慢销品 (30 天 {sales['d30']:.0f} 件), 暂不采购"
+    elif low_margin:
+        status_buy = f"⚪ 利润率 {margin:.0%} 偏低, 暂缓补货"
+    elif daily_rate == 0:
+        status_buy = "⚪ 无销量, 暂不采购"
+    elif immediate == 0 and total_transit == 0:
+        status_buy = f"🔴 本周立即采购 {replenish_qty} 件 (零库存)"
+    elif avg_transit_days and decision_days is not None and decision_days <= 0:
+        status_buy = (f"🔴 本周立即采购 {replenish_qty} 件 (已过补货窗口)"
+                      if replenish_qty > 0 else "🟡 窗口已过但管道暂足")
+    elif avg_transit_days and decision_days is not None and decision_days < ORDER_CYCLE * 2:
+        action = f"采购 {replenish_qty} 件" if replenish_qty > 0 else "保持每周刷新"
+        status_buy = f"🔴 本周必须下单: {action} (窗口仅剩 {int(decision_days)} 天)"
+    elif avg_transit_days and sellable_days < avg_transit_days:
+        status_buy = f"🔴 本周立即采购 {replenish_qty} 件 (可售不足一个物流周期)"
+    elif avg_transit_days and sellable_days < avg_transit_days * 1.5:
+        status_buy = (f"🟡 {int(decision_days)} 天内采购 {replenish_qty} 件"
+                      if replenish_qty > 0 else f"🟡 窗口剩 {int(decision_days)} 天")
+    elif replenish_qty > 0:
+        status_buy = f"🟢 {int(decision_days)} 天后采购约 {replenish_qty} 件"
+    else:
+        status_buy = "🟢 管道充足, 本周无需采购"
+
+    wf5_qty = replenish_qty
+    weekly_total = wf5_qty + lost
+    target = int(pipeline_target) if pipeline_target else 0
+    reasons = []
+    if wf5_qty > 0: reasons.append("正常补货")
+    if lost > 0: reasons.append("丢货补货")
+    if slow_mover: reasons.append("慢销")
+    if low_margin: reasons.append("低利润")
+    if not reasons: reasons.append("正常补货")
+
+    if slow_mover or low_margin:
+        urgency = "无需采购"
+    elif "🔴" in status_buy or "⛔" in status_ops:
+        urgency = "立即"
+    elif "🟡" in status_buy:
+        urgency = "本周"
+    elif weekly_total == 0:
+        urgency = "无需采购"
+    else:
+        urgency = "正常"
+
+    advice = f"[运营] {status_ops}  |  [采购] {status_buy}  |  {replenish_note}"
+    if lost > 0:
+        advice += f"  |  丢货必补 {lost} 件已计入本周"
+
+    return {
+        "partner_sku": partner_sku,
+        "trend": trend, "daily_rate": round(daily_rate, 2),
+        "forecast_10_days": int(fc10), "forecast_30_days": int(fc30),
+        "risk_label": risk, "current_pipeline": int(current_pipeline),
+        "target_pipeline": target, "wf5_replenish_qty": int(wf5_qty),
+        "lost_replenish_qty": int(lost), "weekly_total_replenish": int(weekly_total),
+        "trigger_reasons": reasons, "urgency": urgency, "ops_advice": advice,
+        "week_tag": datetime.now().strftime("%Y-W%V"),
+        "sellable_days": round(sellable_days, 1) if sellable_days < 9999 else None,
+        "decision_days": int(decision_days) if decision_days is not None else None,
+        "status_ops": status_ops, "status_buy": status_buy,
+    }
+
+
+def write_record_v2(rec, tenant_id, alias, conn):
+    ts_expr = "datetime('now','localtime')"
+    cols = ["tenant_id","entity_alias","partner_sku","trend","daily_rate",
+            "forecast_10_days","forecast_30_days","risk_label",
+            "current_pipeline","target_pipeline","wf5_replenish_qty",
+            "lost_replenish_qty","weekly_total_replenish","trigger_reasons",
+            "urgency","ops_advice","week_tag","sellable_days","decision_days",
+            "status_ops","status_buy"]
+    placeholders = ",".join(["?"] * len(cols))
+    update_set = ",".join(f"{c}=excluded.{c}" for c in cols
+                           if c not in ("tenant_id", "entity_alias", "partner_sku"))
+    update_set += f", updated_at={ts_expr}"
+    sql = (
+        f"INSERT INTO wf5_sales_cycle ({','.join(cols)}, updated_at) "
+        f"VALUES ({placeholders}, {ts_expr}) "
+        f"ON CONFLICT (tenant_id, entity_alias, partner_sku) DO UPDATE SET {update_set}"
+    )
+    conn.execute(sql, (
+        tenant_id, alias, rec["partner_sku"], rec["trend"], rec["daily_rate"],
+        rec["forecast_10_days"], rec["forecast_30_days"], rec["risk_label"],
+        rec["current_pipeline"], rec["target_pipeline"], rec["wf5_replenish_qty"],
+        rec["lost_replenish_qty"], rec["weekly_total_replenish"],
+        json.dumps(rec["trigger_reasons"], ensure_ascii=False),
+        rec["urgency"], rec["ops_advice"], rec["week_tag"],
+        rec.get("sellable_days"), rec.get("decision_days"),
+        rec.get("status_ops"), rec.get("status_buy"),
+    ))
+
+
+def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
+           write_db: bool = True, verbose: bool = True) -> dict:
+    """v2 跑某 tenant 的销售周期，写 v2 表。"""
+    import sys
+    from server import data as _data
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from sales_entity_v2 import list_entities_for_tenant
+
+    entities = list_entities_for_tenant(tenant_id)
+    if entity_aliases:
+        entities = [e for e in entities if e["alias"] in entity_aliases]
+    if not entities:
+        raise RuntimeError(f"tenant={tenant_id} no entities")
+
+    conn = _data.conn()
+    all_results = {}
+    for ent in entities:
+        alias = ent["alias"]
+        print(f"\n[v2 tenant={tenant_id} entity {alias}]", file=sys.stderr)
+        # 取该 entity 全部 partner_sku（兼容 sqlite tuple 和 PG dict cursor）
+        rows = conn.execute(
+            "SELECT partner_sku FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            (tenant_id, alias),
+        ).fetchall()
+        ent_skus = skus or [(r["partner_sku"] if isinstance(r, dict) else r[0]) for r in rows]
+        out = []
+        for psk in ent_skus:
+            rec = analyze_one_v2(tenant_id, ent, psk, conn)
+            if not rec:
+                continue
+            if write_db:
+                write_record_v2(rec, tenant_id, alias, conn)
+            out.append(rec)
+            if verbose and len(out) % 200 == 0:
+                print(f"  ... {len(out)} skus done", file=sys.stderr)
+        if write_db:
+            conn.commit()
+        all_results[alias] = len(out)
+        print(f"  [{alias}] {len(out)} skus written to wf5_sales_cycle", file=sys.stderr)
+    conn.close()
+    print(f"\n[done] tenant={tenant_id} {all_results}", file=sys.stderr)
+    return all_results
+
+
 if __name__ == "__main__":
     main()

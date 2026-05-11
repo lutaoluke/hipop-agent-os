@@ -510,6 +510,36 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_erp_products_v2:run_v2")],
         ["sales"],
     ),
+    "wf2_sales_v2": (
+        "ERP 销量价格（自动拉，per-tenant）",
+        [
+            (1, "拉商品库（确保 partner_sku 行存在）", "scripts.ingest_erp_products_v2:run_v2"),
+            (2, "拉销量价格 6 个时间窗 + 更新 wf2_sku", "scripts.ingest_erp_sales_v2:run_v2"),
+        ],
+        ["sales", "replenish"],
+    ),
+    "wf1_stock_v2": (
+        "ERP 库存（自动拉，per-tenant，国内+海外仓）",
+        [(1, "拉所有仓库存 + 写 wf1_stock v2", "scripts.ingest_erp_stock_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
+    "wf5_sales_cycle_v2": (
+        "销售周期 + 补货决策（v2 表，per-tenant）",
+        [(1, "per-entity 销售周期算法 + 写 wf5_sales_cycle v2",
+          "workflows.wf_sales_cycle:run_v2")],
+        ["sales", "replenish"],
+    ),
+    # 全套：商品+销量+库存+销售周期 一键跑
+    "refresh_all_v2": (
+        "完整刷新（商品→销量→库存→销售周期）",
+        [
+            (1, "ERP 商品库", "scripts.ingest_erp_products_v2:run_v2"),
+            (2, "ERP 销量价格", "scripts.ingest_erp_sales_v2:run_v2"),
+            (3, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
+            (4, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
+        ],
+        ["sales", "replenish", "logistics"],
+    ),
     "wf3_logistics": (
         "wf3 物流采集",
         [(1, "全 entity 扫单 + 写 hub + 飞书", "scripts.weekly_run:step_wf3")],

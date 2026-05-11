@@ -233,7 +233,8 @@ TOOLS = [
                     "type": "string",
                     "enum": ["wf1_stock", "wf2_sales", "wf3_logistics",
                              "wf5_sales_cycle", "wf6_alerts", "daily", "weekly",
-                             "wf2_products_v2"],
+                             "wf2_products_v2", "wf2_sales_v2", "wf1_stock_v2",
+                             "wf5_sales_cycle_v2", "refresh_all_v2"],
                 },
                 "followup_prompt": {
                     "type": "string",
