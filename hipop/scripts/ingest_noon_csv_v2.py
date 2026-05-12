@@ -160,23 +160,33 @@ def aggregate_sales_v2(tenant_id: int, entity_alias: str, conn) -> int:
     """从 wf2_orders 重算 wf2_sku 的 sales_10/30/60/90/120/180d。
     Returns: 更新的 SKU 数。
     """
+    import datetime as _dt
     cur = conn.cursor()
+
+    def _scalar(row):
+        """sqlite Row 用 row[0]，PG RealDictRow 用 next(iter(row.values()))。"""
+        if row is None: return None
+        if isinstance(row, dict): return next(iter(row.values()))
+        return row[0]
+
     # 获取该 tenant+entity 所有 SKU
-    skus = [r[0] for r in cur.execute(
+    skus = [_scalar(r) for r in cur.execute(
         "SELECT DISTINCT partner_sku FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
         (tenant_id, entity_alias)
     ).fetchall()]
+    today = _dt.date.today()
     n = 0
     for sku in skus:
         windows = {}
         for days in [10, 30, 60, 90, 120, 180]:
-            count = cur.execute(
+            cutoff = (today - _dt.timedelta(days=days)).isoformat()
+            count = _scalar(cur.execute(
                 "SELECT COUNT(*) FROM wf2_orders "
                 "WHERE tenant_id=? AND entity_alias=? AND partner_sku=? "
                 "AND is_cancelled=0 "
-                "AND order_date >= date('now', ?, 'localtime')",
-                (tenant_id, entity_alias, sku, f"-{days} days")
-            ).fetchone()[0]
+                "AND order_date >= ?",
+                (tenant_id, entity_alias, sku, cutoff)
+            ).fetchone()) or 0
             windows[f"sales_{days}d"] = count
         cur.execute(
             "UPDATE wf2_sku SET "
