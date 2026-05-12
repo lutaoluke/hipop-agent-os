@@ -212,18 +212,16 @@ TOOLS = [
     {
         "name": "run_workflow",
         "description": (
-            "异步触发后台工作流（每个 workflow 都是耗时操作，立即返回 task_id 让前端订阅 SSE 进度）。\n"
-            "可选 workflow:\n"
-            "- wf1_stock：拉 ERP 6 仓 + noon Inventory 库存 + 飞书同步\n"
-            "- wf2_sales：拉商品库 + ERP 销量 + noon CSV 累加 + 聚合销量评级 + 飞书同步\n"
-            "- wf3_logistics：扫所有 entity 物流货单 + 写 hub + 飞书同步\n"
-            "- wf5_sales_cycle：销售周期 + 补货决策 + 飞书 sync_decisions\n"
-            "- wf6_alerts：生成物流告警 + 飞书 alerts/warehouse_appt\n"
-            "- daily：每日例行（wf3 + wf6 + 推日报卡片）\n"
-            "- weekly：每周例行全链路（wf1 + wf2 + wf3 + wf6 + wf5 + 周报卡片）\n"
-            "数据陈旧或用户说『跑/刷新/重新算/同步』时调本工具。\n"
-            "**重要**：如果用户原始问题需要等数据跑完才能答（例如『我该补货吗』而 wf5 数据陈旧），"
-            "在 followup_prompt 字段填上『需要等工作流跑完后接续答的问题』，前端会在 task 完成后自动重新发起一轮 chat，"
+            "异步触发后台工作流（耗时操作，立即返回 task_id 让前端订 SSE 进度）。\n"
+            "**只可选以下 v2 workflow（per-tenant，会用 onboarding 存的加密 ERP 凭据 headless 登录拉数）**：\n"
+            "- refresh_all_v2：全量刷新（商品→销量→库存→销售周期），用户说『拉/同步/刷』全部数据时优先用\n"
+            "- wf2_products_v2：只拉 ERP 商品库（写 wf2_sku）\n"
+            "- wf2_sales_v2：拉商品库 + 销量价格 6 时间窗（写 wf2_sku）\n"
+            "- wf1_stock_v2：拉 ERP 6 仓库存（写 wf1_stock）\n"
+            "- wf5_sales_cycle_v2：基于现有 wf2/wf1/wf3 数据重算销售周期 + 补货决策\n"
+            "用户说『拉/同步/刷新/重算/跑』数据时调本工具。**严禁选 v2 之外的 workflow，老 workflow 只读全局 env，会让多租户用户必崩**。\n"
+            "**重要**：如果用户原始问题需要等数据跑完才能答（如『我该补货吗』而 wf5 陈旧），"
+            "在 followup_prompt 填上『需要等工作流跑完后接续答的问题』，前端会在 task 完成后自动重发一轮 chat，"
             "你那时再用最新数据答最终结论。"
         ),
         "input_schema": {
@@ -231,10 +229,8 @@ TOOLS = [
             "properties": {
                 "workflow": {
                     "type": "string",
-                    "enum": ["wf1_stock", "wf2_sales", "wf3_logistics",
-                             "wf5_sales_cycle", "wf6_alerts", "daily", "weekly",
-                             "wf2_products_v2", "wf2_sales_v2", "wf1_stock_v2",
-                             "wf5_sales_cycle_v2", "refresh_all_v2"],
+                    "enum": ["refresh_all_v2", "wf2_products_v2", "wf2_sales_v2",
+                             "wf1_stock_v2", "wf5_sales_cycle_v2"],
                 },
                 "followup_prompt": {
                     "type": "string",
@@ -624,6 +620,58 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     }
 
 
+def tool_query_1688_similar(image_url: str, pack: int = 1,
+                              material: str = "", title: str = "") -> Dict:
+    """走 N7 1688 图搜找同款. 全自动 cookies + 多件套关 yoloCrop + 规则分桶."""
+    try:
+        from selection.l3_orchestration.nodes.n7_1688_supply import run_query
+    except ImportError as e:
+        return {"ok": False, "error": "selection module not on path", "detail": str(e)}
+
+    query = {
+        "idx": 0,
+        "title": title or "",
+        "image_url": image_url,
+        "pack": pack or 1,
+        "material": material or None,
+    }
+    try:
+        result = run_query(query, cookies=None)  # cookies=None → cookies_manager.ensure()
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    if result.error:
+        return {"ok": False, "error": result.error}
+
+    top = result.offers[:5]
+    return {
+        "ok": True,
+        "found": result.found,
+        "yolocrop": "OFF" if not result.yolocrop_used else "ON",
+        "failed": result.failed,
+        "fallback_keywords": result.fallback_keywords,
+        "verdicts_top5": [o.get("verdict") for o in top],
+        "candidates": [
+            {
+                "offer_id": o.get("offer_id"),
+                "title": o.get("title"),
+                "price_cny": o.get("price"),
+                "company": o.get("company"),
+                "province": o.get("province"),
+                "city": o.get("city"),
+                "verdict": o.get("verdict"),
+                "combined_score": round(o.get("combined_score") or 0, 3),
+                "cos_score": round(o.get("cos_score") or 0, 3),
+                "material": o.get("material"),
+                "warning_flags": o.get("warning_flags") or [],
+                "offer_pic": o.get("offer_pic_url"),
+                "open_url": f"https://detail.1688.com/offer/{o.get('offer_id')}.html",
+            }
+            for o in top
+        ],
+    }
+
+
 # ── Tool 派发 ─────────────────────────────────────────
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
@@ -638,6 +686,7 @@ TOOL_FUNCS = {
     "navigate_user_to": tool_navigate_user_to,
     "notify_via_feishu": tool_notify_via_feishu,
     "run_workflow": tool_run_workflow,
+    "query_1688_similar": tool_query_1688_similar,
 }
 
 
