@@ -31,6 +31,22 @@
     <span class="pc-nav-badge">待开发</span>
   </div>
 
+  <div class="pc-sidebar-section" style="margin-top:16px;">数据刷新</div>
+  <div x-data="refreshPanel()" x-init="init()">
+    <template x-for="r in refreshes" :key="r.workflow">
+      <div class="pc-nav-item" style="font-size:13px;"
+           :title="r.hint"
+           @click="run(r.workflow)"
+           :style="running===r.workflow ? 'opacity:.6;cursor:wait;' : ''">
+        <span class="pc-nav-icon" x-text="running===r.workflow ? '⏳' : r.icon"></span>
+        <span x-text="r.label"></span>
+        <span class="pc-nav-badge" x-show="running===r.workflow" style="background:#e7f3ff;color:#1864d4;">跑中</span>
+      </div>
+    </template>
+    <div x-show="lastMsg" x-text="lastMsg" x-cloak
+         style="padding:6px 14px;font-size:11.5px;color:var(--text-tertiary);"></div>
+  </div>
+
   <div class="pc-sidebar-section" style="margin-top:16px;">系统</div>
   <div class="pc-nav-item">
     <span class="pc-nav-icon">📜</span>
@@ -41,3 +57,52 @@
     <span>策略沉淀</span>
   </div>
 </div>
+<script>
+function refreshPanel() {
+  return {
+    refreshes: [
+      {workflow: "refresh_all_v2",     icon: "🔁", label: "全量刷新（ERP+周期）", hint: "商品→销量→库存→销售周期 一键全套"},
+      {workflow: "wf1_stock_v2",       icon: "📦", label: "刷库存（ERP 6 仓）",    hint: "拉所有仓库存，写 wf1_stock"},
+      {workflow: "wf2_sales_v2",       icon: "📈", label: "刷销量价格（ERP）",    hint: "拉销量价格 6 时间窗，写 wf2_sku"},
+      {workflow: "wf5_sales_cycle_v2", icon: "🧮", label: "重算销售周期 + 补货",   hint: "用现有 wf2/wf1/wf3 数据重算 wf5"},
+    ],
+    running: null,
+    lastMsg: "",
+    async init() {
+      // 监听 workflow-done，清掉 running 标
+      window.addEventListener('workflow-done', (e) => {
+        if (e.detail && this.running === e.detail.workflow) {
+          this.lastMsg = `✓ ${this.refreshes.find(r=>r.workflow===this.running)?.label} 已完成`;
+          this.running = null;
+        }
+      });
+    },
+    async run(workflow) {
+      if (this.running) {
+        this.lastMsg = "已有任务在跑，请等当前完成";
+        return;
+      }
+      try {
+        const r = await fetch('/api/run-workflow', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({workflow: workflow, source: 'ui'}),
+        });
+        if (!r.ok) {
+          const err = await r.text();
+          this.lastMsg = `✗ ${r.status}: ${err.slice(0,80)}`;
+          return;
+        }
+        const t = await r.json();
+        this.running = workflow;
+        this.lastMsg = `已启动 ${t.label}（任务 ${t.task_id}）`;
+        // 让 chat panel 也跟进度（复用现有 chat-attach-task 机制 → 在 chat 里显气泡 + 完成后自动刷模块页）
+        window.dispatchEvent(new CustomEvent('chat-attach-task', {detail: {...t, source: 'ui'}}));
+      } catch(e) {
+        this.lastMsg = `✗ ${e}`;
+      }
+    },
+  };
+}
+</script>

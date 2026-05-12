@@ -43,15 +43,21 @@ ON CONFLICT (id) DO NOTHING;
 -- ============ Agent OS server 内部表 ============
 
 CREATE TABLE IF NOT EXISTS agent_events (
-  id          BIGSERIAL PRIMARY KEY,
-  task_id     TEXT NOT NULL,
-  step_no     INT NOT NULL,
-  step_name   TEXT NOT NULL,
-  status      TEXT NOT NULL,    -- started / done / error / skipped
-  message     TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id            BIGSERIAL PRIMARY KEY,
+  task_id       TEXT NOT NULL,
+  step_no       INT NOT NULL,
+  step_name     TEXT NOT NULL,
+  status        TEXT NOT NULL,    -- started / done / error / skipped
+  message       TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- 触发方留痕（who triggered this workflow）— 2026-05-12
+  actor_user_id BIGINT,
+  actor_email   TEXT,
+  actor_role    TEXT,
+  actor_source  TEXT              -- 'chat' | 'ui' | 'cron' | 'upload'
 );
 CREATE INDEX IF NOT EXISTS idx_agent_events_task ON agent_events(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_actor ON agent_events(actor_user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS agent_actions (
   id              BIGSERIAL PRIMARY KEY,

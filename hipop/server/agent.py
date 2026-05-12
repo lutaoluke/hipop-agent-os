@@ -244,6 +244,27 @@ TOOLS = [
             "required": ["workflow"],
         },
     },
+    {
+        "name": "query_1688_similar",
+        "description": (
+            "拿一张 noon/amazon 商品图片 URL, 走 1688 主站图搜找同款 + 比价. "
+            "用户场景: 粘一张 noon URL 或图片 URL 说『找同款』『1688 有这个吗』『找货源』. "
+            "返回 top 5 候选: offer_id / 标题 / 价格 / 店铺 / cosScore / verdict (inquiry|differentiation|watch|drop) / 跳转 URL. "
+            "verdict=inquiry 即可直接询盘; differentiation 进 N8 差异化挖掘; failed=True 时给文搜兜底关键词."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_url": {"type": "string", "description": "公网可达商品图 URL (noon CDN / amazon CDN / 1688 CDN)"},
+                "pack": {"type": "integer", "default": 1,
+                         "description": "件套数: 1=单只 / 2-6=多件套. 多件套自动关 yoloCrop 提升 set 组识别"},
+                "material": {"type": "string",
+                             "description": "query 材质 (ABS/PC/PP/铝框/软箱/皮箱/未知), 用于跨材质降权"},
+                "title": {"type": "string", "description": "query 标题, 仅记录用"},
+            },
+            "required": ["image_url"],
+        },
+    },
 ]
 
 
@@ -577,8 +598,15 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     task_id = uuid4().hex[:8]
     # 拿当前 chat 的 tenant_id（contextvars 注入），传给后台线程
     tid = _get_tenant()
+    sc = _chat_scope.get() or {}
+    actor = {
+        "user_id": sc.get("user_id"),
+        "email": sc.get("current_user_email") or sc.get("current_user"),
+        "role": sc.get("current_role"),
+        "source": "chat",
+    }
     threading.Thread(
-        target=_api._run_workflow, args=(task_id, workflow, tid), daemon=True,
+        target=_api._run_workflow, args=(task_id, workflow, tid, actor), daemon=True,
     ).start()
     return {
         "ok": True,
@@ -682,11 +710,17 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent，工作在共同
    - "已为你打开 X 页面" → 你不能打开页面，只能告诉用户"在工作台 sidebar 找 X 模块"
    - "我刚调用了 X 工具" → 当且仅当本轮真的调用了，否则不要写
 
-**3. 严禁编造 URL / 域名 / 页面元素 / UI 按钮**
+**3. 严禁编造 URL / 域名 / 页面元素 / UI 按钮 / UI 操作路径**
    - 不要编 `https://agent.diangou.ai/...` 这种**虚构域名**
    - 不要描述前端不存在的 UI（"顶部 Tab 高亮"、"右上角导出按钮已激活"、"行末 🔍 按钮"）
+   - **严禁编"在 sidebar/侧边栏 找到 X 按钮 → 点 Y"** —— sidebar 真实菜单只有：今日总览 / 数据获取 / 销售-库存 / 在途物流 / 补货决策 / 流量推广 / 选品+货源 / 营销活动 / 飞书沉淀 / 数据巡检 / 跟单跨店 + 系统块（Agent 操作记录 / 策略沉淀 / 数据刷新）。**绝不要描述"侧边栏的某某子菜单/路径/选项"，因为模型对实际 DOM 的猜测 80% 是错的**
    - 工作台真实的模块只有：overview / sales / logistics / replenish / selection / feishu / audit + role/liuhe，路径都是 localhost:8765/module/<name>
    - 真有的入口才能引导用户去；不确定就让用户"sidebar 看一下"
+
+**3b. 用户问"刷新 / 跑工作流 / 同步数据 / 重算 X"时，必须直接 `run_workflow`，禁止教用户怎么点按钮**
+   - 你**有** run_workflow tool，能直接触发后台跑（前端会自动订 SSE 显进度）
+   - 禁说"这个需要组长/管理员账号才能触发" / "我没有权限" / "Agent 当前没有权限" —— 你已经被赋予 run_workflow，能跑就跑；只有 tool 真返回 `permission_denied` 才能这么回
+   - 禁说"在工作台 sidebar 找到 X → 点 Y" —— 这种 UI 路径几乎必编错；直接 run_workflow 就对了
 
 **4. 用户报告状态变化时（如"我刷新了"、"我上传了"），必须重新调 tool 验证**
    - 不要直接信用户的报告就回"已确认更新"

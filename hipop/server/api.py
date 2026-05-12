@@ -587,10 +587,11 @@ def _resolve_callable(path: str):
     return getattr(mod, fn_name)
 
 
-def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1):
+def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1, actor: Optional[dict] = None):
     """串行执行 WORKFLOW_REGISTRY 中定义的所有 step，写入 agent_events。
 
     tenant_id：v2 step 函数（接受 tenant_id 参数的）会传入。老 step 不受影响（callable 不接受 kw 时落回无参调用）。
+    actor：触发方信息 {user_id, email, role, source}，每个 event 都带，审计/日志用。
     """
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
     data.write_event(
@@ -600,15 +601,16 @@ def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1):
                     "affected_modules": affected, "total_steps": len(steps),
                     "tenant_id": tenant_id},
                    ensure_ascii=False),
+        actor=actor,
     )
     # 后台线程：必须 set tenant context（middleware 不在这条线程上）
     data.set_current_tenant(tenant_id)
     failed = False
     for step_no, step_name, path in steps:
         if failed:
-            data.write_event(task_id, step_no, step_name, "skipped", "前置步骤失败，已跳过")
+            data.write_event(task_id, step_no, step_name, "skipped", "前置步骤失败，已跳过", actor=actor)
             continue
-        data.write_event(task_id, step_no, step_name, "started")
+        data.write_event(task_id, step_no, step_name, "started", actor=actor)
         try:
             fn = _resolve_callable(path)
             # 探测函数是否接受 tenant_id（v2 step 是 fn(tenant_id)，老 step 是 fn()）
@@ -618,28 +620,38 @@ def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1):
                 fn(tenant_id=tenant_id)
             else:
                 fn()
-            data.write_event(task_id, step_no, step_name, "done")
+            data.write_event(task_id, step_no, step_name, "done", actor=actor)
         except Exception as e:
-            data.write_event(task_id, step_no, step_name, "error", traceback.format_exc()[-500:])
+            data.write_event(task_id, step_no, step_name, "error", traceback.format_exc()[-500:], actor=actor)
             failed = True
     final_status = "error" if failed else "done"
     data.write_event(
         task_id, 99, "管道完成", final_status,
         json.dumps({"workflow": workflow, "affected_modules": affected,
                     "ok": not failed, "tenant_id": tenant_id}, ensure_ascii=False),
+        actor=actor,
     )
 
 
 @router.post("/run-workflow")
 async def api_run_workflow(body: dict, background_tasks: BackgroundTasks,
                             user: dict = Depends(_auth_mod.get_current_user)):
+    from . import rbac as _rbac
+    if not _rbac.can(user, "trigger_workflow"):
+        raise HTTPException(403, f"角色 {user.get('role')} 无 trigger_workflow 权限")
     workflow = (body or {}).get("workflow")
     if workflow not in WORKFLOW_REGISTRY:
         raise HTTPException(400, f"unknown workflow: {workflow}. valid: {list(WORKFLOW_REGISTRY)}")
     tenant_id = user.get("tenant_id") or 1
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
     task_id = uuid4().hex[:8]
-    background_tasks.add_task(_run_workflow, task_id, workflow, tenant_id)
+    actor = {
+        "user_id": user.get("id"),
+        "email": user.get("email"),
+        "role": user.get("role"),
+        "source": (body or {}).get("source") or "ui",
+    }
+    background_tasks.add_task(_run_workflow, task_id, workflow, tenant_id, actor)
     return {
         "task_id": task_id,
         "workflow": workflow,
@@ -648,6 +660,7 @@ async def api_run_workflow(body: dict, background_tasks: BackgroundTasks,
         "affected_modules": affected,
         "tenant_id": tenant_id,
         "status": "started",
+        "triggered_by": actor["email"] or "default",
     }
 
 
@@ -668,6 +681,7 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
         "store": body_scope.get("store") or "KSA",
         "module": body_scope.get("module"),
         "current_user": user.get("display_name") or user.get("email") or "Cherry",
+        "current_user_email": user.get("email"),
         "current_role": user.get("role") or "ops",
         "tenant_id": user.get("tenant_id"),
         "user_id": user.get("id"),

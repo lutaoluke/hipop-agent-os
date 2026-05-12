@@ -648,13 +648,23 @@ def get_today(store: str) -> Dict:
 
 
 # ── Agent 处理事件流（SSE 数据源）────────────────────────
-def write_event(task_id: str, step_no: int, step_name: str, status: str, message: str = ""):
+def write_event(task_id: str, step_no: int, step_name: str, status: str, message: str = "",
+                actor: Optional[Dict] = None):
+    """写工作流执行事件 + 触发方留痕（actor: {user_id, email, role, source}）。
+
+    actor.source ∈ {'chat', 'ui', 'cron', 'upload'}。每个 step 都写一份 actor 列；
+    审计时按 task_id 聚合就能看到这个任务由谁、什么 channel 触发。
+    """
     tid = get_current_tenant() or 1
+    a = actor or {}
     with conn() as c:
         c.execute("""
-            INSERT INTO agent_events (tenant_id, task_id, step_no, step_name, status, message)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (tid, task_id, step_no, step_name, status, message))
+            INSERT INTO agent_events
+              (tenant_id, task_id, step_no, step_name, status, message,
+               actor_user_id, actor_email, actor_role, actor_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tid, task_id, step_no, step_name, status, message,
+              a.get("user_id"), a.get("email"), a.get("role"), a.get("source")))
         c.commit()
 
 

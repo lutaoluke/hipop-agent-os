@@ -221,6 +221,22 @@ hipop/server/
 
 新增 workflow 只需在 `api.WORKFLOW_REGISTRY` 加一项，无需改 agent.py / chat_panel.html。
 
+### 三种触发通道（都留痕 `actor_*`）
+
+| 通道 | 入口 | actor_source | 备注 |
+|---|---|---|---|
+| chat | Agent 调 `run_workflow` tool | `chat` | user 来自 JWT，Agent 直接选 workflow |
+| UI 按钮 | `sidebar.html` "数据刷新" 4 个按钮 | `ui` | 调 `POST /api/run-workflow {workflow, source:'ui'}`，Alpine `refreshPanel()` 跟进度 |
+| 定时 cron | `server/scheduler.py` APScheduler 02:00 | `cron` | 每天给每个 tenant 跑 `refresh_all_v2`；env `DAILY_REFRESH_HOUR/MINUTE` 可调；`DISABLE_DAILY_REFRESH=1` 关闭 |
+
+留痕字段：`agent_events.actor_user_id / actor_email / actor_role / actor_source`。审计查询：
+```sql
+SELECT task_id, status, actor_email, actor_role, actor_source, created_at
+FROM agent_events
+WHERE step_no = 0 AND tenant_id = <tid>
+ORDER BY created_at DESC LIMIT 50;
+```
+
 ## SSE 协议（/api/events/stream/<task_id>）
 
 事件 JSON 结构：
@@ -286,7 +302,7 @@ Endpoints:
 - `PERMISSIONS` 矩阵（12 个 action × 4 角色）
 - `TOOL_PERMISSION` 把 chat tool 名映射到 action（chat 调 tool 前过 RBAC）
 - `can(user, action)` / `tool_allowed(user, tool_name)` / `require_permission(action)` decorator
-- 实测：forwarder 角色调 `run_workflow` → `permission_denied` → Agent 看到错主动给降级方案（"通过上传 CSV 间接驱动"）
+- 2026-05-12：**工作组所有角色（含 forwarder）都能 `trigger_workflow` / `upload_csv`**，行为靠 `agent_events.actor_*` 留痕审计而非角色阻挡。view_billing / edit_store_config 等管理类仍限 owner。
 
 ### 多租户 RLS (`db/schema.sql` + `data.py`)
 - 17 张业务表加 `tenant_id BIGINT NOT NULL DEFAULT 1`（旧数据自动归 HIPOP）

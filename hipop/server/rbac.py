@@ -25,9 +25,9 @@ PERMISSIONS: Dict[str, set] = {
     "view_orders":        {"owner", "manager", "ops", "forwarder"},
     "view_replenish":     {"owner", "manager", "ops", "forwarder"},
 
-    # 触发工作流 / 上传 CSV（forwarder 只看不管运营动作）
-    "trigger_workflow":   {"owner", "manager", "ops"},
-    "upload_csv":         {"owner", "manager", "ops"},
+    # 触发工作流 / 上传 CSV（工作组所有人都能操作，留痕在 agent_events.actor_*）
+    "trigger_workflow":   {"owner", "manager", "ops", "forwarder"},
+    "upload_csv":         {"owner", "manager", "ops", "forwarder"},
 
     # 写入告警状态（forwarder 是跟单，主要写这个）
     "update_alert":       {"owner", "manager", "ops", "forwarder"},

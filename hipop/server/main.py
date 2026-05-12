@@ -40,6 +40,17 @@ from server.api import router as _api_router
 app.include_router(_pages_router)
 app.include_router(_api_router, prefix="/api")
 
+# ── 每日自动刷新（APScheduler）───────────────────────────
+# 默认 02:00 跑 refresh_all_v2 for every active tenant；
+# 可通过 DAILY_REFRESH_CRON='hour=2,minute=0' 调整，DISABLE_DAILY_REFRESH=1 关闭
+@app.on_event("startup")
+def _start_daily_refresh():
+    if os.environ.get("DISABLE_DAILY_REFRESH"):
+        print("[scheduler] DISABLE_DAILY_REFRESH set, skipping")
+        return
+    from server import scheduler as _scheduler
+    _scheduler.start()
+
 # 防重放：记录已处理的 message_id
 _processed = set()
 
