@@ -65,7 +65,7 @@ function refreshPanel() {
       {workflow: "wf1_stock_v2",       icon: "📦", label: "刷库存（ERP 6 仓）",    hint: "拉所有仓库存，写 wf1_stock"},
       {workflow: "wf2_sales_v2",       icon: "📈", label: "刷销量价格（ERP）",    hint: "拉销量价格 6 时间窗，写 wf2_sku"},
       {workflow: "wf5_sales_cycle_v2", icon: "🧮", label: "重算销售周期 + 补货",   hint: "用现有 wf2/wf1/wf3 数据重算 wf5"},
-      {workflow: "wf3_logistics_v2",   icon: "🚚", label: "刷物流在途（stub）",    hint: "当前 stub：占位 listed SKU；接 noon Order API 后真填"},
+      {workflow: "wf3_logistics_v2",   icon: "🚚", label: "扫物流（ERP，~30 分钟）",  hint: "真接 ERP 拉货单 + 物流站节点；默认只扫近 60 天有销量的 SKU"},
       {workflow: "wf6_alerts_v2",      icon: "⚠️", label: "扫物流告警",            hint: "依赖 wf3 真数据；无源时不出新告警"},
     ],
     running: null,

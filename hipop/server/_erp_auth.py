@@ -30,6 +30,7 @@ _cache: dict = {}      # tenant_id -> {"token": str, "exp": ts}
 
 def _get_creds(tenant_id: int) -> Optional[tuple]:
     """从 DB 解密拿 (username, password, erp_url)。"""
+    _data.set_current_tenant(tenant_id)  # 兜底设 RLS context，否则查不到 tenant=N 的凭据
     rows = _data._fetch(
         "SELECT username_enc, password_enc, erp_url FROM tenant_erp_credentials "
         "WHERE tenant_id=?",
