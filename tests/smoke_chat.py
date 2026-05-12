@@ -165,6 +165,18 @@ CASES: List[Case] = [
             "组长.{0,5}管理员.{0,5}才能",
         ],
     ),
+    # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
+    Case(
+        name="刷新物流（必走 v2，禁老 wf3 全局 env）",
+        question="帮我刷一下物流数据",
+        must_use_tools=["run_workflow"],
+        # 严禁老 workflow 名字出现（只有 v2 后缀的可选）
+        must_not_contain=[
+            r"wf3_logistics(?!_v2)",   # 老名字 wf3_logistics 出现 = 选错
+            r"wf6_alerts(?!_v2)",
+            "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
+        ],
+    ),
 ]
 
 

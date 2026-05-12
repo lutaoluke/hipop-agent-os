@@ -61,10 +61,12 @@
 function refreshPanel() {
   return {
     refreshes: [
-      {workflow: "refresh_all_v2",     icon: "🔁", label: "全量刷新（ERP+周期）", hint: "商品→销量→库存→销售周期 一键全套"},
+      {workflow: "refresh_all_v2",     icon: "🔁", label: "全量刷新（ERP+周期+物流）", hint: "商品→销量→库存→销售周期→物流→告警 一键全套"},
       {workflow: "wf1_stock_v2",       icon: "📦", label: "刷库存（ERP 6 仓）",    hint: "拉所有仓库存，写 wf1_stock"},
       {workflow: "wf2_sales_v2",       icon: "📈", label: "刷销量价格（ERP）",    hint: "拉销量价格 6 时间窗，写 wf2_sku"},
       {workflow: "wf5_sales_cycle_v2", icon: "🧮", label: "重算销售周期 + 补货",   hint: "用现有 wf2/wf1/wf3 数据重算 wf5"},
+      {workflow: "wf3_logistics_v2",   icon: "🚚", label: "刷物流在途（stub）",    hint: "当前 stub：占位 listed SKU；接 noon Order API 后真填"},
+      {workflow: "wf6_alerts_v2",      icon: "⚠️", label: "扫物流告警",            hint: "依赖 wf3 真数据；无源时不出新告警"},
     ],
     running: null,
     lastMsg: "",

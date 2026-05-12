@@ -465,21 +465,21 @@ def _run_pipeline_v2(task_id: str, file_paths: list, tenant_id: int,
         try:
             # 设 tenant context（PG RLS 用；SQLite 也无害）
             data.set_current_tenant(tenant_id)
-            from scripts import ingest_noon_csv_v2
-            import sqlite3
-            conn = sqlite3.connect(data.DB_PATH)
+            from hipop.scripts import ingest_noon_csv_v2  # noqa: 用 hipop.* 路径避免 sys.modules 双实例
             total = 0
-            for p in file_paths:
-                if "Inventory" in os.path.basename(p):
-                    continue  # noon Inventory CSV 走 wf1（暂未 v2 化）
-                try:
-                    n = ingest_noon_csv_v2.process_csv_v2(tenant_id, p, conn)
-                    total += n or 0
-                except Exception as e:
-                    data.write_event(task_id, 3, "解析 + 入库", "error",
-                                     f"{os.path.basename(p)}: {e}")
-                    failed = True
-            conn.close()
+            # 关键：用 data.conn() 走 PG 模式时是 _PGConnWrapper（自动转 ?→%s）；
+            # 之前直接 sqlite3.connect(data.DB_PATH) 会让 PG 模式数据写本地 SQLite 文件，无声丢失
+            with data.conn() as conn:
+                for p in file_paths:
+                    if "Inventory" in os.path.basename(p):
+                        continue  # noon Inventory CSV 走 wf1（暂未 v2 化）
+                    try:
+                        n = ingest_noon_csv_v2.process_csv_v2(tenant_id, p, conn)
+                        total += n or 0
+                    except Exception as e:
+                        data.write_event(task_id, 3, "解析 + 入库", "error",
+                                         f"{os.path.basename(p)}: {e}")
+                        failed = True
             if not failed:
                 data.write_event(task_id, 3, f"解析 + 入库", "done",
                                  f"累计 {total} 行 (tenant={tenant_id})")
@@ -491,19 +491,18 @@ def _run_pipeline_v2(task_id: str, file_paths: list, tenant_id: int,
             # 聚合销量到 wf2_sku.sales_*
             data.write_event(task_id, 4, "聚合销量窗口", "started")
             try:
-                import sqlite3
-                conn = sqlite3.connect(data.DB_PATH)
-                # 拿该 tenant 的所有 entity_alias
-                aliases = [r[0] for r in conn.execute(
-                    "SELECT DISTINCT entity_alias FROM wf2_orders WHERE tenant_id=?",
-                    (tenant_id,)
-                ).fetchall()]
-                from scripts.ingest_noon_csv_v2 import aggregate_sales_v2
-                total_skus = 0
-                for alias in aliases:
-                    n = aggregate_sales_v2(tenant_id, alias, conn)
-                    total_skus += n
-                conn.close()
+                with data.conn() as conn:
+                    # 拿该 tenant 的所有 entity_alias
+                    aliases = [r[0] if not isinstance(r, dict) else r["entity_alias"]
+                               for r in conn.execute(
+                        "SELECT DISTINCT entity_alias FROM wf2_orders WHERE tenant_id=?",
+                        (tenant_id,)
+                    ).fetchall()]
+                    from hipop.scripts.ingest_noon_csv_v2 import aggregate_sales_v2
+                    total_skus = 0
+                    for alias in aliases:
+                        n = aggregate_sales_v2(tenant_id, alias, conn)
+                        total_skus += n
                 data.write_event(task_id, 4, "聚合销量窗口", "done",
                                  f"刷新 {total_skus} 个 SKU 的 sales_*d")
             except Exception as e:
@@ -598,14 +597,28 @@ WORKFLOW_REGISTRY = {
           "workflows.wf_sales_cycle:run_v2")],
         ["sales", "replenish"],
     ),
-    # 全套：商品+销量+库存+销售周期 一键跑
+    # 物流：v2 stub — 当前给 listed SKU 写占位行；等接 noon Order Tracking API 后真填
+    "wf3_logistics_v2": (
+        "物流在途占位（v2 stub，等接 noon Order Tracking）",
+        [(1, "占位 wf3_logistics_hub_v2 行", "workflows.wf3_logistics_v2:run_v2")],
+        ["logistics"],
+    ),
+    "wf6_alerts_v2": (
+        "物流告警生成（v2，依赖 wf3 真数据）",
+        [(1, "扫 wf3_logistics_hub_v2 → 生成告警",
+          "workflows.wf6_alerts_v2:run_v2")],
+        ["logistics", "replenish"],
+    ),
+    # 全套：商品+销量+库存+销售周期+物流占位+告警 一键跑
     "refresh_all_v2": (
-        "完整刷新（商品→销量→库存→销售周期）",
+        "完整刷新（商品→销量→库存→销售周期→物流→告警）",
         [
             (1, "ERP 商品库", "scripts.ingest_erp_products_v2:run_v2"),
             (2, "ERP 销量价格", "scripts.ingest_erp_sales_v2:run_v2"),
             (3, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
             (4, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
+            (5, "物流在途占位", "workflows.wf3_logistics_v2:run_v2"),
+            (6, "物流告警", "workflows.wf6_alerts_v2:run_v2"),
         ],
         ["sales", "replenish", "logistics"],
     ),

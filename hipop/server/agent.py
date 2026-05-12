@@ -214,11 +214,13 @@ TOOLS = [
         "description": (
             "异步触发后台工作流（耗时操作，立即返回 task_id 让前端订 SSE 进度）。\n"
             "**只可选以下 v2 workflow（per-tenant，会用 onboarding 存的加密 ERP 凭据 headless 登录拉数）**：\n"
-            "- refresh_all_v2：全量刷新（商品→销量→库存→销售周期），用户说『拉/同步/刷』全部数据时优先用\n"
+            "- refresh_all_v2：全量刷新（商品→销量→库存→销售周期→物流→告警），用户说『拉/同步/刷』全部数据时优先用\n"
             "- wf2_products_v2：只拉 ERP 商品库（写 wf2_sku）\n"
             "- wf2_sales_v2：拉商品库 + 销量价格 6 时间窗（写 wf2_sku）\n"
             "- wf1_stock_v2：拉 ERP 6 仓库存（写 wf1_stock）\n"
             "- wf5_sales_cycle_v2：基于现有 wf2/wf1/wf3 数据重算销售周期 + 补货决策\n"
+            "- wf3_logistics_v2：物流在途占位（当前 stub —— 真接 noon Order Tracking 前只写占位行）\n"
+            "- wf6_alerts_v2：物流告警（依赖 wf3 真数据，无源时不出 alert）\n"
             "用户说『拉/同步/刷新/重算/跑』数据时调本工具。**严禁选 v2 之外的 workflow，老 workflow 只读全局 env，会让多租户用户必崩**。\n"
             "**重要**：如果用户原始问题需要等数据跑完才能答（如『我该补货吗』而 wf5 陈旧），"
             "在 followup_prompt 填上『需要等工作流跑完后接续答的问题』，前端会在 task 完成后自动重发一轮 chat，"
@@ -230,7 +232,8 @@ TOOLS = [
                 "workflow": {
                     "type": "string",
                     "enum": ["refresh_all_v2", "wf2_products_v2", "wf2_sales_v2",
-                             "wf1_stock_v2", "wf5_sales_cycle_v2"],
+                             "wf1_stock_v2", "wf5_sales_cycle_v2",
+                             "wf3_logistics_v2", "wf6_alerts_v2"],
                 },
                 "followup_prompt": {
                     "type": "string",

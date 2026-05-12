@@ -22,7 +22,13 @@ from ingest_noon_csv import (
     build_header_index, get_col, parse_money, parse_date,
     country_from_filename,
 )
-from sales_entity_v2 import get_entity_by_country
+# 走包路径，避免 sys.modules 双实例导致 contextvar 不共享（PG RLS 会拒）
+import importlib
+try:
+    _sev2 = importlib.import_module("hipop.scripts.sales_entity_v2")
+    get_entity_by_country = _sev2.get_entity_by_country
+except ModuleNotFoundError:
+    from sales_entity_v2 import get_entity_by_country  # type: ignore
 
 
 def process_csv_v2(tenant_id: int, path: str, conn,
