@@ -48,35 +48,70 @@ def _get_creds(tenant_id: int) -> Optional[tuple]:
 
 
 def _login_headless(username: str, password: str, erp_url: str) -> Optional[str]:
-    """用密码 headless 登 ERP，拦截 erp-api 请求拿 Bearer token。"""
+    """用密码 headless 登 ERP，拦截 erp-api 请求拿 Bearer token。
+    伪装真实 Chrome（user-agent + viewport），绕 dbuyerp 对 HeadlessChrome 的风控。"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise RuntimeError("playwright 未装：pip install playwright && playwright install chromium")
 
-    captured = {"token": None}
+    REAL_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+    captured = {"token": None, "after_url": "", "errors": []}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent=REAL_UA,
+            viewport={"width": 1280, "height": 800},
+            locale="zh-CN",
+        )
+        page = ctx.new_page()
+        # 抹掉 navigator.webdriver
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
         page.on("request", lambda r: captured.update(
             {"token": r.headers["authorization"].replace("Bearer ", "")}
         ) if r.headers.get("authorization", "").startswith("Bearer ")
           and "erp-api" in r.url and not captured["token"] else None)
+        page.on("response", lambda r: captured["errors"].append(
+            f"{r.status} {r.url[:80]}"
+        ) if r.status >= 400 and "dbuyerp" in r.url else None)
 
         try:
             page.goto(erp_url, wait_until="networkidle", timeout=20000)
-            page.fill('input[placeholder="Username"]', username)
-            page.fill('input[placeholder="Password"]', password)
+            # dbuyerp 是中文界面 placeholder=账号/密码；老 hipop 内部账号 UA 下可能给英文
+            # 用 OR selector + name 兜底
+            page.fill(
+                'input[name="username"], input[placeholder="账号"], input[placeholder="Username"]',
+                username,
+            )
+            page.fill(
+                'input[name="password"], input[placeholder="密码"], input[placeholder="Password"]',
+                password,
+            )
             page.keyboard.press("Enter")
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(5000)
+            captured["after_url"] = page.url
             # 进任意内页让 ERP-API 真发起请求
             page.goto(erp_url + "/#/system/delivery/list",
                       wait_until="networkidle", timeout=20000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
         except Exception as e:
-            print(f"[erp_auth] login error: {e}")
+            captured["errors"].append(f"playwright error: {e}")
         finally:
+            ctx.close()
             browser.close()
+
+    if not captured["token"]:
+        # 关键诊断信息（之前是静默 None）
+        print(
+            f"[erp_auth] login FAILED for user={username!r} url={erp_url!r}: "
+            f"after_submit_url={captured['after_url']!r} errors={captured['errors'][:5]}"
+        )
     return captured["token"]
 
 
