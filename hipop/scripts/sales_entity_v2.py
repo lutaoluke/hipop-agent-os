@@ -43,6 +43,7 @@ T_LOGISTICS_ALERTS = "wf6_logistics_alerts_v2"
 # ── tenant 配置：sales_entities 表 CRUD ────────────────
 def list_entities_for_tenant(tenant_id: int) -> List[Dict]:
     """返回某租户配置的全部销售主体。"""
+    _data.set_current_tenant(tenant_id)  # 兜底，让 PG RLS USING 子句通过
     rows = _data._fetch(
         "SELECT id, tenant_id, alias, country, platform, store_name AS store, "
         "store_id, currency, feishu_table_id, feishu_decisions_table_id, "
@@ -54,6 +55,7 @@ def list_entities_for_tenant(tenant_id: int) -> List[Dict]:
 
 
 def get_entity(tenant_id: int, alias: str) -> Optional[Dict]:
+    _data.set_current_tenant(tenant_id)
     rows = _data._fetch(
         "SELECT id, tenant_id, alias, country, platform, store_name AS store, "
         "store_id, currency FROM sales_entities WHERE tenant_id=? AND alias=? AND active=1",
@@ -64,6 +66,7 @@ def get_entity(tenant_id: int, alias: str) -> Optional[Dict]:
 
 def get_entity_by_country(tenant_id: int, country: str) -> Optional[Dict]:
     """按国别拿（CSV ingest 路由用）。"""
+    _data.set_current_tenant(tenant_id)
     rows = _data._fetch(
         "SELECT id, tenant_id, alias, country, platform, store_name AS store, "
         "store_id, currency FROM sales_entities "
