@@ -360,20 +360,35 @@ def collect_sku_orders(sku, token):
     return in_transit, completed
 
 # ── 主入口 ─────────────────────────────────────────────────
-def analyze_skus(skus, write_db=True, verbose=True):
-    """对若干 SKU 分析物流情况，写入 wf3_logistics_hub。返回 list of sku_record。"""
+def analyze_skus(skus, write_db=True, verbose=True, max_workers: int = 6):
+    """对若干 SKU 分析物流情况，写入 wf3_logistics_hub。返回 list of sku_record。
+
+    max_workers：阶段 1 ERP 拉单并发 worker 数。默认 6（ERP API 抗住 6 并发不限流；
+    单线程 255 SKU ≈ 15-20 分钟，6 并发 ≈ 3-4 分钟）。
+    """
     if write_db:
         ensure_schema()
     token = get_erp_token()
 
-    # 阶段 1：ERP 全量拉单
-    if verbose: print("=== 阶段 1：ERP 拉单 ===")
+    # 阶段 1：ERP 全量拉单（并发 ThreadPool — 单 SKU 内多个 HTTP 也是 IO-bound）
+    if verbose: print(f"=== 阶段 1：ERP 拉单（{len(skus)} SKU × {max_workers} 并发）===")
     sku_orders = {}
-    for sku in skus:
-        in_t, cp = collect_sku_orders(sku, token)
-        sku_orders[sku] = (in_t, cp)
-        if verbose:
-            print(f"  {sku}: 在途 {len(in_t)} | 已完成 {len(cp)}")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_sku = {ex.submit(collect_sku_orders, sku, token): sku for sku in skus}
+        done = 0
+        for fut in as_completed(future_to_sku):
+            sku = future_to_sku[fut]
+            done += 1
+            try:
+                in_t, cp = fut.result()
+                sku_orders[sku] = (in_t, cp)
+                if verbose and (done % 20 == 0 or len(in_t) > 0):
+                    print(f"  [{done}/{len(skus)}] {sku}: 在途 {len(in_t)} | 已完成 {len(cp)}", flush=True)
+            except Exception as e:
+                sku_orders[sku] = ([], [])
+                if verbose:
+                    print(f"  [{done}/{len(skus)}] {sku}: ERROR {e}", flush=True)
 
     # 阶段 2：物流站抓节点（共享浏览器）
     if verbose: print("\n=== 阶段 2：物流站抓节点 ===")
