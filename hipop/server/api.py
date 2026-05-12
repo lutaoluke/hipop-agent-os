@@ -599,12 +599,13 @@ WORKFLOW_REGISTRY = {
     ),
     # 物流：v2 stub — 当前给 listed SKU 写占位行；等接 noon Order Tracking API 后真填
     "wf3_logistics_v2": (
-        "物流在途占位（v2 stub，等接 noon Order Tracking）",
-        [(1, "占位 wf3_logistics_hub_v2 行", "workflows.wf3_logistics_v2:run_v2")],
+        "扫 ERP 物流（近 60 天有销量 SKU，约 30 分钟）",
+        [(1, "ERP 拉单 + 物流站抓节点 + 写 wf3_logistics_hub_v2",
+          "workflows.wf3_logistics_v2:run_v2")],
         ["logistics"],
     ),
     "wf6_alerts_v2": (
-        "物流告警生成（v2，依赖 wf3 真数据）",
+        "物流告警生成（依赖 wf3 真数据）",
         [(1, "扫 wf3_logistics_hub_v2 → 生成告警",
           "workflows.wf6_alerts_v2:run_v2")],
         ["logistics", "replenish"],

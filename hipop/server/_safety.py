@@ -115,6 +115,19 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
     if promise_notify and "notify_via_feishu" not in tools_used:
         warnings.append("⚠️ Agent 宣称已通知/发飞书，但没调 notify_via_feishu — 这是 hallucinate")
 
+    # "已触发 / 已启动 / 再次触发 wf*" → 检查是否真调了 run_workflow
+    promise_workflow = re.search(
+        r"(已触发|已启动|已开始|再次触发|已经在.{0,5}(后台|跑)|"
+        r"任务.{0,10}(提交|启动)|已让.{0,5}系统|系统已经在.{0,5}后台|后台跑了)",
+        reply,
+    )
+    if promise_workflow and "run_workflow" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 宣称已触发/启动工作流，但本轮没真调 run_workflow tool — "
+            "这是 hallucinate（实际没创建后台任务，请重发"
+            "『帮我扫一下 ERP 物流』之类更明确的指令）"
+        )
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"

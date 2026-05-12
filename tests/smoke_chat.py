@@ -177,6 +177,26 @@ CASES: List[Case] = [
             "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
         ],
     ),
+    # ─── 用户用"扫"措辞（Luke 真实场景）───
+    Case(
+        name="扫 ERP 物流（用户口语，必走 run_workflow）",
+        question="你扫下 erp 物流信息",
+        must_use_tools=["run_workflow"],
+        must_warn=False,  # 真调了 tool 就不会触发 _safety 警告
+        must_not_contain=[
+            "再次触发",                          # 别假装上次已触发
+            "已经在.{0,5}后台",                  # 别假装在跑
+            "可能.{0,5}还没.{0,5}跑完",          # 别编上次状态
+        ],
+    ),
+    # ─── 防 Agent "已触发" 撒谎：故意问个不需要触发的问题，看 Agent 别瞎说"已触发"───
+    Case(
+        name="只查不触发（必不出现已触发字样）",
+        question="今天是几号",
+        must_not_contain=[
+            "已触发", "已启动", "已开始", "后台.{0,5}跑",
+        ],
+    ),
 ]
 
 
