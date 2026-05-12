@@ -21,7 +21,13 @@ from typing import List, Dict, Optional, Tuple
 # data 模块在 server 包里
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # hipop/
-from server import data as _data
+# 强制走 hipop.server.data 同一个 module 实例（避免 sys.path hack 导致 contextvar 不共享，
+# 否则 RLS 上下文与 FastAPI 请求里的不是同一个，会被 RLS 拒绝）。
+import importlib
+try:
+    _data = importlib.import_module("hipop.server.data")
+except ModuleNotFoundError:
+    from server import data as _data  # 仅 CLI 直跑时回退
 
 
 # ── 表名常量（v2 列存版）───────────────────────────────
@@ -90,19 +96,27 @@ def upsert_entity(
             )
             c.commit()
         return existing["id"]
+    is_pg = _data.is_postgres()
+    sql = (
+        "INSERT INTO sales_entities "
+        "(tenant_id, alias, country, platform, store_name, store_id, currency, "
+        "feishu_table_id, feishu_decisions_table_id, feishu_stock_table_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)"
+        + (" RETURNING id" if is_pg else "")
+    )
+    # 兜底 set RLS 上下文 — 避免 ContextVar 在 sys.path 双 module / 跨线程场景下丢失
+    _data.set_current_tenant(tenant_id)
     with _data.conn() as c:
         cur = c.execute(
-            "INSERT INTO sales_entities "
-            "(tenant_id, alias, country, platform, store_name, store_id, currency, "
-            "feishu_table_id, feishu_decisions_table_id, feishu_stock_table_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            sql,
             (tenant_id, alias, country, platform, store_name, store_id, currency,
              feishu_table_id, feishu_decisions_table_id, feishu_stock_table_id),
         )
-        c.commit()
-        if _data.is_postgres():
+        if is_pg:
             row = cur.fetchone()
+            c.commit()
             return row["id"] if isinstance(row, dict) else row[0]
+        c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 

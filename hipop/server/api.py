@@ -124,14 +124,18 @@ def api_onboarding_finish(body: dict, user: dict = Depends(_auth_mod.get_current
         saved_entities.append({"id": eid, "alias": alias, "store": store,
                                 "country": e.get("country"), "store_id": e.get("store_id")})
 
-    # 2. ERP 凭据加密存
+    # 2. ERP 凭据加密存（用 ON CONFLICT 让 SQLite/PG 都兼容）
     erp_configured = False
     if erp.get("username") and erp.get("password"):
         with data.conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO tenant_erp_credentials "
+                "INSERT INTO tenant_erp_credentials "
                 "(tenant_id, erp_kind, erp_url, username_enc, password_enc, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime')) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET "
+                "erp_kind=EXCLUDED.erp_kind, erp_url=EXCLUDED.erp_url, "
+                "username_enc=EXCLUDED.username_enc, password_enc=EXCLUDED.password_enc, "
+                "updated_at=EXCLUDED.updated_at",
                 (tenant_id, erp.get("kind", "dbuyerp"),
                  erp.get("url", "https://www.dbuyerp.com"),
                  _crypto.encrypt(erp["username"]),
@@ -145,12 +149,16 @@ def api_onboarding_finish(body: dict, user: dict = Depends(_auth_mod.get_current
     if feishu.get("webhook") or feishu.get("app_secret") or feishu.get("base_id"):
         with data.conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO tenant_feishu_credentials "
+                "INSERT INTO tenant_feishu_credentials "
                 "(tenant_id, app_id, app_secret_enc, webhook_enc, bitable_base_id, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime')) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET "
+                "app_id=EXCLUDED.app_id, app_secret_enc=EXCLUDED.app_secret_enc, "
+                "webhook_enc=EXCLUDED.webhook_enc, bitable_base_id=EXCLUDED.bitable_base_id, "
+                "updated_at=EXCLUDED.updated_at",
                 (tenant_id, feishu.get("app_id"),
-                 _crypto.encrypt(feishu.get("app_secret")),
-                 _crypto.encrypt(feishu.get("webhook")),
+                 _crypto.encrypt(feishu.get("app_secret")) if feishu.get("app_secret") else None,
+                 _crypto.encrypt(feishu.get("webhook")) if feishu.get("webhook") else None,
                  feishu.get("base_id")),
             )
             c.commit()
@@ -271,6 +279,67 @@ def api_selection(store: str):
         "strategies": data.get_selection_strategies(),
         "message": "选品 Agent 在工程化中（见 plans/productization.md 阶段 2）",
     }
+
+
+# ── N7: 1688 图搜找同款 ──────────────────────────────────
+@router.post("/n7/image-search")
+def api_n7_image_search(body: dict):
+    """N7 1688 主站图搜. body: {image_url, pack?, material?, title?}.
+
+    cookies 由 cookies_manager 自动管理 (失活时无头续期). 失败 query 给 fallback_keywords.
+    """
+    from selection.l3_orchestration.nodes.n7_1688_supply import run_query
+    image_url = (body or {}).get("image_url", "").strip()
+    if not image_url:
+        raise HTTPException(400, "image_url required")
+    query = {
+        "idx": 0,
+        "title": (body or {}).get("title") or "",
+        "image_url": image_url,
+        "pack": (body or {}).get("pack", 1) or 1,
+        "material": (body or {}).get("material"),
+    }
+    try:
+        result = run_query(query, cookies=None)
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    if result.error:
+        raise HTTPException(500, result.error)
+    top = result.offers[:10]
+    return {
+        "found": result.found,
+        "yolocrop": "OFF" if not result.yolocrop_used else "ON",
+        "failed": result.failed,
+        "fallback_keywords": result.fallback_keywords,
+        "candidates": [
+            {
+                "offer_id": o.get("offer_id"),
+                "title": o.get("title"),
+                "price_cny": o.get("price"),
+                "company": o.get("company"),
+                "city": o.get("city"),
+                "province": o.get("province"),
+                "verdict": o.get("verdict"),
+                "combined_score": round(o.get("combined_score") or 0, 3),
+                "cos_score": round(o.get("cos_score") or 0, 3),
+                "material": o.get("material"),
+                "warning_flags": o.get("warning_flags") or [],
+                "offer_pic": o.get("offer_pic_url"),
+                "open_url": f"https://detail.1688.com/offer/{o.get('offer_id')}.html",
+                "repurchase_rate": o.get("repurchase_rate"),
+                "min_quantity": o.get("min_quantity"),
+                "win_port_url": o.get("win_port_url"),
+            }
+            for o in top
+        ],
+    }
+
+
+@router.get("/n7/cookies-status")
+def api_n7_cookies_status():
+    """供前端 / 监控查 1688 cookies 当前状态."""
+    from selection.l0_data.api_clients.cookies_manager import status
+    return status()
 
 
 @router.get("/marketing/{store}")
