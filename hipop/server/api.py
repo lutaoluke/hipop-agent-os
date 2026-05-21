@@ -807,6 +807,9 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
     try:
         out = await asyncio.get_event_loop().run_in_executor(None, agent.chat, messages, scope)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[chat error] {tb}", flush=True)
         err = f"⚠️ chat error: {e}"
         data.write_chat_message(store, "agent", "Agent", err, tag="error")
         return JSONResponse({"reply": err, "references": [], "action_id": None}, status_code=200)
