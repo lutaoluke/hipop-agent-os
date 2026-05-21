@@ -119,6 +119,12 @@ def spawn_task(
         )
         c.commit()
 
+    # observability
+    try:
+        from . import observability as _obs
+        _obs.task_lifecycle("spawned", task_id, workflow, tenant_id, worker_pid=pid)
+    except Exception: pass
+
     return task_id
 
 
@@ -167,6 +173,15 @@ def wake_task(task_id: str) -> dict:
             (new_pid, task_id),
         )
         c.commit()
+
+    # observability — wake 是关键运维事件
+    try:
+        from . import observability as _obs
+        _obs.task_lifecycle("waked", task_id, row["workflow"], row.get("tenant_id") or 0,
+                             new_pid=new_pid, old_pid=old_pid,
+                             wake_count=row["wake_count"] + 1)
+    except Exception: pass
+
     return {"ok": True, "task_id": task_id, "new_pid": new_pid,
             "wake_count": row["wake_count"] + 1}
 

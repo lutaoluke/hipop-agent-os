@@ -810,6 +810,12 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
         import traceback
         tb = traceback.format_exc()
         print(f"[chat error] {tb}", flush=True)
+        try:
+            from . import observability as _obs
+            _obs.track_error(e, context={"endpoint": "/api/chat", "scope": scope,
+                                            "last_user_msg": (messages[-1].get("content") if messages else "")[:200]},
+                              severity="error")
+        except Exception: pass
         err = f"⚠️ chat error: {e}"
         data.write_chat_message(store, "agent", "Agent", err, tag="error")
         return JSONResponse({"reply": err, "references": [], "action_id": None}, status_code=200)

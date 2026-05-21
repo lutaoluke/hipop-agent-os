@@ -73,8 +73,21 @@ def _finish(task_id: str, state: str, summary: str = "",
                 else:
                     state = "done_unverified"
                     summary = f"{summary} | verify ✗ FAIL ({v['verdict']}; {evidence_str})"
+                    # observability: verify failed 是关键事件，要观测
+                    try:
+                        from hipop.server import observability as _obs
+                        _obs.verify_failed(task_id, workflow, tenant_id,
+                                            verdict=v["verdict"], evidence=v.get("evidence", {}))
+                    except Exception: pass
         except Exception as e:
             summary = f"{summary} | verify error: {type(e).__name__}: {str(e)[:120]}"
+
+    # observability: task 终结事件（done/done_unverified/error）
+    try:
+        from hipop.server import observability as _obs
+        _obs.task_lifecycle(state, task_id, workflow or "?", tenant_id or 0,
+                             summary=summary[:200])
+    except Exception: pass
 
     _data.set_current_tenant_to_task(task_id)
     with _data.conn() as c:
