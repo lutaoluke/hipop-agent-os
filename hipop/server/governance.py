@@ -393,6 +393,86 @@ def _check_deterministic_preconditions(proposal: ActionProposal) -> Optional[str
 
 _TOKEN_TTL_SEC = int(os.environ.get("EXEC_TOKEN_TTL_SEC", "30"))
 
+_PROPOSALS_DIR = Path(os.environ.get(
+    "HIPOP_PROPOSALS_DIR", os.path.expanduser("~/hipop/proposals")
+))
+_PROPOSAL_TTL_SEC = int(os.environ.get("PROPOSAL_TTL_SEC", "300"))  # 5 min
+
+
+def _save_pending_proposal(proposal: ActionProposal, decision: Decision) -> None:
+    """AskUser 时持久化 proposal，等用户回 OK 时读出来 execute。"""
+    _PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
+    p = _PROPOSALS_DIR / f"{proposal.proposal_id}.json"
+    with open(p, "w") as f:
+        json.dump({
+            "proposal": proposal.to_dict(),
+            "decision": asdict(decision),
+            "expires_at": time.time() + _PROPOSAL_TTL_SEC,
+        }, f, ensure_ascii=False, default=str, indent=2)
+
+
+def _load_pending_proposal(proposal_id: str) -> Optional[dict]:
+    """读暂存的 proposal。返回 None 如果不存在 / 过期。"""
+    p = _PROPOSALS_DIR / f"{proposal_id}.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if data.get("expires_at", 0) < time.time():
+        try: p.unlink()
+        except Exception: pass
+        return None
+    return data
+
+
+def confirm_proposal(proposal_id: str, user_decision: str, actor: dict, tool_funcs: dict) -> dict:
+    """用户在 chat 回 "OK" / "cancel" 后，由 chat tool 调本函数推进。
+
+    - user_decision='ok'     → issue_token + execute_with_token
+    - user_decision='cancel' → 写 denied record，删暂存
+    """
+    data = _load_pending_proposal(proposal_id)
+    if not data:
+        return {"error": "proposal_not_found_or_expired",
+                "proposal_id": proposal_id,
+                "hint": "proposal 5 分钟内有效；超时请用原 query 重新发起"}
+
+    proposal_data = data["proposal"]
+    # 验 actor 是同一个用户（防越权 confirm 别人的 proposal）
+    if proposal_data["actor"].get("user_id") != actor.get("user_id"):
+        return {"error": "actor_mismatch",
+                "reason": f"only original proposer can confirm; "
+                          f"proposal user_id={proposal_data['actor'].get('user_id')}, "
+                          f"current user_id={actor.get('user_id')}"}
+
+    proposal = ActionProposal(**{
+        k: v for k, v in proposal_data.items()
+        if k in ActionProposal.__dataclass_fields__
+    })
+
+    p = _PROPOSALS_DIR / f"{proposal_id}.json"
+    try: p.unlink()
+    except Exception: pass
+
+    if user_decision.lower() in ("cancel", "no", "不要", "取消"):
+        write_execution_record(
+            proposal,
+            token=ExecToken(token_id="-", proposal_id=proposal_id,
+                             tool_name=proposal.tool_name, boundary={}, expires_at=0, issued_at=0),
+            result=None, status="cancelled_by_user",
+            error="用户取消",
+        )
+        return {"action_type": "cancelled", "proposal_id": proposal_id,
+                "message": "已取消"}
+
+    # OK → issue token + execute
+    fake_decision = Decision(kind="Allow", reason="user_confirmed")
+    token = issue_token(proposal, fake_decision)
+    return execute_with_token(proposal, token, tool_funcs)
+
 
 def issue_token(proposal: ActionProposal, decision: Decision) -> ExecToken:
     """Allow 后立刻 issue ExecToken。boundary = bound_args 全锁定。"""
@@ -495,7 +575,8 @@ def propose_and_execute(
         return execute_with_token(proposal, token, tool_funcs)
 
     if decision.kind == "AskUser":
-        # 不执行，给 chat 一个 plan 让用户确认
+        # 持久化 proposal 等用户回 OK（5 min TTL）
+        _save_pending_proposal(proposal, decision)
         return {
             "action_type": "plan",
             "needs_user_confirmation": True,

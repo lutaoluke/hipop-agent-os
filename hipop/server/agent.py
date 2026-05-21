@@ -244,6 +244,25 @@ TOOLS = [
         },
     },
     {
+        "name": "confirm_proposal",
+        "description": (
+            "用户已确认 / 取消之前 destructive 行动的 Plan。\n"
+            "**触发时机**：上一轮你给用户返了 plan_text（action_type='plan'），用户回复 'OK / 是 / 确认' "
+            "或 '取消 / 不要 / no'，本轮必须调本工具推进。\n"
+            "**绝不要**自己再次调原 destructive tool（governance pipeline 会拒）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string",
+                                 "description": "上一轮 plan 返回的 proposal_id"},
+                "user_decision": {"type": "string", "enum": ["ok", "cancel"],
+                                   "description": "用户的最终决定"},
+            },
+            "required": ["proposal_id", "user_decision"],
+        },
+    },
+    {
         "name": "query_1688_similar",
         "description": (
             "拿一张 noon/amazon 商品图片 URL, 走 1688 主站图搜找同款 + 比价. "
@@ -675,6 +694,20 @@ def tool_query_1688_similar(image_url: str, pack: int = 1,
     }
 
 
+def _tool_confirm_proposal(proposal_id: str, user_decision: str) -> Dict:
+    """confirm_proposal tool 实现 — 用 chat scope 当前 user 验签 + 走 governance.confirm_proposal."""
+    from . import governance as _gov
+    sc = _chat_scope.get() or {}
+    actor = {
+        "user_id": sc.get("user_id"),
+        "email": sc.get("current_user_email") or sc.get("current_user"),
+        "role": sc.get("current_role"),
+        "tenant_id": sc.get("tenant_id") or _get_tenant(),
+        "source": "chat",
+    }
+    return _gov.confirm_proposal(proposal_id, user_decision, actor, TOOL_FUNCS)
+
+
 # ── Tool 派发 ─────────────────────────────────────────
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
@@ -689,6 +722,7 @@ TOOL_FUNCS = {
     "navigate_user_to": tool_navigate_user_to,
     "notify_via_feishu": tool_notify_via_feishu,
     "run_workflow": tool_run_workflow,
+    "confirm_proposal": lambda proposal_id, user_decision: _tool_confirm_proposal(proposal_id, user_decision),
     "query_1688_similar": tool_query_1688_similar,
 }
 
@@ -795,6 +829,13 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent，工作在共同
    - 用户连发两次同一指令时，**不要**假设"上次已触发了"（你不知道上次有没有真触发）—— 重新调 run_workflow 一次，最多重复了一次，比让用户以为任务在跑实际没跑要好
    - 禁说"这个需要组长/管理员账号才能触发" / "我没有权限" / "Agent 当前没有权限" —— 你已经被赋予 run_workflow，能跑就跑；只有 tool 真返回 `permission_denied` 才能这么回
    - 禁说"在工作台 sidebar 找到 X → 点 Y" —— 这种 UI 路径几乎必编错；直接 run_workflow 就对了
+
+**3c. destructive tool 返回 `action_type='plan'` 时 — Explore→Plan→Implement 三段**
+   - 高风险 destructive（update_alert_status 改物流告警 / 等）走治理 pipeline，第一次调返 `{action_type:'plan', plan_text:..., proposal_id:'xxx'}`
+   - 你必须**原文转告 plan_text 给用户**，让用户回 OK / 不要 / 改
+   - 用户回 "OK / 是 / 确认" → 本轮必须调 `confirm_proposal(proposal_id='xxx', user_decision='ok')`
+   - 用户回 "不要 / 取消 / no" → 调 `confirm_proposal(proposal_id='xxx', user_decision='cancel')`
+   - **绝不要**自己再次调原 destructive tool（governance 会拒）
 
 **4. 用户报告状态变化时（如"我刷新了"、"我上传了"），必须重新调 tool 验证**
    - 不要直接信用户的报告就回"已确认更新"
