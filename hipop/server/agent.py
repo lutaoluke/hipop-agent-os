@@ -694,7 +694,13 @@ TOOL_FUNCS = {
 
 
 def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
-    """tool 执行前先过 RBAC（user.role → 是否允许这个 tool）。"""
+    """tool 执行前先过 RBAC + governance pipeline。
+
+    - RBAC: user.role → tool 入口权限
+    - Governance (Phase 0.2 半 MSCL): destructive tool 走
+      ActionProposal → Decision (Haiku) → ExecToken → Execute → ExecutionRecord
+      read-only tool 跳过 governance，直调
+    """
     try:
         from . import rbac as _rbac
         if user and not _rbac.tool_allowed(user, name):
@@ -704,10 +710,23 @@ def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
                 "user_role": user.get("role"),
                 "message": f"当前角色 {user.get('role')} 不能调用 {name}（请向 owner/manager 申请权限）",
             }
+        if name not in TOOL_FUNCS:
+            return {"error": f"unknown tool: {name}"}
+        # ── Governance pipeline（仅 destructive） ──
+        from . import governance as _gov
+        if _gov.is_destructive(name):
+            sc = _chat_scope.get() or {}
+            actor = {
+                "user_id": (user or {}).get("id") or sc.get("user_id"),
+                "email": (user or {}).get("email") or sc.get("current_user_email"),
+                "role": (user or {}).get("role") or sc.get("current_role"),
+                "tenant_id": (user or {}).get("tenant_id") or sc.get("tenant_id") or _get_tenant(),
+                "source": sc.get("source") or "chat",
+            }
+            return _gov.propose_and_execute(name, args, actor, sc, TOOL_FUNCS)
+        # read-only 直调
         fn = TOOL_FUNCS[name]
         return fn(**args)
-    except KeyError:
-        return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 

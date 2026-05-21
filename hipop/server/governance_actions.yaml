@@ -1,0 +1,67 @@
+# Action Registry — 半 MSCL 治理（Phase 0.2，2026-05-21）
+#
+# 注册 destructive tool 的语义化行动 schema。read-only tool 不在此列。
+# 跟 Anthropic 范式对应：
+#   Writing Tools for Agents — 显式 schema + actionable error
+#   Agentic Misalignment    — irreversible action 必须 OOB approval（不靠 prompt）
+#   MSCL（Palantir AIP）     — ActionProposal → Decision → ExecToken → ExecutionRecord
+#
+# risk_level:
+#   read       — 只读，不走 pipeline
+#   medium     — 可逆，Decision Agent 单独 OK 即可（auto + Haiku 校验）
+#   high       — 可逆但影响业务链，必须 user 二次确认（Explore→Plan→Implement）
+#   critical   — 不可逆 / 跨 tenant / 大额，必须 OOB approval 推 manager IM 审批
+
+update_alert_status:
+  description: 改 wf6_logistics_alerts_v2 状态（"已确认丢货" 会触发补货 +N）
+  risk_level: high
+  target_object_class: LogisticsAlert
+  target_table: wf6_logistics_alerts_v2
+  required_fields: [order_no, status]
+  allowed_statuses:
+    - 已确认推进
+    - 已确认丢货
+    - 已约仓
+    - 已结案
+    - 处理中
+  preconditions:
+    - "alert exists for actor.tenant_id + order_no"
+    - "alert.resolved_at IS NULL（已结案的不能再改）"
+    - "actor.role in [owner, manager, ops, forwarder]"
+  expected_effects:
+    - "wf6_logistics_alerts.ops_status 状态转移"
+    - "若 status='已确认丢货' → wf5 补货决策自动 +N"
+    - "audit log entry (ExecutionRecord)"
+  irreversible: false   # 改回去 OK，但 wf5 +N 难撤
+  examples:
+    - {order_no: "PDZ0026727", status: "已确认丢货", note: "..."}
+
+run_workflow:
+  description: 触发后台 v2 workflow（拉 ERP / 写业务表）
+  risk_level: medium
+  target_object_class: BackgroundTask
+  target_table: tasks
+  required_fields: [workflow]
+  allowed_workflows:
+    - refresh_all_v2
+    - wf2_products_v2
+    - wf2_sales_v2
+    - wf1_stock_v2
+    - wf5_sales_cycle_v2
+    - wf3_logistics_v2
+    - wf6_alerts_v2
+  preconditions:
+    - "workflow in allowed_workflows"
+    - "actor.role in [owner, manager, ops, forwarder]"
+    - "no other instance of same workflow running for this tenant"
+  expected_effects:
+    - "起一个 subprocess worker"
+    - "5-30 分钟后 wf2_sku/wf1_stock/wf3_hub_v2 等表更新"
+    - "Managed Agents wake() 兜底 — 挂了自愈"
+  irreversible: false   # 跑完不喜欢可以再跑覆盖
+
+# 未来扩展（占位，未启用）：
+# send_inquiry_1688:    # 询盘 — critical（外部副作用 + 不可撤回）
+#   risk_level: critical
+# delete_sales_entity:  # 删 entity — critical
+#   risk_level: critical
