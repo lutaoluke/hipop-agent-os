@@ -244,6 +244,38 @@ TOOLS = [
         },
     },
     {
+        "name": "tenant_notes_get",
+        "description": (
+            "读 tenant 跨 session 沉淀的 NOTES.md（客户偏好 / 业务规则 / 学到的经验）。"
+            "适用：用户问'我的偏好' / '上次我说的 X' / Agent 准备做高风险决策前查 context。"
+            "section 可选；不给返全文。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "section": {"type": "string",
+                             "description": "可选，只返指定 # 标题段（如'补货偏好'/'选品方向'）"},
+            },
+        },
+    },
+    {
+        "name": "tenant_notes_append",
+        "description": (
+            "把用户明确表达的偏好/规则/经验追加到 NOTES.md 跨 session 沉淀。"
+            "**只在用户明确说'以后都这么办' / '记住' / '默认' 等持久化语义时调**，"
+            "不要把每条聊天都写进 NOTES（NOTES.md 要短而高信号，按 Anthropic 哲学）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note": {"type": "string", "description": "要沉淀的一句话规则/偏好"},
+                "section": {"type": "string", "default": "通用",
+                             "description": "归入哪个 # 标题（补货偏好/选品方向/物流规则/通用 等）"},
+            },
+            "required": ["note"],
+        },
+    },
+    {
         "name": "confirm_proposal",
         "description": (
             "用户已确认 / 取消之前 destructive 行动的 Plan。\n"
@@ -694,6 +726,24 @@ def tool_query_1688_similar(image_url: str, pack: int = 1,
     }
 
 
+def _tool_tenant_notes_get(section: str = "") -> Dict:
+    from . import tenant_notes
+    tid = _get_tenant()
+    content = tenant_notes.get_notes(tid, section or None)
+    return {
+        "tenant_id": tid,
+        "section": section or "(全文)",
+        "content": content or "(尚无 NOTES，可用 tenant_notes_append 沉淀)",
+        "sections": tenant_notes.list_sections(tid),
+    }
+
+
+def _tool_tenant_notes_append(note: str, section: str = "通用") -> Dict:
+    from . import tenant_notes
+    tid = _get_tenant()
+    return tenant_notes.append_note(tid, note, section)
+
+
 def _tool_confirm_proposal(proposal_id: str, user_decision: str) -> Dict:
     """confirm_proposal tool 实现 — 用 chat scope 当前 user 验签 + 走 governance.confirm_proposal."""
     from . import governance as _gov
@@ -723,6 +773,8 @@ TOOL_FUNCS = {
     "notify_via_feishu": tool_notify_via_feishu,
     "run_workflow": tool_run_workflow,
     "confirm_proposal": lambda proposal_id, user_decision: _tool_confirm_proposal(proposal_id, user_decision),
+    "tenant_notes_get": lambda section="": _tool_tenant_notes_get(section),
+    "tenant_notes_append": lambda note, section="通用": _tool_tenant_notes_append(note, section),
     "query_1688_similar": tool_query_1688_similar,
 }
 
@@ -1018,6 +1070,10 @@ scope: {scope}
 4. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
 5. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
 6. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
+
+## 长期偏好沉淀
+- 用户明确说"以后都这么办" / "记住" / "默认 X" → 调 tenant_notes_append
+- 高风险决策前可调 tenant_notes_get 看客户既定偏好（按需，不每次都拉）
 
 ## 回答风格
 - 中文 2-4 句一段，给结论 + 简明建议

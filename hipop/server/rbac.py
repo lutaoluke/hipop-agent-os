@@ -55,6 +55,9 @@ TOOL_PERMISSION = {
     "export_table":           "view_dashboard",
     "navigate_user_to":       "view_dashboard",
     "notify_via_feishu":      "view_dashboard",  # stub，真发飞书时改 invite_user
+    "tenant_notes_get":       "view_dashboard",
+    "tenant_notes_append":    "view_dashboard",
+    "confirm_proposal":       "view_dashboard",
 }
 
 
