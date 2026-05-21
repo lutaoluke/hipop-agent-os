@@ -727,14 +727,40 @@ async def api_run_workflow(body: dict, background_tasks: BackgroundTasks,
         raise HTTPException(400, f"unknown workflow: {workflow}. valid: {list(WORKFLOW_REGISTRY)}")
     tenant_id = user.get("tenant_id") or 1
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
-    task_id = uuid4().hex[:8]
     actor = {
         "user_id": user.get("id"),
         "email": user.get("email"),
         "role": user.get("role"),
         "source": (body or {}).get("source") or "ui",
     }
-    background_tasks.add_task(_run_workflow, task_id, workflow, tenant_id, actor)
+    # Managed Agents 架构（2026-05-21 Phase 0.1）：
+    # 不再起 daemon thread（重启 uvicorn 会杀），改成独立 subprocess + 文件式 task state +
+    # watchdog 自动接管 orphan。当前 subprocess pool runner 在 hipop.runtime.workflow_runners 注册。
+    # 只对 runners 里有注册的 workflow 走新架构；老 workflow（wf1_stock / wf2_sales / 等）仍走 daemon
+    # （Phase 0.1 暂不动 — 因为这些 chat tool enum 早砍掉了，仅 ci/test 用）。
+    from hipop.runtime import workflow_runners as _runners
+    from . import runtime as _runtime
+    if workflow in _runners.list_runners():
+        task_id = _runtime.spawn_task(
+            workflow=workflow,
+            tenant_id=tenant_id,
+            actor=actor,
+            spec=(body or {}).get("spec"),
+        )
+        # 同时写 agent_events step 0 done（前端 SSE 渲染 + 审计兼容）
+        data.set_current_tenant(tenant_id)
+        data.write_event(
+            task_id, 0, "初始化", "done",
+            json.dumps({"workflow": workflow, "label": label,
+                        "affected_modules": affected, "total_steps": len(steps),
+                        "tenant_id": tenant_id,
+                        "runtime": "managed_agents"}, ensure_ascii=False),
+            actor=actor,
+        )
+    else:
+        # 老 workflow 走旧 daemon thread（向后兼容）
+        task_id = uuid4().hex[:8]
+        background_tasks.add_task(_run_workflow, task_id, workflow, tenant_id, actor)
     return {
         "task_id": task_id,
         "workflow": workflow,

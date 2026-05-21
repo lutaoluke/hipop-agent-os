@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger("hipop.scheduler")
 
@@ -50,6 +51,34 @@ def _run_daily_refresh():
     logger.info("[cron] daily_refresh finished")
 
 
+def _watchdog_orphan_tasks():
+    """Managed Agents watchdog — 每 1 分钟扫一次 last_heartbeat 超时的 task，自动 wake_task 接管。
+
+    跟 Anthropic Managed Agents 范式对应：harness 死了新 harness 通过 wake(sessionId) 接管。
+    """
+    try:
+        from . import runtime as _runtime
+        orphans = _runtime.find_orphan_tasks()
+        if not orphans:
+            return
+        logger.info("[watchdog] found %d orphan tasks", len(orphans))
+        for t in orphans:
+            tid = t["task_id"]
+            stale = t["stale_sec"]
+            old_pid = t["worker_pid"]
+            logger.warning(
+                "[watchdog] task=%s stale=%ds old_pid=%s → wake_task",
+                tid, stale, old_pid,
+            )
+            try:
+                res = _runtime.wake_task(tid)
+                logger.info("[watchdog] wake result: %s", res)
+            except Exception:
+                logger.exception("[watchdog] wake_task(%s) failed", tid)
+    except Exception:
+        logger.exception("[watchdog] tick failed")
+
+
 def start():
     """启动后台 scheduler。idempotent — 已起就不重起。"""
     global _scheduler
@@ -63,12 +92,23 @@ def start():
         trigger=CronTrigger(hour=hour, minute=minute),
         id="daily_refresh_all",
         replace_existing=True,
-        misfire_grace_time=3600,  # 错过 1h 内还能补跑
+        misfire_grace_time=3600,
     )
+    # Watchdog — 每 60s 扫一次 orphan task
+    if not os.environ.get("DISABLE_WATCHDOG"):
+        watchdog_interval = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "60"))
+        _scheduler.add_job(
+            _watchdog_orphan_tasks,
+            trigger=IntervalTrigger(seconds=watchdog_interval),
+            id="watchdog_orphan_tasks",
+            replace_existing=True,
+            misfire_grace_time=30,
+        )
     _scheduler.start()
     logger.info("[scheduler] daily_refresh_all scheduled at %02d:%02d (TZ=%s)",
                 hour, minute, _scheduler.timezone)
-    print(f"[scheduler] daily refresh scheduled at {hour:02d}:{minute:02d} ({_scheduler.timezone})")
+    logger.info("[scheduler] watchdog_orphan_tasks scheduled (every 60s)")
+    print(f"[scheduler] daily refresh @ {hour:02d}:{minute:02d}, watchdog @ 60s ({_scheduler.timezone})")
     return _scheduler
 
 

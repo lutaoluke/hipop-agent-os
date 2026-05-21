@@ -31,6 +31,31 @@ def get_current_tenant() -> Optional[int]:
     return _current_tenant.get()
 
 
+def set_current_tenant_to_task(task_id: str) -> Optional[int]:
+    """从 tasks 表反查 task 的 tenant_id 并 set context。给 watchdog / 跨 tenant 操作用。
+    用 ALTER TABLE NO FORCE 临时绕 RLS 拿 tenant_id（PG owner 才行）；查到后立刻 SET。
+    """
+    if not is_postgres():
+        return None
+    import psycopg2
+    raw = psycopg2.connect(DB_URL)
+    raw.autocommit = True
+    try:
+        with raw.cursor() as cur:
+            cur.execute("ALTER TABLE tasks NO FORCE ROW LEVEL SECURITY")
+            cur.execute("SET app.current_tenant = '0'")
+            cur.execute("SELECT tenant_id FROM tasks WHERE task_id=%s", (task_id,))
+            row = cur.fetchone()
+            cur.execute("ALTER TABLE tasks FORCE ROW LEVEL SECURITY")
+    finally:
+        raw.close()
+    if row:
+        tid = row[0]
+        _current_tenant.set(tid)
+        return tid
+    return None
+
+
 def is_postgres() -> bool:
     return bool(DB_URL and DB_URL.startswith(("postgresql://", "postgres://")))
 

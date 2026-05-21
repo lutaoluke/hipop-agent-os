@@ -54,10 +54,46 @@ CREATE TABLE IF NOT EXISTS agent_events (
   actor_user_id BIGINT,
   actor_email   TEXT,
   actor_role    TEXT,
-  actor_source  TEXT              -- 'chat' | 'ui' | 'cron' | 'upload'
+  actor_source  TEXT,             -- 'chat' | 'ui' | 'cron' | 'upload'
+  -- Managed Agents 升级（2026-05-21）：subprocess heartbeat
+  worker_pid    BIGINT,           -- 真在跑这个 step 的 subprocess pid（用于 watchdog 检测死活）
+  last_heartbeat TIMESTAMPTZ      -- subprocess 每 30s 更新一次；watchdog 5min 没更新 → orphan
 );
 CREATE INDEX IF NOT EXISTS idx_agent_events_task ON agent_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_agent_events_actor ON agent_events(actor_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_events_heartbeat ON agent_events(status, last_heartbeat) WHERE status = 'started';
+
+-- ============ Managed Agents：tasks 顶层登记表（2026-05-21 Phase 0.1）============
+-- 每个长任务（wf3 / wf2_sales / refresh_all / 选品 multi-agent）都登记在这里。
+-- agent_events 是 append-only 事件流；tasks 是当前状态视图。
+-- 跟 Anthropic Managed Agents 范式对应：Brain stateless / Hands = subprocess / Session = (tasks + agent_events).
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id        TEXT PRIMARY KEY,
+  tenant_id      BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  workflow       TEXT NOT NULL,        -- WORKFLOW_REGISTRY 里的 key
+  state          TEXT NOT NULL,        -- queued / running / orphan / done / error / cancelled
+  worker_pid     BIGINT,               -- 当前 subprocess pid（null 表示 worker 不在跑）
+  spec_path      TEXT,                 -- ~/hipop/tasks/<task_id>/spec.json — initializer 写的输入
+  progress_path  TEXT,                 -- ~/hipop/tasks/<task_id>/progress.json — worker 写的进度（chunk_idx / done_items / failures）
+  scratch_dir    TEXT,                 -- ~/hipop/tasks/<task_id>/scratch/ — 中间数据，避免污染 agent context（MCP Code Execution 思路）
+  actor_user_id  BIGINT,
+  actor_email    TEXT,
+  actor_source   TEXT,                 -- 'chat' | 'ui' | 'cron' | 'upload'
+  started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_heartbeat TIMESTAMPTZ,          -- worker 每 30s UPDATE，watchdog 5min 没动 → wake
+  finished_at    TIMESTAMPTZ,
+  wake_count     INT NOT NULL DEFAULT 0,   -- 被 watchdog 唤醒接管的次数
+  result_summary TEXT                  -- 完成时的 1-2 句话总结（"325 SKU 写 wf3_hub_v2, 97 真在途"）
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant_state ON tasks(tenant_id, state);
+CREATE INDEX IF NOT EXISTS idx_tasks_heartbeat ON tasks(state, last_heartbeat) WHERE state IN ('running', 'queued');
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+DO $$ BEGIN
+  CREATE POLICY tenant_isolation ON tasks
+    USING (tenant_id = current_setting('app.current_tenant', true)::BIGINT)
+    WITH CHECK (tenant_id = current_setting('app.current_tenant', true)::BIGINT);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS agent_actions (
   id              BIGSERIAL PRIMARY KEY,

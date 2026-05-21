@@ -72,6 +72,89 @@ def _make_write_hub_v2(tenant_id: int):
     return write_hub_v2
 
 
+def run_v2_chunked(
+    tenant_id: int,
+    chunk_size: int = 25,
+    start_chunk_idx: int = 0,
+    max_skus: int = None,
+    heartbeat=None,
+    save_progress=None,
+) -> int:
+    """Chunked 版（Managed Agents Initializer+Coding Agent 范式）— 每 chunk 完成后
+    save_progress + heartbeat，断电重启从 progress.chunk_idx 续跑。
+
+    参数：
+      chunk_size: 每 chunk 多少 SKU（默认 25 — 平衡 browser 启动 vs checkpoint 粒度）
+      start_chunk_idx: 续跑起点（resume 从 progress 读）
+      heartbeat: callable 每 chunk 调一次 — UPDATE tasks.last_heartbeat
+      save_progress: callable(dict) — 把 {chunk_idx, total_chunks, done_skus, failed_chunks} 写 progress.json
+    """
+    from hipop.server import _erp_auth
+    token = _erp_auth.get_erp_token_for_tenant(tenant_id)
+    if not token:
+        print(f"[wf3_v2_chunked] tenant={tenant_id} 没 ERP 凭据，跳过")
+        return 0
+
+    skus = _list_listed_skus(tenant_id)
+    if max_skus:
+        skus = skus[:max_skus]
+    if not skus:
+        return 0
+
+    total = len(skus)
+    total_chunks = (total + chunk_size - 1) // chunk_size
+
+    # monkey-patch wls + wf0 — 跟 run_v2 同思路
+    import sys
+    _hipop_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _hipop_dir not in sys.path:
+        sys.path.insert(0, _hipop_dir)
+    from workflows import wf0_logistics as _wf0
+    from workflows import wf_logistics_status as _wls
+    _orig_wf0_token = _wf0.get_erp_token
+    _orig_wls_write = _wls.write_hub
+    _wf0.get_erp_token = lambda: token
+    _wls.get_erp_token = lambda: token
+    _wls.write_hub = _make_write_hub_v2(tenant_id)
+
+    done_skus = 0
+    failed_chunks = []
+
+    print(f"[wf3_v2_chunked] tenant={tenant_id} {total} SKU / {total_chunks} chunks / chunk_size={chunk_size} / start={start_chunk_idx}", flush=True)
+
+    try:
+        for chunk_idx in range(start_chunk_idx, total_chunks):
+            chunk = skus[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+            print(f"[wf3_v2_chunked] chunk {chunk_idx + 1}/{total_chunks} ({len(chunk)} SKU)", flush=True)
+            if heartbeat:
+                try: heartbeat()
+                except Exception: pass
+            try:
+                records = _wls.analyze_skus(chunk, write_db=True, verbose=False)
+                done_skus += len(records or [])
+            except Exception as e:
+                err = str(e)[:200]
+                failed_chunks.append({"chunk_idx": chunk_idx, "error": err})
+                print(f"[wf3_v2_chunked] chunk {chunk_idx} FAILED: {err}", flush=True)
+            # 每 chunk 完了立刻 commit progress — 断电重启续跑用
+            if save_progress:
+                try:
+                    save_progress({
+                        "chunk_idx": chunk_idx + 1,        # next start (已完成 chunk_idx)
+                        "total_chunks": total_chunks,
+                        "done_skus": done_skus,
+                        "failed_chunks": failed_chunks,
+                        "total_skus": total,
+                    })
+                except Exception: pass
+
+        return done_skus
+    finally:
+        _wf0.get_erp_token = _orig_wf0_token
+        _wls.get_erp_token = _orig_wf0_token
+        _wls.write_hub = _orig_wls_write
+
+
 def run_v2(tenant_id: int, max_skus: int = None) -> int:
     """真接 ERP 拉物流。返回写入的 SKU 数。"""
     from hipop.server import _erp_auth

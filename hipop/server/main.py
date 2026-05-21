@@ -46,10 +46,21 @@ app.include_router(_api_router, prefix="/api")
 @app.on_event("startup")
 def _start_daily_refresh():
     if os.environ.get("DISABLE_DAILY_REFRESH"):
-        print("[scheduler] DISABLE_DAILY_REFRESH set, skipping")
+        print("[scheduler] DISABLE_DAILY_REFRESH set, skipping", flush=True)
         return
-    from server import scheduler as _scheduler
-    _scheduler.start()
+    # 用 importlib 走 hipop.server.scheduler，避免 sys.path hack 双 module
+    # （之前 sev2/_erp_auth 都踩过，feedback_pg_sqlite_compat memory）
+    import importlib
+    try:
+        _scheduler = importlib.import_module("hipop.server.scheduler")
+    except ModuleNotFoundError:
+        from server import scheduler as _scheduler  # CLI 直跑兜底
+    try:
+        _scheduler.start()
+        print("[scheduler] started OK", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"[scheduler] start FAILED: {e}\n{traceback.format_exc()}", flush=True)
 
 # 防重放：记录已处理的 message_id
 _processed = set()
