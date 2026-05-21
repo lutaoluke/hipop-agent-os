@@ -54,8 +54,28 @@ def _save_progress(task_id: str, progress: dict) -> None:
     os.replace(tmp, paths["progress"])  # 原子写
 
 
-def _finish(task_id: str, state: str, summary: str = "") -> None:
-    """worker 完成时调 — UPDATE tasks.state + finished_at + result_summary。"""
+def _finish(task_id: str, state: str, summary: str = "",
+            workflow: Optional[str] = None, tenant_id: Optional[int] = None,
+            started_at: Optional[float] = None) -> None:
+    """worker 完成时调 — UPDATE tasks.state + finished_at + result_summary。
+
+    Phase 0.4: 跑 verify contract，FAIL 时把 state 标 done_unverified（防 premature marking）。
+    """
+    # 跑 verify contract（仅 done 时；error/cancelled 跳过）
+    if state == "done" and workflow and tenant_id and started_at:
+        try:
+            from hipop.runtime import verifiers
+            v = verifiers.run_verifier(workflow, task_id, tenant_id, started_at)
+            if v:
+                evidence_str = ", ".join(f"{k}={v_val}" for k, v_val in v.get("evidence", {}).items())
+                if v["ok"]:
+                    summary = f"{summary} | verify ✓ ({v['verdict']}; {evidence_str})"
+                else:
+                    state = "done_unverified"
+                    summary = f"{summary} | verify ✗ FAIL ({v['verdict']}; {evidence_str})"
+        except Exception as e:
+            summary = f"{summary} | verify error: {type(e).__name__}: {str(e)[:120]}"
+
     _data.set_current_tenant_to_task(task_id)
     with _data.conn() as c:
         c.execute(
@@ -114,7 +134,9 @@ def main(task_id: str) -> int:
             save_progress=lambda p: _save_progress(task_id, p),
         )
         summary = (result or {}).get("summary") or "done"
-        _finish(task_id, "done", summary)
+        _finish(task_id, "done", summary,
+                workflow=workflow, tenant_id=tenant_id,
+                started_at=spec.get("created_at") or time.time())
         print(f"[worker] DONE {summary}", flush=True)
         return 0
 
