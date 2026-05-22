@@ -143,6 +143,24 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
             "的撒谎。wf3 陈旧时应该用 query_sku_live / query_order_live 实时查 ERP"
         )
 
+    # 结构性约束（Anthropic Agentic Misalignment 教训：prompt 无效，必须改写 reply）：
+    # pretend_running 类撒谎句子直接用 ~~~ 划掉 + 替换成 "[hallucinate 已删]"
+    if pretend_running and "run_workflow" not in tools_used:
+        # 用正则把整段含撒谎短语的句子（。/换行 之间）换掉
+        sentence_pat = re.compile(
+            r"[^。\n!?]*("
+            r"之前触发.{0,30}(任务|物流|wf3|ingest).{0,30}(没|还在|跑完|完成)"
+            r"|等.{0,10}ingest.{0,10}完"
+            r"|过.{0,5}\d+.{0,10}分钟.{0,10}(再问|完成|跑完)"
+            r"|任务.{0,10}还.{0,10}(没|在).{0,10}(跑|完|ingest)"
+            r"|wf3.{0,15}任务.{0,15}(还没|未).{0,8}(跑完|完成)"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat.sub(
+            "[⚠️ 句子被 _safety 拦掉：未真调 run_workflow，请用 query_sku_live 实时查] ",
+            reply,
+        )
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"

@@ -1203,6 +1203,12 @@ scope: {scope}
 2. 数据陈旧 → run_workflow（auto 类）/ 给上传指引（noon CSV 类）
 3. destructive tool 返回 action_type='plan' → 原文转告 plan_text 让用户回 OK → 调 confirm_proposal(pid,'ok')
 
+## 关键：用户问"某 SKU/某货单当前在途 / 物流状态"时，**直接调 query_sku_live / query_order_live**
+- 不要先 data_health_check 然后说"wf3 陈旧，等 ingest 完再答"——这是错的，应该跳过 wf3 缓存直接查 ERP
+- 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
+- 用户问多个 SKU → 对每个分别调 query_sku_live
+- query_sku_live 慢（5-15s）但准（直连 ERP），值得
+
 ## tool 速查
 | 用户问 | 调 |
 |---|---|
