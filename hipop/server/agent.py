@@ -244,6 +244,38 @@ TOOLS = [
         },
     },
     {
+        "name": "query_sku_live",
+        "description": (
+            "**实时**查单个 SKU 的 ERP 在途货单 + 物流公司 + tracking 号（不读 wf3_hub_v2 缓存，直连 ERP）。"
+            "适用：用户问'SKU X 在途多少' / 'X 的最新物流' / 'wf3 数据陈旧时'。"
+            "比 query_sku 慢（首次 5-15s，含 ERP 登录），但返回最新。"
+            "返回: in_transit_count / total_qty / 各货单的 forwarder + tracking_no + delivery_at + 物流站直链。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string", "description": "SKU 码，如 TBC0168A"},
+            },
+            "required": ["sku"],
+        },
+    },
+    {
+        "name": "query_order_live",
+        "description": (
+            "**实时**查单个货单的 ERP 当前状态 + 物流公司 + tracking 号 + 物流站直链。"
+            "适用：用户问 'PDxxx 现在到哪了' / 'PDxxx 物流卡几天' / 'PDxxx 实时状态'。"
+            "比 query_order 慢（实时拉），但 ERP 状态最新（hipop wf3 缓存可能 N 天前）。"
+            "返回 forwarder + tracking_no + 物流站 URL（让用户/Agent 点过去看节点）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_no": {"type": "string", "description": "货单号 PDxxx"},
+            },
+            "required": ["order_no"],
+        },
+    },
+    {
         "name": "tenant_notes_get",
         "description": (
             "读 tenant 跨 session 沉淀的 NOTES.md（客户偏好 / 业务规则 / 学到的经验）。"
@@ -726,6 +758,128 @@ def tool_query_1688_similar(image_url: str, pack: int = 1,
     }
 
 
+def _erp_token_or_error(tid: int):
+    """共用：拿 per-tenant ERP token，没有就返 error dict"""
+    from . import _erp_auth
+    token = _erp_auth.get_erp_token_for_tenant(tid)
+    if not token:
+        return None, {"ok": False, "error": "no_erp_credentials",
+                       "message": f"tenant {tid} 没有 ERP 凭据 — 请去 /onboarding 配 dbuyerp 账号"}
+    return token, None
+
+
+def _patch_wls_token(token: str):
+    """共用：monkey-patch wls + wf0.get_erp_token 闭包，跟 wf3_logistics_v2 同套路"""
+    import sys as _sys
+    _hipop_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _hipop_dir not in _sys.path:
+        _sys.path.insert(0, _hipop_dir)
+    from workflows import wf0_logistics as _wf0
+    from workflows import wf_logistics_status as _wls
+    _orig = _wf0.get_erp_token
+    _wf0.get_erp_token = lambda: token
+    _wls.get_erp_token = lambda: token
+    return _wf0, _wls, _orig
+
+
+def _physical_tracking_url(forwarder: str, tracking_no: str) -> str:
+    """根据 forwarder 拼物流站直链。"""
+    if not forwarder or not tracking_no:
+        return ""
+    from workflows.wf_logistics_status import LOGISTICS_URLS
+    base = LOGISTICS_URLS.get(forwarder, "")
+    if not base:
+        return f"(无直链, forwarder={forwarder})"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}msg={tracking_no}" if "tracking" in base.lower() else f"{base}{sep}no={tracking_no}"
+
+
+def tool_query_sku_live(sku: str) -> Dict:
+    """实时查单 SKU ERP 在途货单 — 不读 wf3 缓存，每次直连。"""
+    tid = _get_tenant()
+    token, err = _erp_token_or_error(tid)
+    if err: return err
+    _wf0, _wls, _orig = _patch_wls_token(token)
+    try:
+        in_transit, completed = _wls.collect_sku_orders(sku, token)
+    except Exception as e:
+        return {"ok": False, "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        _wf0.get_erp_token = _orig
+        _wls.get_erp_token = _orig
+    in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
+    return {
+        "ok": True,
+        "sku": sku,
+        "fetched_from": "ERP realtime (bypass wf3_hub_v2 cache)",
+        "in_transit_count": len(in_transit),
+        "in_transit_total_qty": in_t_qty,
+        "completed_count": len(completed),
+        "in_transit_orders": [
+            {
+                "order_no": o["order_no"],
+                "qty": o.get("qty"),
+                "forwarder": o.get("logistics_name"),
+                "tracking_no": o.get("tracking_no"),
+                "delivery_at": o.get("delivery_at"),
+                "tracking_url": _physical_tracking_url(o.get("logistics_name"), o.get("tracking_no")),
+            }
+            for o in in_transit[:15]
+        ],
+        "recent_completed": [
+            {"order_no": o["order_no"], "forwarder": o.get("logistics_name"),
+             "delivery_at": o.get("delivery_at")}
+            for o in completed[:5]
+        ],
+        "references": [
+            {"table": "ERP /delivery (realtime)", "where": f"keyword={sku}",
+             "as_of_date": "now"}
+        ],
+    }
+
+
+def tool_query_order_live(order_no: str) -> Dict:
+    """实时查单货单 ERP 状态 + 物流站直链。"""
+    tid = _get_tenant()
+    token, err = _erp_token_or_error(tid)
+    if err: return err
+    _wf0, _wls, _orig = _patch_wls_token(token)
+    try:
+        # 用 erp_get /delivery?keyword=order_no 找货单
+        from workflows.wf0_logistics import erp_get
+        data = erp_get("/delivery", {"keyword": order_no, "page": 1, "page_size": 20}, token)
+        items = data.get("data", {}).get("list", []) if isinstance(data, dict) else []
+    except Exception as e:
+        _wf0.get_erp_token = _orig; _wls.get_erp_token = _orig
+        return {"ok": False, "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}"}
+    finally:
+        _wf0.get_erp_token = _orig
+        _wls.get_erp_token = _orig
+    # 找精确匹配
+    match = [o for o in items if (o.get("delivery_order_no") or "").upper() == order_no.upper()]
+    if not match:
+        return {"ok": False, "error": "order_not_found_in_erp", "order_no": order_no}
+    o = match[0]
+    forwarder = (o.get("logistics") or {}).get("logistics_name", "")
+    tracking = o.get("logistics_bill_no", "")
+    return {
+        "ok": True,
+        "order_no": order_no,
+        "fetched_from": "ERP realtime",
+        "status": o.get("status"),
+        "store": (o.get("store") or {}).get("name", ""),
+        "forwarder": forwarder,
+        "tracking_no": tracking,
+        "tracking_url": _physical_tracking_url(forwarder, tracking),
+        "delivery_at": (o.get("delivery_at") or "")[:10],
+        "in_storage_at": (o.get("latest_in_storage_at") or "")[:10],
+        "references": [
+            {"table": "ERP /delivery (realtime)", "where": f"keyword={order_no}",
+             "as_of_date": "now"}
+        ],
+    }
+
+
 def _tool_tenant_notes_get(section: str = "") -> Dict:
     from . import tenant_notes
     tid = _get_tenant()
@@ -775,6 +929,8 @@ TOOL_FUNCS = {
     "confirm_proposal": lambda proposal_id, user_decision: _tool_confirm_proposal(proposal_id, user_decision),
     "tenant_notes_get": lambda section="": _tool_tenant_notes_get(section),
     "tenant_notes_append": lambda note, section="通用": _tool_tenant_notes_append(note, section),
+    "query_sku_live": tool_query_sku_live,
+    "query_order_live": tool_query_order_live,
     "query_1688_similar": tool_query_1688_similar,
 }
 
@@ -1051,7 +1207,9 @@ scope: {scope}
 | 用户问 | 调 |
 |---|---|
 | <SKU> 卖得 / 库存 / 趋势 | query_sku |
-| <PDxxx> 状态 / 卡几天 | query_order |
+| <SKU> 当前在途多少 / 实时物流 / wf3 陈旧时 | **query_sku_live**（实时 ERP，5-15s）|
+| <PDxxx> 状态 / 卡几天（hipop 缓存）| query_order |
+| <PDxxx> 现在到哪了 / 实时状态 / 物流码 | **query_order_live**（实时 ERP）|
 | <PDxxx> 已确认丢货/已结案 | update_alert_status |
 | 我该补货吗 / 必补哪些 | compute_replenishment |
 | 海运空运 ROI | compute_air_freight_roi |
@@ -1066,10 +1224,11 @@ scope: {scope}
 ## 死规矩（违反 = 事故）
 1. **业务数据先调 data_health_check**，不要凭空猜"X 天前更新"
 2. **禁说"已触发/启动/导出/发飞书"除非本轮真调了对应 tool**（_safety 后处理会拦你撒谎）
-3. **禁编 URL / 字段名 / SKU id / 时间戳** — 数字必须来自 tool 返回
-4. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
-5. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
-6. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
+3. **禁说"之前触发的任务还没跑完 / 等 X 分钟 ingest 完 / 任务还在跑"** — 这是新型撒谎模式：用过去时绕开 hook 检测。**真要知道有没有任务在跑，调 data_health_check 看 stale_days，没有"还在跑"这种中间态。wf3 陈旧 → 用 query_sku_live / query_order_live 实时查 ERP（不要等 wf3 跑完）**
+4. **禁编 URL / 字段名 / SKU id / 时间戳** — 数字必须来自 tool 返回
+5. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
+6. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
+7. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
 
 ## 长期偏好沉淀
 - 用户明确说"以后都这么办" / "记住" / "默认 X" → 调 tenant_notes_append

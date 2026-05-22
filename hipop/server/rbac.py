@@ -58,6 +58,8 @@ TOOL_PERMISSION = {
     "tenant_notes_get":       "view_dashboard",
     "tenant_notes_append":    "view_dashboard",
     "confirm_proposal":       "view_dashboard",
+    "query_sku_live":         "view_sku",
+    "query_order_live":       "view_orders",
 }
 
 

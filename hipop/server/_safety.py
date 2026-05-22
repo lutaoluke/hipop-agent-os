@@ -128,6 +128,21 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
             "『帮我扫一下 ERP 物流』之类更明确的指令）"
         )
 
+    # 新型撒谎模式：用过去时编"任务还在跑、等 ingest 完" 绕开上面的 hook
+    pretend_running = re.search(
+        r"(之前触发.{0,20}(任务|物流|ingest).{0,20}(没|还在|跑完)|"
+        r"等.{0,8}ingest.{0,5}完|"
+        r"过.{0,3}\d+.{0,5}分钟.{0,8}(再问|完成)|"
+        r"任务.{0,5}还.{0,5}(没|在).{0,5}(跑|完|ingest))",
+        reply,
+    )
+    if pretend_running and "run_workflow" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 编了'之前触发的任务还在跑/等 X 分钟 ingest 完'但本轮没调"
+            " run_workflow，且过去也未必有真在跑的任务。这是用过去时绕开 hook "
+            "的撒谎。wf3 陈旧时应该用 query_sku_live / query_order_live 实时查 ERP"
+        )
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"
