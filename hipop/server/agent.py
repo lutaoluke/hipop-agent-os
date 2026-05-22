@@ -247,14 +247,16 @@ TOOLS = [
         "name": "query_sku_live",
         "description": (
             "**实时**查单个 SKU 的 ERP 在途货单 + 物流公司 + tracking 号（不读 wf3_hub_v2 缓存，直连 ERP）。"
-            "适用：用户问'SKU X 在途多少' / 'X 的最新物流' / 'wf3 数据陈旧时'。"
-            "比 query_sku 慢（首次 5-15s，含 ERP 登录），但返回最新。"
-            "返回: in_transit_count / total_qty / 各货单的 forwarder + tracking_no + delivery_at + 物流站直链。"
+            "默认快版（只 ERP，5-15s）。with_nodes=True 时**额外用 playwright 抓物流站节点**"
+            "（义特无忧/安时达/阳光/飞坦 4 家），多花 5-10s 每单，但能告诉用户'卡在哪个节点'。"
+            "**触发 with_nodes=True 的关键词**：节点 / 卡哪 / 物流轨迹 / 走到哪了 / 详细物流状态。"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "sku": {"type": "string", "description": "SKU 码，如 TBC0168A"},
+                "with_nodes": {"type": "boolean", "default": False,
+                                "description": "是否抓物流站节点（慢但准）"},
             },
             "required": ["sku"],
         },
@@ -782,6 +784,25 @@ def _patch_wls_token(token: str):
     return _wf0, _wls, _orig
 
 
+def _fetch_logistics_nodes(forwarder: str, tracking_no: str) -> dict:
+    """playwright 实时抓物流站节点（安时达/阳光/义特/飞坦）。返回 {nodes, note}."""
+    if not forwarder or not tracking_no:
+        return {"nodes": [], "note": "缺 forwarder 或 tracking_no"}
+    try:
+        from playwright.sync_api import sync_playwright
+        from workflows.wf_logistics_status import query_tracking
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                r = query_tracking(page, forwarder, tracking_no)
+            finally:
+                browser.close()
+            return r
+    except Exception as e:
+        return {"nodes": [], "note": f"playwright_error: {type(e).__name__}: {str(e)[:100]}"}
+
+
 def _physical_tracking_url(forwarder: str, tracking_no: str) -> str:
     """根据 forwarder 拼物流站直链。"""
     if not forwarder or not tracking_no:
@@ -794,8 +815,10 @@ def _physical_tracking_url(forwarder: str, tracking_no: str) -> str:
     return f"{base}{sep}msg={tracking_no}" if "tracking" in base.lower() else f"{base}{sep}no={tracking_no}"
 
 
-def tool_query_sku_live(sku: str) -> Dict:
-    """实时查单 SKU ERP 在途货单 — 不读 wf3 缓存，每次直连。"""
+def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
+    """实时查单 SKU ERP 在途货单 — 不读 wf3 缓存，每次直连。
+    with_nodes=True 时对每个在途货单跑 playwright 抓物流站节点（慢 5-10s/单）。
+    默认 False（只 ERP 拉单 + tracking_no，快），用户问'节点'/'卡哪'时设 True。"""
     tid = _get_tenant()
     token, err = _erp_token_or_error(tid)
     if err: return err
@@ -808,24 +831,30 @@ def tool_query_sku_live(sku: str) -> Dict:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
+    in_transit_out = []
+    for o in in_transit[:15]:
+        item = {
+            "order_no": o["order_no"],
+            "qty": o.get("qty"),
+            "forwarder": o.get("logistics_name"),
+            "tracking_no": o.get("tracking_no"),
+            "delivery_at": o.get("delivery_at"),
+            "tracking_url": _physical_tracking_url(o.get("logistics_name"), o.get("tracking_no")),
+        }
+        if with_nodes and o.get("tracking_no"):
+            n = _fetch_logistics_nodes(o.get("logistics_name"), o.get("tracking_no"))
+            item["nodes"] = n.get("nodes", [])
+            item["current_node"] = n["nodes"][-1] if n.get("nodes") else None
+            item["nodes_note"] = n.get("note", "")
+        in_transit_out.append(item)
     return {
         "ok": True,
         "sku": sku,
-        "fetched_from": "ERP realtime (bypass wf3_hub_v2 cache)",
+        "fetched_from": ("ERP realtime + 物流站节点抓取" if with_nodes else "ERP realtime"),
         "in_transit_count": len(in_transit),
         "in_transit_total_qty": in_t_qty,
         "completed_count": len(completed),
-        "in_transit_orders": [
-            {
-                "order_no": o["order_no"],
-                "qty": o.get("qty"),
-                "forwarder": o.get("logistics_name"),
-                "tracking_no": o.get("tracking_no"),
-                "delivery_at": o.get("delivery_at"),
-                "tracking_url": _physical_tracking_url(o.get("logistics_name"), o.get("tracking_no")),
-            }
-            for o in in_transit[:15]
-        ],
+        "in_transit_orders": in_transit_out,
         "recent_completed": [
             {"order_no": o["order_no"], "forwarder": o.get("logistics_name"),
              "delivery_at": o.get("delivery_at")}
@@ -848,7 +877,11 @@ def tool_query_order_live(order_no: str) -> Dict:
         # 用 erp_get /delivery?keyword=order_no 找货单
         from workflows.wf0_logistics import erp_get
         data = erp_get("/delivery", {"keyword": order_no, "page": 1, "page_size": 20}, token)
-        items = data.get("data", {}).get("list", []) if isinstance(data, dict) else []
+        if isinstance(data, dict):
+            dd = data.get("data") or []
+            items = dd if isinstance(dd, list) else dd.get("list", [])
+        else:
+            items = []
     except Exception as e:
         _wf0.get_erp_token = _orig; _wls.get_erp_token = _orig
         return {"ok": False, "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}"}
@@ -862,10 +895,12 @@ def tool_query_order_live(order_no: str) -> Dict:
     o = match[0]
     forwarder = (o.get("logistics") or {}).get("logistics_name", "")
     tracking = o.get("logistics_bill_no", "")
+    # 抓物流站节点（playwright 5-10s）
+    nodes_result = _fetch_logistics_nodes(forwarder, tracking) if tracking else {"nodes": [], "note": "无单号"}
     return {
         "ok": True,
         "order_no": order_no,
-        "fetched_from": "ERP realtime",
+        "fetched_from": "ERP realtime + 物流站节点抓取",
         "status": o.get("status"),
         "store": (o.get("store") or {}).get("name", ""),
         "forwarder": forwarder,
@@ -873,8 +908,12 @@ def tool_query_order_live(order_no: str) -> Dict:
         "tracking_url": _physical_tracking_url(forwarder, tracking),
         "delivery_at": (o.get("delivery_at") or "")[:10],
         "in_storage_at": (o.get("latest_in_storage_at") or "")[:10],
+        "nodes": nodes_result.get("nodes", []),
+        "nodes_note": nodes_result.get("note", ""),
+        "current_node": nodes_result["nodes"][-1] if nodes_result.get("nodes") else None,
         "references": [
-            {"table": "ERP /delivery (realtime)", "where": f"keyword={order_no}",
+            {"table": "ERP /delivery + 物流站节点 (realtime)",
+             "where": f"order={order_no} tracking={tracking}",
              "as_of_date": "now"}
         ],
     }
