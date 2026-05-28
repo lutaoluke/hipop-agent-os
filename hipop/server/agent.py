@@ -278,6 +278,29 @@ TOOLS = [
         },
     },
     {
+        "name": "logistics_status",
+        "description": (
+            "物流状态总入口（结构化强制实时，不读 wf3 缓存）。用户问 看物流/物流情况/在途/卡哪/到哪了/"
+            "实时物流 一律走这个，禁止改用 query_sku 缓存或 export_table 糊弄。"
+            "\n- 给定 1-N 个具体 SKU（skus=[...]，<=10 个）-> 逐个实时查 ERP（在途货单+物流公司+tracking+物流站节点+直链）"
+            "\n- 笼统看 sku 物流 / 所有 SKU / 没给具体码 / SKU >10 个 -> 传 scope_all=True，"
+            "它返回 全店约 N 个、约 X 分钟、①下班后定时 ②现在异步 的选择，原文转告用户让其选，不要自己同步硬跑"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "skus": {"type": "array", "items": {"type": "string"},
+                          "description": "具体 SKU 码列表（1-10 个）。笼统/全部时留空并设 scope_all=True"},
+                "store": {"type": "string", "default": "KSA",
+                           "description": "店铺/销售主体，如 KSA / UAE"},
+                "scope_all": {"type": "boolean", "default": False,
+                               "description": "查全店所有 SKU（不给具体码时设 True，返回 defer 选择不同步硬跑）"},
+                "with_nodes": {"type": "boolean", "default": True,
+                                "description": "是否抓物流站节点（默认 True，给完整 trace）"},
+            },
+        },
+    },
+    {
         "name": "tenant_notes_get",
         "description": (
             "读 tenant 跨 session 沉淀的 NOTES.md（客户偏好 / 业务规则 / 学到的经验）。"
@@ -952,6 +975,54 @@ def _tool_confirm_proposal(proposal_id: str, user_decision: str) -> Dict:
 
 
 # ── Tool 派发 ─────────────────────────────────────────
+def tool_logistics_status(skus=None, store="KSA", scope_all=False, with_nodes=True) -> Dict:
+    """物流状态总入口：结构化强制实时（不读 wf3 缓存）。
+    1-N 个具体 SKU(<=10) -> 逐个 tool_query_sku_live 实时 trace（在途货单+物流公司+tracking+物流站节点）。
+    全部/笼统/SKU>10 -> 返回 defer 决策（下班后定时 / 现在异步），不同步硬跑。"""
+    tid = _get_tenant()
+    sku_list = [s for s in (skus or []) if s]
+    if sku_list and not scope_all and len(sku_list) <= 10:
+        results = [tool_query_sku_live(s, with_nodes=with_nodes) for s in sku_list]
+        return {
+            "ok": True,
+            "mode": "realtime_trace",
+            "fetched_from": "ERP realtime（强制实时，未读 wf3 缓存）",
+            "queried": len(results),
+            "results": results,
+            "references": [{"table": "ERP /delivery (realtime)",
+                            "where": f"skus={sku_list[:10]}", "as_of_date": "now"}],
+        }
+    # 全部 / 笼统 / 太多 -> defer 决策，绝不同步硬跑
+    alias = _resolve_entity_alias(store) or ""
+    try:
+        rows = _data._fetch(
+            "SELECT COUNT(*) AS n FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            (tid, alias))
+        total = (rows[0]["n"] if rows else 0) or 0
+    except Exception:
+        total = 0
+    est_min = max(1, round(total * 10 / 60))
+    return {
+        "ok": True,
+        "mode": "defer_decision",
+        "store": store,
+        "total_skus": total,
+        "est_minutes": est_min,
+        "needs_user_choice": True,
+        "message": (
+            f"全店约 {total} 个 SKU，逐个实时查 ERP 约 {est_min} 分钟（约 {round(est_min/60,1)} 小时）。两种方式：\n"
+            f"① 下班后定时自动跑（推荐）— 等今晚定时全量刷新自动扫，明早给结果\n"
+            f"② 现在后台异步跑 — 起 wf3_logistics_v2 后台扫，不阻塞你，跑完通知\n"
+            f"你选哪个？（选②我调 run_workflow 跑 wf3_logistics_v2）"
+        ),
+        "options": [
+            {"key": "schedule", "label": "下班后定时自动跑（推荐）"},
+            {"key": "async_now", "label": "现在后台异步跑（不阻塞）",
+             "next": "run_workflow:wf3_logistics_v2"},
+        ],
+    }
+
+
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
     "query_order": tool_query_order,
@@ -970,6 +1041,7 @@ TOOL_FUNCS = {
     "tenant_notes_append": lambda note, section="通用": _tool_tenant_notes_append(note, section),
     "query_sku_live": tool_query_sku_live,
     "query_order_live": tool_query_order_live,
+    "logistics_status": tool_logistics_status,
     "query_1688_similar": tool_query_1688_similar,
 }
 
@@ -1242,17 +1314,19 @@ scope: {scope}
 2. 数据陈旧 → run_workflow（auto 类）/ 给上传指引（noon CSV 类）
 3. destructive tool 返回 action_type='plan' → 原文转告 plan_text 让用户回 OK → 调 confirm_proposal(pid,'ok')
 
-## 关键：用户问"某 SKU/某货单当前在途 / 物流状态"时，**直接调 query_sku_live / query_order_live**
-- 不要先 data_health_check 然后说"wf3 陈旧，等 ingest 完再答"——这是错的，应该跳过 wf3 缓存直接查 ERP
-- 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
-- 用户问多个 SKU → 对每个分别调 query_sku_live
-- query_sku_live 慢（5-15s）但准（直连 ERP），值得
+## 关键：物流状态/在途/卡哪/到哪/"看物流"问题 → **一律调 logistics_status**（结构化强制实时）
+- 具体 1-N 个 SKU（有码）→ logistics_status(skus=[...])，它逐个实时查 ERP（不读 wf3 缓存）
+- 笼统"看 sku 物流"/"所有 SKU"/没给具体码 → logistics_status(scope_all=True)，它返回"全店约 N 个、约 X 分钟、①下班后定时 ②现在异步"的选择 → **原文转告用户让其选**
+- 用户选②异步 → run_workflow('wf3_logistics_v2')；选①定时 → 告知今晚定时全量刷新会扫
+- **禁止**：物流状态问题用 query_sku（缓存）或 export_table（过时表格）糊弄；禁说"wf3 陈旧等 ingest"
+- 单货单 PDxxx 实时 → query_order_live
 
 ## tool 速查
 | 用户问 | 调 |
 |---|---|
 | <SKU> 卖得 / 库存 / 趋势 | query_sku |
-| <SKU> 当前在途多少 / 实时物流 / wf3 陈旧时 | **query_sku_live**（实时 ERP，5-15s）|
+| <SKU> 物流/在途/卡哪/到哪了/看物流（1-N 个有码）| **logistics_status(skus=[...])**（强制实时）|
+| 笼统/所有 SKU 看物流情况（没具体码）| **logistics_status(scope_all=True)** → 转告选择，禁甩 export |
 | <PDxxx> 状态 / 卡几天（hipop 缓存）| query_order |
 | <PDxxx> 现在到哪了 / 实时状态 / 物流码 | **query_order_live**（实时 ERP）|
 | <PDxxx> 已确认丢货/已结案 | update_alert_status |
