@@ -27,6 +27,11 @@ from ingest_erp_sales import (
 from sales_entity_v2 import list_entities_for_tenant
 from server._erp_auth import get_erp_token_for_tenant
 from server import data as _data
+try:
+    from server.runtime import tick, set_progress
+except ImportError:
+    tick = lambda *a, **k: None
+    set_progress = lambda *a, **k: None
 
 
 def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = None) -> dict:
@@ -55,13 +60,16 @@ def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = 
             continue
 
         print(f"\n[{alias}] country={country} store={store}", file=sys.stderr)
+        tick(f"start entity {alias} country={country}")
 
         # partner_sku -> 累积 dict
         bucket = {}
-        for days in win_list:
+        for w_idx, days in enumerate(win_list, 1):
             max_items = max_pages * 50 if max_pages else None
             items = fetch_window(token, nation_id, days, max_items=max_items)
             print(f"  {days}d: {len(items)} skus", file=sys.stderr)
+            tick(f"[{alias}] window {w_idx}/{len(win_list)} ({days}d): {len(items)} skus")
+            set_progress({"current_entity": alias, "windows_done": w_idx, "windows_total": len(win_list)})
             for it in items:
                 erp_sku = it.get("sku_id")
                 if not erp_sku:

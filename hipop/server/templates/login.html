@@ -95,8 +95,12 @@ function authForm(mode) {
         if (!r.ok || !data.ok) {
           this.err = data.detail || data.error || (r.status + ' ' + r.statusText);
         } else {
-          // 注册后跳 onboarding；登录直接进工作台
-          window.location.href = this.isRegister ? '/onboarding' : '/?store=ksa';
+          // 注册后跳 onboarding；登录读 URL ?next= 跳转回原页面，否则默认工作台
+          const params = new URLSearchParams(window.location.search);
+          const next = params.get('next');
+          window.location.href = this.isRegister
+            ? '/onboarding'
+            : (next || '/?store=ksa');
         }
       } catch (e) {
         this.err = '网络错误：' + e.message;

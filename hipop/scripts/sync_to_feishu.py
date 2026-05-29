@@ -12,7 +12,7 @@ import sqlite3
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from scripts.feishu_bridge import bridge
 
-DB = "/Users/luke/Downloads/点购工作流/hipop.db"
+DB = "/Users/luke/code/hipop/hipop.db"
 
 
 def sync_hub():

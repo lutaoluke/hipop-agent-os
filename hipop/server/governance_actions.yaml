@@ -18,12 +18,16 @@ update_alert_status:
   target_object_class: LogisticsAlert
   target_table: wf6_logistics_alerts_v2
   required_fields: [order_no, status]
+  # 这些状态是 hipop 自己定义的（非 ERP 内置），ops_status 是 TEXT free text，可任意扩展
+  # 加新状态：本列表加一行 + agent.py update_alert_status schema enum 加一项即可，无需 DB migration
+  # 终态（resolved）判定在 wf_logistics_alerts.py TERMINAL_STATUSES（不含"延迟"/"处理中"）
   allowed_statuses:
     - 已确认推进
     - 已确认丢货
     - 已约仓
     - 已结案
     - 处理中
+    - 延迟
   preconditions:
     - "alert exists for actor.tenant_id + order_no"
     - "alert.resolved_at IS NULL（已结案的不能再改）"

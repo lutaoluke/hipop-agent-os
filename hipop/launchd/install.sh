@@ -29,7 +29,7 @@ case "$cmd" in
         echo "📅 周一 10:00 自动跑全量（wf1+wf2+wf3+wf6+wf5+周报）"
         echo "📦 每天 09:00 自动跑物流（wf3+wf6+日报）"
         echo "🔄 每 30 分钟拉飞书反馈"
-        echo "📂 日志: /Users/luke/Downloads/点购工作流/logs/"
+        echo "📂 日志: /Users/luke/code/hipop/logs/"
         ;;
     uninstall)
         for p in "${PLISTS[@]}"; do

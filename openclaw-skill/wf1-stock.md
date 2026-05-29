@@ -114,7 +114,7 @@ CREATE TABLE wf1_<alias>_stock (
 或：
 
 ```bash
-cd /Users/luke/Downloads/点购工作流
+cd /Users/luke/code/hipop
 python3 hipop/scripts/ingest_erp_stock.py
 python3 hipop/scripts/ingest_noon_stock_csv.py
 python3 hipop/workflows/wf_stock_static.py
@@ -165,7 +165,7 @@ table_id 自动写回 `config/hipop.json -> sales_entities[].feishu_stock_table_
   [hipop_ksa] wrote 198 rows to wf1_hipop_ksa_stock
   [hipop_uae] wrote 198 rows to wf1_hipop_uae_stock
 
-=== /Users/luke/Downloads/点购工作流/inbox/Inventory.csv ===
+=== /Users/luke/code/hipop/inbox/Inventory.csv ===
   read 1143 rows
   [hipop_ksa] 715 skus → wf1_hipop_ksa_stock
 

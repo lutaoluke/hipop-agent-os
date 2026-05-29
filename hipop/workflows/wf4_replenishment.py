@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from scripts.notify import send_card
 from workflows.wf3_sales_cycle import analyze, LOGISTICS_MONTHS, TARGET_MONTHS, URGENT_THRESHOLD, WARNING_THRESHOLD
 
-DB_PATH = "/Users/luke/Downloads/点购工作流/hipop.db"
+DB_PATH = "/Users/luke/code/hipop/hipop.db"
 
 # 补货配置
 BATCH_RATIO = 0.6      # 首批采购比例（剩余40%后续补），降低仓库积压

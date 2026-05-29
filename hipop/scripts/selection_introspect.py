@@ -17,7 +17,7 @@ HIPOP_ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HIPOP_ROOT)
 sys.path.insert(0, os.path.dirname(HIPOP_ROOT))
 
-DB = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
+DB = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
 OUT_DIR = os.path.join(HIPOP_ROOT, "agent_memory", "strategies")
 os.makedirs(OUT_DIR, exist_ok=True)
 

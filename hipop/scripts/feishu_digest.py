@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(HIPOP_ROOT))
 
 from server.feishu import _get_tenant_token
 
-DB = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
+DB = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
 
 
 def list_chats(token: str):

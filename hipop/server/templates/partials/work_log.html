@@ -32,11 +32,24 @@ function workLog() {
       const m = (item.ref || "").match(/agent_actions#(\d+)/);
       if (m) {
         fetch('/api/agent-actions/' + m[1]).then(r=>r.json()).then(d => {
+          const confColor = d.confidence>=0.8 ? 'var(--ok,#16a34a)'
+                          : d.confidence>=0.6 ? 'var(--warn,#d97706)' : 'var(--danger,#dc2626)';
+          const confHtml = d.confidence!=null
+            ? '<div style="margin-top:4px;">置信度: <b style="color:'+confColor+'">'+Math.round(d.confidence*100)+'%</b></div>'
+            : '';
+          const adopted = (d.status==='adopted'||d.status==='rejected');
+          const adoptHtml = adopted
+            ? '<div style="margin-top:6px;color:var(--text-secondary);">已'+(d.status==='adopted'?'采纳':'拒绝')+(d.adopted_by?'（'+d.adopted_by+'）':'')+'</div>'
+            : '<div style="margin-top:8px;display:flex;gap:8px;">'
+              + '<button onclick="window.adoptAction('+d.id+',\'adopt\')" style="padding:3px 12px;border:1px solid var(--ok,#16a34a);color:var(--ok,#16a34a);background:none;border-radius:4px;cursor:pointer;">✓ 采纳</button>'
+              + '<button onclick="window.adoptAction('+d.id+',\'reject\')" style="padding:3px 12px;border:1px solid var(--danger,#dc2626);color:var(--danger,#dc2626);background:none;border-radius:4px;cursor:pointer;">✗ 拒绝</button>'
+              + '</div>';
           window.dispatchEvent(new CustomEvent('open-ref', {
             detail: {
               title: 'Agent 操作 #' + d.id,
               body: '<div><b>' + (d.judge || d.pill_text || '') + '</b></div>'
-                  + '<div style="color:var(--text-secondary);margin-top:4px;">主题: ' + (d.subject||'—') + ' · 模块: ' + d.module + ' · 状态: ' + d.status + '</div>',
+                  + '<div style="color:var(--text-secondary);margin-top:4px;">主题: ' + (d.subject||'—') + ' · 模块: ' + d.module + ' · 状态: ' + d.status + '</div>'
+                  + confHtml + adoptHtml,
               refs: d.references || [],
             }
           }));
@@ -53,4 +66,21 @@ function workLog() {
     },
   };
 }
+
+// 采纳/拒绝 agent 建议 — adopted_by 由后端从登录态取（不信 body）
+window.adoptAction = function(id, decision) {
+  fetch('/api/agent-actions/' + id + '/adopt', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'include',
+    body: JSON.stringify({decision: decision}),
+  }).then(r=>r.json()).then(d => {
+    if (d.ok) {
+      alert(decision === 'adopt' ? '✓ 已采纳' : '✗ 已拒绝');
+      window.dispatchEvent(new CustomEvent('close-ref'));
+    } else {
+      alert('操作失败: ' + (d.error || '未知错误'));
+    }
+  }).catch(e => alert('网络错误: ' + e.message));
+};
 </script>

@@ -99,11 +99,14 @@ def spawn_task(
         c.commit()
 
     # 3. 起 subprocess worker（nohup detached，重启 uvicorn 不影响）
+    # 用 sys.executable 而非裸 "python3" —— 后者在 PATH 上可能解析到错的 venv（如 homebrew
+    # python3.14 没装 anthropic/psycopg2），导致 worker 一启动就 ImportError
+    import sys as _sys
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     log_f = open(paths["log"], "a")
     proc = subprocess.Popen(
-        ["python3", "-u", "-m", "hipop.runtime.worker", task_id],
+        [_sys.executable, "-u", "-m", "hipop.runtime.worker", task_id],
         stdout=log_f, stderr=subprocess.STDOUT,
         env=env,
         start_new_session=True,  # detach 不绑父进程
@@ -241,6 +244,52 @@ def heartbeat(task_id: str, message: Optional[str] = None) -> None:
             "UPDATE tasks SET last_heartbeat=NOW() WHERE task_id=?", (task_id,)
         )
         c.commit()
+
+
+def save_progress(task_id: str, payload: dict) -> None:
+    """worker 写 progress.json — merge 进已有 payload。"""
+    paths = _task_paths(task_id)
+    existing = {}
+    if os.path.exists(paths["progress"]):
+        try:
+            with open(paths["progress"]) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    existing.update(payload)
+    existing["updated_at"] = time.time()
+    with open(paths["progress"], "w") as f:
+        json.dump(existing, f, ensure_ascii=False, default=str)
+
+
+# ── env-aware helpers (workflow / script 用) ────────────────────
+# 任何 workflow 函数都可以 from hipop.server.runtime import tick, set_progress
+# 然后在循环里 tick(f"已处理 {i}/{n}")。无 HIPOP_TASK_ID env 时自动 no-op。
+# spawn_task 注入 env var 给 worker subprocess (见 worker.py)。
+
+def tick(message: Optional[str] = None) -> None:
+    """env-aware heartbeat。无 HIPOP_TASK_ID 时 no-op。失败不抛错（不影响主流程）。"""
+    tid = os.environ.get("HIPOP_TASK_ID")
+    if not tid:
+        return
+    try:
+        heartbeat(tid, message)
+        if message:
+            # 也写一行到 progress.json 的 message 字段，前端可读
+            save_progress(tid, {"message": message})
+    except Exception:
+        pass
+
+
+def set_progress(payload: dict) -> None:
+    """env-aware progress.json 更新。无 env 时 no-op。"""
+    tid = os.environ.get("HIPOP_TASK_ID")
+    if not tid:
+        return
+    try:
+        save_progress(tid, payload)
+    except Exception:
+        pass
 
 
 def find_orphan_tasks() -> list:

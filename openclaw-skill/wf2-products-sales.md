@@ -205,7 +205,7 @@ raw_json                                     -- 留底原始 CSV 行
 或直接调用脚本：
 
 ```bash
-cd /Users/luke/Downloads/点购工作流
+cd /Users/luke/code/hipop
 python3 hipop/scripts/ingest_erp_products.py
 python3 hipop/scripts/ingest_erp_sales.py
 python3 hipop/scripts/ingest_noon_csv.py

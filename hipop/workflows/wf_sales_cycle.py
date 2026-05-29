@@ -921,6 +921,7 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     """v2 跑某 tenant 的销售周期，写 v2 表。"""
     import sys
     from server import data as _data
+    from server.runtime import tick, set_progress
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
     from sales_entity_v2 import list_entities_for_tenant
 
@@ -930,11 +931,40 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     if not entities:
         raise RuntimeError(f"tenant={tenant_id} no entities")
 
+    tick(f"wf5 start tenant={tenant_id} entities={[e['alias'] for e in entities]}")
     conn = _data.conn()
     all_results = {}
+    skipped_entities = []
     for ent in entities:
         alias = ent["alias"]
         print(f"\n[v2 tenant={tenant_id} entity {alias}]", file=sys.stderr)
+        # ── 上游空表保护（5/12 root cause: tenant=5 wf1_stock 空导致 need_replenish 全 0）──
+        # wf5 = SKU 销量 + 库存 + 在途 → 补货建议
+        # 任何上游空都会静默返 0，必须 fail-fast 告诉用户先跑 ingest
+        sku_cnt = conn.execute(
+            "SELECT COUNT(*) AS n FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            (tenant_id, alias),
+        ).fetchall()[0]
+        sku_cnt = sku_cnt["n"] if isinstance(sku_cnt, dict) else sku_cnt[0]
+        stock_cnt = conn.execute(
+            "SELECT COUNT(*) AS n FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
+            (tenant_id, alias),
+        ).fetchall()[0]
+        stock_cnt = stock_cnt["n"] if isinstance(stock_cnt, dict) else stock_cnt[0]
+        if sku_cnt < 10 or stock_cnt < 10:
+            print(f"  [{alias}] SKIP: wf2_sku={sku_cnt} wf1_stock={stock_cnt}（上游空），先跑 wf2/wf1 ingest",
+                  file=sys.stderr)
+            skipped_entities.append({
+                "alias": alias,
+                "reason": "upstream_empty",
+                "wf2_sku_count": sku_cnt,
+                "wf1_stock_count": stock_cnt,
+                "next_action": (
+                    f"run_workflow(name='wf2_products_v2', alias='{alias}') 拉 SKU；"
+                    f"再 run_workflow(name='wf1_stock_v2', alias='{alias}') 拉库存"
+                ),
+            })
+            continue
         # 取该 entity 全部 partner_sku（兼容 sqlite tuple 和 PG dict cursor）
         rows = conn.execute(
             "SELECT partner_sku FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
@@ -942,7 +972,8 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
         ).fetchall()
         ent_skus = skus or [(r["partner_sku"] if isinstance(r, dict) else r[0]) for r in rows]
         out = []
-        for psk in ent_skus:
+        total_sku = len(ent_skus)
+        for idx, psk in enumerate(ent_skus, 1):
             rec = analyze_one_v2(tenant_id, ent, psk, conn)
             if not rec:
                 continue
@@ -951,12 +982,31 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
             out.append(rec)
             if verbose and len(out) % 200 == 0:
                 print(f"  ... {len(out)} skus done", file=sys.stderr)
+            if idx % 50 == 0:
+                tick(f"[{alias}] {idx}/{total_sku} skus analyzed")
         if write_db:
             conn.commit()
         all_results[alias] = len(out)
+        set_progress({"entities_done": list(all_results.keys()), "current_results": all_results})
+        tick(f"[{alias}] done {len(out)} skus written")
         print(f"  [{alias}] {len(out)} skus written to wf5_sales_cycle", file=sys.stderr)
     conn.close()
     print(f"\n[done] tenant={tenant_id} {all_results}", file=sys.stderr)
+    if skipped_entities:
+        print(f"[skipped] {len(skipped_entities)} entities upstream_empty: "
+              f"{[s['alias'] for s in skipped_entities]}", file=sys.stderr)
+    # 全部 entity 都被跳 → 整体 fail-fast，告诉调用方 wf5 没产出数据
+    if not all_results and skipped_entities:
+        return {
+            "ok": False,
+            "error": "upstream_empty",
+            "message": f"tenant={tenant_id} 全部 {len(skipped_entities)} 个 entity 上游空"
+                       f"（wf2_sku 或 wf1_stock 不足 10 行），请先跑 wf2/wf1 ingest",
+            "skipped": skipped_entities,
+        }
+    # 部分成功 → 正常返回 + warning
+    if skipped_entities:
+        all_results["_skipped"] = skipped_entities
     return all_results
 
 

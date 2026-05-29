@@ -11,7 +11,7 @@ PG 模式下 SQL 占位符自动 ? → %s；datetime('now','localtime') → NOW(
 import sqlite3, os, json, datetime, re
 from typing import List, Dict, Optional, Any
 
-DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
+DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
 DB_URL  = os.environ.get("DB_URL")  # 设置时走 PG，否则 SQLite
 
 # 多租户：connection 拿到时 SET app.current_tenant = <tid>，让 PG RLS 自动过滤。
@@ -178,13 +178,23 @@ def _resolve_entity_for_store(store: str) -> tuple:
 
 
 # ── SKU 健康（销售/库存模块）────────────────────────────────
-def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30) -> List[Dict]:
-    """读 wf2_sku + wf5_sales_cycle + wf3_logistics_hub_v2，按 tenant_id+entity 过滤"""
+def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30,
+                    listing: str = "listed") -> List[Dict]:
+    """读 wf2_sku + wf5_sales_cycle + wf3_logistics_hub_v2，按 tenant_id+entity 过滤。
+
+    listing: 'listed'（默认，向后兼容老 UI 行为）/ 'unlisted' / 'all'
+    """
     tid, alias = _resolve_entity_for_store(store)
-    sql = """
+    where_extra = ""
+    if listing == "listed":
+        where_extra = " AND w2.is_listed=1"
+    elif listing == "unlisted":
+        where_extra = " AND (w2.is_listed=0 OR w2.is_listed IS NULL)"
+    # listing == "all" → 不加 is_listed 条件
+    sql = f"""
     SELECT
       w2.partner_sku, w2.title, w2.image_url,
-      w2.sales_30d, w2.sales_10d, w2.latest_price, w2.latest_profit_rate,
+      w2.sales_30d, w2.sales_10d, w2.sales_180d, w2.latest_price, w2.latest_profit_rate,
       w2.sales_grade, w2.is_listed, w2.return_rate, w2.cancel_rate,
       w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
       w5.current_pipeline, w5.target_pipeline, w5.wf5_replenish_qty,
@@ -195,7 +205,7 @@ def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30) -
       AND w2.partner_sku=w5.partner_sku
     LEFT JOIN wf3_logistics_hub_v2 h
       ON w2.tenant_id=h.tenant_id AND w2.partner_sku=h.sku
-    WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.is_listed=1
+    WHERE w2.tenant_id=? AND w2.entity_alias=?{where_extra}
     """
     rows = _fetch(sql, (tid, alias))
     for r in rows:
@@ -863,6 +873,26 @@ def write_agent_action(
         ))
         c.commit()
         return cur._cur.lastrowid if hasattr(cur, "_cur") else cur.lastrowid
+
+
+def set_action_status(action_id: int, status: str, by: str) -> dict:
+    """采纳/拒绝 agent_action。status: adopted / rejected。
+    带 tenant 校验（只能改自己租户的 action），adopted_by 由调用方从登录态传（不信前端）。
+    PG 走 RLS 自动隔离；SQLite 无 RLS，UPDATE 不带 tenant 但归属在 PG 侧已隔离。"""
+    if status not in ("adopted", "rejected"):
+        return {"ok": False, "error": f"invalid status: {status}"}
+    # 校验 action 存在且属于当前租户（PG RLS 让跨租户查不到）
+    row = _fetch("SELECT id, status FROM agent_actions WHERE id=?", (action_id,))
+    if not row:
+        return {"ok": False, "error": "action 不存在或无权限"}
+    ts = "datetime('now','localtime')"
+    with conn() as c:
+        c.execute(
+            f"UPDATE agent_actions SET status=?, adopted_by=?, adopted_at={ts} WHERE id=?",
+            (status, by, action_id),
+        )
+        c.commit()
+    return {"ok": True, "id": action_id, "status": status, "by": by}
 
 
 def get_agent_action(action_id: int) -> Optional[Dict]:

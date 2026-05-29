@@ -88,7 +88,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "order_no": {"type": "string"},
-                "status": {"type": "string", "enum": ["已确认推进", "已确认丢货", "已约仓", "已结案", "处理中"]},
+                "status": {"type": "string", "enum": ["已确认推进", "已确认丢货", "已约仓", "已结案", "处理中", "延迟"]},
                 "note": {"type": "string", "description": "运营备注，可选"},
             },
             "required": ["order_no", "status"],
@@ -161,16 +161,30 @@ TOOLS = [
     {
         "name": "export_table",
         "description": (
-            "用户要求『导出/下载/给我表格/Excel』时调本工具。"
-            "本系统目前 **没有 Excel 导出能力**——本工具仅返回 stub 引导用户去模块页用浏览器内置导出，或自行复制。"
-            "\n严禁不调本 tool 自行宣称『已导出』『生成了下载链接』；那是事故。"
+            "用户要求『导出/下载/给我表格/打成表格/Excel』时调本工具。"
+            "**真生成 xlsx 文件** 到 ~/hipop/exports/，返 {download_url, row_count, filename}。"
+            "返完后用 markdown 链接 `[文件名](download_url)` 给用户。"
+            "\n**禁** 自己编『下载链接』；**禁** 说『系统只能返 X 个示例』(filtered_count 才是真总数，items 由 limit 控制)。"
+            "\n常用 view："
+            "\n  - `unlisted_with_sales` 未上架但 180d 有销量 SKU（Luke 高频）"
+            "\n  - `sales` wf2_sku 销量全字段（配 listing/sales_only 细化）"
+            "\n  - `sku_health` 销量+库存+在途跨表"
+            "\n  - `replenish` wf5_sales_cycle 补货建议"
+            "\n  - `logistics` wf3 卡单告警"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "view": {"type": "string", "description": "用户想导什么：replenish / sales / logistics / sku_health / orders 等"},
-                "format": {"type": "string", "enum": ["excel", "csv", "feishu"]},
-                "filter_desc": {"type": "string", "description": "用户筛选条件描述（可选）"},
+                "view": {"type": "string", "enum": [
+                    "unlisted_with_sales", "sales", "sku_health", "replenish", "logistics"
+                ]},
+                "store": {"type": "string", "enum": ["KSA", "UAE"], "default": "KSA"},
+                "listing": {"type": "string", "enum": ["all", "listed", "unlisted"], "default": "all",
+                            "description": "用于 sales/sku_health view"},
+                "sales_only": {"type": "boolean", "default": False,
+                               "description": "用于 sales/sku_health view — 只要 180d 有销量"},
+                "format": {"type": "string", "enum": ["excel"], "default": "excel"},
+                "filter_desc": {"type": "string", "description": "用户筛选条件描述（写到文件名/响应里）"},
             },
             "required": ["view"],
         },
@@ -347,6 +361,20 @@ TOOLS = [
                 "title": {"type": "string", "description": "query 标题, 仅记录用"},
             },
             "required": ["image_url"],
+        },
+    },
+    {
+        "name": "explain_status_enum",
+        "description": (
+            "用户问『5 个状态哪里来的 / 能加 X 状态吗 / 状态定义在哪 / 这是 ERP 内置还是 hipop 自己的字段』时调本工具。"
+            "返回字段出处、当前枚举值、是否可扩展、扩展方法。不要凭空说『状态写死在系统里』；必须真调本 tool 拿到 source 引用。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "enum": ["alert_status"], "default": "alert_status",
+                          "description": "目前只支持 alert_status (告警 ops_status)"},
+            },
         },
     },
 ]
@@ -610,27 +638,130 @@ def tool_list_products(store: str, listing: str = "all",
     }
 
 
-def tool_export_table(view: str, format: str = "excel", filter_desc: str = "") -> Dict:
-    """stub — 没真 export 能力，引导用户去模块页用浏览器导出。"""
-    module_map = {
-        "replenish": "/module/replenish",
-        "sales": "/module/sales",
-        "sku_health": "/module/sales",
-        "logistics": "/module/logistics",
-        "orders": "/module/logistics",
-    }
-    path = module_map.get(view, f"/module/{view}")
+def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
+                       store: str = "KSA", listing: str = "all",
+                       sales_only: bool = False) -> Dict:
+    """真生成 xlsx 文件 — 写 ~/hipop/exports/<filename>.xlsx 返下载 URL。
+
+    view 决定数据源 + 列：
+      - unlisted_with_sales: wf2_sku WHERE is_listed=0 AND sales_180d>0  (Luke 高频需求)
+      - sales:               wf2_sku 全量销量字段
+      - sku_health:          wf2_sku 销量 + 库存 + 在途 (跨表)
+      - replenish:           wf5_sales_cycle (补货建议)
+      - logistics:           wf3_logistics_hub_v2 (物流告警)
+    listing/sales_only 是 sales / sku_health view 的细化筛选。
+    """
+    import os
+    from datetime import datetime
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return {"ok": False, "error": "openpyxl 未装 (pip install openpyxl)"}
+
+    tid = _get_tenant()
+    alias = _resolve_entity_alias(store) or ""
+    if not alias:
+        return {"ok": False, "error": f"未知店铺 store={store}"}
+
+    # 决定 query
+    if view == "unlisted_with_sales":
+        where = (f"tenant_id={tid} AND entity_alias='{alias}' "
+                 f"AND (is_listed=0 OR is_listed IS NULL) "
+                 f"AND COALESCE(sales_180d,0) > 0")
+        cols = ["partner_sku", "title", "sales_180d", "sales_90d", "sales_30d",
+                "sales_10d", "latest_price", "avg_price", "latest_profit_rate",
+                "cost_price", "currency", "brand", "product_category_detail",
+                "latest_order_date", "is_listed"]
+        order_by = "COALESCE(sales_180d,0) DESC"
+    elif view in ("sales", "sku_health"):
+        w = [f"tenant_id={tid}", f"entity_alias='{alias}'"]
+        if listing == "listed": w.append("is_listed=1")
+        elif listing == "unlisted": w.append("(is_listed=0 OR is_listed IS NULL)")
+        if sales_only: w.append("COALESCE(sales_180d,0) > 0")
+        where = " AND ".join(w)
+        cols = ["partner_sku", "title", "is_listed", "sales_10d", "sales_30d",
+                "sales_60d", "sales_90d", "sales_180d", "latest_price", "avg_price",
+                "latest_profit_rate", "cost_price", "currency", "brand",
+                "product_category_detail", "latest_order_date"]
+        order_by = "COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC"
+    elif view == "replenish":
+        from . import data as _d
+        rows = _d._fetch(
+            f"SELECT * FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=? "
+            f"ORDER BY urgency DESC, sellable_days ASC",
+            (tid, alias),
+        )
+        return _write_xlsx_and_return(rows, f"replenish_{store}", filter_desc)
+    elif view == "logistics":
+        from . import data as _d
+        rows = _d._fetch(
+            f"SELECT * FROM wf3_logistics_hub_v2 WHERE tenant_id=? AND has_stuck_batch=1 "
+            f"ORDER BY in_transit_total_qty DESC",
+            (tid,),
+        )
+        return _write_xlsx_and_return(rows, f"logistics_stuck_{store}", filter_desc)
+    else:
+        return {"ok": False, "error": f"未知 view={view}；支持: "
+                "unlisted_with_sales / sales / sku_health / replenish / logistics"}
+
+    # 走 wf2_sku 通用路径
+    from . import data as _d
+    rows = _d._fetch(
+        f"SELECT {','.join(cols)} FROM wf2_sku WHERE {where} ORDER BY {order_by}",
+        (),
+    )
+    return _write_xlsx_and_return(rows, f"{view}_{store}", filter_desc, cols)
+
+
+def _write_xlsx_and_return(rows: list, name_prefix: str, filter_desc: str = "",
+                             cols: list = None) -> Dict:
+    """统一 xlsx 写盘 + 返下载链接 helper。"""
+    import os, time
+    from datetime import datetime
+    from openpyxl import Workbook
+
+    export_dir = os.path.expanduser("~/hipop/exports")
+    os.makedirs(export_dir, exist_ok=True)
+
+    if not rows:
+        return {"ok": True, "row_count": 0,
+                "message": "查询无数据 — 不生成空文件"}
+
+    if not cols:
+        cols = list(rows[0].keys()) if isinstance(rows[0], dict) else []
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{name_prefix}_{ts}.xlsx"
+    fpath = os.path.join(export_dir, fname)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = name_prefix[:30]
+    ws.append(cols)
+    for r in rows:
+        if isinstance(r, dict):
+            ws.append([r.get(c) for c in cols])
+        else:
+            ws.append(list(r))
+    # 第一行加粗
+    for cell in ws[1]:
+        cell.font = cell.font.copy(bold=True)
+    # 自适应列宽（粗略）
+    for col_idx, c in enumerate(cols, 1):
+        max_len = max((len(str(r.get(c) if isinstance(r, dict) else "")) for r in rows[:50]),
+                      default=10)
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max(len(c), max_len) + 2, 40)
+    wb.save(fpath)
+
+    download_url = f"/api/download/{fname}"
     return {
-        "ok": False,
-        "supported": False,
-        "view": view,
-        "format": format,
-        "message": (
-            f"系统目前没有内建 export 能力。请去工作台 {path} 页面，"
-            f"用浏览器右键『另存为』或选中表格复制到 Excel/飞书。"
-            "如需自动化导出，是产品化阶段 2 的功能。"
-        ),
-        "navigate_to": path,
+        "ok": True,
+        "row_count": len(rows),
+        "download_url": download_url,
+        "filename": fname,
+        "filter_desc": filter_desc,
+        "message": f"已生成 {len(rows)} 行 xlsx，下载: {download_url}",
+        "file_path": fpath,  # 本地路径方便排查
     }
 
 
@@ -761,13 +892,55 @@ def tool_query_1688_similar(image_url: str, pack: int = 1,
 
 
 def _erp_token_or_error(tid: int):
-    """共用：拿 per-tenant ERP token，没有就返 error dict"""
+    """共用：拿 per-tenant ERP token。没凭据返 'no_creds'；登录失败返 'login_failed'."""
     from . import _erp_auth
+    creds = _erp_auth._get_creds(tid)
+    if not creds:
+        return None, {"ok": False, "error": "no_erp_credentials",
+                       "message": f"tenant {tid} 没配 ERP 账号 — 请去 /onboarding 配 dbuyerp"}
     token = _erp_auth.get_erp_token_for_tenant(tid)
     if not token:
-        return None, {"ok": False, "error": "no_erp_credentials",
-                       "message": f"tenant {tid} 没有 ERP 凭据 — 请去 /onboarding 配 dbuyerp 账号"}
+        return None, {"ok": False, "error": "erp_login_failed",
+                       "message": f"ERP 凭据存在但 playwright 登录失败 "
+                                   "（dbuyerp 可能在风控同账号短时间多次登），稍后重试或用 wf3 缓存"}
     return token, None
+
+
+def _query_sku_from_cache(sku: str, tid: int) -> dict:
+    """ERP 拿不到 token 时的 fallback：从 wf3_logistics_hub_v2 缓存读。
+    数据可能 N 天前但总比 hallucinate 强。"""
+    from . import data as _data
+    _data.set_current_tenant(tid)
+    rows = _data._fetch(
+        "SELECT sku, in_transit_total_qty, total_transit_qty, transit_batches_json, "
+        "       updated_at FROM wf3_logistics_hub_v2 "
+        "WHERE tenant_id=? AND sku=?",
+        (tid, sku),
+    )
+    if not rows:
+        return {"ok": True, "sku": sku, "fetched_from": "wf3_cache_no_data",
+                "in_transit_total_qty": 0, "stale_warn": "wf3 缓存里这个 SKU 没数据"}
+    r = rows[0]
+    try:
+        import json as _json
+        batches = _json.loads(r.get("transit_batches_json") or "[]")
+    except Exception:
+        batches = []
+    upd = r.get("updated_at")
+    return {
+        "ok": True,
+        "sku": sku,
+        "fetched_from": "wf3_logistics_hub_v2 cache (ERP 实时拿不到 token 时的兜底)",
+        "stale_warn": f"⚠️ 此为 wf3 缓存数据，更新于 {upd}（非实时）。若需实时请稍后重试。",
+        "in_transit_total_qty": r.get("in_transit_total_qty") or 0,
+        "total_transit_qty": r.get("total_transit_qty") or 0,
+        "cache_updated_at": str(upd) if upd else None,
+        "in_transit_orders": [
+            {"order_no": b.get("order_no"), "qty": b.get("qty"),
+             "forwarder": b.get("forwarder"), "tracking_no": b.get("tracking_no")}
+            for b in batches[:10]
+        ],
+    }
 
 
 def _patch_wls_token(token: str):
@@ -821,7 +994,12 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     默认 False（只 ERP 拉单 + tracking_no，快），用户问'节点'/'卡哪'时设 True。"""
     tid = _get_tenant()
     token, err = _erp_token_or_error(tid)
-    if err: return err
+    if err:
+        if err.get("error") == "erp_login_failed":
+            cache_resp = _query_sku_from_cache(sku, tid)
+            cache_resp["live_query_failed_reason"] = err["message"]
+            return cache_resp
+        return err
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
         in_transit, completed = _wls.collect_sku_orders(sku, token)
@@ -871,7 +1049,12 @@ def tool_query_order_live(order_no: str) -> Dict:
     """实时查单货单 ERP 状态 + 物流站直链。"""
     tid = _get_tenant()
     token, err = _erp_token_or_error(tid)
-    if err: return err
+    if err:
+        if err.get("error") == "erp_login_failed":
+            return {"ok": False, "error": "erp_login_failed_no_cache",
+                     "message": f"ERP 实时查失败（{err['message']}），单货单查询没缓存兜底。"
+                                 "请用 query_sku_live(sku) 查整 SKU 的缓存。"}
+        return err
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
         # 用 erp_get /delivery?keyword=order_no 找货单
@@ -951,6 +1134,49 @@ def _tool_confirm_proposal(proposal_id: str, user_decision: str) -> Dict:
     return _gov.confirm_proposal(proposal_id, user_decision, actor, TOOL_FUNCS)
 
 
+def tool_explain_status_enum(field: str = "alert_status") -> Dict:
+    """告诉用户某个枚举字段的取值出处 + 是否能扩展。
+    Luke 多次问『5 个状态哪里来的 / 能加状态吗』，Agent 必须能说清此事。
+    """
+    if field in ("alert_status", "ops_status", "update_alert_status"):
+        import yaml as _yaml
+        yaml_path = os.path.join(os.path.dirname(__file__), "governance_actions.yaml")
+        try:
+            with open(yaml_path) as f:
+                spec = _yaml.safe_load(f).get("update_alert_status", {})
+        except Exception as e:
+            return {"ok": False, "error": f"读 yaml 失败: {e}"}
+        return {
+            "ok": True,
+            "field": "ops_status (wf6_logistics_alerts_v2 表的告警处理状态)",
+            "current_allowed": spec.get("allowed_statuses", []),
+            "source": "hipop 自己定义在 hipop/server/governance_actions.yaml:update_alert_status.allowed_statuses",
+            "from_erp_api": False,
+            "explanation": (
+                "这些状态不是 ERP/dbuyerp 软件内置的，是 hipop 工作流自己的运营字段。"
+                "DB 字段 ops_status 是 TEXT free text 类型（非 ENUM），技术上可任意扩展，"
+                "只是 chat agent 调用时会按 yaml 白名单校验。"
+            ),
+            "how_to_add_new_status": (
+                "加新状态需 2 处改动：\n"
+                "  1) hipop/server/governance_actions.yaml — allowed_statuses 加一行\n"
+                "  2) hipop/server/agent.py — update_alert_status schema enum 加一项\n"
+                "重启 uvicorn 后立即生效，数据库无需 migration。\n"
+                "如新状态需算告警关闭，再改 wf_logistics_alerts.py TERMINAL_STATUSES。"
+            ),
+            "references": [
+                {"table": "wf6_logistics_alerts_v2.ops_status", "type": "TEXT"},
+                {"file": "hipop/server/governance_actions.yaml", "key": "update_alert_status.allowed_statuses"},
+                {"file": "hipop/server/agent.py", "key": "TOOLS[update_alert_status].input_schema.status.enum"},
+            ],
+        }
+    return {
+        "ok": False,
+        "error": f"unknown field={field}",
+        "supported_fields": ["alert_status"],
+    }
+
+
 # ── Tool 派发 ─────────────────────────────────────────
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
@@ -971,6 +1197,7 @@ TOOL_FUNCS = {
     "query_sku_live": tool_query_sku_live,
     "query_order_live": tool_query_order_live,
     "query_1688_similar": tool_query_1688_similar,
+    "explain_status_enum": tool_explain_status_enum,
 }
 
 
@@ -981,6 +1208,13 @@ def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
     - Governance (Phase 0.2 半 MSCL): destructive tool 走
       ActionProposal → Decision (Haiku) → ExecToken → Execute → ExecutionRecord
       read-only tool 跳过 governance，直调
+
+    ⚠️ INVARIANT (2026-05-26)：
+    所有 LLM tool 调用必须经此函数。provider 层（_provider_anthropic /
+    _provider_openai）禁止自己实现 _exec_tool —— 历史上 5/21 把 _exec_tool
+    复制到 provider 文件只做 RBAC，导致 destructive tool 全部裸跑（governance
+    pipeline 形同虚设）。新增 provider 时：from . import agent; agent._exec_tool(...).
+    smoke_governance.py 会跑 inspect.getsource 检查 provider 没自定义 _exec_tool。
     """
     try:
         from . import rbac as _rbac
@@ -1247,6 +1481,7 @@ scope: {scope}
 - 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
 - 用户问多个 SKU → 对每个分别调 query_sku_live
 - query_sku_live 慢（5-15s）但准（直连 ERP），值得
+- query_sku_live 返回里有 `stale_warn` 或 `live_query_failed_reason` 时：必须明告用户「ERP 实时拉失败，给你的是 wf3 缓存（更新于 X），稍后可重试」，**不许**当作实时数据呈现
 
 ## tool 速查
 | 用户问 | 调 |
@@ -1262,7 +1497,8 @@ scope: {scope}
 | 商品总数 / SKU 数 | list_products |
 | 数据新鲜吗 | data_health_check |
 | 跑/刷新/扫/拉/重算/同步 | run_workflow |
-| 导出/下载/Excel | export_table（禁编 link）|
+| 导出/下载/Excel/打成表格 | **export_table**（真生成 xlsx，禁说"系统只能返 N 个示例"——filtered_count 才是真总数；返完用 [文件名](download_url) markdown 给用户）|
+| 状态/字段哪来 / 5 个状态出处 / 能加 X 状态吗 / 是 ERP 字段还是 hipop 字段 | **explain_status_enum**（不要凭空说"系统写死"，必须真调拿 source 引用）|
 | 打开 X 页面 | navigate_user_to（禁编 URL）|
 | 发飞书 / 通知群 | notify_via_feishu（禁说"已发"）|
 
@@ -1291,11 +1527,109 @@ scope: {scope}
 """
 
 
+_JUDGE_SYSTEM_PROMPT = (
+    "你是 Agent 回复质量评判官。基于用户问题、Agent 回复、调用的工具、系统检测到的幻觉信号，"
+    "判断这个回复是否真回答了问题、有无编造、引用是否支撑结论。\n"
+    "严格只返回 JSON（不要任何其他文字）：{\"confidence\": 0~1 浮点, \"verdict\": \"一句话评判\"}。\n"
+    "工具调用多、有数据引用、无幻觉信号 → 高置信(0.8+)；凭空作答、有幻觉信号 → 低置信(0.4-)。"
+)
+
+
+def _run_llm_judge(question, reply, tool_log, warnings):
+    """独立 LLM 给回复打分。复用 governance 的 LLM 调用 + JSON 抽取 pattern。
+    走当前 provider（默认 deepseek，便宜）。失败返 None → 调用方退回启发式分。"""
+    from . import _provider, governance as _gov
+    prompt = (
+        f"用户问：{(question or '')[:300]}\n\n"
+        f"Agent 回复：{(reply or '')[:600]}\n\n"
+        f"调用工具：{[t['name'] for t in tool_log]}\n"
+        f"系统检测到的幻觉信号：{warnings or '无'}\n\n"
+        "严格返回 JSON。"
+    )
+    try:
+        r = _provider.chat_with_tools(
+            messages=[{"role": "user", "content": prompt}],
+            system=_JUDGE_SYSTEM_PROMPT, tools=[], tool_funcs={},
+            scope={"_judge_only": True},
+        )
+        return _gov._extract_json(r.get("reply") or "")
+    except Exception:
+        return None
+
+
+def _compute_judge_confidence(question, reply, tool_log, refs, warnings):
+    """judge + confidence 混合算法。
+    启发式 baseline 每次跑（0 成本）；低置信 OR destructive 时触发 LLM judge 复核。
+    返回 (judge_text, confidence_float, method)。
+    """
+    from . import governance as _gov
+    n_tools = len(tool_log)
+    n_fields = sum(len(t.get("result_keys") or []) for t in tool_log)
+    n_warn = len(warnings or [])
+    has_refs = bool(refs)
+
+    # 启发式打分
+    conf = 0.85
+    conf -= 0.15 * min(n_warn, 3)        # 幻觉信号惩罚（最多 -0.45）
+    if n_tools == 0: conf -= 0.20        # 凭空作答（没调任何 tool）
+    if not has_refs: conf -= 0.10        # 无数据源引用
+    conf = max(0.1, min(conf, 0.95))
+
+    parts = [f"{n_tools}工具/{n_fields}字段"]
+    if n_warn: parts.append(f"{n_warn}个幻觉信号")
+    if refs: parts.append("源:" + ",".join((r.get("table") or "")[:20] for r in refs[:2]))
+    judge = " · ".join(parts)[:200]
+    method = "heuristic"
+
+    # 混合：低置信 OR destructive tool → LLM judge 复核
+    is_destr = any(_gov.is_destructive(t["name"]) for t in tool_log)
+    if conf < 0.6 or is_destr:
+        llm = _run_llm_judge(question, reply, tool_log, warnings)
+        if llm and "confidence" in llm:
+            try:
+                conf = max(0.1, min(float(llm["confidence"]), 0.99))
+                judge = (llm.get("verdict") or judge)[:200]
+                method = "llm"
+            except (TypeError, ValueError):
+                pass  # LLM 返回的 confidence 不是数字 → 保留启发式分
+    return judge, conf, method
+
+
+import re as _re
+# _safety 加的 banner / 低置信 tip 是给用户的展示层，绝不能回流进 LLM 历史 —— 否则
+# LLM 复读 banner 文字（含"之前触发任务还在跑"触发词）→ sanitize 再包一层 → 无限自激双 banner。
+_SAFETY_BANNER_RE = _re.compile(
+    r"⚠️ \*\*系统检测到 Agent 回复中可能存在不准确之处\*\*：[\s\S]*?"
+    r"以下是原始回复（已标记可疑部分）：\s*---\s*"
+)
+_LOWCONF_TIP_RE = _re.compile(r"⚠️ 我对这个回答的置信度较低（\d+%）[^\n]*\n\n---\n\n")
+
+
+def _strip_safety_banner(text):
+    """剥掉 _safety banner + 低置信 tip，拿回干净正文（用于持久化 + 喂 LLM 历史）。"""
+    if not text or not isinstance(text, str):
+        return text
+    text = _SAFETY_BANNER_RE.sub("", text)
+    text = _LOWCONF_TIP_RE.sub("", text)
+    return text
+
+
+def _clean_history(messages: List[Dict]) -> List[Dict]:
+    """喂 LLM 前清掉 assistant 历史里残留的 banner（清 DB 已有的脏数据 + 防自激）。"""
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+            out.append({**m, "content": _strip_safety_banner(m["content"])})
+        else:
+            out.append(m)
+    return out
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
     scope: {store, current_user, current_role, tenant_id, user_id, ...}
-    返回: {reply, references, action_id, tag, workflow_task, tools_used, provider}
+    返回: {reply, clean_reply, references, action_id, tag, workflow_task, tools_used, provider, confidence}
 
     走 _provider 抽象层，通过 LLM_PROVIDER env 切换 anthropic / qwen / deepseek / doubao。
     """
@@ -1309,16 +1643,36 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
 
     sys_text = SYSTEM_PROMPT.format(scope=json.dumps(scope, ensure_ascii=False))
     result = _provider.chat_with_tools(
-        messages=messages,
+        messages=_clean_history(messages),   # 清掉历史里残留的 banner，断自激
         system=sys_text,
         tools=TOOLS,
         tool_funcs=TOOL_FUNCS,
         scope=scope,
     )
-    final_text   = result["reply"]
+    clean_reply  = result["reply"]           # LLM 原文（无 banner）— 用于持久化 + 喂未来历史
     tool_log     = result["tool_log"]
     refs_collected = result["refs_collected"]
     workflow_task  = result.get("workflow_task")
+    tools_used     = [t["name"] for t in tool_log]
+
+    # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
+    # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
+    from . import _safety
+    final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used)
+
+    # judge + confidence 真逻辑（混合：启发式 + 低置信/destructive 触发 LLM judge）
+    question = messages[-1].get("content") if messages else ""
+    if isinstance(question, list):  # content 可能是 blocks
+        question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+    judge, confidence, judge_method = _compute_judge_confidence(
+        question, final_text, tool_log, refs_collected, hallu_warnings)
+
+    # 低置信自动在 reply 头部加提示（_safety 已加 banner 时不重复，避免双 banner）
+    if confidence < 0.6 and not hallu_warnings:
+        final_text = (
+            f"⚠️ 我对这个回答的置信度较低（{int(confidence*100)}%），"
+            "建议你核实关键数字，或换个更明确的问法。\n\n---\n\n"
+        ) + final_text
 
     # 写入 agent_actions（reference 系统）
     action_id = None
@@ -1329,10 +1683,10 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                 module="chat",
                 action_type="execute",
                 subject=tool_log[0]["args"].get("sku") or tool_log[0]["args"].get("order_no") if tool_log else None,
-                judge=final_text[:200],
+                judge=judge,
                 pill_text="执行" if tool_log else "信息",
                 pill="info",
-                confidence=0.9,
+                confidence=confidence,
                 options=[],
                 references=_dedup_refs(refs_collected),
                 owner=scope.get("current_user", "Cherry"),
@@ -1341,13 +1695,17 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             pass
 
     return {
-        "reply": final_text.strip() or "(无回复)",
+        "reply": final_text.strip() or "(无回复)",          # 展示版（带 banner）给前端当场看
+        "clean_reply": (clean_reply or "").strip() or "(无回复)",  # 无 banner 版给持久化，防历史自激
         "references": _dedup_refs(refs_collected),
         "action_id": action_id,
-        "tools_used": [t["name"] for t in tool_log],
-        "tag": "执行" if tool_log else None,
+        "tools_used": tools_used,
+        "tag": ("hallucinate" if hallu_warnings else ("执行" if tool_log else None)),
         "workflow_task": workflow_task,
         "provider": _provider.get_provider(),
+        "confidence": round(confidence, 2),
+        "judge_method": judge_method,
+        "hallucination_warnings": hallu_warnings or None,
     }
 
 

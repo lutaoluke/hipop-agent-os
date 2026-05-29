@@ -107,6 +107,10 @@ def _heartbeat(task_id: str) -> None:
 def main(task_id: str) -> int:
     print(f"[worker {os.getpid()}] starting task={task_id}", flush=True)
 
+    # 让 workflow 内部代码（不在 runner 里直接 call）能 from runtime import tick 自动 heartbeat
+    # 见 hipop/server/runtime.py:tick 的 env-aware 实现
+    os.environ["HIPOP_TASK_ID"] = task_id
+
     try:
         spec = _load_spec(task_id)
     except Exception as e:

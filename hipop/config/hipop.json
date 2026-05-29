@@ -43,7 +43,7 @@
     }
   },
   "db": {
-    "path": "/Users/luke/Downloads/点购工作流/hipop.db"
+    "path": "/Users/luke/code/hipop/hipop.db"
   },
   "noon": {
     "url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon"

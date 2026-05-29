@@ -15,6 +15,12 @@ CLI:
 import os, sys, json, sqlite3, argparse, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sales_entity import load_entities, ensure_tables, sku_table, entity_for
+# 长任务 heartbeat — 无 HIPOP_TASK_ID env 时自动 no-op
+try:
+    from hipop.server.runtime import tick, set_progress
+except ImportError:
+    tick = lambda *a, **k: None
+    set_progress = lambda *a, **k: None
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "hipop.db")
 NOON_PLATFORM_ID = 2
@@ -71,6 +77,7 @@ def fetch_products(token, page_size=50, max_pages=None, store_id=None):
         meta = data.get("meta") or {}
         total = meta.get("total") or 0
         print(f"  page {page}: {len(items)} products (total={total})", file=sys.stderr)
+        tick(f"fetch page {page} ({len(items)} products, total={total})")
         if len(items) < page_size:
             break
         if max_pages and page >= max_pages:
@@ -104,6 +111,7 @@ def run(max_pages=None):
                   file=sys.stderr)
             continue
         print(f"\n[entity {alias}] fetch store_ids={store_id}...", file=sys.stderr)
+        tick(f"start entity {alias} store_id={store_id}")
 
         seen_skus = 0
         bound_skus = 0
@@ -185,9 +193,11 @@ def run(max_pages=None):
         for rec in rows:
             cur.execute(sql, tuple(rec.get(c) for c in cols))
         print(f"  {alias}: {len(rows)} rows upserted into {t}", file=sys.stderr)
+        tick(f"upserted {len(rows)} rows into {t}")
     conn.commit()
     conn.close()
     print("[done]", file=sys.stderr)
+    set_progress({"done": True, "by_entity": {a: len(r) for a, r in by_entity.items()}})
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """LLM Provider 抽象层 — 支持 Anthropic + OpenAI 兼容协议（Qwen / DeepSeek / 豆包）
 
-切换方式：环境变量 LLM_PROVIDER=qwen | deepseek | doubao | anthropic（默认 qwen）
+切换方式：环境变量 LLM_PROVIDER=deepseek | qwen | doubao | anthropic（默认 deepseek）
 
 统一接口：
     chat_with_tools(messages, system, tools, tool_funcs, scope) -> ChatResult
@@ -37,10 +37,10 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
 
 
 def get_provider() -> str:
-    """当前生效的 provider 名。默认 qwen（性价比 ¥18/万次 + 国内直连 + ICP 备案过 + 与产品化路线对齐）。
-    实测 3 层防护（prompt 硬约束 + 3 stub tool 门控 + _safety 后处理）对 Qwen 长对话 hallucinate 全部生效。
-    本地无 QWEN_API_KEY 时显式 LLM_PROVIDER=anthropic 走 OAuth keychain。"""
-    return os.environ.get("LLM_PROVIDER", "qwen").lower()
+    """当前生效的 provider 名。默认 deepseek（Luke 实操选定，性价比 + 国内直连）。
+    DEEPSEEK_API_KEY 从 /Users/luke/code/hipop/.env.local 自动 load。
+    本地无 key 时显式 LLM_PROVIDER=anthropic 走 OAuth keychain。"""
+    return os.environ.get("LLM_PROVIDER", "deepseek").lower()
 
 
 def chat_with_tools(

@@ -128,7 +128,7 @@ CREATE TABLE wf6_<alias>_replenishment_queue (
 或：
 
 ```bash
-cd /Users/luke/Downloads/点购工作流
+cd /Users/luke/code/hipop
 python3 hipop/workflows/wf_logistics_alerts.py
 ```
 

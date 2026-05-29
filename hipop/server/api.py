@@ -2,7 +2,7 @@
 HIPOP 工作台 - JSON API (read-only Day 1 + 上传/SSE/chat Day 2-3)
 """
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException, Response
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from typing import Optional
 from uuid import uuid4
 import asyncio, os, json, shutil, sys, traceback
@@ -206,9 +206,53 @@ def api_modules(store: str):
     return data.get_module_summaries(store)
 
 
+@router.get("/download/{filename}")
+def api_download_export(filename: str):
+    """下载 chat 通过 export_table 生成的 xlsx (~/hipop/exports/<filename>)。"""
+    import os, re
+    if not re.match(r"^[\w\-.]+\.(xlsx|csv)$", filename):
+        raise HTTPException(400, "invalid filename")
+    fpath = os.path.expanduser(f"~/hipop/exports/{filename}")
+    if not os.path.exists(fpath):
+        raise HTTPException(404, f"file not found: {filename}")
+    return FileResponse(
+        fpath,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@router.post("/export")
+def api_export(body: dict, user: dict = Depends(_auth_mod.get_current_user)):
+    """前端直发 export 请求 → 调 agent.tool_export_table 生成 xlsx → 返 {download_url, row_count}。
+    不走 chat，UI 按钮直接调，节省 LLM 一轮往返。"""
+    if not user or user.get("is_default"):
+        raise HTTPException(401, "需登录")
+    tid = user.get("tenant_id") or 1
+    # ContextVar 在 async middleware ↔ sync handler 之间不传 + agent 有自己独立的 _chat_tenant
+    # 必须把两个都 set 才能让 tool_export_table 内部走对 tenant 的 sales_entities/wf2_sku
+    data.set_current_tenant(tid)
+    from . import agent
+    agent._chat_tenant.set(tid)
+    body = body or {}
+    return agent.tool_export_table(
+        view=body.get("view", "sales"),
+        store=body.get("store", "KSA"),
+        listing=body.get("listing", "all"),
+        sales_only=body.get("sales_only", False),
+        filter_desc=body.get("filter_desc", ""),
+    )
+
+
 @router.get("/sku-health/{store}")
-def api_sku_health(store: str, urgency: str = "all", limit: int = 30):
-    rows = data.get_sku_health(store, urgency=None if urgency == "all" else urgency, limit=limit)
+def api_sku_health(store: str, urgency: str = "all", limit: int = 30, listing: str = "listed"):
+    """listing: listed (默认) / unlisted / all。前端销售看板 5/26 加 3 态切换。"""
+    rows = data.get_sku_health(
+        store,
+        urgency=None if urgency == "all" else urgency,
+        limit=limit,
+        listing=listing,
+    )
     return rows
 
 
@@ -369,7 +413,10 @@ def api_cross_logistics():
 
 # ── Agent Actions / Reference 系统 ─────────────────────
 @router.get("/agent-actions/{action_id}")
-def api_agent_action(action_id: int):
+def api_agent_action(action_id: int, user: dict = Depends(_auth_mod.get_current_user)):
+    if not user or user.get("is_default"):
+        raise HTTPException(401, "需登录")
+    data.set_current_tenant(user.get("tenant_id") or 1)  # PG RLS 防跨租户读
     a = data.get_agent_action(action_id)
     if not a:
         raise HTTPException(404, "action not found")
@@ -377,20 +424,24 @@ def api_agent_action(action_id: int):
 
 
 @router.get("/agent-actions")
-def api_list_agent_actions(store: str = "ksa", module: Optional[str] = None, limit: int = 30):
+def api_list_agent_actions(store: str = "ksa", module: Optional[str] = None, limit: int = 30,
+                            user: dict = Depends(_auth_mod.get_current_user)):
+    if not user or user.get("is_default"):
+        raise HTTPException(401, "需登录")
+    data.set_current_tenant(user.get("tenant_id") or 1)
     return data.list_agent_actions(store, module, limit)
 
 
 @router.post("/agent-actions/{action_id}/adopt")
-def api_adopt(action_id: int, body: dict):
-    by = body.get("by", "Cherry")
-    with data.conn() as c:
-        c.execute("""
-            UPDATE agent_actions SET status='adopted', adopted_by=?,
-            adopted_at=datetime('now','localtime') WHERE id=?
-        """, (by, action_id))
-        c.commit()
-    return {"ok": True, "id": action_id, "status": "adopted"}
+def api_adopt(action_id: int, body: dict, user: dict = Depends(_auth_mod.get_current_user)):
+    """采纳/拒绝 agent 建议。adopted_by 从登录态取（不信 body 防伪造），带 tenant 越权防护。"""
+    if not user or user.get("is_default"):
+        raise HTTPException(401, "需登录")
+    data.set_current_tenant(user.get("tenant_id") or 1)
+    decision = (body or {}).get("decision", "adopt")
+    status = "adopted" if decision == "adopt" else "rejected"
+    by = user.get("display_name") or user.get("email") or "user"
+    return data.set_action_status(action_id, status, by)
 
 
 # ── 飞书 digest ───────────────────────────────────────
@@ -820,19 +871,15 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
         data.write_chat_message(store, "agent", "Agent", err, tag="error")
         return JSONResponse({"reply": err, "references": [], "action_id": None}, status_code=200)
 
-    # Layer 3 hallucinate 后处理验证
-    from . import _safety
-    sanitized, hallu_warnings = _safety.sanitize_reply(out.get("reply") or "", out.get("tools_used") or [])
-    if hallu_warnings:
-        out["reply"] = sanitized
-        out["hallucination_warnings"] = hallu_warnings
-        out["tag"] = "hallucinate"
+    # sanitize + judge/confidence 已在 agent.chat() 内做（2026-05-26 上移），这里只读结果
+    # out 已带 reply(已 sanitize) / hallucination_warnings / confidence / tag
 
-    # 持久化 agent 回复
+    # 持久化 agent 回复 —— 存 clean_reply（无 banner），防下一轮作为历史喂 LLM 时自激双 banner。
+    # 前端当场显示用 out["reply"]（带 banner）；刷新后从 chat-history 读到 clean 版（banner 是临时提醒）。
     try:
         data.write_chat_message(
             store, "agent", "Agent",
-            out.get("reply") or "(无回复)",
+            out.get("clean_reply") or out.get("reply") or "(无回复)",
             tag=out.get("tag") or "",
             references=out.get("references") or [],
             task=out.get("workflow_task"),

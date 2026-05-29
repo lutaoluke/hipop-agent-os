@@ -18,6 +18,12 @@ import os, sys, json, sqlite3, argparse, re, time
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sales_entity import load_entities, ensure_tables, sku_table
+# 长任务 heartbeat — 无 HIPOP_TASK_ID env 时自动 no-op
+try:
+    from hipop.server.runtime import tick, set_progress
+except ImportError:
+    tick = lambda *a, **k: None
+    set_progress = lambda *a, **k: None
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "hipop.db")
 ERP_API_BASE = "https://erp-api.dbuyerp.com/admin"
@@ -294,13 +300,16 @@ def run(entity_aliases=None, windows=None, max_pages=None):
             continue
 
         print(f"\n[entity {alias}] country={country} store={store}", file=sys.stderr)
+        tick(f"start entity {alias} country={country} store={store}")
 
         # partner_sku -> 累积 dict
         bucket = {}
-        for days in win_list:
+        for idx, days in enumerate(win_list, 1):
             max_items = max_pages * 50 if max_pages else None
             items = fetch_window(token, nation_id, days, max_items=max_items)
             print(f"  {days}d: {len(items)} skus", file=sys.stderr)
+            tick(f"[{alias}] window {idx}/{len(win_list)} ({days}d): {len(items)} skus")
+            set_progress({"current_entity": alias, "windows_done": idx, "windows_total": len(win_list)})
             for it in items:
                 erp_sku = it.get("sku_id")
                 if not erp_sku:

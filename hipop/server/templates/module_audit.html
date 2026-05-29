@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}{{ store_full }} · 数据巡检 · 点购 Agent OS{% endblock %}
+{% block crumb %}<a href="/?store={{ store_lower }}">今日总览</a><span class="pc-crumb-sep">/</span>数据巡检{% endblock %}
+
+{% block main %}
+<div class="pc-page-title">{{ store_full }} · 数据巡检 Agent
+  <span style="font-size:12px;color:var(--text-tertiary);font-weight:400;">10 个 invariant 实时检查 · 防 P0 类 bug 回归</span>
+</div>
+
+<div x-data="auditPage()" x-init="init()">
+
+  <div class="pc-health-chips" x-show="data">
+    <div class="pc-health-chip" :class="{'': data.overall === 'ok'}">
+      <span class="pc-dot" :class="data.overall"></span>
+      <span x-text="'整体: ' + (data.overall === 'ok' ? '健康' : (data.overall === 'warn' ? '需关注' : '严重'))"></span>
+    </div>
+    <div class="pc-health-chip"><span class="pc-dot ok"></span>通过 <b><span x-text="data.counts.ok"></span></b></div>
+    <div class="pc-health-chip" x-show="data.counts.warn"><span class="pc-dot warn"></span>警告 <b><span x-text="data.counts.warn"></span></b></div>
+    <div class="pc-health-chip" x-show="data.counts.danger"><span class="pc-dot danger"></span>严重 <b><span x-text="data.counts.danger"></span></b></div>
+    <div class="pc-health-chip" style="color:var(--text-tertiary)" x-text="'as_of: ' + (data.as_of || '').slice(0,19)"></div>
+    <button class="pc-chip" @click="refresh()" :disabled="loading">
+      <span x-show="!loading">↻ 重跑巡检</span>
+      <span x-show="loading">跑中...</span>
+    </button>
+  </div>
+
+  <div class="pc-table" x-show="data">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:30px;"></th>
+          <th style="width:160px;">检查项</th>
+          <th>检查结果</th>
+          <th style="width:240px;">修复路径</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="r in data.checks" :key="r.check">
+          <tr :class="r.status === 'danger' ? 'danger-row' : (r.status === 'warn' ? 'warn-row' : '')">
+            <td style="text-align:center;font-size:14px;"
+                x-text="({ok:'✓', warn:'⚠', danger:'✗', info:'·'})[r.status]"
+                :style="{color: r.status === 'danger' ? 'var(--text-danger)' : (r.status === 'warn' ? 'var(--text-warning)' : 'var(--text-success)')}"></td>
+            <td><b x-text="r.check"></b></td>
+            <td>
+              <div x-text="r.message" style="font-size:12.5px;"></div>
+            </td>
+            <td style="font-size:11.5px;color:var(--text-secondary);">
+              <span x-text="r.fix || '—'"></span>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div x-show="!data" style="padding:30px;text-align:center;color:var(--text-tertiary);">巡检中…</div>
+
+  <div style="margin-top:14px;font-size:11.5px;color:var(--text-tertiary);background:var(--bg-tertiary);padding:10px 14px;border-radius:6px;">
+    <b>10 个 invariant 涵盖：</b>
+    聚合一致性 (P0#1) · SKU 池跨表漂移 (P0#5) · 数据新鲜度 · 数据流断裂 (P0#6) ·
+    sa_main 死引用扫描 (P0#5/#7) · 算法基线 (慢销卷入率/补货数) ·
+    慢销 v2 代码漂移 (P0#8) · Canary SKU · 必需表存在 · P0 回归测试
+  </div>
+</div>
+
+<style>
+.danger-row td { background: var(--bg-danger); }
+.warn-row td { background: var(--bg-warning); }
+</style>
+
+<script>
+function auditPage() {
+  return {
+    data: null,
+    loading: false,
+    async init() { await this.refresh(); },
+    async refresh() {
+      this.loading = true;
+      try {
+        const r = await fetch('/api/audit/{{ store_lower }}');
+        this.data = await r.json();
+      } catch(e) { alert('巡检异常: ' + e); }
+      this.loading = false;
+    },
+  };
+}
+</script>
+{% endblock %}

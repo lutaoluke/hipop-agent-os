@@ -9,22 +9,8 @@ import anthropic
 
 from . import _auth
 
-
-def _exec_tool(tool_funcs: Dict[str, Callable], name: str, args: dict, user: dict = None) -> dict:
-    try:
-        from . import rbac as _rbac
-        if user and not _rbac.tool_allowed(user, name):
-            return {
-                "error": "permission_denied",
-                "tool": name, "user_role": user.get("role"),
-                "message": f"当前角色 {user.get('role')} 不能调用 {name}",
-            }
-        fn = tool_funcs[name]
-        return fn(**args)
-    except KeyError:
-        return {"error": f"unknown tool: {name}"}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+# governance dispatch 统一走 agent._exec_tool —— 历史上这里有过 _exec_tool 副本
+# 只做 RBAC 绕过了 governance，2026-05-26 删掉。详见 agent.py _exec_tool docstring。
 
 
 def run(messages: List[Dict], system: str, tools: List[Dict],
@@ -72,7 +58,8 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
             elif getattr(block, "type", None) == "tool_use":
                 tool_name = block.name
                 tool_args = block.input or {}
-                result = _exec_tool(tool_funcs, tool_name, tool_args, user=scope)
+                from . import agent as _agent
+                result = _agent._exec_tool(tool_name, tool_args, user=scope)
                 if isinstance(result, dict) and "references" in result:
                     refs_collected.extend(result["references"])
                 if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):

@@ -60,6 +60,7 @@ TOOL_PERMISSION = {
     "confirm_proposal":       "view_dashboard",
     "query_sku_live":         "view_sku",
     "query_order_live":       "view_orders",
+    "explain_status_enum":    "view_dashboard",
 }
 
 

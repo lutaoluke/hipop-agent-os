@@ -23,7 +23,7 @@ from typing import Optional, List, Tuple, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-DB = "/Users/luke/Downloads/点购工作流/hipop.db"
+DB = "/Users/luke/code/hipop/hipop.db"
 
 # ── 意图识别 ───────────────────────────────────────────
 SKU_RE = re.compile(r"\b([A-Z]{2,4}\d{4,6}[A-Z]?)\b")

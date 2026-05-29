@@ -29,6 +29,11 @@ from sales_entity import (
 from sales_entity_v2 import list_entities_for_tenant
 from server._erp_auth import get_erp_token_for_tenant
 from server import data as _data
+try:
+    from server.runtime import tick, set_progress
+except ImportError:
+    tick = lambda *a, **k: None
+    set_progress = lambda *a, **k: None
 
 
 def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
@@ -52,10 +57,13 @@ def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
         needed_wh.update(overseas_warehouses_for(ent["country"]))
     print(f"[warehouses] {sorted(needed_wh)}", file=sys.stderr)
 
-    for wid in sorted(needed_wh):
+    wh_total = len(sorted(needed_wh))
+    for wh_idx, wid in enumerate(sorted(needed_wh), 1):
         w = WAREHOUSES[wid]
         print(f"\n[wh {wid} {w['name']} ({w['scope']}/{w['country'] or '-'})]", file=sys.stderr)
+        tick(f"warehouse {wh_idx}/{wh_total}: {w['name']}")
         items = fetch_warehouse_stock(token, wid, max_pages=max_pages)
+        set_progress({"warehouses_done": wh_idx, "warehouses_total": wh_total, "current_wh": w['name']})
         for it in items:
             partner_sku = it.get("sku_id")
             if not partner_sku:

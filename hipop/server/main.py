@@ -13,6 +13,17 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Auto-load .env.local（DEEPSEEK_API_KEY 等），重启 uvicorn 不必每次手动 export
+_DOTENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env.local")
+if os.path.exists(_DOTENV_PATH):
+    for _line in open(_DOTENV_PATH):
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        _k, _v = _k.strip(), _v.strip().strip("'").strip('"')
+        os.environ.setdefault(_k, _v)
+
 from server.feishu import reply_text, send_card, send_text
 from server.intent import parse_intent
 from server.skills import dispatch
@@ -20,15 +31,53 @@ from server.skills import dispatch
 app = FastAPI(title="HIPOP Skill Server + Agent OS")
 
 
-# ── 多租户 middleware：每个请求自动 set tenant context（PG RLS 用）─────
+# ── Auth lockdown (2026-05-26 Phase 7)：未登录禁止访问，杜绝陌生人看 tenant=1 数据 ──
+# 历史 fallback `tenant_id=1`（=Cherry/HIPOP）让任何未登录请求都能读到真实数据。
+# 现在 middleware 在最外层拦：白名单内放行，其他要么 401 (API) 要么跳 /login (页面)。
+# 可通过 env AUTH_LOCKDOWN=0 临时关闭（仅用于 debug；切勿在生产）。
+_PUBLIC_ROUTES = {
+    "/login", "/register", "/health", "/ready", "/favicon.ico",
+    "/feishu/webhook",
+    "/api/auth/login", "/api/auth/register", "/api/auth/logout",
+}
+_PUBLIC_PREFIXES = ("/static/", "/api/auth/")
+
+
+def _is_public_path(path: str) -> bool:
+    if path in _PUBLIC_ROUTES:
+        return True
+    return any(path.startswith(p) for p in _PUBLIC_PREFIXES)
+
+
 @app.middleware("http")
 async def tenant_context_middleware(request, call_next):
     from server import auth as _auth_mod, data as _data
+    from fastapi.responses import JSONResponse, RedirectResponse
+
+    path = request.url.path
+    lockdown = os.environ.get("AUTH_LOCKDOWN", "1") != "0"
+
+    if _is_public_path(path):
+        # 公开路由：不设 tenant（数据访问应被各 endpoint 自己拒）
+        _data.set_current_tenant(0)
+        return await call_next(request)
+
     try:
         user = _auth_mod.get_current_user(request)
-        _data.set_current_tenant(user.get("tenant_id") or 1)
     except Exception:
-        _data.set_current_tenant(1)  # 默认 HIPOP 租户
+        user = None
+
+    if lockdown and (not user or user.get("is_default")):
+        # 未登录：API 返 401（前端可拦后跳转），页面跳 /login?next=<原路径>
+        if path.startswith("/api/"):
+            return JSONResponse(
+                {"detail": "未登录，请先登录后再访问"},
+                status_code=401,
+            )
+        return RedirectResponse(f"/login?next={path}", status_code=302)
+
+    # 登录用户 — 设 tenant context（PG RLS 用）
+    _data.set_current_tenant((user or {}).get("tenant_id") or 1)
     return await call_next(request)
 
 # ── Phase 1: 工作台 UI + JSON API ─────────────────────────
@@ -39,6 +88,46 @@ from server.pages import router as _pages_router
 from server.api import router as _api_router
 app.include_router(_pages_router)
 app.include_router(_api_router, prefix="/api")
+
+# ── Startup self-check: smoke_governance + dbuyerp token 过期 ─────
+# 后台跑（不阻塞启动），结果只 log。fail 不阻 server 起来，但 Luke 一看 log 就知道
+@app.on_event("startup")
+def _startup_selfcheck():
+    import subprocess, threading
+
+    def _smoke():
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        env = {**os.environ, "PYTHONPATH": repo}
+        for name in ("smoke_governance", "smoke_judge"):
+            try:
+                r = subprocess.run(
+                    [sys.executable, f"tests/{name}.py"],
+                    cwd=repo, capture_output=True, text=True, timeout=60, env=env,
+                )
+                if r.returncode == 0:
+                    print(f"[startup] ✓ {name} passed", flush=True)
+                else:
+                    print(f"[startup] ⚠️ {name} FAILED:", flush=True)
+                    print(r.stdout[-800:] or r.stderr[-800:], flush=True)
+            except Exception as e:
+                print(f"[startup] {name} skipped: {e}", flush=True)
+
+    def _token_check():
+        try:
+            from server import _erp_auth
+            status = _erp_auth.check_persist_token_expiry()
+            if status.get("needs_refresh"):
+                print(f"[startup] ⚠️ dbuyerp token 即将过期或已过期: {status['tokens']}", flush=True)
+                print(f"[startup]    → 跑 skill 刷新: /refresh-dbuyerp-token", flush=True)
+            elif status.get("tokens"):
+                days = [f"{t['user']}={t['days_left']}d" for t in status['tokens']]
+                print(f"[startup] ✓ dbuyerp tokens healthy: {days}", flush=True)
+        except Exception as e:
+            print(f"[startup] token check skipped: {e}", flush=True)
+
+    threading.Thread(target=_smoke, daemon=True).start()
+    threading.Thread(target=_token_check, daemon=True).start()
+
 
 # ── 每日自动刷新（APScheduler）───────────────────────────
 # 默认 02:00 跑 refresh_all_v2 for every active tenant；
@@ -68,8 +157,16 @@ _processed = set()
 # ── 健康检查 ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    """liveness — 进程在跑就 200。容器编排用。"""
-    return {"status": "ok"}
+    """liveness + 关键依赖状态。"""
+    try:
+        from server import _erp_auth
+        erp_token = _erp_auth.check_persist_token_expiry()
+    except Exception as e:
+        erp_token = {"error": str(e)[:200]}
+    return {
+        "status": "ok",
+        "erp_token": erp_token,  # {tokens: [...], needs_refresh: bool}
+    }
 
 
 @app.get("/ready")

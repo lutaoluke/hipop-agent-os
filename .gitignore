@@ -7,6 +7,14 @@
 inbox/
 logs/
 
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 大体量数据目录 — 不进 git（运行时产物）
+selection/
+refs/
+
 # 选品 Agent 凭证 — 不要 commit
 点购_选品_凭证.md
 .chrome-profiles/

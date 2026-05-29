@@ -22,7 +22,7 @@ import sys
 import sqlite3
 import argparse
 
-DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/Downloads/点购工作流/hipop.db")
+DB_PATH = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
 HIPOP_TENANT = 1
 
 # (源表 pattern, 目标 v2 表, 主键列)

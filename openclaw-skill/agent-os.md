@@ -1,6 +1,6 @@
 点购 Agent OS — 工作台 + 协作 Agent + 工作流触发（hipop/server）：FastAPI + Jinja2 + Alpine 的本地工作台，右侧 chat 通过 Anthropic tool-use 调用 7 个 tool；触发工作流后实时进度推到气泡 + 模块页自动刷新。
 
-工作目录：/Users/luke/Downloads/点购工作流
+工作目录：/Users/luke/code/hipop
 
 ## 启动（三种模式）
 

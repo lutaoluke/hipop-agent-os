@@ -25,6 +25,12 @@ from ingest_erp_products import fetch_products, NOON_PLATFORM_ID, NATION_BY_ID
 from sales_entity_v2 import list_entities_for_tenant
 from server._erp_auth import get_erp_token_for_tenant
 from server import data as _data
+# 长任务 heartbeat — 无 HIPOP_TASK_ID env 时自动 no-op
+try:
+    from server.runtime import tick, set_progress
+except ImportError:
+    tick = lambda *a, **k: None
+    set_progress = lambda *a, **k: None
 
 
 def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
@@ -55,6 +61,7 @@ def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
             print(f"[{alias}] 跳过：sales_entities.store_id 没配", file=sys.stderr)
             continue
         print(f"\n[{alias}] fetch ERP store_ids={store_id}...", file=sys.stderr)
+        tick(f"start entity {alias} (store_id={store_id})")
 
         rows_for_entity = []
         for product in fetch_products(token, max_pages=max_pages, store_id=store_id):
@@ -123,15 +130,20 @@ def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
             f"ON CONFLICT (tenant_id, entity_alias, partner_sku) DO UPDATE SET {update_set}"
         )
         n = 0
+        total = len(rows_for_entity)
         for rec in rows_for_entity:
             try:
                 conn.execute(sql, tuple(rec.get(c) for c in cols))
                 n += 1
+                if n % 100 == 0:
+                    tick(f"[{alias}] upserted {n}/{total} rows")
             except Exception as e:
                 print(f"[{alias}] row fail: {str(e)[:100]}", file=sys.stderr)
                 break
         conn.commit()
         counts[alias] = n
+        set_progress({"by_entity": counts})
+        tick(f"[{alias}] done +{n} rows")
         print(f"[{alias}] +{n} rows upserted to wf2_sku", file=sys.stderr)
 
     conn.close()

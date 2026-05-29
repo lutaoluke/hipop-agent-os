@@ -17,12 +17,28 @@
     <div class="pc-health-chip">库存 < 14 天 <span x-text="counts.lowDays||0"></span></div>
   </div>
 
+  <!-- 上架状态切换 + 下载按钮 (2026-05-26 Phase 9 — Luke 报"看不到未上架商品") -->
+  <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span style="font-size:12px;color:var(--text-secondary);">上架状态:</span>
+      <button class="pc-chip" :class="{'active': listing==='listed'}"   @click="setListing('listed')">已上架</button>
+      <button class="pc-chip" :class="{'active': listing==='unlisted'}" @click="setListing('unlisted')">未上架</button>
+      <button class="pc-chip" :class="{'active': listing==='all'}"      @click="setListing('all')">全部</button>
+      <span style="font-size:11px;color:var(--text-tertiary);" x-text="'共 ' + rows.length + ' 条'"></span>
+    </div>
+    <button class="pc-chip" @click="downloadCurrent()" :disabled="downloading"
+            x-text="downloading ? '⏳ 生成中…' : '⬇️ 下载当前结果 (xlsx)'"
+            style="cursor:pointer;"></button>
+  </div>
+
   <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;">
     <span style="font-size:12px;color:var(--text-secondary);">筛选:</span>
     <button class="pc-chip" :class="{'active': filter==='all'}" @click="filter='all'">全部</button>
     <button class="pc-chip" :class="{'active': filter==='urgent'}" @click="filter='urgent'">立即处理</button>
     <button class="pc-chip" :class="{'active': filter==='lowmargin'}" @click="filter='lowmargin'">低利润</button>
     <button class="pc-chip" :class="{'active': filter==='stuck'}" @click="filter='stuck'">在途异常</button>
+    <button class="pc-chip" :class="{'active': filter==='everSold'}" @click="filter='everSold'"
+            x-show="listing==='unlisted'">未上架但有销量</button>
   </div>
 
   <div class="pc-table">
@@ -81,14 +97,22 @@ function salesModule() {
     rows: [],
     counts: {},
     filter: 'urgent',
+    listing: 'listed',     // listed / unlisted / all
+    downloading: false,
     async init() {
       await this.refresh();
       window.addEventListener('workflow-done', (e) => {
         if ((e.detail.affected_modules || []).includes('sales')) this.refresh();
       });
     },
+    setListing(v) {
+      this.listing = v;
+      // 切到未上架默认显示全部（不只显示"立即处理"，因为未上架本身就没在售趋势）
+      if (v === 'unlisted') this.filter = 'everSold';
+      this.refresh();
+    },
     async refresh() {
-      const r = await fetch('/api/sku-health/{{ store_lower }}?urgency=all&limit=200');
+      const r = await fetch(`/api/sku-health/{{ store_lower }}?urgency=all&limit=500&listing=${this.listing}`);
       this.rows = await r.json();
       this.counts = {
         '急速下降': this.rows.filter(r=>r.trend==='急速下降').length,
@@ -99,15 +123,42 @@ function salesModule() {
         'lowDays': this.rows.filter(r=>r.days_left !== null && r.days_left < 14 && r.days_left > 0).length,
       };
     },
+    async downloadCurrent() {
+      this.downloading = true;
+      try {
+        // 未上架视图走 unlisted_with_sales (只导有销量的 - Luke 高频需求)；其他走 sales 全表
+        const view = this.listing === 'unlisted' ? 'unlisted_with_sales' : 'sales';
+        const r = await fetch('/api/export', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({
+            view, store: '{{ store_lower }}'.toUpperCase(),
+            listing: this.listing,
+            filter_desc: `listing=${this.listing}, filter=${this.filter}`,
+          }),
+        });
+        const d = await r.json();
+        if (d.ok && d.download_url) {
+          window.open(d.download_url, '_blank');
+        } else {
+          alert('导出失败: ' + (d.error || d.message || JSON.stringify(d)));
+        }
+      } catch (e) {
+        alert('网络错误: ' + e.message);
+      }
+      this.downloading = false;
+    },
     trendClass(t) {
       return ({'急速下降':'danger','下降':'warn','加速增长':'info','平稳':'ok','增长':'ok','无销量':''})[t] || '';
     },
     filtered() {
-      if (this.filter === 'all') return this.rows.slice(0, 50);
-      if (this.filter === 'urgent') return this.rows.filter(r=>['急速下降','下降'].includes(r.trend)).slice(0, 50);
-      if (this.filter === 'lowmargin') return this.rows.filter(r=>r.profit_rate !== null && r.profit_rate < 10).slice(0, 50);
-      if (this.filter === 'stuck') return this.rows.filter(r=>r.has_stuck_batch).slice(0, 50);
-      return this.rows.slice(0, 50);
+      if (this.filter === 'all') return this.rows.slice(0, 100);
+      if (this.filter === 'urgent') return this.rows.filter(r=>['急速下降','下降'].includes(r.trend)).slice(0, 100);
+      if (this.filter === 'lowmargin') return this.rows.filter(r=>r.profit_rate !== null && r.profit_rate < 10).slice(0, 100);
+      if (this.filter === 'stuck') return this.rows.filter(r=>r.has_stuck_batch).slice(0, 100);
+      if (this.filter === 'everSold') return this.rows.filter(r=>(r.sales_180d||0) > 0).slice(0, 100);
+      return this.rows.slice(0, 100);
     },
     openRef(r) {
       window.dispatchEvent(new CustomEvent('open-ref', {

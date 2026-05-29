@@ -8,6 +8,102 @@
 </div>
 
 <div x-data="selectionModule()" x-init="init()">
+
+  <!-- ── N7: 1688 找同款 ─────────────────────────────── -->
+  <div class="pc-section-title">1688 找同款 <span class="ref">N7 图搜 · cosScore 重排 · 多件套自动关 yoloCrop</span></div>
+  <div class="pc-table" style="padding:14px;margin-bottom:20px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+      <div style="flex:1;min-width:280px;">
+        <label style="font-size:11.5px;color:var(--text-tertiary);">商品图 URL</label>
+        <input type="text" x-model="n7.imageUrl" placeholder="https://f.nooncdn.com/... 或 https://cbu01.alicdn.com/..."
+               style="width:100%;padding:6px 8px;font-size:12px;border:1px solid var(--border-default);border-radius:4px;">
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--text-tertiary);">件数</label>
+        <select x-model.number="n7.pack" style="padding:6px;font-size:12px;border:1px solid var(--border-default);border-radius:4px;">
+          <option value="1">1 (单只)</option>
+          <option value="2">2</option><option value="3">3</option><option value="4">4</option>
+          <option value="5">5</option><option value="6">6</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--text-tertiary);">材质</label>
+        <select x-model="n7.material" style="padding:6px;font-size:12px;border:1px solid var(--border-default);border-radius:4px;">
+          <option value="">未知</option>
+          <option value="ABS">ABS</option><option value="PC">PC</option><option value="PP">PP</option>
+          <option value="ABS+PC">ABS+PC</option><option value="铝框">铝框</option>
+          <option value="软箱">软箱</option><option value="皮箱">皮箱</option>
+        </select>
+      </div>
+      <button @click="searchN7()" :disabled="n7.loading || !n7.imageUrl"
+              style="padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;"
+              :style="n7.loading || !n7.imageUrl ? 'opacity:.5' : ''">
+        <span x-text="n7.loading ? '搜索中...' : '搜 1688 同款'"></span>
+      </button>
+    </div>
+    <div x-show="n7.cookiesStatus" style="margin-top:8px;font-size:11px;color:var(--text-tertiary);">
+      cookies 状态: <span x-text="n7.cookiesStatus"></span>
+    </div>
+  </div>
+
+  <div x-show="n7.error" class="pc-table" style="padding:12px;margin-bottom:14px;background:#fff3f3;color:#c00;font-size:12px;" x-text="'❌ ' + n7.error"></div>
+
+  <div x-show="n7.result && n7.result.candidates && n7.result.candidates.length" style="margin-bottom:24px;">
+    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">
+      <span x-text="'找到 ' + (n7.result?.found || 0) + ' 个候选, 展示 top ' + (n7.result?.candidates?.length || 0)"></span>
+      · yoloCrop <b x-text="n7.result?.yolocrop"></b>
+      <template x-if="n7.result?.failed">
+        <span style="color:#c80;"> · ⚠️ 图搜失败建议文搜兜底: <b x-text="n7.result.fallback_keywords"></b></span>
+      </template>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead>
+        <tr style="border-bottom:1px solid var(--border-default);">
+          <th style="text-align:left;padding:6px;width:54px;">图</th>
+          <th style="text-align:left;padding:6px;">商品 / 店铺</th>
+          <th style="text-align:right;padding:6px;width:70px;">价</th>
+          <th style="text-align:center;padding:6px;width:90px;">cos / comb</th>
+          <th style="text-align:center;padding:6px;width:100px;">verdict</th>
+          <th style="text-align:left;padding:6px;width:60px;">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="(c,i) in n7.result.candidates" :key="c.offer_id">
+          <tr style="border-bottom:1px solid var(--border-subtle);">
+            <td style="padding:6px;">
+              <a :href="c.open_url" target="_blank">
+                <img :src="c.offer_pic" referrerpolicy="no-referrer"
+                     style="width:48px;height:48px;object-fit:cover;border-radius:4px;">
+              </a>
+            </td>
+            <td style="padding:6px;">
+              <a :href="c.open_url" target="_blank"
+                 style="color:var(--text-primary);text-decoration:none;font-weight:500;"
+                 x-text="c.title"></a>
+              <div style="font-size:11px;color:var(--text-tertiary);">
+                <span x-text="c.company || c.city || ''"></span>
+                <template x-if="c.material"><span> · 材质 <b x-text="c.material"></b></span></template>
+                <template x-for="w in c.warning_flags"><span style="color:#c80;"> · ⚠️<span x-text="w"></span></span></template>
+              </div>
+            </td>
+            <td style="padding:6px;text-align:right;" x-text="'¥' + c.price_cny"></td>
+            <td style="padding:6px;text-align:center;font-family:ui-monospace,Menlo,monospace;">
+              <div x-text="c.cos_score"></div>
+              <div style="font-size:11px;color:var(--text-tertiary);" x-text="c.combined_score"></div>
+            </td>
+            <td style="padding:6px;text-align:center;">
+              <span :style="verdictStyle(c.verdict)" x-text="c.verdict"></span>
+            </td>
+            <td style="padding:6px;">
+              <a :href="c.open_url" target="_blank" style="font-size:11px;color:var(--accent);">详情 →</a>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── 旧的候选品评估区 (stub, 保留, 等 N7 接 N8 之后并入) ─────── -->
   <div class="pc-section-title">候选品评估 (3) <span class="ref">基于成功/失败模式 + 类目相似度</span></div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px;">
     <template x-for="c in candidates" :key="c.candidate">
@@ -47,11 +143,52 @@ function selectionModule() {
   return {
     candidates: [],
     strategies: {},
+    n7: { imageUrl: '', pack: 1, material: '', loading: false, result: null, error: '', cookiesStatus: '' },
     async init() {
       const r = await fetch('/api/selection/{{ store_lower }}');
       const d = await r.json();
       this.candidates = d.candidates;
       this.strategies = d.strategies;
+      // N7 cookies 状态展示
+      try {
+        const cs = await fetch('/api/n7/cookies-status').then(r => r.json());
+        this.n7.cookiesStatus = cs.state +
+          (cs.h5tk_expiry_in_h !== null && cs.h5tk_expiry_in_h !== undefined
+            ? ' (h5tk ' + cs.h5tk_expiry_in_h.toFixed(1) + 'h)' : '');
+      } catch(e) {}
+    },
+    async searchN7() {
+      this.n7.loading = true; this.n7.error = ''; this.n7.result = null;
+      try {
+        const r = await fetch('/api/n7/image-search', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            image_url: this.n7.imageUrl,
+            pack: this.n7.pack,
+            material: this.n7.material,
+          }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          this.n7.error = 'HTTP ' + r.status + ': ' + t.slice(0, 300);
+        } else {
+          this.n7.result = await r.json();
+        }
+      } catch(e) {
+        this.n7.error = e.message || String(e);
+      } finally {
+        this.n7.loading = false;
+      }
+    },
+    verdictStyle(v) {
+      const map = {
+        inquiry:        'background:#d9f2d9;color:#2a7a2a;padding:2px 8px;border-radius:10px;font-size:11px;',
+        differentiation:'background:#fff4d4;color:#8a5a00;padding:2px 8px;border-radius:10px;font-size:11px;',
+        watch:          'background:#e4e8f5;color:#446;padding:2px 8px;border-radius:10px;font-size:11px;',
+        drop:           'background:#f0f0f0;color:#888;padding:2px 8px;border-radius:10px;font-size:11px;',
+      };
+      return map[v] || '';
     },
     show(c) {
       window.dispatchEvent(new CustomEvent('open-ref', {
