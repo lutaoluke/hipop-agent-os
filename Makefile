@@ -7,11 +7,11 @@
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-.PHONY: test test-chat test-governance test-judge test-all
+.PHONY: test test-chat test-governance test-judge test-sales-contract test-all
 
-test: test-governance test-judge
+test: test-governance test-judge test-sales-contract
 	@echo ""
-	@echo "✓ governance + judge smoke passed"
+	@echo "✓ governance + judge + sales-contract smoke passed"
 	@echo "  (跑全套: make test-all；跑 chat smoke: make test-chat)"
 
 test-governance:
@@ -22,10 +22,14 @@ test-judge:
 	@echo "▶ judge/confidence smoke (防 confidence=0.9 硬编码回退)"
 	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_judge.py
 
+test-sales-contract:
+	@echo "▶ sales-contract smoke (WS-15: 销量录入数据契约 fail-then-pass，SQLite 自洽)"
+	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_sales_contract.py
+
 test-chat:
 	@echo "▶ chat smoke (17 cases, 需要 uvicorn 在 :8765 跑着)"
 	cd $(REPO)/tests && bash run_smoke.sh
 
-test-all: test-governance test-judge test-chat
+test-all: test-governance test-judge test-sales-contract test-chat
 	@echo ""
 	@echo "✓ all smoke passed"
