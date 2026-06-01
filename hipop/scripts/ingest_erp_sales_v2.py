@@ -87,8 +87,12 @@ def _upsert_order_costs(conn, tenant_id, alias, rec, nation_id, token):
                currency, cost_local, cost_pack, cost_intl, profit, profit_rate, source)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (tenant_id, entity_alias, partner_sku, item_nr) DO UPDATE SET
+              -- 确定性规则：ERP 只补成本/利润，noon 订单字段不被覆盖。已有 noon 行优先
+              -- （noon_sku / order_date / currency 都保 noon）；seller_price/customer_paid/
+              -- status/fulfillment 不在 SET 里 → 天然保留。order_date 曾误走 excluded 优先，
+              -- 会把 noon 订单日期盖成 ERP detail 日期，污染最新订单/销量窗口口径（WS-17 红队打回）。
               noon_sku    = COALESCE(wf2_orders.noon_sku, excluded.noon_sku),
-              order_date  = COALESCE(excluded.order_date, wf2_orders.order_date),
+              order_date  = COALESCE(wf2_orders.order_date, excluded.order_date),
               currency    = COALESCE(wf2_orders.currency, excluded.currency),
               cost_local  = excluded.cost_local,
               cost_pack   = excluded.cost_pack,

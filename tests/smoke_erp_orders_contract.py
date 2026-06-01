@@ -287,8 +287,86 @@ def test_contract():
     return check.failures
 
 
+def _seed_noon_order(conn, item_nr, **noon):
+    """预置一条 noon 订单行（模拟 noon ASN/订单 ingest 先写过），供 ERP 成本 upsert 撞键。"""
+    cols = ["tenant_id", "entity_alias", "partner_sku", "noon_sku", "item_nr",
+            "order_date", "status", "seller_price", "customer_paid", "currency",
+            "fulfillment", "source"]
+    vals = [TID, ALIAS, "SKU777A", "NOON-AAA", item_nr,
+            noon.get("order_date"), noon.get("status"), noon.get("seller_price"),
+            noon.get("customer_paid"), noon.get("currency"),
+            noon.get("fulfillment"), "noon"]
+    ph = ",".join("?" * len(cols))
+    conn.execute(f"INSERT INTO wf2_orders ({','.join(cols)}) VALUES ({ph})", vals)
+    conn.commit()
+
+
+def test_noon_not_overwritten():
+    """确定性规则：ERP 只补成本/利润，noon 订单字段（含 order_date）不被 ERP 覆盖。
+
+    红队发现的口径洞（验门人打回）：冲突更新若 order_date 走 ERP 优先，已有 noon 订单
+    日期会被 ERP SKU detail 日期盖掉，污染最新订单日期/销量窗口口径。
+
+    fail-then-pass：seed 一条 noon PSA001（order_date=2026-06-15、seller_price/
+    customer_paid/status/fulfillment 都是 noon 值、成本利润为空），再跑 sales_v2 让
+    ERP 成本明细按 item_nr 撞键 upsert。改动前（order_date 走 excluded 优先）→
+    order_date 被覆成 ERP 的 2026-05-30 → FAIL；改动后保 noon → PASS。同时成本/利润
+    必须被 ERP 写入。
+    """
+    print("== test_noon_not_overwritten (ERP 不覆盖 noon 订单字段) ==")
+    import importlib
+    hdata = importlib.import_module("hipop.server.data")
+
+    path = _build_db()
+
+    # 先写 noon 订单行（ERP ingest 之前 noon 已落库的状态）
+    conn = hdata.conn()
+    _seed_noon_order(conn, "PSA001",
+                     order_date="2026-06-15", status="delivered",
+                     seller_price=199.0, customer_paid=210.0,
+                     currency="SAR", fulfillment="FBN")
+    conn.close()
+
+    # 再跑 ERP 管道：products_v2 + sales_v2（ERP detail 的 PSA001 order_date=2026-05-30）
+    _patch_and_run(path)
+
+    check = _Checker()
+    conn = hdata.conn()
+    orders = _order_rows(conn, "SKU777A")
+    by_nr = {o["item_nr"]: o for o in orders}
+    if "PSA001" in by_nr:
+        o = by_nr["PSA001"]
+        # ── noon 字段必须保住（ERP 不覆盖）──
+        check("PSA001 order_date 保 noon==2026-06-15（不被 ERP 覆盖）",
+              o["order_date"] == "2026-06-15", f"got {o['order_date']!r}")
+        check("PSA001 seller_price 保 noon==199",
+              _approx(o["seller_price"], 199.0), f"got {o['seller_price']!r}")
+        check("PSA001 customer_paid 保 noon==210",
+              _approx(o["customer_paid"], 210.0), f"got {o['customer_paid']!r}")
+        check("PSA001 status 保 noon==delivered",
+              o["status"] == "delivered", f"got {o['status']!r}")
+        check("PSA001 fulfillment 保 noon==FBN",
+              o["fulfillment"] == "FBN", f"got {o['fulfillment']!r}")
+        # ── 成本/利润必须被 ERP 写入（这一半 upsert 是真的）──
+        check("PSA001 cost_local 被 ERP 写入==30",
+              _approx(o["cost_local"], 30.0), f"got {o['cost_local']!r}")
+        check("PSA001 profit 被 ERP 写入==30",
+              _approx(o["profit"], 30.0), f"got {o['profit']!r}")
+        check("PSA001 profit_rate 被 ERP 写入==0.30",
+              _approx(o["profit_rate"], 0.30), f"got {o['profit_rate']!r}")
+    else:
+        check("PSA001 存在", False, f"orders={list(by_nr)}")
+
+    conn.close()
+    if check.failures and os.environ.get("SMOKE_SKIP_ORDER_COST") == "1":
+        print("  （SMOKE_SKIP_ORDER_COST=1：成本未 ingest，这是预期的'改动前 fail'。）")
+    return check.failures
+
+
 def run():
     failures = test_contract()
+    print()
+    failures += test_noon_not_overwritten()
     print()
     if failures:
         print(f"✗ {len(failures)} 项断言失败: {failures}")
