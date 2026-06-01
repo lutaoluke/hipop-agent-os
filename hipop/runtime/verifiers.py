@@ -118,6 +118,44 @@ def _v_wf1_stock(task_id, tenant_id, started_at, **kw):
     }
 
 
+@register("wf1_stock_snapshot_v2")
+def _v_wf1_stock_snapshot(task_id, tenant_id, started_at, **kw):
+    """库存历史快照 — 本次 run 应往 wf1_stock_history 写了带业务日 as_of_date 的行，
+    且 as_of_date 必须是合法业务日（YYYY-MM-DD），不是 imported_at/今天兜底出来的。
+
+    断言口径（挡"占位假数据"）：
+      - 本 run（snapshot_at >= started_at）至少写了 1 行历史。
+      - 这些行的 as_of_date 全是合法 YYYY-MM-DD（来自运行参数，不是空/今天反推）。
+      - as_of_date 不等于 snapshot_at 的日期部分时也算合法 —— 历史回溯本就常写过去的业务日。
+    """
+    from hipop.server import data
+    data.set_current_tenant(tenant_id)
+    cutoff = _started_at_iso(started_at)
+    rows = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock_history WHERE tenant_id=? AND snapshot_at >= ?",
+        (tenant_id, cutoff),
+    ) or 0
+    bad_dates = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock_history WHERE tenant_id=? AND snapshot_at >= ? "
+        "AND (as_of_date IS NULL OR as_of_date NOT LIKE '____-__-__')",
+        (tenant_id, cutoff),
+    ) or 0
+    distinct_days = data._scalar(
+        "SELECT COUNT(DISTINCT as_of_date) FROM wf1_stock_history WHERE tenant_id=?",
+        (tenant_id,),
+    ) or 0
+    ok = rows > 0 and bad_dates == 0
+    return {
+        "ok": ok,
+        "evidence": {"rows_this_run": rows, "bad_as_of_date": bad_dates,
+                     "distinct_business_days": distinct_days},
+        "verdict": (f"{rows} 行历史快照写入，业务日合法（共 {distinct_days} 个业务日在档）"
+                    if ok else
+                    (f"{bad_dates} 行 as_of_date 非法（疑似硬编码/空业务日）"
+                     if bad_dates else "0 行历史写入 — latest wf1_stock 可能为空")),
+    }
+
+
 @register("wf5_sales_cycle_v2")
 def _v_wf5(task_id, tenant_id, started_at, **kw):
     """销售周期 — 跑完 wf5_sales_cycle 应该有 trend / urgency / weekly_total_replenish 等字段."""

@@ -92,6 +92,25 @@ def _run_wf1_inbound_staging(task_id, tenant_id, actor, spec, progress, heartbea
     return {"summary": f"wf1_inbound_staging: {res}"}
 
 
+@register("wf1_stock_snapshot_v2")
+def _run_wf1_stock_snapshot(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """库存历史快照 — 把 latest wf1_stock 按业务日冻结进 wf1_stock_history（WS-22）。
+
+    spec: {"as_of_date": "YYYY-MM-DD"} 必填业务日运行参数；
+          缺失 → run_v2 直接 raise（红灯，不假装 today）。
+          可选 {"entity_alias": "..."} 只冻结单 entity。
+    """
+    from hipop.scripts import stock_history
+    heartbeat()
+    res = stock_history.run_v2(
+        tenant_id=tenant_id,
+        as_of_date=(spec or {}).get("as_of_date"),
+        entity_alias=(spec or {}).get("entity_alias"),
+    )
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf1_stock_snapshot: {res}"}
+
+
 @register("wf2_sales_v2")
 def _run_wf2_sales(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """ERP 销量价格利润率 ingest — 6 时间窗，可断点续。
