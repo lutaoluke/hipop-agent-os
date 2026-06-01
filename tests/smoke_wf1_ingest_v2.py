@@ -54,7 +54,7 @@ def _extract_create(table: str) -> str:
 
 def _setup_db():
     c = sqlite3.connect(_TMP_DB)
-    for t in ("sales_entities", "wf2_sku", "wf1_stock"):
+    for t in ("sales_entities", "wf2_sku", "wf1_stock", "tenant_erp_credentials"):
         c.executescript(_extract_create(t))
     # 销售主体：SA / AE 两个 entity
     c.executemany(
@@ -122,6 +122,51 @@ def main():
     # 新建行不得伪造 pending_inbound_qty
     assert b["pending_inbound_qty"] is None and cc["pending_inbound_qty"] is None, "凭空写了 pending_inbound_qty"
 
+    # ── 1b. ERP 库存清单 fixture → wf1_stock ERP 列（DoD: ERP 行数 + ≥2 仓）──
+    import ingest_erp_stock_v2 as erp
+
+    def _erp_item(sku, qty):
+        return {"sku_id": sku, "stock_total_available_count": qty,
+                "platform_sku_ids": [{"platform": {"id": 2},
+                                      "store": {"name": "HIPOP-NOON-KSA"},
+                                      "platform_sku_id": "Z" + sku}]}
+    # warehouse_id → items（义乌6 / 东莞15 / SA 海外 8,14；7,16=AE 海外返空）
+    ERP_FIX = {
+        6:  [_erp_item("SKU-A", 100), _erp_item("SKU-B", 50)],
+        15: [_erp_item("SKU-D", 40)],
+        8:  [_erp_item("SKU-A", 30)],
+        14: [_erp_item("SKU-D", 10)],
+    }
+    touched = set()
+
+    def fake_fetch(token, wid, **kw):
+        assert token == "FAKE-TEST-TOKEN", "ERP fetch 没拿到注入的 token"
+        touched.add(wid)
+        return ERP_FIX.get(wid, [])
+
+    eres = erp.run_v2(TENANT, token="FAKE-TEST-TOKEN", fetch_fn=fake_fetch)
+    assert eres.get("hipop_ksa") == 3, f"ERP 写入 SKU 数 {eres} != 3"
+    assert len([w for w in touched if ERP_FIX.get(w)]) >= 2, f"覆盖仓库 < 2: {touched}"
+
+    erows = {r["partner_sku"]: r for r in _q("SELECT * FROM wf1_stock ORDER BY partner_sku")}
+    ea = erows["SKU-A"]
+    assert (ea["yiwu_qty"], ea["dongguan_qty"], ea["overseas_total_qty"], ea["total_stock"]) == (100, 0, 30, 130), ea
+    ed = erows["SKU-D"]
+    assert (ed["dongguan_qty"], ed["overseas_total_qty"], ed["total_stock"]) == (40, 10, 50), ed
+    # ERP producer 部分 upsert：不碰 noon 列（SKU-A 仍是步骤 1 的 noon 值）
+    assert (ea["noon_total_qty"], ea["noon_saleable_qty"]) == (15, 10), f"ERP 覆盖了 noon 列: {ea}"
+
+    # ── 1c. 缺 ERP token → 红灯，不回落 backfill/假数据 ─────────────
+    before = _q("SELECT count(*) c FROM wf1_stock")[0]["c"]
+    raised = False
+    try:
+        erp.run_v2(TENANT, fetch_fn=fake_fetch)   # token=None → 查无凭据 → None
+    except RuntimeError:
+        raised = True
+    after = _q("SELECT count(*) c FROM wf1_stock")[0]["c"]
+    assert raised, "缺 ERP token 时应 raise 红灯，而不是静默回落"
+    assert before == after, "缺 token 仍写了库（回落到假数据/backfill）"
+
     # ── 2. ASN/送仓 → wf1_asn_lines_staging（供 WS-11）─────────────
     sres = inbound.run_v2(
         TENANT,
@@ -143,16 +188,30 @@ def main():
     erp_lines = [r for r in stg if r["source"] == "erp_inbound"]
     assert {r["partner_sku"] for r in erp_lines} == {"SKU-A", "SKU-B"}, erp_lines
 
-    # ── 3. 死代码短路：绝不创建/写入 v1 per-alias 表 ───────────────
+    # ── 3. 真实入口接线：WORKFLOW_REGISTRY + callable 可解析 ───────
+    # （验门人 finding #1：只注册 runner、没进 registry，/run-workflow 会 400）
+    from hipop.server import api
+    for wf in ("wf1_noon_stock_v2", "wf1_inbound_staging_v2"):
+        assert wf in api.WORKFLOW_REGISTRY, f"{wf} 不在 WORKFLOW_REGISTRY → /run-workflow 会 400"
+        _, steps, _ = api.WORKFLOW_REGISTRY[wf]
+        fn = api._resolve_callable(steps[0][2])
+        assert callable(fn) and fn.__name__ == "run_v2", f"{wf} callable 解析失败: {steps}"
+    from hipop.runtime import workflow_runners as wr
+    assert {"wf1_noon_stock_v2", "wf1_inbound_staging_v2"} <= set(wr.list_runners()), \
+        "runner 注册表缺新 workflow（后台 worker 路径）"
+
+    # ── 4. 死代码短路：绝不创建/写入 v1 per-alias 表 ───────────────
     tables = {r["name"] for r in _q("SELECT name FROM sqlite_master WHERE type='table'")}
     v1 = {t for t in tables if re.fullmatch(r"wf1_hipop_(ksa|uae)_stock", t)}
     assert not v1, f"写到了 v1 per-alias 表（死法#2）: {v1}"
 
     print("✓ noon producer 写入 wf1_stock.noon_*（3 SKU，平台 SKU 已映射）")
-    print("✓ 部分 upsert 不覆盖 ERP 列 / 不伪造 pending_inbound_qty")
+    print("✓ ERP 库存清单 fixture 写入 wf1_stock ERP 列（3 SKU / ≥2 仓）")
+    print("✓ noon↔ERP 互不覆盖；缺 ERP token 红灯且不回落 backfill/假数据")
     print("✓ ASN/送仓 5 行落 wf1_asn_lines_staging（2 ASN，partner_sku 已映射）")
+    print("✓ wf1_noon_stock_v2 / wf1_inbound_staging_v2 进 WORKFLOW_REGISTRY + runner（真实入口可触发）")
     print("✓ 没有创建/写入 v1 wf1_<alias>_stock 路径")
-    print("\n4/4 passed")
+    print("\n6/6 passed")
 
 
 if __name__ == "__main__":

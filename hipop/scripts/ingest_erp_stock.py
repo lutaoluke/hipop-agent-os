@@ -23,7 +23,9 @@ from sales_entity import (load_entities, ensure_tables, stock_table,
                           WAREHOUSES, overseas_warehouses_for, domestic_warehouses)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "hipop.db")
-ERP_API_BASE = "https://erp-api.dbuyerp.com/admin"
+# 受控配置入口：API base 可由 env 覆盖（生产走真实 dbuyerp；测试/自托管可换）。
+# token/cookie 不在这里硬编码 —— 走 _erp_auth.get_erp_token_for_tenant（受审计 env/runtime）。
+ERP_API_BASE = os.environ.get("ERP_API_BASE", "https://erp-api.dbuyerp.com/admin")
 NOON_PLATFORM_ID = 2
 
 

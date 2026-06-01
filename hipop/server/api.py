@@ -642,6 +642,20 @@ WORKFLOW_REGISTRY = {
         [(1, "拉所有仓库存 + 写 wf1_stock v2", "scripts.ingest_erp_stock_v2:run_v2")],
         ["sales", "replenish"],
     ),
+    # WS-10：Noon my inventory（导表/inbox 驱动）→ wf1_stock.noon_*
+    "wf1_noon_stock_v2": (
+        "Noon 官方仓库存（导表 → wf1_stock.noon_*，per-tenant）",
+        [(1, "扫 inbox Noon inventory CSV + 映射 partner_sku + 写 wf1_stock.noon_*",
+          "scripts.ingest_noon_stock_csv_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
+    # WS-10：ERP 送仓/拣货 + Noon ASN → wf1_asn_lines_staging（供 WS-11）
+    "wf1_inbound_staging_v2": (
+        "在途/送仓 ASN（导表 → wf1_asn_lines_staging，供 WS-11）",
+        [(1, "扫 inbox ASN/送仓 CSV + 映射 partner_sku + 写 staging",
+          "scripts.ingest_inbound_staging_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
     "wf5_sales_cycle_v2": (
         "销售周期 + 补货决策（v2 表，per-tenant）",
         [(1, "per-entity 销售周期算法 + 写 wf5_sales_cycle v2",

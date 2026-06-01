@@ -35,6 +35,25 @@ from sales_entity_v2 import get_entity_by_country, get_entity, noon_sku_map
 from server import data as _data
 
 STAGING_TABLE = "wf1_asn_lines_staging"
+INBOX_DIR = os.path.join(HERE, "..", "..", "inbox")
+
+
+def _classify_csv(path) -> str | None:
+    """按列签名判断是 Noon ASN 还是 ERP 送仓/拣货导出；都不像则 None。"""
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            cols = set(csv.DictReader(f).fieldnames or [])
+    except Exception:
+        return None
+    if "asn_number" not in cols:
+        return None
+    has_sku = ("partner_sku" in cols) or ("sku" in cols) or ("noon_sku" in cols)
+    if not has_sku:
+        return None
+    # ERP 送仓/拣货导出带送仓时间(inbound_date)；Noon ASN 不带。
+    if "inbound_date" in cols:
+        return "erp_inbound"
+    return "noon_asn"
 
 
 def safe_int(v):
@@ -136,22 +155,47 @@ def _process_file(conn, tenant_id, path, source) -> dict:
     return {"rows": rows_in, "lines": written, "unmapped": unmapped}
 
 
+def _scan_inbox(inbox: str) -> dict:
+    """扫 inbox，按列签名把 CSV 分到 noon_asn / erp_inbound。"""
+    found = {"noon_asn": [], "erp_inbound": []}
+    if not os.path.isdir(inbox):
+        return found
+    for fn in sorted(os.listdir(inbox)):
+        if not fn.endswith(".csv") or fn.startswith("."):
+            continue
+        kind = _classify_csv(os.path.join(inbox, fn))
+        if kind:
+            found[kind].append(os.path.join(inbox, fn))
+    return found
+
+
 def run_v2(tenant_id: int, noon_asn_file: str | None = None,
-           erp_inbound_file: str | None = None, dry_run: bool = False) -> dict:
+           erp_inbound_file: str | None = None,
+           inbox: str | None = None, dry_run: bool = False) -> dict:
     print(f"\n=== ingest_inbound_staging v2 tenant={tenant_id} ===", file=sys.stderr)
     _data.set_current_tenant(tenant_id)
+
+    # 没给显式文件时扫 inbox（让 /run-workflow 入口能真正触发，而不是 no-op）
+    noon_files = [noon_asn_file] if noon_asn_file else []
+    erp_files = [erp_inbound_file] if erp_inbound_file else []
+    if not noon_files and not erp_files:
+        scanned = _scan_inbox(inbox or INBOX_DIR)
+        noon_files, erp_files = scanned["noon_asn"], scanned["erp_inbound"]
+
     conn = _data.conn()
     result = {"noon_asn": {}, "erp_inbound": {}, "asn_lines": 0}
     try:
         ensure_staging_tables(conn)
         if dry_run:
             return result
-        if noon_asn_file:
-            result["noon_asn"] = _process_file(conn, tenant_id, noon_asn_file, "noon_asn")
-            print(f"  noon_asn: {result['noon_asn']}", file=sys.stderr)
-        if erp_inbound_file:
-            result["erp_inbound"] = _process_file(conn, tenant_id, erp_inbound_file, "erp_inbound")
-            print(f"  erp_inbound: {result['erp_inbound']}", file=sys.stderr)
+        for p in noon_files:
+            r = _process_file(conn, tenant_id, p, "noon_asn")
+            result["noon_asn"] = {k: result["noon_asn"].get(k, 0) + v for k, v in r.items()}
+            print(f"  noon_asn {os.path.basename(p)}: {r}", file=sys.stderr)
+        for p in erp_files:
+            r = _process_file(conn, tenant_id, p, "erp_inbound")
+            result["erp_inbound"] = {k: result["erp_inbound"].get(k, 0) + v for k, v in r.items()}
+            print(f"  erp_inbound {os.path.basename(p)}: {r}", file=sys.stderr)
     finally:
         conn.close()
     result["asn_lines"] = (result["noon_asn"].get("lines", 0)
