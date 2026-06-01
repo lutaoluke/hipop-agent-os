@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS wf2_orders (
   customer_paid REAL,
   currency      TEXT,
   fulfillment   TEXT,
+  -- ERP 视角下该订单的成本/利润（WS-17：由 ingest_erp_sales_v2 从 ERP SKU 成本利润详情写入）。
+  -- 老物理切表 wf2_<a>_orders 早就有这 5 列但从无 ingest 写它们（占位假数据）；v2 之前还把列删了。
+  -- WS-17 把列补回 + 接上真正的生产写入，由 tests/smoke_erp_orders_contract.py 钉死 fail-then-pass。
+  cost_local    REAL,
+  cost_pack     REAL,
+  cost_intl     REAL,
+  profit        REAL,
+  profit_rate   REAL,
   destination   TEXT,
   source        TEXT,
   raw_json      TEXT,
