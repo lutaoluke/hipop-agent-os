@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import datetime
 import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,11 +50,33 @@ _BUSINESS_COLS = (
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def is_valid_business_date(s) -> bool:
+    """是否为合法业务日字符串：零填充 'YYYY-MM-DD' **且**是真实存在的日历日。
+
+    两道关一起卡（缺一就漏)：
+      · 形状关（正则）：必须是带短横的零填充 'YYYY-MM-DD' —— 挡掉 '20260530' / '2026/05/30'。
+      · 日历关（strptime 真实解析）：年月日必须真实存在 —— 挡掉 '2026-99-99' / '2026-02-30'
+        这种形状对、但根本不存在的占位假业务日。
+    verifier 与 normalize_as_of_date 共用这一份判据，避免两处规则漂移。
+    """
+    if s is None:
+        return False
+    t = str(s).strip()
+    if not _DATE_RE.match(t):
+        return False
+    try:
+        datetime.datetime.strptime(t, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
 def normalize_as_of_date(as_of_date) -> str:
     """校验业务日 → 'YYYY-MM-DD'。
 
-    缺失 / 非法格式一律 raise —— 这是挡"占位假数据"的门：调用方**必须**给真实业务日，
-    不允许靠默认值悄悄回落到 today。
+    缺失 / 非法格式 / 非法日历日一律 raise —— 这是挡"占位假数据"的门：调用方**必须**给
+    真实存在的业务日，不允许靠默认值悄悄回落到 today，也不允许 '2026-99-99' 这种形状对、
+    日历上不存在的假日子混进历史抽检层。
     """
     if as_of_date is None:
         raise ValueError(
@@ -63,8 +86,11 @@ def normalize_as_of_date(as_of_date) -> str:
     # 兼容传进来带时间的 'YYYY-MM-DD HH:MM:SS' / ISO，截前 10 位
     if len(s) >= 10 and (s[10:11] in (" ", "T")):
         s = s[:10]
-    if not _DATE_RE.match(s):
-        raise ValueError(f"as_of_date 格式非法：{as_of_date!r}（应为 YYYY-MM-DD 业务日）")
+    if not is_valid_business_date(s):
+        raise ValueError(
+            f"as_of_date 非法：{as_of_date!r}（应为真实存在的 YYYY-MM-DD 业务日，"
+            f"如 '2026-99-99'/'2026-02-30' 这类不存在的日期会被拒绝）"
+        )
     return s
 
 

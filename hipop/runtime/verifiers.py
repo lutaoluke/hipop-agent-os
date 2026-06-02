@@ -118,14 +118,26 @@ def _v_wf1_stock(task_id, tenant_id, started_at, **kw):
     }
 
 
+def _valid_business_date(s) -> bool:
+    """as_of_date 是否为合法业务日：零填充 'YYYY-MM-DD' 且真实存在的日历日。
+
+    复用 scripts/stock_history.is_valid_business_date 同一份判据，避免规则两处漂移
+    —— **不能只靠 SQL LIKE 看形状**：'2026-99-99' / '2026-02-30' 形状对但日历上不存在，
+    必须用真实日期解析判掉，否则占位假业务日会蒙混过门。
+    """
+    from hipop.scripts import stock_history
+    return stock_history.is_valid_business_date(s)
+
+
 @register("wf1_stock_snapshot_v2")
 def _v_wf1_stock_snapshot(task_id, tenant_id, started_at, **kw):
     """库存历史快照 — 本次 run 应往 wf1_stock_history 写了带业务日 as_of_date 的行，
-    且 as_of_date 必须是合法业务日（YYYY-MM-DD），不是 imported_at/今天兜底出来的。
+    且 as_of_date 必须是**真实存在的**业务日（YYYY-MM-DD），不是 imported_at/今天兜底、
+    也不是 '2026-99-99' 这种形状对、日历上不存在的占位假日。
 
     断言口径（挡"占位假数据"）：
       - 本 run（snapshot_at >= started_at）至少写了 1 行历史。
-      - 这些行的 as_of_date 全是合法 YYYY-MM-DD（来自运行参数，不是空/今天反推）。
+      - 这些行的 as_of_date 全是真实日历日 —— 用 strptime 真解析判定，**不靠 SQL LIKE 形状**。
       - as_of_date 不等于 snapshot_at 的日期部分时也算合法 —— 历史回溯本就常写过去的业务日。
     """
     from hipop.server import data
@@ -135,11 +147,17 @@ def _v_wf1_stock_snapshot(task_id, tenant_id, started_at, **kw):
         "SELECT COUNT(*) FROM wf1_stock_history WHERE tenant_id=? AND snapshot_at >= ?",
         (tenant_id, cutoff),
     ) or 0
-    bad_dates = data._scalar(
-        "SELECT COUNT(*) FROM wf1_stock_history WHERE tenant_id=? AND snapshot_at >= ? "
-        "AND (as_of_date IS NULL OR as_of_date NOT LIKE '____-__-__')",
+    # 拉本 run 写入的所有 as_of_date，在 Python 里用真实日期解析判合法（含非法日历日）。
+    run_dates = data._fetch(
+        "SELECT as_of_date FROM wf1_stock_history WHERE tenant_id=? AND snapshot_at >= ?",
         (tenant_id, cutoff),
-    ) or 0
+    )
+    bad_samples = sorted({
+        str(r.get("as_of_date"))
+        for r in run_dates
+        if not _valid_business_date(r.get("as_of_date"))
+    })
+    bad_dates = len(bad_samples)
     distinct_days = data._scalar(
         "SELECT COUNT(DISTINCT as_of_date) FROM wf1_stock_history WHERE tenant_id=?",
         (tenant_id,),
@@ -148,10 +166,11 @@ def _v_wf1_stock_snapshot(task_id, tenant_id, started_at, **kw):
     return {
         "ok": ok,
         "evidence": {"rows_this_run": rows, "bad_as_of_date": bad_dates,
+                     "bad_samples": bad_samples,
                      "distinct_business_days": distinct_days},
-        "verdict": (f"{rows} 行历史快照写入，业务日合法（共 {distinct_days} 个业务日在档）"
+        "verdict": (f"{rows} 行历史快照写入，业务日均为真实日历日（共 {distinct_days} 个业务日在档）"
                     if ok else
-                    (f"{bad_dates} 行 as_of_date 非法（疑似硬编码/空业务日）"
+                    (f"{bad_dates} 行 as_of_date 非法业务日 {bad_samples}（占位/不存在的日期）"
                      if bad_dates else "0 行历史写入 — latest wf1_stock 可能为空")),
     }
 
