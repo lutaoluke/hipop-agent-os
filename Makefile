@@ -7,11 +7,11 @@
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-replenish-inputs test-all
+.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-all
 
-test: test-governance test-judge test-sales-contract test-erp-orders test-replenish-inputs
+test: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs
 	@echo ""
-	@echo "✓ governance + judge + sales-contract + erp-orders + replenish-inputs smoke passed"
+	@echo "✓ governance + judge + sales-contract + erp-orders + wf1-ingest + replenish-inputs smoke passed"
 	@echo "  (跑全套: make test-all；跑 chat smoke: make test-chat)"
 
 test-governance:
@@ -30,6 +30,10 @@ test-erp-orders:
 	@echo "▶ erp-orders smoke (WS-17: ERP 商品总表 + 订单成本利润接入 fail-then-pass，SQLite 自洽)"
 	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_erp_orders_contract.py
 
+test-wf1-ingest:
+	@echo "▶ wf1 ingest smoke (Noon inventory + ASN/送仓 → v2 wf1_stock/staging, WS-10)"
+	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_wf1_ingest_v2.py
+
 test-replenish-inputs:
 	@echo "▶ replenish static-input smoke (三类输入契约 + 缺失检测点)"
 	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_replenish_inputs.py
@@ -38,6 +42,6 @@ test-chat:
 	@echo "▶ chat smoke (17 cases, 需要 uvicorn 在 :8765 跑着)"
 	cd $(REPO)/tests && bash run_smoke.sh
 
-test-all: test-governance test-judge test-sales-contract test-erp-orders test-replenish-inputs test-chat
+test-all: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-chat
 	@echo ""
 	@echo "✓ all smoke passed"

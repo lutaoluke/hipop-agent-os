@@ -143,6 +143,23 @@ def filter_clause(tenant_id: int, entity_alias: Optional[str] = None,
     return "WHERE " + " AND ".join(parts), tuple(params)
 
 
+# ── Noon 平台 SKU ↔ partner_sku 映射（v2 ingest 路由用）──
+def noon_sku_map(tenant_id: int, entity_alias: Optional[str] = None) -> Dict[str, str]:
+    """返回 {noon_sku(Z 开头平台 SKU): partner_sku}，取自 wf2_sku.noon_sku。
+
+    Noon my inventory / ASN 明细常以平台 SKU 为键，用它回到 partner_sku，
+    保证写 wf1_stock / staging 时主键 (tenant, entity, partner_sku) 对齐。
+    """
+    _data.set_current_tenant(tenant_id)  # 兜底 PG RLS
+    where, params = filter_clause(tenant_id, entity_alias)
+    rows = _data._fetch(
+        f"SELECT noon_sku, partner_sku FROM {T_SKU} {where} "
+        f"AND noon_sku IS NOT NULL AND noon_sku != ''",
+        params,
+    )
+    return {r["noon_sku"]: r["partner_sku"] for r in rows if r.get("partner_sku")}
+
+
 # ── 兼容旧 API（hipop.json fallback）────────────────────
 def load_entities_legacy() -> List[Dict]:
     """旧 sales_entity.load_entities() — 从 hipop.json 读，hipop 老代码用。"""

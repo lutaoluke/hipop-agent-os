@@ -36,16 +36,28 @@ except ImportError:
     set_progress = lambda *a, **k: None
 
 
-def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
+def run_v2(tenant_id: int, max_pages: int | None = None,
+           token: str | None = None, fetch_fn=None) -> dict:
+    """拉 ERP 各仓库存 → wf1_stock 的 ERP 列（v2）。
+
+    受控配置 / 可测性：
+    - token：默认从受审计的 _erp_auth.get_erp_token_for_tenant 取（env/runtime
+      secret，不在代码/fixture 里）。测试可注入 fake token。
+    - fetch_fn：默认真实 HTTP fetch_warehouse_stock；测试可注入 fixture fetcher。
+    - **缺 token 直接 raise（红灯），绝不回落到 backfill / 假数据。**
+    """
     print(f"\n=== ingest_erp_stock v2 tenant={tenant_id} ===", file=sys.stderr)
 
     entities = list_entities_for_tenant(tenant_id)
     if not entities:
         raise RuntimeError(f"tenant={tenant_id} 没配 sales_entities")
 
-    token = get_erp_token_for_tenant(tenant_id)
+    token = token or get_erp_token_for_tenant(tenant_id)
     if not token:
-        raise RuntimeError(f"tenant={tenant_id} ERP token 拿不到")
+        # 红灯：不写库、不回落旧数据，让上游知道 ERP 库存这条断了。
+        raise RuntimeError(f"tenant={tenant_id} ERP token 拿不到（缺失/过期）；"
+                           f"拒绝回落到 backfill/假数据")
+    fetch = fetch_fn or fetch_warehouse_stock
 
     conn = _data.conn()
     today_iso = datetime.now().date().isoformat()
@@ -62,7 +74,7 @@ def run_v2(tenant_id: int, max_pages: int | None = None) -> dict:
         w = WAREHOUSES[wid]
         print(f"\n[wh {wid} {w['name']} ({w['scope']}/{w['country'] or '-'})]", file=sys.stderr)
         tick(f"warehouse {wh_idx}/{wh_total}: {w['name']}")
-        items = fetch_warehouse_stock(token, wid, max_pages=max_pages)
+        items = fetch(token, wid, max_pages=max_pages)
         set_progress({"warehouses_done": wh_idx, "warehouses_total": wh_total, "current_wh": w['name']})
         for it in items:
             partner_sku = it.get("sku_id")

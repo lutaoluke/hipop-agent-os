@@ -1,0 +1,4 @@
+asn_number,status,sku,qty,country_code
+ASN001,in_transit,ZSA001,50,SA
+ASN001,in_transit,ZSA002,30,SA
+ASN002,received,ZAE001,25,AE

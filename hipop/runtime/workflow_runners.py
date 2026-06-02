@@ -62,6 +62,36 @@ def _run_wf1_stock(task_id, tenant_id, actor, spec, progress, heartbeat, save_pr
     return {"summary": f"wf1_stock: {res}"}
 
 
+@register("wf1_noon_stock_v2")
+def _run_wf1_noon_stock(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """Noon my inventory → v2 wf1_stock.noon_*（CSV/导表驱动，WS-10）。
+
+    spec: {"file": <path>} 指定单文件；不给则扫 inbox/。
+    """
+    from hipop.scripts import ingest_noon_stock_csv_v2
+    heartbeat()
+    res = ingest_noon_stock_csv_v2.run_v2(tenant_id=tenant_id, file=spec.get("file"))
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf1_noon_stock: {res}"}
+
+
+@register("wf1_inbound_staging_v2")
+def _run_wf1_inbound_staging(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """ERP 送仓/拣货 + Noon ASN → wf1_asn_lines_staging（供 WS-11，WS-10）。
+
+    spec: {"noon_asn": <path>, "erp_inbound": <path>}
+    """
+    from hipop.scripts import ingest_inbound_staging_v2
+    heartbeat()
+    res = ingest_inbound_staging_v2.run_v2(
+        tenant_id=tenant_id,
+        noon_asn_file=spec.get("noon_asn"),
+        erp_inbound_file=spec.get("erp_inbound"),
+    )
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf1_inbound_staging: {res}"}
+
+
 @register("wf2_sales_v2")
 def _run_wf2_sales(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """ERP 销量价格利润率 ingest — 6 时间窗，可断点续。
