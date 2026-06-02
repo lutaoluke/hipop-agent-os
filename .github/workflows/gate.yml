@@ -1,8 +1,10 @@
 name: gate
 # harness 门2(交付门)的机械化:PR 不过 make test,这条 check 就红,
 # 配合 branch protection 把本 check 设为 required → 不过就拦住合并。
-# 注:这里只跑 make test(governance + judge + wf1-ingest);
+# 注:只跑 make test(governance + judge + wf1-ingest);
 #     不跑 make test-chat(它要 uvicorn 起在 :8765,太重、留给本地/后续)。
+# governance smoke 强制连 PG(smoke_governance.py 硬编码 DB_URL=...localhost:5432),
+# 故起一个与 docker-compose 同款的 postgres 服务 + 灌 db/schema.sql。
 
 on:
   pull_request:
@@ -12,6 +14,22 @@ jobs:
   make-test:
     name: make test (governance + judge + wf1-ingest)
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hipop
+          POSTGRES_USER: hipop
+          POSTGRES_PASSWORD: hipop_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hipop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +40,16 @@ jobs:
 
       - name: Install deps
         run: pip install -r requirements.txt
+
+      - name: Load schema into PG
+        run: |
+          python - <<'PY'
+          import psycopg2
+          c = psycopg2.connect("postgresql://hipop:hipop_dev_password@localhost:5432/hipop")
+          c.autocommit = True
+          c.cursor().execute(open("db/schema.sql").read())
+          print("✓ db/schema.sql loaded into CI postgres")
+          PY
 
       - name: Gate — make test
         run: make test PYTHON=python
