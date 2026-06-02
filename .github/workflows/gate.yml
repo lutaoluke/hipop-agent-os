@@ -1,0 +1,59 @@
+name: gate
+# harness 门2(交付门)的机械化:PR 不过 make test,这条 check 就红,
+# 配合 branch protection 把本 check 设为 required → 不过就拦住合并。
+# 注:只跑 make test(governance + judge + wf1-ingest);
+#     不跑 make test-chat(它要 uvicorn 起在 :8765,太重、留给本地/后续)。
+# governance smoke 强制连 PG(smoke_governance.py 硬编码 DB_URL=...localhost:5432),
+# 故起一个与 docker-compose 同款的 postgres 服务 + 灌 db/schema.sql。
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  make-test:
+    name: make test (governance + judge + wf1-ingest)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hipop
+          POSTGRES_USER: hipop
+          POSTGRES_PASSWORD: hipop_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hipop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Load schema into PG
+        env:
+          DBURL: postgresql://hipop:hipop_dev_password@localhost:5432/hipop
+        run: |
+          which psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+          # 用 psql(原生处理 $$ DO 块)+ ON_ERROR_STOP=0 容错:
+          # schema_v2.sql 有 PG 不认的 AUTOINCREMENT,跳过;pg_extra 补回 PG 版(sales_entities/wf6_logistics_alerts_v2 + RLS)。
+          for f in db/schema.sql db/schema_v2.sql db/schema_v2_pg_extra.sql; do
+            echo "== loading $f =="
+            psql "$DBURL" -v ON_ERROR_STOP=0 -q -f "$f" || true
+          done
+          echo "== 关键表存在性检查 =="
+          psql "$DBURL" -tc "select to_regclass('public.wf6_logistics_alerts_v2'), to_regclass('public.tasks'), to_regclass('public.agent_actions');"
+
+      - name: Gate — make test
+        run: make test PYTHON=python
