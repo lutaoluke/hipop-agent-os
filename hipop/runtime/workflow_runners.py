@@ -92,6 +92,21 @@ def _run_wf1_inbound_staging(task_id, tenant_id, actor, spec, progress, heartbea
     return {"summary": f"wf1_inbound_staging: {res}"}
 
 
+@register("wf1_pending_inbound_v2")
+def _run_wf1_pending_inbound(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """ASN 送仓未上架 → wf1_stock.pending_inbound_qty（确定性状态规则，WS-11）。
+
+    读 wf1_asn_lines_staging（WS-10 产出），按 ASN 状态计入 → 聚合 →
+    部分 upsert 回 wf1_stock.pending_inbound_qty。消费端 wf_sales_cycle.run_v2
+    已读该列（计入 immediate）。
+    """
+    from hipop.scripts import compute_pending_inbound_v2
+    heartbeat()
+    res = compute_pending_inbound_v2.run_v2(tenant_id=tenant_id)
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf1_pending_inbound: {res}"}
+
+
 @register("wf1_stock_snapshot_v2")
 def _run_wf1_stock_snapshot(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """库存历史快照 — 把 latest wf1_stock 按业务日冻结进 wf1_stock_history（WS-22）。
