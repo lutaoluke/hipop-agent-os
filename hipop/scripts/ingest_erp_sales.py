@@ -273,6 +273,78 @@ def parse_pct(s):
         return None
 
 
+def _num(v):
+    """成本/利润金额 → float。接受裸数字或带币种字符串（'30.0 SAR' / '30'）。"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    amt, _ = parse_money(v)
+    return amt
+
+
+# ── ERP SKU 成本/利润详情 ────────────────────────────────────────────
+# product-order-statistics 是"按 SKU 聚合"的，没有订单号；订单粒度的成本/利润拆解
+# （头程 cost_local / 打包 cost_pack / 国际运费 cost_intl / 利润额 / 利润率）要从
+# SKU 详情接口拿。端点口径见 hipop/scripts/probe_erp_sku_detail.py（/sku/<id>/detail）。
+#
+# ⚠️ 字段名以 probe 脚本探到的 dbuyerp SKU 详情结构为准；本环境无 ERP token 不能跑真接口
+#    联调，确切字段需上线前用真 token 跑 probe_erp_sku_detail.py 复核一次（PR 已标residual风险）。
+#    解析做成"容错取候选键"，缺字段返回 None 而不是硬编码，避免占位假数据。
+def fetch_sku_cost_detail(token, erp_sku_id, nation_id=None):
+    """拉单个 ERP SKU 的订单级成本/利润详情。返回原始 ERP 响应 dict。"""
+    params = {"keyword": erp_sku_id, "keyword_type": 1}
+    if nation_id is not None:
+        params["nation_id"] = nation_id
+    return erp_get(token, f"/sku/{erp_sku_id}/detail", params)
+
+
+def _first(d, *keys):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) is not None:
+            return d[k]
+    return None
+
+
+def parse_sku_cost_orders(detail, country=None):
+    """把 SKU 详情响应解析成订单级成本/利润行 list。
+
+    每行: {item_nr, order_date, cost_local, cost_pack, cost_intl, profit, profit_rate}
+    缺字段 → None（不编造）。无订单 → []。
+    """
+    if not detail:
+        return []
+    data = detail.get("data") if isinstance(detail, dict) else None
+    if isinstance(data, dict):
+        orders = (_first(data, "orders", "order_list", "details", "order_details")
+                  or [])
+    elif isinstance(data, list):
+        orders = data
+    else:
+        orders = []
+
+    out = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        item_nr = _first(o, "item_nr", "itemNr", "order_item_nr", "order_no", "order_sn")
+        if item_nr is None:
+            continue  # wf2_orders 主键含 item_nr，没号的订单无法落库
+        order_date = _first(o, "order_date", "ordered_time", "ordered_at", "create_time")
+        if order_date:
+            order_date = str(order_date)[:10]
+        out.append({
+            "item_nr":     str(item_nr),
+            "order_date":  order_date,
+            "cost_local":  _num(_first(o, "cost_local", "first_leg_cost", "domestic_cost")),
+            "cost_pack":   _num(_first(o, "cost_pack", "pack_cost", "packing_cost")),
+            "cost_intl":   _num(_first(o, "cost_intl", "intl_cost", "international_cost", "shipping_cost")),
+            "profit":      _num(_first(o, "profit", "profit_amount", "net_profit")),
+            "profit_rate": parse_pct(_first(o, "profit_rate", "newest_profit_rate", "margin_rate")),
+        })
+    return out
+
+
 # ── 主流程：每个 entity 独立处理 ──────────────────────────────────────
 def run(entity_aliases=None, windows=None, max_pages=None):
     all_entities = load_entities()
