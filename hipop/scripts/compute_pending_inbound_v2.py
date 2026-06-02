@@ -19,16 +19,25 @@ v2 `wf1_stock.pending_inbound_qty`。消费端 `wf_sales_cycle.read_sales_v2`
 聚合主键 = v2 wf1_stock 主键 `(tenant_id, entity_alias, partner_sku)`；
 同一 SKU 出现在多个 ASN（含多 source）时数量求和。
 
+快照范围（避免越界写 / ghost stock row —— 红队打回的洞）：
+- **只更新本次 v2 库存快照范围内的 SKU**，即已经存在于 `wf1_stock`
+  `(tenant_id, entity_alias, partner_sku)` 的行。生产端用 **UPDATE**（不是
+  INSERT/upsert），所以结构上不可能给只在 staging 出现、却不在快照里的 SKU
+  新建 `wf1_stock` 行。范围外的 staging SKU 被显式跳过并计数（`skipped_out_of_snapshot`、
+  stderr 打印），不静默 INSERT。
+  理由：staging 一旦混入错 SKU 或过期映射，不能让它凭空进正式库存表，
+  否则下游 `wf_sales_cycle.run_v2` 会把不属于本次快照的 pending 算进销售周期。
+
 刷新语义（避免占位假数据 / 陈旧值）：
-- 对**所有出现在 staging 里的** (alias, partner_sku) 都写一个算出来的值；
+- 对**快照内、且出现在 staging 里的** (alias, partner_sku) 都写一个算出来的值；
   没有任何计入状态的 SKU 写 0（而不是留 NULL / 沿用上次的旧值）。
   这样 ASN 从 Scheduled 流转到 GRN Completed 后，pending 会被刷回 0。
-- staging 里完全没有的 SKU 不动（没有在途信息，保持原样）。
+- staging 里完全没有的快照 SKU 不动（没有在途信息，保持原样）。
 - 海外仓直送：ERP 库存清单已因"已发货"扣减海外仓时，pending 只作为即将
   可售补充（消费端 immediate 与 transfer/overseas 是分桶相加，不二次扣海外仓）。
 
-写回用部分 upsert（只动 pending_inbound_qty + updated_at），不覆盖 ERP / Noon 列，
-与 ingest_noon_stock_csv_v2._upsert 同范式。**不碰** v1 wf1_<alias>_stock / wf_stock_static。
+写回用部分 UPDATE（只动 pending_inbound_qty + updated_at），不覆盖 ERP / Noon 列，
+不新建行。**不碰** v1 wf1_<alias>_stock / wf_stock_static。
 
 CLI:
   python3 compute_pending_inbound_v2.py --tenant 1
@@ -93,22 +102,42 @@ def aggregate_pending(rows, counted=COUNTED_STATUSES) -> dict:
     return agg
 
 
-def _upsert_pending(conn, tenant_id, agg) -> int:
-    """部分 upsert：只写 pending_inbound_qty（+ updated_at），不碰 ERP / Noon 列。"""
+def _load_snapshot_keys(conn, tenant_id) -> set:
+    """本次 v2 库存快照范围 = 当前 wf1_stock 里该 tenant 已有的 (alias, partner_sku)。"""
+    rows = conn.execute(
+        f"SELECT entity_alias, partner_sku FROM {STOCK_TABLE} WHERE tenant_id=?",
+        (tenant_id,),
+    ).fetchall()
+    keys = set()
+    for r in rows:
+        d = dict(r)
+        keys.add(((d.get("entity_alias") or "").strip(),
+                  (d.get("partner_sku") or "").strip()))
+    return keys
+
+
+def _update_pending(conn, tenant_id, agg, snapshot_keys):
+    """部分 UPDATE：只写**快照范围内**的 SKU 的 pending_inbound_qty（+ updated_at），
+    不碰 ERP / Noon 列，也绝不为快照外的 staging SKU 新建行。
+
+    返回 (written, skipped)，skipped = 不在快照范围、被显式跳过的 (alias, sku) 列表。
+    """
     ts = "datetime('now','localtime')"
     sql = (
-        f"INSERT INTO {STOCK_TABLE} "
-        f"(tenant_id, entity_alias, partner_sku, pending_inbound_qty, imported_at, updated_at) "
-        f"VALUES (?,?,?,?, {ts}, {ts}) "
-        f"ON CONFLICT (tenant_id, entity_alias, partner_sku) "
-        f"DO UPDATE SET pending_inbound_qty=excluded.pending_inbound_qty, updated_at={ts}"
+        f"UPDATE {STOCK_TABLE} "
+        f"SET pending_inbound_qty=?, updated_at={ts} "
+        f"WHERE tenant_id=? AND entity_alias=? AND partner_sku=?"
     )
-    n = 0
+    written = 0
+    skipped = []
     for (alias, sku), qty in agg.items():
-        conn.execute(sql, (tenant_id, alias, sku, int(qty)))
-        n += 1
+        if (alias, sku) not in snapshot_keys:
+            skipped.append((alias, sku))  # 范围外：不新建行、显式归类
+            continue
+        conn.execute(sql, (int(qty), tenant_id, alias, sku))
+        written += 1
     conn.commit()
-    return n
+    return written, skipped
 
 
 def run_v2(tenant_id: int, counted_statuses=COUNTED_STATUSES,
@@ -131,17 +160,26 @@ def run_v2(tenant_id: int, counted_statuses=COUNTED_STATUSES,
         ).fetchall()
         rows = [dict(r) for r in rows]
         agg = aggregate_pending(rows, counted_statuses)
-        counted_qty = sum(v for v in agg.values() if v)
+        snapshot_keys = _load_snapshot_keys(conn, tenant_id)
+        # 只统计快照范围内的量（这才是真正写进库存表、被下游消费的口径）。
+        in_range = {k: v for k, v in agg.items() if k in snapshot_keys}
+        out_of_snapshot = sorted(k for k in agg if k not in snapshot_keys)
+        counted_qty = sum(v for v in in_range.values() if v)
+        if out_of_snapshot:
+            print(f"[skip] {len(out_of_snapshot)} 个 staging SKU 不在本次 v2 库存快照范围, "
+                  f"不新建 wf1_stock 行: {out_of_snapshot[:20]}", file=sys.stderr)
         if dry_run:
-            result = {"staging_rows": len(rows), "skus": len(agg),
+            result = {"staging_rows": len(rows), "skus": len(in_range),
+                      "skipped_out_of_snapshot": len(out_of_snapshot),
                       "pending_total": counted_qty, "written": 0}
             print(f"[dry-run] {result}", file=sys.stderr)
             return result
-        written = _upsert_pending(conn, tenant_id, agg)
+        written, skipped = _update_pending(conn, tenant_id, agg, snapshot_keys)
     finally:
         if own_conn:
             conn.close()
-    result = {"staging_rows": len(rows), "skus": len(agg),
+    result = {"staging_rows": len(rows), "skus": written,
+              "skipped_out_of_snapshot": len(skipped),
               "pending_total": counted_qty, "written": written}
     print(f"[done] {result}", file=sys.stderr)
     return result

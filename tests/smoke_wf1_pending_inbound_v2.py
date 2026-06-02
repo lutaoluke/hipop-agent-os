@@ -10,6 +10,9 @@ fail-then-pass 承重墙（钉死三种死法）：
     WORKFLOW_REGISTRY + 可解析（/run-workflow 能触发）。
   · 死代码短路：只写 v2 wf1_stock，绝不创建/写 v1 wf1_<alias>_stock；部分 upsert
     不覆盖 ERP/Noon 列。
+  · 越界写 / ghost stock row（红队打回的洞）：只更新本次 v2 库存快照范围内
+    （已存在于 wf1_stock）的 SKU；staging 里有、但快照没有的 SKU（SKU-Z）绝不
+    被新建成 wf1_stock 行。
 
 改动前（base commit）：scripts/compute_pending_inbound_v2 不存在 → import 失败 →
 smoke fail。改动后 → pass。
@@ -70,8 +73,12 @@ STAGING_ROWS = [
     ("hipop_ksa", "erp_inbound", "PO-9002", "SKU-D", 40, "拣货中"),
     # 第二个 entity：SKU-E Scheduled 12 → 12（验聚合按 entity 隔离）。
     ("hipop_uae", "noon_asn",    "ASN100", "SKU-E", 12,  "scheduled"),  # 大小写不敏感
+    # SKU-Z：staging 里有 Scheduled 25，但**不在**本次库存快照范围（wf1_stock 没有它）
+    #        → 红队的 ghost stock row 场景。producer 绝不能凭空给它新建 wf1_stock 行。
+    ("hipop_ksa", "noon_asn",    "ASN999", "SKU-Z", 25,  "Scheduled"),
 ]
 
+# 快照内、应被 UPDATE 的 SKU 与期望 pending 值。
 EXPECTED = {
     ("hipop_ksa", "SKU-A"): 100,
     ("hipop_ksa", "SKU-B"): 15,
@@ -79,6 +86,9 @@ EXPECTED = {
     ("hipop_ksa", "SKU-D"): 0,
     ("hipop_uae", "SKU-E"): 12,
 }
+
+# 快照外、必须被排除（不新建 wf1_stock 行）的 staging SKU。
+OUT_OF_SNAPSHOT = ("hipop_ksa", "SKU-Z")
 
 
 def _setup_db():
@@ -105,6 +115,13 @@ def _setup_db():
         "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, pending_inbound_qty) "
         "VALUES (?,?,?,?)", (TENANT, "hipop_ksa", "SKU-C", 50),
     )
+    # 预置 SKU-B / SKU-D / SKU-E 进快照（它们也在本次库存快照范围内，应被 UPDATE）。
+    # 注意：故意**不**预置 SKU-Z —— 它只在 staging，验越界写不会发生。
+    for (alias, sku) in (("hipop_ksa", "SKU-B"), ("hipop_ksa", "SKU-D"), ("hipop_uae", "SKU-E")):
+        c.execute(
+            "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku) VALUES (?,?,?)",
+            (TENANT, alias, sku),
+        )
     # 消费端要 wf2_sku 行才会返回（read_sales_v2 先查 wf2_sku）。
     c.execute(
         "INSERT INTO wf2_sku (tenant_id, entity_alias, partner_sku, "
@@ -142,12 +159,21 @@ def main():
     res = pend.run_v2(TENANT)
     assert res["skus"] == len(EXPECTED), f"写入 SKU 数 {res['skus']} != {len(EXPECTED)}"
     assert res["pending_total"] == 100 + 15 + 12, f"pending 总量 {res['pending_total']} 不对"
+    # 越界写死法：SKU-Z 在 staging 但不在快照 → 必须被显式跳过、计入 skipped。
+    assert res["skipped_out_of_snapshot"] == 1, \
+        f"快照外 SKU 应被显式跳过 1 个, 实际 {res['skipped_out_of_snapshot']}"
 
     rows = {(r["entity_alias"], r["partner_sku"]): r
             for r in _q("SELECT * FROM wf1_stock ORDER BY entity_alias, partner_sku")}
     for key, want in EXPECTED.items():
         got = rows[key]["pending_inbound_qty"]
         assert got == want, f"{key} pending_inbound_qty={got} != {want}（状态规则/聚合错）"
+
+    # 越界写 / ghost stock row 死法：快照外的 SKU-Z 绝不能被新建成 wf1_stock 行。
+    assert OUT_OF_SNAPSHOT not in rows, \
+        f"快照外 staging SKU {OUT_OF_SNAPSHOT} 被凭空写进了 wf1_stock（ghost stock row / 越界写）"
+    assert len(rows) == len(EXPECTED), \
+        f"wf1_stock 行数 {len(rows)} != {len(EXPECTED)}（producer 新建了快照外的行？）"
 
     # 占位假数据死法：SKU-C/SKU-D 必须是真算出的 0，不是 NULL；陈旧 50 已被刷回 0。
     assert rows[("hipop_ksa", "SKU-C")]["pending_inbound_qty"] == 0, "陈旧 pending 没被刷回 0"
@@ -192,7 +218,8 @@ def main():
     print("✓ 消费端 read_sales_v2.immediate == noon_saleable + pending_inbound（接线通）")
     print("✓ wf1_pending_inbound_v2 进 WORKFLOW_REGISTRY + runner（真实入口可触发）")
     print("✓ 规则参数化可覆写、未创建/写入 v1 wf1_<alias>_stock 路径")
-    print("\n6/6 passed")
+    print("✓ 快照外 staging SKU-Z 被显式跳过, 未凭空新建 wf1_stock 行（无 ghost stock row）")
+    print("\n7/7 passed")
 
 
 if __name__ == "__main__":
