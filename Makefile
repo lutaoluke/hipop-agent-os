@@ -7,11 +7,11 @@
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-all
+.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-replenish-algorithm test-all
 
-test: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs
+test: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-replenish-algorithm
 	@echo ""
-	@echo "✓ governance + judge + sales-contract + erp-orders + wf1-ingest + replenish-inputs smoke passed"
+	@echo "✓ governance + judge + sales-contract + erp-orders + wf1-ingest + replenish-inputs + replenish-algorithm smoke passed"
 	@echo "  (跑全套: make test-all；跑 chat smoke: make test-chat)"
 
 test-governance:
@@ -38,10 +38,14 @@ test-replenish-inputs:
 	@echo "▶ replenish static-input smoke (三类输入契约 + 缺失检测点)"
 	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_replenish_inputs.py
 
+test-replenish-algorithm:
+	@echo "▶ replenish algorithm smoke (WS-6: 补货量算法 + 缺失标注 fail-then-pass)"
+	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_replenish_algorithm.py
+
 test-chat:
 	@echo "▶ chat smoke (17 cases, 需要 uvicorn 在 :8765 跑着)"
 	cd $(REPO)/tests && bash run_smoke.sh
 
-test-all: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-chat
+test-all: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-replenish-algorithm test-chat
 	@echo ""
 	@echo "✓ all smoke passed"
