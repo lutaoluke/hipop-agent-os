@@ -56,7 +56,13 @@ def _clamp(x, lo, hi):
 def compute_metrics(rec: dict, config: dict | None = None) -> dict:
     """从 SKU 记录算评级/预测共用的中间量（确定性，纯数值）。
 
-    返回 sales_30d / trend / net_value / return_rate / base_daily。
+    消费全部 6 个销量窗口 sales_10/30/60/90/120/180d：
+      · 预测基线日均 = 6 窗口各自日均的加权混合（每个窗口都有非零权重）；
+      · 趋势 = 近30天日均 vs 前史(30~180天)日均，故 sales_180d 也进趋势。
+    缺历史保守闸门：前史订单数不足（新品 / sales_60~180d 缺失致前史≤0）时
+    趋势记 insufficient_trend（默认中性 0），不顶满、不臆造强增长。
+
+    返回 sales_30d / trend / net_value / return_rate / base_daily / has_history。
     """
     cfg = config or load_grading_config()
 
@@ -64,14 +70,21 @@ def compute_metrics(rec: dict, config: dict | None = None) -> dict:
     s30 = _num(rec.get("sales_30d"))
     s60 = _num(rec.get("sales_60d"))
     s90 = _num(rec.get("sales_90d"))
+    s120 = _num(rec.get("sales_120d"))
+    s180 = _num(rec.get("sales_180d"))
 
-    # 趋势：近30天 vs 前30天日均增速
-    prior30 = max(s60 - s30, 0.0)
+    # 趋势：近30天日均 vs 前史(30~180天)日均。前史订单 = sales_180d − sales_30d。
+    # 缺历史（前史订单 < 阈值，含 sales_180d 缺失致负值）→ 中性趋势，不顶满。
     tcfg = cfg["trend"]
-    if prior30 > 0:
-        trend = (s30 - prior30) / prior30
+    recent_daily = s30 / 30.0
+    prior_orders = s180 - s30
+    prior_days = tcfg["prior_window_days"]
+    has_history = prior_orders >= tcfg["min_prior_orders"]
+    if not has_history:
+        trend = tcfg["insufficient_trend"]
     else:
-        trend = tcfg["clamp_max"] if s30 > 0 else 0.0
+        prior_daily = prior_orders / prior_days
+        trend = (recent_daily - prior_daily) / prior_daily
     trend = _clamp(trend, tcfg["clamp_min"], tcfg["clamp_max"])
 
     # 销售净值：营收 × 利润率 ×（1 − 退货率），缺利润率记 0（保守）
@@ -82,11 +95,14 @@ def compute_metrics(rec: dict, config: dict | None = None) -> dict:
     keep = (1.0 - return_rate) if ncfg.get("use_return_rate") else 1.0
     net_value = revenue * profit_rate * keep
 
-    # 预测基线日均：多窗口混合（不只看单一 30 天）
+    # 预测基线日均：6 窗口多视角混合（每个窗口都参与，改任一都改预测）
     w = cfg["forecast"]["window_weights"]
     base_daily = (w["w10"] * (s10 / 10.0)
                   + w["w30"] * (s30 / 30.0)
-                  + w["w90"] * (s90 / 90.0))
+                  + w["w60"] * (s60 / 60.0)
+                  + w["w90"] * (s90 / 90.0)
+                  + w["w120"] * (s120 / 120.0)
+                  + w["w180"] * (s180 / 180.0))
 
     return {
         "sales_30d": s30,
@@ -94,6 +110,7 @@ def compute_metrics(rec: dict, config: dict | None = None) -> dict:
         "net_value": net_value,
         "return_rate": return_rate,
         "base_daily": base_daily,
+        "has_history": has_history,
     }
 
 
