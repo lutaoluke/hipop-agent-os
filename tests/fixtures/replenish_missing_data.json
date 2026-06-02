@@ -1,0 +1,13 @@
+{
+  "_doc": "数据缺失夹具：故意缺『各仓现有库存』这一类（inventory 整段缺省），供步骤2 断言被缺失检测点标注。物流 + 近N天销量到位，唯独 inventory 没拿到。",
+  "_missing_class": "inventory",
+  "sku": "TBA0210A",
+  "logistics": {
+    "in_transit_qty": 0,
+    "pending_shipment_qty": 0
+  },
+  "recent_sales": {
+    "window_days": 7,
+    "daily_units": [3, 2, 4, 1, 5, 2, 3]
+  }
+}

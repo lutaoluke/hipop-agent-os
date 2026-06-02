@@ -1,0 +1,24 @@
+{
+  "_doc": "已知输入夹具：三类数据齐全 + 人工给定预期补货量。供步骤2 断言算法输出对得上。",
+  "sku": "TBJ0059A",
+  "logistics": {
+    "in_transit_qty": 120,
+    "pending_shipment_qty": 40
+  },
+  "recent_sales": {
+    "window_days": 7,
+    "daily_units": [8, 6, 7, 9, 5, 10, 6]
+  },
+  "inventory": {
+    "by_warehouse": {
+      "KSA_overseas": 30,
+      "CN_domestic": 50,
+      "noon_official": 12
+    }
+  },
+  "expected_replenishment": {
+    "_doc": "人工给定的预期补货量，供步骤2 的算法断言。不是算法产物，是验收锚点。",
+    "total_replenish": 60,
+    "rationale": "近7天日均约7件→月均约210件；即时库存92件+在途待发160件≈含在途252件≈1.2月，目标2个月，缺口约168件取整批补，人工核定首批60件。"
+  }
+}
