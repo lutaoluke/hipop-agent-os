@@ -116,6 +116,31 @@ CREATE TABLE IF NOT EXISTS wf1_stock (
 );
 CREATE INDEX IF NOT EXISTS idx_wf1_stock_tenant ON wf1_stock(tenant_id, entity_alias);
 
+-- 库存历史快照（WS-22）：按业务日 as_of_date 留存每日全量快照，供 WS-12 历史抽检/回溯。
+-- 与 wf1_stock（latest 当前快照）列对齐，PK 多一个 as_of_date → 同一 SKU 多天并存、互不覆盖。
+-- latest 层 wf1_stock 不动，现有 wf5 / 工作台仍读 wf1_stock。
+-- as_of_date 是业务日运行参数（YYYY-MM-DD），**绝不取 today，也不从 imported_at 反推**。
+CREATE TABLE IF NOT EXISTS wf1_stock_history (
+  tenant_id                  BIGINT NOT NULL,
+  entity_alias               TEXT NOT NULL,
+  partner_sku                TEXT NOT NULL,
+  as_of_date                 TEXT NOT NULL,        -- 业务日 YYYY-MM-DD（运行参数，非 imported_at/today）
+  noon_total_qty             INT,
+  noon_saleable_qty          INT,
+  noon_unsaleable_qty        INT,
+  noon_warehouses_json       TEXT,
+  pending_inbound_qty        INT,
+  overseas_total_qty         INT,
+  overseas_breakdown_json    TEXT,
+  yiwu_qty                   INT,
+  dongguan_qty               INT,
+  total_stock                INT,
+  source_imported_at         TEXT,                 -- 冻结时 latest 行的 imported_at（审计用，不参与 PK）
+  snapshot_at                TEXT DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (tenant_id, entity_alias, partner_sku, as_of_date)
+);
+CREATE INDEX IF NOT EXISTS idx_wf1_stock_history_tenant ON wf1_stock_history(tenant_id, entity_alias, as_of_date);
+
 -- 销售周期 + 补货
 CREATE TABLE IF NOT EXISTS wf5_sales_cycle (
   tenant_id               BIGINT NOT NULL,
@@ -258,7 +283,7 @@ ON CONFLICT (tenant_id, alias) DO NOTHING;
 DO $$
 DECLARE
   v2_tables TEXT[] := ARRAY[
-    'wf2_sku','wf2_orders','wf1_stock','wf5_sales_cycle',
+    'wf2_sku','wf2_orders','wf1_stock','wf1_stock_history','wf5_sales_cycle',
     'wf3_logistics_hub_v2','wf6_logistics_alerts_v2','wf6_replenishment_queue_v2',
     'sales_entities','tenant_erp_credentials','tenant_feishu_credentials'
   ];
