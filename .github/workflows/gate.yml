@@ -1,0 +1,27 @@
+name: gate
+# harness 门2(交付门)的机械化:PR 不过 make test,这条 check 就红,
+# 配合 branch protection 把本 check 设为 required → 不过就拦住合并。
+# 注:这里只跑 make test(governance + judge + wf1-ingest);
+#     不跑 make test-chat(它要 uvicorn 起在 :8765,太重、留给本地/后续)。
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  make-test:
+    name: make test (governance + judge + wf1-ingest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Gate — make test
+        run: make test PYTHON=python
