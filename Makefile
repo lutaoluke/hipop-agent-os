@@ -1,51 +1,36 @@
 # 点购 hipop / 工作流 测试入口
 # 用法：
-#   make test           跑 governance smoke（启动 hook 也跑这个）
-#   make test-chat      跑 chat 端到端 smoke（17 个 case，要 server 起着）
-#   make test-all       全部 smoke
+#   make test           跑全部 smoke（自动聚合 tests/smoke_*.py，排除需 server 的 chat）
+#   make test-chat      跑 chat 端到端 smoke（17 个 case，要 server 起在 :8765）
+#   make test-all       test + test-chat
+#   make test-one F=tests/smoke_judge.py   跑单个 smoke
+#
+# 关键：`make test` 自动扫 tests/smoke_*.py，新增 smoke 文件无需改本文件——
+# 这避免了多分支都改 `test:` 同一行导致的连环 merge 冲突（WS-* 流水线踩过）。
 
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-wf1-history test-all
+# 自动发现所有 smoke，排除 chat（需 uvicorn 起着，单独 make test-chat）
+SMOKE_FILES := $(filter-out tests/smoke_chat.py,$(sort $(wildcard tests/smoke_*.py)))
 
-test: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-wf1-history
-	@echo ""
-	@echo "✓ governance + judge + sales-contract + erp-orders + wf1-ingest + replenish-inputs + wf1-history smoke passed"
-	@echo "  (跑全套: make test-all；跑 chat smoke: make test-chat)"
+.PHONY: test test-chat test-one test-all
 
-test-governance:
-	@echo "▶ governance smoke (provider 委托 + plan pipeline)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_governance.py
+test:
+	@set -e; for f in $(SMOKE_FILES); do \
+	  echo ""; echo "▶ $$f"; \
+	  PYTHONPATH=$(REPO) $(PYTHON) $$f; \
+	done; \
+	echo ""; echo "✓ 自动聚合跑过 $(words $(SMOKE_FILES)) 个 smoke 全绿（chat 需 server，另跑 make test-chat）"
 
-test-judge:
-	@echo "▶ judge/confidence smoke (防 confidence=0.9 硬编码回退)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_judge.py
-
-test-sales-contract:
-	@echo "▶ sales-contract smoke (WS-15: 销量录入数据契约 fail-then-pass，SQLite 自洽)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_sales_contract.py
-
-test-erp-orders:
-	@echo "▶ erp-orders smoke (WS-17: ERP 商品总表 + 订单成本利润接入 fail-then-pass，SQLite 自洽)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_erp_orders_contract.py
-
-test-wf1-ingest:
-	@echo "▶ wf1 ingest smoke (Noon inventory + ASN/送仓 → v2 wf1_stock/staging, WS-10)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_wf1_ingest_v2.py
-
-test-replenish-inputs:
-	@echo "▶ replenish static-input smoke (三类输入契约 + 缺失检测点)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_replenish_inputs.py
-
-test-wf1-history:
-	@echo "▶ wf1 history smoke (WS-22: as_of_date dated 快照层 + 历史抽检 fail-then-pass)"
-	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_wf1_stock_history_v2.py
+test-one:
+	@test -n "$(F)" || (echo "用法: make test-one F=tests/smoke_judge.py"; exit 2)
+	PYTHONPATH=$(REPO) $(PYTHON) $(F)
 
 test-chat:
 	@echo "▶ chat smoke (17 cases, 需要 uvicorn 在 :8765 跑着)"
 	cd $(REPO)/tests && bash run_smoke.sh
 
-test-all: test-governance test-judge test-sales-contract test-erp-orders test-wf1-ingest test-replenish-inputs test-wf1-history test-chat
+test-all: test test-chat
 	@echo ""
 	@echo "✓ all smoke passed"
