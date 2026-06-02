@@ -19,6 +19,14 @@ v2 `wf1_stock.pending_inbound_qty`。消费端 `wf_sales_cycle.read_sales_v2`
 聚合主键 = v2 wf1_stock 主键 `(tenant_id, entity_alias, partner_sku)`；
 同一 SKU 出现在多个 ASN（含多 source）时数量求和。
 
+本次输入窗口（避免历史残留 ASN 污染——验门人打回的洞）：
+- staging 表 `wf1_asn_lines_staging` 由 WS-10 ingest 做**本轮快照替换**：每次 run
+  在某 `(source, entity_alias)` 首次出现时先删旧行再灌本轮文件，所以 staging 里
+  留下的就是"本次 v2 库存快照输入范围"，不是 tenant 下 staging 全历史。
+- 因此这里 `SELECT ... WHERE tenant_id=?` 读到的即本次输入：昨天 Scheduled、
+  今天已 GRN Completed 或已从文件消失的旧 ASN 不会留在 staging 里被重复计入。
+  口径的运行/窗口收敛在 producer 侧完成（见 ingest_inbound_staging_v2._clear_snapshot）。
+
 快照范围（避免越界写 / ghost stock row —— 红队打回的洞）：
 - **只更新本次 v2 库存快照范围内的 SKU**，即已经存在于 `wf1_stock`
   `(tenant_id, entity_alias, partner_sku)` 的行。生产端用 **UPDATE**（不是
