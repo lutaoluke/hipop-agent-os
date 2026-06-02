@@ -156,8 +156,11 @@ def process_csv_v2(tenant_id: int, path: str, conn,
         return n
 
 
-def aggregate_sales_v2(tenant_id: int, entity_alias: str, conn) -> int:
+def aggregate_sales_v2(tenant_id: int, entity_alias: str, conn, as_of=None) -> int:
     """从 wf2_orders 重算 wf2_sku 的 sales_10/30/60/90/120/180d。
+
+    as_of: 'YYYY-MM-DD' 或 date —— 时间窗基准日。生产默认 None=今天；
+           测试传固定日期让窗口计数可确定性断言（不耦合"跑测试那天"）。
     Returns: 更新的 SKU 数。
     """
     import datetime as _dt
@@ -174,7 +177,12 @@ def aggregate_sales_v2(tenant_id: int, entity_alias: str, conn) -> int:
         "SELECT DISTINCT partner_sku FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
         (tenant_id, entity_alias)
     ).fetchall()]
-    today = _dt.date.today()
+    if as_of is None:
+        today = _dt.date.today()
+    elif isinstance(as_of, str):
+        today = _dt.date.fromisoformat(as_of)
+    else:
+        today = as_of
     n = 0
     for sku in skus:
         windows = {}

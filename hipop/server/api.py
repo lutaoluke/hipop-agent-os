@@ -479,7 +479,7 @@ async def api_upload(
         "workflow": "upload_pipeline",
         "label": label,
         "affected_modules": affected_modules,
-        "total_steps": 4,
+        "total_steps": 5,
         "followup_prompt": followup_prompt,
         "tenant_id": tenant_id,
     }, ensure_ascii=False))
@@ -494,7 +494,7 @@ async def api_upload(
         "label": label,
         "affected_modules": affected_modules,
         "followup_prompt": followup_prompt,
-        "total_steps": 4,
+        "total_steps": 5,
         "workflow": "upload_pipeline",
     }
 
@@ -557,7 +557,33 @@ def _run_pipeline_v2(task_id: str, file_paths: list, tenant_id: int,
                 data.write_event(task_id, 4, "聚合销量窗口", "done",
                                  f"刷新 {total_skus} 个 SKU 的 sales_*d")
             except Exception as e:
+                # 聚合是关键步：失败必须让管道整体 error，否则销量窗口为空却假绿。
                 data.write_event(task_id, 4, "聚合销量窗口", "error", str(e)[:200])
+                failed = True
+
+        if not failed:
+            # 合并 noon 视角契约字段（latest_customer_paid / 订单号集合 / anomalies /
+            # 订单计数与退取率 / total_revenue 等）。窗口之外这些字段没有别的入口算，
+            # 不在这一步 merge 就会是死列。契约由 tests/smoke_sales_contract.py 钉死。
+            data.write_event(task_id, 5, "合并销量契约字段", "started")
+            try:
+                from hipop.workflows.wf_sales_static_v2 import merge_entity_v2
+                with data.conn() as conn:
+                    aliases = [r[0] if not isinstance(r, dict) else r["entity_alias"]
+                               for r in conn.execute(
+                        "SELECT DISTINCT entity_alias FROM wf2_orders WHERE tenant_id=?",
+                        (tenant_id,)
+                    ).fetchall()]
+                    merged_skus = 0
+                    for alias in aliases:
+                        merged_skus += merge_entity_v2(tenant_id, alias, conn)
+                data.write_event(task_id, 5, "合并销量契约字段", "done",
+                                 f"merge {merged_skus} 个 SKU 的契约字段")
+            except Exception as e:
+                # merge 是关键步：失败时契约字段（latest_customer_paid / 订单号集合 /
+                # anomalies_json）仍是死列，绝不能让最终 step 99 报 done/ok:true 假绿。
+                data.write_event(task_id, 5, "合并销量契约字段", "error", str(e)[:200])
+                failed = True
 
         data.write_event(task_id, 99, "管道完成",
                          "error" if failed else "done",

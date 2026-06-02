@@ -1,0 +1,62 @@
+{
+  "_comment": "ERP 商品/销量 fixture — 模拟 ingest_erp_products_v2 + ingest_erp_sales_v2 跑完写入 wf2_sku 的状态（不需要真 ERP 登录）。merge 步骤会在此基础上用 noon 订单覆盖/补全契约字段。",
+  "entity": {
+    "tenant_id": 990001,
+    "alias": "smoke_sa",
+    "country": "SA",
+    "platform": "Noon",
+    "store_name": "SMOKE-NOON-KSA",
+    "store_id": 9001,
+    "currency": "SAR"
+  },
+  "skus": [
+    {
+      "partner_sku": "TBB0116A",
+      "erp_sku_id": "TBB0116A",
+      "noon_sku": "NOON-TBB0116A-SA",
+      "product_id": "PRD116",
+      "title": "便携榨汁杯 A 款",
+      "fulfillment": "FBN",
+      "brand": "BR1",
+      "cost_price": 60.0,
+      "currency": "SAR",
+      "is_listed": 1,
+      "latest_price": 100.0,
+      "avg_price": 100.0,
+      "latest_profit_rate": 0.30,
+      "sales_180d": 5
+    },
+    {
+      "partner_sku": "TBB0200X",
+      "erp_sku_id": "TBB0200X",
+      "noon_sku": "NOON-TBB0200X-SA",
+      "product_id": "PRD200",
+      "title": "无线小风扇 X 款",
+      "fulfillment": "FBP",
+      "brand": "BR2",
+      "cost_price": 90.0,
+      "currency": "SAR",
+      "is_listed": 1,
+      "latest_price": 200.0,
+      "avg_price": 200.0,
+      "latest_profit_rate": 0.40,
+      "sales_180d": 3
+    },
+    {
+      "partner_sku": "TBB0300Z",
+      "erp_sku_id": "TBB0300Z",
+      "noon_sku": "NOON-TBB0300Z-SA",
+      "product_id": "PRD300",
+      "title": "桌面收纳盒 Z 款",
+      "fulfillment": "FBN",
+      "brand": "BR3",
+      "cost_price": 20.0,
+      "currency": "SAR",
+      "is_listed": 1,
+      "latest_price": 50.0,
+      "avg_price": 50.0,
+      "latest_profit_rate": 0.50,
+      "sales_180d": 8
+    }
+  ]
+}
