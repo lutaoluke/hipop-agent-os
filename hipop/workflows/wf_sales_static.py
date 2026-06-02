@@ -4,8 +4,8 @@
 对 config 里每个 sales_entity，扫它对应的 wf2_<alias>_sku + wf2_<alias>_orders：
   1. 从 orders 重算 noon 视角的 total/valid/cancel/return（覆盖 ERP 数据）
   2. noon vs ERP 差异写到 anomalies_json
-  3. 评级 ABCD（占位规则）
-  4. 预测 10/30 天（线性占位）
+  3. 评级 ABCD（sales_grading 确定性算法，消费销量趋势 + 销售净值）
+  4. 预测 10/30 天（sales_grading：多窗口混合日均 × 趋势倍率）
   5. is_listed 由 ingest_erp_products 决定（= 是否绑定 noon platform_sku_id），本脚本不再覆写
   6. 收集订单号集合 → order_item_nrs_json
 
@@ -19,30 +19,15 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from sales_entity import load_entities, ensure_tables, sku_table, orders_table
 
+# 评级 ABCD / 10-30 天预测的确定性算法抽到 sales_grading（可配置、供两条
+# 生产路径与看板/导出复用）。这里 re-export，保持 wf_sales_static_v2 的 import 不变。
+# 兼容包路径（hipop.workflows.*）与直跑（sys.path）两种 import 上下文。
+try:
+    from hipop.workflows.sales_grading import grade_sku, forecast, compute_metrics  # noqa: F401
+except ModuleNotFoundError:
+    from sales_grading import grade_sku, forecast, compute_metrics  # type: ignore  # noqa: F401
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "hipop.db")
-
-
-def grade_sku(rec):
-    s30 = rec.get("sales_30d") or 0
-    s60 = rec.get("sales_60d") or 0
-    prev30 = max(s60 - s30, 0)
-    growth = (s30 - prev30) / prev30 if prev30 > 0 else (1.0 if s30 > 0 else 0.0)
-    if s30 >= 30 and growth >= 0.10:
-        return "A"
-    if s30 >= 10 or growth >= 0.10:
-        return "B"
-    if s30 >= 3:
-        return "C"
-    return "D"
-
-
-def forecast(rec):
-    s30 = rec.get("sales_30d") or 0
-    daily = s30 / 30.0
-    return {
-        "forecast_10d": int(round(daily * 10)),
-        "forecast_30d": int(round(daily * 30)),
-    }
 
 
 def detect_anomalies(rec, noon_view):

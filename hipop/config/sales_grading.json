@@ -1,0 +1,28 @@
+{
+  "_about": "WS-19 销量评级 ABCD + 10/30 天预测的确定性算法阈值。改这里就改评级/预测结果（smoke 钉死可配置性），无需动代码、不进 prompt。",
+  "_source": "首版阈值来源：(1) 仓库原占位 grade_sku 的 sales_30d / 趋势分档(30/10/3, 0.10) 为基线；(2) WS-19 需求补充'消费销售净值 + 趋势'，故新增 net_value 维度与 risk 闸门。这些是工程缺省值，业务口径(净值定义、A/B/C 切点、退货上限)待 ops/Luke 终判校准后覆盖本文件。",
+  "net_value": {
+    "_def": "销售净值 = total_revenue × latest_profit_rate × (1 − return_rate)，单位 = 主体币种。缺 latest_profit_rate 时净值记 0（保守降档，不臆测利润）。",
+    "use_profit_rate": true,
+    "use_return_rate": true
+  },
+  "trend": {
+    "_def": "趋势 = (近30天日均 − 前30天日均) / 前30天日均；近30天 = sales_30d，前30天 = max(sales_60d − sales_30d, 0)。前30天为 0 时：有近30天销量记 clamp_max，否则记 0。",
+    "clamp_min": -1.0,
+    "clamp_max": 5.0
+  },
+  "grade": {
+    "_def": "先过 risk 闸门（退货过高或明显下降直接判 D），再按 A→B→C 阈值自上而下匹配，都不满足落 D。A 需同时满足量+净值+趋势；B 需量+净值；C 只需最低量。",
+    "A": { "min_sales_30d": 30, "min_net_value": 1000.0, "min_trend": 0.10 },
+    "B": { "min_sales_30d": 10, "min_net_value": 300.0 },
+    "C": { "min_sales_30d": 3 },
+    "risk": { "max_return_rate": 0.20, "min_trend": -0.20 }
+  },
+  "forecast": {
+    "_def": "基线日均 = w10·(sales_10d/10) + w30·(sales_30d/30) + w90·(sales_90d/90)（多窗口混合，不只看单一30天）；再乘趋势倍率 clamp(1 + 趋势×trend_weight, mult_min, mult_max)。forecast_10d/30d = round(日均 × 10 / 30)。",
+    "window_weights": { "w10": 0.5, "w30": 0.3, "w90": 0.2 },
+    "trend_weight": 0.5,
+    "mult_min": 0.5,
+    "mult_max": 1.5
+  }
+}
