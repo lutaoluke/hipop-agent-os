@@ -7,11 +7,11 @@
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-.PHONY: test test-chat test-governance test-judge test-sales-contract test-all
+.PHONY: test test-chat test-governance test-judge test-sales-contract test-erp-orders test-all
 
-test: test-governance test-judge test-sales-contract
+test: test-governance test-judge test-sales-contract test-erp-orders
 	@echo ""
-	@echo "✓ governance + judge + sales-contract smoke passed"
+	@echo "✓ governance + judge + sales-contract + erp-orders smoke passed"
 	@echo "  (跑全套: make test-all；跑 chat smoke: make test-chat)"
 
 test-governance:
@@ -26,10 +26,14 @@ test-sales-contract:
 	@echo "▶ sales-contract smoke (WS-15: 销量录入数据契约 fail-then-pass，SQLite 自洽)"
 	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_sales_contract.py
 
+test-erp-orders:
+	@echo "▶ erp-orders smoke (WS-17: ERP 商品总表 + 订单成本利润接入 fail-then-pass，SQLite 自洽)"
+	cd $(REPO) && PYTHONPATH=$(REPO) $(PYTHON) tests/smoke_erp_orders_contract.py
+
 test-chat:
 	@echo "▶ chat smoke (17 cases, 需要 uvicorn 在 :8765 跑着)"
 	cd $(REPO)/tests && bash run_smoke.sh
 
-test-all: test-governance test-judge test-sales-contract test-chat
+test-all: test-governance test-judge test-sales-contract test-erp-orders test-chat
 	@echo ""
 	@echo "✓ all smoke passed"
