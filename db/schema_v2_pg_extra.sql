@@ -67,7 +67,7 @@ ON CONFLICT (tenant_id, alias) DO NOTHING;
 DO $$
 DECLARE
   v2_tables TEXT[] := ARRAY[
-    'wf2_sku','wf2_orders','wf1_stock','wf5_sales_cycle',
+    'wf2_sku','wf2_orders','wf1_stock','wf1_stock_history','wf5_sales_cycle',
     'wf3_logistics_hub_v2','wf6_logistics_alerts_v2','wf6_replenishment_queue_v2',
     'sales_entities','tenant_erp_credentials','tenant_feishu_credentials'
   ];
