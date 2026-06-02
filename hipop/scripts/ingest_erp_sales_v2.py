@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from ingest_erp_sales import (
     fetch_window, parse_country_value, parse_int, parse_money, parse_pct,
+    fetch_sku_cost_detail, parse_sku_cost_orders,
     NATION_TO_ID, NOON_PLATFORM_ID, WINDOWS,
 )
 from sales_entity_v2 import list_entities_for_tenant
@@ -32,6 +33,81 @@ try:
 except ImportError:
     tick = lambda *a, **k: None
     set_progress = lambda *a, **k: None
+
+
+# WS-17 新增的 wf2_orders 成本/利润列。schema_v2.sql 已加，但生产里早建好的
+# DB 不会因 CREATE TABLE IF NOT EXISTS 而补列 → 这里幂等 ALTER，避免"列在 schema
+# 里有、生产表里没有 → 写入静默失败"的接线缺失死法。SQLite/PG 都支持 ADD COLUMN。
+_ORDER_COST_COLS = [
+    ("cost_local", "REAL"), ("cost_pack", "REAL"), ("cost_intl", "REAL"),
+    ("profit", "REAL"), ("profit_rate", "REAL"),
+]
+
+
+def _existing_columns(conn, table: str) -> set:
+    if _data.is_postgres():
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name=?",
+            (table,),
+        ).fetchall()
+        return {(r[0] if not isinstance(r, dict) else r["column_name"]) for r in rows}
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r[1] for r in rows}
+
+
+def _ensure_order_cost_cols(conn):
+    existing = _existing_columns(conn, "wf2_orders")
+    for col, ctype in _ORDER_COST_COLS:
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE wf2_orders ADD COLUMN {col} {ctype}")
+            except Exception as e:
+                print(f"[migrate] add {col} skip: {str(e)[:80]}", file=sys.stderr)
+    conn.commit()
+
+
+def _upsert_order_costs(conn, tenant_id, alias, rec, nation_id, token):
+    """拉该 SKU 的 ERP 订单级成本/利润，按 item_nr upsert 进 wf2_orders。
+
+    只写 ERP 负责的成本/利润列 + 关联键；noon 订单字段（seller_price/customer_paid）
+    若已存在不被覆盖（确定性规则：ERP 不盖 noon 订单字段）。返回写入行数。
+    """
+    erp_sku = rec["partner_sku"]
+    try:
+        detail = fetch_sku_cost_detail(token, erp_sku, nation_id=nation_id)
+    except Exception as e:
+        print(f"  [{alias}/{erp_sku}] cost detail fail: {str(e)[:80]}", file=sys.stderr)
+        return 0
+    orders = parse_sku_cost_orders(detail, country=rec.get("country"))
+    n = 0
+    for od in orders:
+        sql = """
+            INSERT INTO wf2_orders
+              (tenant_id, entity_alias, partner_sku, noon_sku, item_nr, order_date,
+               currency, cost_local, cost_pack, cost_intl, profit, profit_rate, source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (tenant_id, entity_alias, partner_sku, item_nr) DO UPDATE SET
+              -- 确定性规则：ERP 只补成本/利润，noon 订单字段不被覆盖。已有 noon 行优先
+              -- （noon_sku / order_date / currency 都保 noon）；seller_price/customer_paid/
+              -- status/fulfillment 不在 SET 里 → 天然保留。order_date 曾误走 excluded 优先，
+              -- 会把 noon 订单日期盖成 ERP detail 日期，污染最新订单/销量窗口口径（WS-17 红队打回）。
+              noon_sku    = COALESCE(wf2_orders.noon_sku, excluded.noon_sku),
+              order_date  = COALESCE(wf2_orders.order_date, excluded.order_date),
+              currency    = COALESCE(wf2_orders.currency, excluded.currency),
+              cost_local  = excluded.cost_local,
+              cost_pack   = excluded.cost_pack,
+              cost_intl   = excluded.cost_intl,
+              profit      = excluded.profit,
+              profit_rate = excluded.profit_rate
+        """
+        conn.execute(sql, (
+            tenant_id, alias, erp_sku, rec.get("noon_sku"), od["item_nr"],
+            od["order_date"], rec.get("currency"),
+            od["cost_local"], od["cost_pack"], od["cost_intl"],
+            od["profit"], od["profit_rate"], "erp",
+        ))
+        n += 1
+    return n
 
 
 def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = None) -> dict:
@@ -47,7 +123,10 @@ def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = 
         raise RuntimeError(f"tenant={tenant_id} ERP token 拿不到")
 
     conn = _data.conn()
+    _ensure_order_cost_cols(conn)
     counts = {}
+    order_counts = {}
+    skip_order_cost = os.environ.get("SMOKE_SKIP_ORDER_COST") == "1"
 
     for ent in entities:
         alias = ent["alias"]
@@ -87,6 +166,7 @@ def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = 
                         "noon_sku":    psk.get("platform_sku_id"),
                         "image_url":   sku.get("sku_image"),
                         "currency":    currency,
+                        "country":     country,
                     })
                     sales_str = parse_country_value(it.get("sales_count"), country)
                     rec[f"sales_{days}d"] = parse_int(sales_str)
@@ -135,8 +215,22 @@ def run_v2(tenant_id: int, windows: list | None = None, max_pages: int | None = 
         counts[alias] = n
         print(f"[{alias}] +{n} sku updated", file=sys.stderr)
 
+        # ── ERP 订单级成本/利润 → wf2_orders（WS-17 新增的承重墙）──
+        # 不接这一步，cost_local/cost_pack/cost_intl/profit/profit_rate 永远是空列。
+        if skip_order_cost:
+            print(f"[{alias}] SMOKE_SKIP_ORDER_COST=1 → 跳过订单成本利润 ingest（模拟改动前）",
+                  file=sys.stderr)
+        else:
+            n_orders = 0
+            for rec in bucket.values():
+                n_orders += _upsert_order_costs(conn, tenant_id, alias, rec, nation_id, token)
+            conn.commit()
+            order_counts[alias] = n_orders
+            tick(f"[{alias}] +{n_orders} order cost/profit rows")
+            print(f"[{alias}] +{n_orders} wf2_orders cost/profit rows", file=sys.stderr)
+
     conn.close()
-    print(f"\n[done] tenant={tenant_id} {counts}", file=sys.stderr)
+    print(f"\n[done] tenant={tenant_id} sku={counts} orders={order_counts}", file=sys.stderr)
     return counts
 
 
