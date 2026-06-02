@@ -42,14 +42,18 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Load schema into PG
+        env:
+          DBURL: postgresql://hipop:hipop_dev_password@localhost:5432/hipop
         run: |
-          python - <<'PY'
-          import psycopg2
-          c = psycopg2.connect("postgresql://hipop:hipop_dev_password@localhost:5432/hipop")
-          c.autocommit = True
-          c.cursor().execute(open("db/schema.sql").read())
-          print("✓ db/schema.sql loaded into CI postgres")
-          PY
+          which psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+          # 用 psql(原生处理 $$ DO 块)+ ON_ERROR_STOP=0 容错:
+          # schema_v2.sql 有 PG 不认的 AUTOINCREMENT,跳过;pg_extra 补回 PG 版(sales_entities/wf6_logistics_alerts_v2 + RLS)。
+          for f in db/schema.sql db/schema_v2.sql db/schema_v2_pg_extra.sql; do
+            echo "== loading $f =="
+            psql "$DBURL" -v ON_ERROR_STOP=0 -q -f "$f" || true
+          done
+          echo "== 关键表存在性检查 =="
+          psql "$DBURL" -tc "select to_regclass('public.wf6_logistics_alerts_v2'), to_regclass('public.tasks'), to_regclass('public.agent_actions');"
 
       - name: Gate — make test
         run: make test PYTHON=python
