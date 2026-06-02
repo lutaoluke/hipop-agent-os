@@ -1,0 +1,21 @@
+# CODEOWNERS — harness 权限/skill 关口
+# 改这些要害文件的 PR,需 @lutaoluke(owner)审批后才能合并。
+# 配合 branch protection 的 "Require review from Code Owners" 生效。
+# 见 plan(excel-2-calm-stream.md):卡点 D(权限关口)+ 卡点 E(skill 回归关口)。
+
+# chat agent 核心(含 SYSTEM_PROMPT「死规矩」——确定性规则应进 verifier,不应往这里堆)
+/hipop/server/agent.py                  @lutaoluke
+
+# 治理与权限:动作门 / 决策 pipeline / RBAC(动这些 = 动系统的关口)
+/hipop/server/governance.py             @lutaoluke
+/hipop/server/governance_actions.yaml   @lutaoluke
+/hipop/server/rbac.py                   @lutaoluke
+
+# 数据库 schema(多租户 RLS 隔离,改错会串租户)
+/db/                                    @lutaoluke
+
+# skill 工件(改 skill = 改代码,必须走 PR + 审批)
+/openclaw-skill/                        @lutaoluke
+
+# harness 本身:CI 门 / owners(防 agent 自我绕过这道门)
+/.github/                               @lutaoluke
