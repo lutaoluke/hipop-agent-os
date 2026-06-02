@@ -1,0 +1,6 @@
+country_code,sku,warehouse_code,qty,inventory_type,title
+SA,ZSA001,whA,10,saleable,SKU A title
+SA,ZSA001,whB,5,unsaleable,SKU A title
+SA,ZSA002,whA,20,saleable,SKU B title
+AE,ZAE001,whC,7,saleable,SKU C title
+AE,ZAE001,whC,3,unsaleable,SKU C title
