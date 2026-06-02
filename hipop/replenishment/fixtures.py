@@ -22,7 +22,10 @@ _FIXTURE_DIR = os.path.join(
 )
 
 KNOWN_INPUT_FIXTURE = os.path.join(_FIXTURE_DIR, "replenish_known_input.json")
+# 三份缺失夹具：各缺一类，逐一钉死「缺任意一类都显式标注、不静默给 0」。
 MISSING_DATA_FIXTURE = os.path.join(_FIXTURE_DIR, "replenish_missing_data.json")
+MISSING_LOGISTICS_FIXTURE = os.path.join(_FIXTURE_DIR, "replenish_missing_logistics.json")
+MISSING_SALES_FIXTURE = os.path.join(_FIXTURE_DIR, "replenish_missing_sales.json")
 
 
 def _parse(raw: dict) -> SkuReplenishInput:
@@ -47,17 +50,46 @@ def _parse(raw: dict) -> SkuReplenishInput:
 
 
 def load_known_input() -> Tuple[SkuReplenishInput, Optional[dict]]:
-    """已知输入夹具：三类齐全。返回 (契约对象, 人工给定的预期补货量)。
+    """已知输入夹具：三类齐全。返回 (契约对象, main(WS-5) 既有人工锚点)。
 
-    预期补货量是步骤2 的验收锚点（人工核定，非算法产物）。
+    第二个返回值是 WS-5 留在 main 的 `expected_replenishment`（含人工首批
+    total_replenish=60），**保持向后兼容**，不挪 WS-5 的锚点——WS-5 的 smoke
+    仍消费它。步骤2 的缺口锚点另走 `load_known_step2_expected`。
     """
     with open(KNOWN_INPUT_FIXTURE, encoding="utf-8") as f:
         raw = json.load(f)
     return _parse(raw), raw.get("expected_replenishment")
 
 
-def load_missing_data() -> Tuple[SkuReplenishInput, str]:
-    """数据缺失夹具：故意缺某一类。返回 (契约对象, 该夹具声明缺的类)。"""
-    with open(MISSING_DATA_FIXTURE, encoding="utf-8") as f:
+def load_known_step2_expected() -> Tuple[SkuReplenishInput, Optional[dict]]:
+    """已知输入夹具：三类齐全。返回 (契约对象, 步骤2 专属验收锚点)。
+
+    第二个返回值是夹具里 **步骤2 专属**的 `expected_step2_total`（缺口总量
+    gap_total=168）。步骤2 只对「该补多少总量(=缺口)」负责，用本层自己的字段
+    断言，不挪 WS-5 留在 main 的首批锚点。
+    """
+    with open(KNOWN_INPUT_FIXTURE, encoding="utf-8") as f:
+        raw = json.load(f)
+    return _parse(raw), raw.get("expected_step2_total")
+
+
+def _load_missing(fixture_path: str) -> Tuple[SkuReplenishInput, str]:
+    """通用缺失夹具加载：返回 (契约对象, 该夹具声明缺的类)。"""
+    with open(fixture_path, encoding="utf-8") as f:
         raw = json.load(f)
     return _parse(raw), raw["_missing_class"]
+
+
+def load_missing_data() -> Tuple[SkuReplenishInput, str]:
+    """数据缺失夹具：缺『各仓现有库存 inventory』。返回 (契约对象, 缺的类)。"""
+    return _load_missing(MISSING_DATA_FIXTURE)
+
+
+def load_missing_logistics() -> Tuple[SkuReplenishInput, str]:
+    """数据缺失夹具：缺『物流 logistics』。返回 (契约对象, 缺的类)。"""
+    return _load_missing(MISSING_LOGISTICS_FIXTURE)
+
+
+def load_missing_sales() -> Tuple[SkuReplenishInput, str]:
+    """数据缺失夹具：缺『近N天销量 recent_sales』。返回 (契约对象, 缺的类)。"""
+    return _load_missing(MISSING_SALES_FIXTURE)

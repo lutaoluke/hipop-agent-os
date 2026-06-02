@@ -1,0 +1,15 @@
+{
+  "_doc": "数据缺失夹具：故意缺『近N天销量』这一类（recent_sales 整段缺省），供步骤2 断言被缺失检测点标注。物流 + 各仓库存到位，唯独 recent_sales 没拿到。",
+  "_missing_class": "recent_sales",
+  "sku": "TBS0412A",
+  "logistics": {
+    "in_transit_qty": 60,
+    "pending_shipment_qty": 10
+  },
+  "inventory": {
+    "by_warehouse": {
+      "KSA_overseas": 25,
+      "noon_official": 8
+    }
+  }
+}

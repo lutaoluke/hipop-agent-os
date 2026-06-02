@@ -1,0 +1,15 @@
+{
+  "_doc": "数据缺失夹具：故意缺『物流(在途/待发货)』这一类（logistics 整段缺省），供步骤2 断言被缺失检测点标注。近N天销量 + 各仓库存到位，唯独 logistics 没拿到。",
+  "_missing_class": "logistics",
+  "sku": "TBL0311A",
+  "recent_sales": {
+    "window_days": 7,
+    "daily_units": [4, 5, 3, 6, 2, 4, 5]
+  },
+  "inventory": {
+    "by_warehouse": {
+      "KSA_overseas": 20,
+      "CN_domestic": 35
+    }
+  }
+}
