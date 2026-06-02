@@ -177,6 +177,28 @@ def _resolve_entity_for_store(store: str) -> tuple:
     return tid, (rows[0]["alias"] if rows else "")
 
 
+# ── 库存历史抽检（WS-22 → WS-12）────────────────────────────
+def stock_as_of(tenant_id: int, entity_alias: str, partner_sku: str,
+                as_of_date) -> Optional[Dict]:
+    """WS-12 历史抽检入口：读某业务日的库存快照（官方仓/海外仓/义乌/东莞/pending 等）。
+
+    走 dated 层 wf1_stock_history，**不碰** latest 层 wf1_stock，也不用 imported_at
+    冒充业务日。as_of_date 非法直接 raise（见 stock_history.normalize_as_of_date）。
+    """
+    from hipop.scripts import stock_history
+    set_current_tenant(tenant_id)
+    with conn() as c:
+        return stock_history.read_snapshot(c, tenant_id, entity_alias, partner_sku, as_of_date)
+
+
+def stock_history_dates(tenant_id: int, entity_alias: Optional[str] = None) -> List[str]:
+    """列出某 tenant（可选 entity）已在档的库存业务日，最新在前 —— WS-12 选日期用。"""
+    from hipop.scripts import stock_history
+    set_current_tenant(tenant_id)
+    with conn() as c:
+        return stock_history.list_dates(c, tenant_id, entity_alias)
+
+
 # ── SKU 健康（销售/库存模块）────────────────────────────────
 def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30,
                     listing: str = "listed") -> List[Dict]:

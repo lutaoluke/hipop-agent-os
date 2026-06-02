@@ -675,6 +675,14 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_noon_stock_csv_v2:run_v2")],
         ["sales", "replenish"],
     ),
+    # WS-22：库存历史快照 — 按业务日冻结 wf1_stock → wf1_stock_history（供 WS-12 抽检）
+    # spec 需带 {"as_of_date":"YYYY-MM-DD"}；走 runtime runner（spawn_task 传 spec）。
+    "wf1_stock_snapshot_v2": (
+        "库存历史快照（按业务日冻结 wf1_stock → wf1_stock_history，WS-22）",
+        [(1, "按 as_of_date 把 latest wf1_stock 冻结进 wf1_stock_history",
+          "scripts.stock_history:run_v2")],
+        ["sales", "replenish"],
+    ),
     # WS-10：ERP 送仓/拣货 + Noon ASN → wf1_asn_lines_staging（供 WS-11）
     "wf1_inbound_staging_v2": (
         "在途/送仓 ASN（导表 → wf1_asn_lines_staging，供 WS-11）",
