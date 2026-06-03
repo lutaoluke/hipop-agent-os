@@ -118,6 +118,45 @@ def _v_wf1_stock(task_id, tenant_id, started_at, **kw):
     }
 
 
+@register("wf1_stock_merge_v2")
+def _v_wf1_stock_merge(task_id, tenant_id, started_at, **kw):
+    """库存快照合并（WS-12）— 本次 run 写出的 total_stock 必须 == 各来源列确定性求和，
+    且不为 NULL。挡两种死法：
+      · 死代码短路 / 绕过 pending_inbound：total_stock 必须等于
+        noon_total + overseas + yiwu + dongguan + pending_inbound（含 pending），
+        逐行用 SQL 真比对，任一行不等即 FAIL（不靠 LLM 自述）。
+      · 占位假数据：本 run 至少更新 1 行,且 total_stock 不留 NULL。
+
+    SQL 求和表达式由 merge_stock_snapshot_v2.TOTAL_STOCK_COMPONENTS 现取现拼，
+    与生产合并规则共用同一份列清单 —— 规则改了这里不会漂移。
+    """
+    from hipop.server import data
+    from hipop.scripts import merge_stock_snapshot_v2 as merge
+    data.set_current_tenant(tenant_id)
+    cutoff = _started_at_iso(started_at)
+    sum_expr = merge._sum_expr(merge.TOTAL_STOCK_COMPONENTS)
+    rows = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? AND updated_at >= ?",
+        (tenant_id, cutoff),
+    ) or 0
+    # total_stock 与确定性求和不符（含 NULL）的行数 —— 必须为 0。
+    mismatched = data._scalar(
+        f"SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? AND updated_at >= ? "
+        f"AND (total_stock IS NULL OR total_stock != ({sum_expr}))",
+        (tenant_id, cutoff),
+    ) or 0
+    ok = rows > 0 and mismatched == 0
+    return {
+        "ok": ok,
+        "evidence": {"rows_merged_this_run": rows, "mismatched_total_stock": mismatched,
+                     "components": list(merge.TOTAL_STOCK_COMPONENTS)},
+        "verdict": (f"{rows} 行 total_stock = 各来源确定性求和（含 pending），无绕过/NULL"
+                    if ok else
+                    (f"{mismatched} 行 total_stock 与求和不符或为 NULL（绕过 pending/占位假数据）"
+                     if mismatched else "0 行被合并 — 合并步骤没接上/快照为空")),
+    }
+
+
 def _valid_business_date(s) -> bool:
     """as_of_date 是否为合法业务日：零填充 'YYYY-MM-DD' 且真实存在的日历日。
 

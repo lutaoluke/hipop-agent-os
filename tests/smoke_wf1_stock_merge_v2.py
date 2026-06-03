@@ -26,6 +26,7 @@ import os
 import sys
 import re
 import json
+import time
 import sqlite3
 import tempfile
 
@@ -213,6 +214,23 @@ def main():
                   encoding="utf-8").read()
     assert '("wf1_stock_merge_v2"' in wr_src, "refresh_all_v2 没接入 wf1_stock_merge_v2 步骤"
 
+    # ── 5b. 确定性校验写成 verifier（交付门复跑，不靠自述）────────────────
+    from hipop.runtime import verifiers as vr
+    assert "wf1_stock_merge_v2" in vr._VERIFIERS, "verifier 注册表缺 → 交付门没确定性校验"
+    # 合并后的快照口径一致 → verifier 过（total_stock 全 == 各来源求和、非 NULL）。
+    res_ok = vr.run_verifier("wf1_stock_merge_v2", "smoke", TENANT, time.time() - 3600)
+    assert res_ok and res_ok["ok"] is True, f"合并后 verifier 应过: {res_ok}"
+    assert res_ok["evidence"]["mismatched_total_stock"] == 0, res_ok
+    # 注入一行被绕过/写错的 total_stock（模拟最终快照绕过 pending）→ verifier 必须红灯。
+    cbad = sqlite3.connect(_TMP_DB)
+    cbad.execute(
+        "UPDATE wf1_stock SET total_stock=999999 WHERE tenant_id=? AND entity_alias=? "
+        "AND partner_sku='SKU-A'", (TENANT, ALIAS))
+    cbad.commit(); cbad.close()
+    res_bad = vr.run_verifier("wf1_stock_merge_v2", "smoke", TENANT, time.time() - 3600)
+    assert res_bad and res_bad["ok"] is False, f"被绕过的 total_stock verifier 应红灯: {res_bad}"
+    assert res_bad["evidence"]["mismatched_total_stock"] >= 1, res_bad
+
     # ── 6. 死代码短路死法：绝不创建/写 v1 per-alias 表 ──────────────────
     c = sqlite3.connect(_TMP_DB)
     try:
@@ -229,7 +247,8 @@ def main():
     print("✓ merge 只 roll-up 不新建行；来源列 + overseas/noon 追溯 json 原样保留")
     print("✓ 下游 read_sales_v2 从系统 DB 读到合并快照（immediate=noon_saleable+pending）")
     print("✓ runner + WORKFLOW_REGISTRY + refresh_all_v2 链均接入；未写 v1 wf1_<alias>_stock")
-    print("\n7/7 passed")
+    print("✓ verifier 复跑确定性校验：合并后 ok=True，注入绕过/写错 total_stock 后 ok=False")
+    print("\n8/8 passed")
 
 
 if __name__ == "__main__":
