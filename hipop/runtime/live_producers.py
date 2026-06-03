@@ -50,8 +50,19 @@ def register_all() -> list:
         print(f"[live_producers] noon 订单 live producer 自动接线失败（生产入口继续，"
               f"run_live 将回落 CSV）: {type(e).__name__}: {e}", file=sys.stderr)
 
+    # ── noon 可售库存（WS-N2.2/WS-59）→ ingest_noon_stock_csv_v2 的 MY_INVENTORY 注册表 ──
+    try:
+        try:
+            import noon_stock_fetcher as _stock  # scripts 同级（noon_stock_fetcher 自插 path）
+        except ModuleNotFoundError:
+            from hipop.scripts import noon_stock_fetcher as _stock  # 包路径回落
+        _stock.register_live_producer()
+        registered.append("my_inventory")
+    except Exception as e:  # noqa: BLE001 — 接线失败不阻断生产入口加载
+        print(f"[live_producers] noon 库存 live producer 自动接线失败（生产入口继续，"
+              f"run_live 将回落 CSV）: {type(e).__name__}: {e}", file=sys.stderr)
+
     # 后续抓取器就绪后在此各加一行：
-    #   stock（WS-N2.2）→ ingest_noon_stock_csv_v2 的 MY_INVENTORY 注册表
     #   asn  （WS-N2.3）→ ingest_inbound_staging_v2 的 ASN 注册表
     return registered
 
