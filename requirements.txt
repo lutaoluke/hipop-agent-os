@@ -11,6 +11,9 @@ playwright>=1.40             # ERP token 兜底路径
 anthropic>=0.40              # Anthropic / Claude（本地 OAuth keychain）
 openai>=1.50                 # Qwen / DeepSeek / 豆包 OpenAI 协议兼容
 
+# 导出 — chat/UI 的 export_table 生成 xlsx（销量「最后输出数据」导出，WS-20）
+openpyxl>=3.1
+
 # DB
 psycopg2-binary>=2.9      # Postgres（DB_URL 设置时启用）
 # sqlalchemy>=2.0          # 暂未使用，留给阶段 2 任务队列
