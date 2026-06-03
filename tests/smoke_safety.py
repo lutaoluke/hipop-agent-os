@@ -1,0 +1,140 @@
+"""Smoke: WS-55 反幻觉黑名单误报修复 — 合法字段名/措辞放行，真幻觉仍拦。
+
+背景
+----
+test-chat 全局门把两类**合法措辞**当成幻觉误报：
+  1. `可撑天数` = 真实字段 `sellable_days` 的中文人话说法，deepseek 描述补货页时
+     自然带出 → 被 _safety / 黑名单当幻觉拦（还会二次回贴告警再踩一次）。
+  2. 散文里提到旧表名 `wf3_logistics`，但**实际 tool 调用是 wf3_logistics_v2（正确）**
+     → reply 正则 `wf3_logistics(?!_v2)` 误报。
+
+WS-55(方案 A，Luke sign-off) 精修黑名单：合法字段名/措辞**放行**，黑名单只在
+"真被当成编造字段（与真幻觉字段同框）/ 真选错老 workflow"时触发 —— 修误报=纠正性
+提升，不是挖空反幻觉门。
+
+fail-then-pass（钉死本修复，防回退 + 防把门挖空）
+-----------------------------------------------
+- 改动前：`_safety.HALLUCINATED_FIELDS` 含 `可撑天数` → 单独合法提及被误报 →
+  test_legit_* FAIL。
+- 改动前：smoke_chat 用 reply 正则 `wf3_logistics(?!_v2)` → 散文提旧名（真跑 v2）
+  被误报 → test_wf3_prose_* FAIL。
+- 改动后：合法提及放行、真幻觉字段 / 真选错老 workflow 仍拦 → 全 PASS。
+
+跑法：python3 tests/smoke_safety.py （也会被 `make test` 自动聚合）
+"""
+import os
+import sys
+import traceback
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))   # repo root → import hipop.server
+sys.path.insert(0, HERE)                      # tests/ → import smoke_chat
+
+from hipop.server import _safety  # noqa: E402
+import smoke_chat                  # noqa: E402
+
+
+def _field_warned(warns):
+    """是否出现『字段不在 wf2/wf5 表中』这条幻觉告警。"""
+    return any("字段" in w and "不在" in w for w in warns)
+
+
+# ── 可撑天数：真实字段 sellable_days 的人话，合法提及必须放行 ──────────────
+def test_legit_sellable_days_with_anchor_passes():
+    reply, warns = _safety.sanitize_reply(
+        "TBJ0059A 当前可撑天数约 30 天（即 sellable_days 字段），建议关注。", [])
+    assert not any("可撑天数" in w for w in warns), \
+        f"合法提及『可撑天数』被误报为幻觉: {warns}"
+    assert not reply.startswith("⚠️"), f"不该加幻觉 banner: {reply[:80]}"
+
+
+def test_legit_sellable_days_no_anchor_passes():
+    # deepseek 描述补货页时自然带出，不一定同时写 sellable_days —— 仍应放行
+    reply, warns = _safety.sanitize_reply("这个 SKU 可撑天数还有 12 天。", [])
+    assert not any("可撑天数" in w for w in warns), f"误报: {warns}"
+
+
+# ── 真幻觉字段：无任何真实字段背书，必须仍拦（不挖空门）────────────────────
+def test_real_hallucinated_field_still_flagged():
+    _, warns = _safety.sanitize_reply("该 SKU 海运ROI预估 18%，推荐物流方式空运。", [])
+    assert _field_warned(warns), f"真幻觉字段未被拦: {warns}"
+
+
+def test_alias_in_fabrication_context_still_flagged():
+    # 可撑天数 出现在"编造字段堆"里（与真幻觉字段同框）→ 整段仍被拦
+    _, warns = _safety.sanitize_reply(
+        "字段汇总：海运ROI预估 18%、可撑天数 30 天、weekly_priority 高。", [])
+    assert _field_warned(warns), f"编造字段上下文应被拦: {warns}"
+
+
+# ── 回归：精确时间戳幻觉守卫不受影响 ─────────────────────────────────────
+def test_timestamp_guard_intact():
+    _, warns = _safety.sanitize_reply("数据更新于 2026-06-03T12:00:00Z。", [])
+    assert any("时间戳" in w for w in warns), f"时间戳守卫被破坏: {warns}"
+
+
+# ── smoke_chat: wf3 选 workflow 用真实 workflow_task 判定，不再靠散文正则 ──
+def _wf3_case():
+    return next(c for c in smoke_chat.CASES if "刷新物流" in c.name)
+
+
+def test_wf3_prose_mention_with_correct_v2_passes():
+    # Agent 散文里提了旧表名，但真跑的是 v2 → 应 PASS（修误报）
+    c = _wf3_case()
+    resp = {
+        "reply": "好的，我用物流采集工作流（内部表 wf3_logistics_hub_v2，"
+                 "旧称 wf3_logistics）帮你刷新。",
+        "tools_used": ["run_workflow"],
+        "workflow_task": {"workflow": "wf3_logistics_v2"},
+    }
+    ok, reasons = smoke_chat.check(c, resp)
+    assert ok, f"散文提旧名但真跑 v2 被误报: {reasons}"
+
+
+def test_wf3_real_old_workflow_selection_still_fails():
+    # 真选错：实际触发老 wf3_logistics（非 v2）→ 必须 FAIL（不挖空门）
+    c = _wf3_case()
+    resp = {
+        "reply": "已触发物流刷新。",
+        "tools_used": ["run_workflow"],
+        "workflow_task": {"workflow": "wf3_logistics"},
+    }
+    ok, reasons = smoke_chat.check(c, resp)
+    assert not ok, "真选错老 workflow 应被拦，但通过了"
+
+
+def test_wf3_no_workflow_triggered_still_fails():
+    c = _wf3_case()
+    resp = {"reply": "好的。", "tools_used": [], "workflow_task": None}
+    ok, _ = smoke_chat.check(c, resp)
+    assert not ok, "没真触发 workflow 应 FAIL"
+
+
+def test_global_blacklist_drops_legit_alias():
+    assert "可撑天数" not in smoke_chat.GLOBAL_BLACKLIST, \
+        "可撑天数 是真实字段 sellable_days 的人话，不该在全局黑名单"
+
+
+if __name__ == "__main__":
+    tests = [
+        test_legit_sellable_days_with_anchor_passes,
+        test_legit_sellable_days_no_anchor_passes,
+        test_real_hallucinated_field_still_flagged,
+        test_alias_in_fabrication_context_still_flagged,
+        test_timestamp_guard_intact,
+        test_wf3_prose_mention_with_correct_v2_passes,
+        test_wf3_real_old_workflow_selection_still_fails,
+        test_wf3_no_workflow_triggered_still_fails,
+        test_global_blacklist_drops_legit_alias,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"✓ {t.__name__}")
+        except Exception as e:
+            failed += 1
+            print(f"✗ {t.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(0 if failed == 0 else 1)

@@ -43,11 +43,18 @@ WF2_REAL_FIELDS = {
     "total_orders", "valid_orders", "cancel_count", "return_count",
     "cancel_rate", "return_rate", "anomalies_json",
 }
-# 已知 Qwen 编过的不存在字段
+# 真正不存在的字段（无任何真实字段背书）—— 永远拦。
 HALLUCINATED_FIELDS = {
-    "海运ROI预估", "空运ROI预估", "推荐物流方式", "可撑天数",
+    "海运ROI预估", "空运ROI预估", "推荐物流方式",
     "weekly_priority", "replenish_priority", "next_ship_date",
     "7天销量",  # 真实是 sales_10d/30d 等
+}
+# 真实字段的中文人话别名（WS-55）：提及它们是合法的，不是幻觉。
+# `可撑天数` = wf5 真实字段 sellable_days，deepseek 描述补货页时会自然带出。
+# 合法提及一律放行；只有当它和"真正编造字段"同框出现（被当成编造字段堆里的一员）
+# 才一并点名 —— 此时拦截由 HALLUCINATED_FIELDS 命中触发，别名只是补充说明。
+LEGIT_FIELD_ALIASES = {
+    "可撑天数": "sellable_days",
 }
 
 # 精确时间戳模式（data_health_check 只返回日期粒度，没时分秒）
@@ -91,7 +98,11 @@ def _check_fake_fields(text: str) -> List[str]:
     warns = []
     hits = [f for f in HALLUCINATED_FIELDS if f in text]
     if hits:
-        warns.append(f"⚠️ Agent 提到的字段不在 wf2/wf5 表中: {', '.join(hits)} — 数字可能是编造的")
+        # 只有真正编造字段出现时，才把同框的合法别名一并点名（它被当成编造字段堆里
+        # 的一员）。别名单独出现 = 真实字段的人话说法 = 放行（WS-55 修误报）。
+        alias_hits = [a for a in LEGIT_FIELD_ALIASES if a in text]
+        names = ", ".join(hits + alias_hits)
+        warns.append(f"⚠️ Agent 提到的字段不在 wf2/wf5 表中: {names} — 数字可能是编造的")
     return warns
 
 

@@ -39,13 +39,15 @@ class Case:
     must_contain: List[str] = field(default_factory=list)        # reply 必须含
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
+    workflow_must_be_v2: bool = False                            # 真触发的 workflow 名必须以 _v2 结尾
     timeout: int = 60
 
 
 # 禁忌词集中：所有 case 共享（hallucinate 黑名单）
+# WS-55：`可撑天数` 是真实字段 sellable_days 的中文人话，属合法措辞，已从黑名单移除
+# （误报根因修复）；真正不存在的字段在 _safety.HALLUCINATED_FIELDS 里仍被运行时拦。
 GLOBAL_BLACKLIST = [
     "agent.diangou",         # 之前 Qwen 编过这个虚构域名
-    "可撑天数",                # 不存在的字段（真名 sellable_days）
     ".zeabur.app/dashboard",  # 编造路径
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
@@ -111,9 +113,9 @@ CASES: List[Case] = [
         name="单 SKU 查询 TBJ0059A（必含 SKU 名 + 不能编不存在字段）",
         question="TBJ0059A 卖得怎么样",
         must_contain=["TBJ0059A"],
-        # 关键防守：禁编不存在字段（wf5 真实字段是 sellable_days / decision_days）
+        # 关键防守：禁编真正不存在的字段（wf5 真实字段是 sellable_days / decision_days）。
+        # WS-55：`可撑天数` 是 sellable_days 的人话别名（合法），已移除；保留真幻觉字段。
         must_not_contain=[
-            "可撑天数",       # Qwen 反复爱编
             "7天销量",        # 真实是 sales_10d / sales_30d
             "海运ROI预估",
         ],
@@ -179,14 +181,16 @@ CASES: List[Case] = [
         ],
     ),
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
+    # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
+    # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的
+    # workflow 名**（workflow_task.workflow 必须以 _v2 结尾）—— 直接钉死"选对 workflow"
+    # 这个真关口，比扫散文更准、更强（纠正性提升，非挖空）。
     Case(
         name="刷新物流（必走 v2，禁老 wf3 全局 env）",
         question="帮我刷一下物流数据",
         must_use_tools=["run_workflow"],
-        # 严禁老 workflow 名字出现（只有 v2 后缀的可选）
+        workflow_must_be_v2=True,    # 真触发的 workflow 必须是 *_v2，老 workflow=选错
         must_not_contain=[
-            r"wf3_logistics(?!_v2)",   # 老名字 wf3_logistics 出现 = 选错
-            r"wf6_alerts(?!_v2)",
             "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
         ],
     ),
@@ -276,6 +280,14 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     for bw in blacklist:
         if re.search(bw, reply):
             reasons.append(f"reply 含禁忌词: {bw!r}")
+
+    if c.workflow_must_be_v2:
+        wt = resp.get("workflow_task") or {}
+        wf = wt.get("workflow") or ""
+        if not wf:
+            reasons.append("未真触发任何 workflow（workflow_task 为空）")
+        elif not wf.endswith("_v2"):
+            reasons.append(f"选错 workflow: {wf!r}（应为 *_v2，老 workflow 已禁）")
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
