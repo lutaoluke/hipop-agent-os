@@ -664,6 +664,48 @@ def tool_list_products(store: str, listing: str = "all",
     }
 
 
+# ── 销量录入「最后输出数据」字段口径（WS-20 / WS-14-6）─────────────────
+# 替代人工 Excel 汇总表。需求声明的全字段，按 (导出列 key, 中文表头, 来源) 排序。
+# 来源约定：
+#   entity     → sales_entities（同 tenant+entity 过滤）
+#   wf2_sku    → 动态分析层最终口径（由 wf_sales_static_v2.merge_entity_v2 算出并落库）
+#   derived    → 由 wf2_sku 字段就地派生（订单号 = order_item_nrs_json 展开）
+# 这是导出契约的单一事实源：smoke (tests/smoke_sales_export_fields.py) 钉死它，
+# 改这里 = 改导出口径，必须连带改 smoke。
+SALES_EXPORT_SPEC = [
+    ("country",              "国别",        "entity"),
+    ("store_name",           "店铺名",      "entity"),
+    ("product_id",           "主SKU",       "wf2_sku"),
+    ("partner_sku",          "PSKU",        "wf2_sku"),
+    ("total_orders",         "订单量",      "wf2_sku"),
+    ("order_no",             "订单号",      "derived"),
+    ("title",                "商品标题",    "wf2_sku"),
+    ("fulfillment",          "售卖形式",    "wf2_sku"),
+    ("latest_price",         "商品最新售价", "wf2_sku"),
+    ("avg_price",            "平均售价",    "wf2_sku"),
+    ("latest_customer_paid", "最新成交价",  "wf2_sku"),
+    ("latest_profit_rate",   "最新利润率",  "wf2_sku"),
+    ("return_rate",          "退货率",      "wf2_sku"),
+    ("cancel_rate",          "取消率",      "wf2_sku"),
+    ("latest_order_date",    "最新出单日期", "wf2_sku"),
+    ("sales_10d",            "近10天销量",  "wf2_sku"),
+    ("sales_30d",            "近30天销量",  "wf2_sku"),
+    ("sales_60d",            "近60天销量",  "wf2_sku"),
+    ("sales_90d",            "近90天销量",  "wf2_sku"),
+    ("sales_120d",           "近120天销量", "wf2_sku"),
+    ("sales_180d",           "近180天销量", "wf2_sku"),
+    ("total_revenue",        "总销售额",    "wf2_sku"),
+    ("anomalies",            "异常标记",    "derived"),
+    ("sales_grade",          "销量评级",    "wf2_sku"),
+    ("forecast_10d",         "10天预测",    "wf2_sku"),
+    ("forecast_30d",         "30天预测",    "wf2_sku"),
+]
+# 实际从 wf2_sku 取的列（含派生用的原始 JSON 列）。
+_SALES_WF2_COLS = [k for k, _h, src in SALES_EXPORT_SPEC if src == "wf2_sku"] + [
+    "order_item_nrs_json", "anomalies_json",
+]
+
+
 def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
                        store: str = "KSA", listing: str = "all",
                        sales_only: bool = False) -> Dict:
@@ -705,11 +747,41 @@ def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
         elif listing == "unlisted": w.append("(is_listed=0 OR is_listed IS NULL)")
         if sales_only: w.append("COALESCE(sales_180d,0) > 0")
         where = " AND ".join(w)
-        cols = ["partner_sku", "title", "is_listed", "sales_10d", "sales_30d",
-                "sales_60d", "sales_90d", "sales_180d", "latest_price", "avg_price",
-                "latest_profit_rate", "cost_price", "currency", "brand",
-                "product_category_detail", "latest_order_date"]
         order_by = "COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC"
+        # WS-20：导出「最后输出数据」全字段，替代人工 Excel 汇总。
+        # 列口径单一事实源 = SALES_EXPORT_SPEC（wf2_sku v2 + sales_entities，同 tenant/entity 过滤）。
+        from . import data as _d
+        rows = _d._fetch(
+            f"SELECT {','.join(_SALES_WF2_COLS)} FROM wf2_sku WHERE {where} ORDER BY {order_by}",
+            (),
+        )
+        ent = _d._fetch(
+            "SELECT country, store_name FROM sales_entities "
+            "WHERE tenant_id=? AND alias=? LIMIT 1",
+            (tid, alias),
+        )
+        country = ent[0]["country"] if ent else None
+        store_name = ent[0]["store_name"] if ent else None
+        for r in rows:
+            r["country"] = country
+            r["store_name"] = store_name
+            # 订单号：order_item_nrs_json 展开成逗号串（来源 wf2_orders 的 item_nr 集合）
+            try:
+                nrs = json.loads(r.get("order_item_nrs_json") or "[]")
+            except (ValueError, TypeError):
+                nrs = []
+            r["order_no"] = ",".join(str(x) for x in nrs) if nrs else None
+            # 异常标记：anomalies_json 摘成 type 串（noon vs ERP 异常），空则留空
+            try:
+                anoms = json.loads(r.get("anomalies_json") or "[]")
+            except (ValueError, TypeError):
+                anoms = []
+            r["anomalies"] = ";".join(
+                str(a.get("type", a)) if isinstance(a, dict) else str(a) for a in anoms
+            ) if anoms else None
+        cols = [k for k, _h, _s in SALES_EXPORT_SPEC]
+        headers = [h for _k, h, _s in SALES_EXPORT_SPEC]
+        return _write_xlsx_and_return(rows, f"{view}_{store}", filter_desc, cols, headers)
     elif view == "replenish":
         from . import data as _d
         rows = _d._fetch(
@@ -740,8 +812,13 @@ def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
 
 
 def _write_xlsx_and_return(rows: list, name_prefix: str, filter_desc: str = "",
-                             cols: list = None) -> Dict:
-    """统一 xlsx 写盘 + 返下载链接 helper。"""
+                             cols: list = None, headers: list = None) -> Dict:
+    """统一 xlsx 写盘 + 返下载链接 helper。
+
+    cols    决定取值用的 row dict key（顺序即列顺序）。
+    headers 可选，写表头时用的展示名（与 cols 一一对应，长度须相等）；
+            缺省退回 cols 自身（向后兼容老调用）。
+    """
     import os, time
     from datetime import datetime
     from openpyxl import Workbook
@@ -760,10 +837,13 @@ def _write_xlsx_and_return(rows: list, name_prefix: str, filter_desc: str = "",
     fname = f"{name_prefix}_{ts}.xlsx"
     fpath = os.path.join(export_dir, fname)
 
+    if not headers or len(headers) != len(cols):
+        headers = cols
+
     wb = Workbook()
     ws = wb.active
     ws.title = name_prefix[:30]
-    ws.append(cols)
+    ws.append(headers)
     for r in rows:
         if isinstance(r, dict):
             ws.append([r.get(c) for c in cols])
