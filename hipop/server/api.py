@@ -772,6 +772,15 @@ WORKFLOW_REGISTRY = {
         ],
         ["sales", "logistics", "replenish"],
     ),
+    # WS-7：补货接线 — 三类静态数据 → 步骤2 算法 → 每 SKU 补货量表。
+    # 注册进 registry，使其经 /run-workflow（UI/chat/scheduler）能被 runner 解析触发，
+    # 而非只能单跑 CLI/smoke（防「接线缺失」死法）。本圈只吃静态夹具（不接实时 ERP）。
+    "wf4_replenish_suggest": (
+        "补货建议（三类静态数据 → 每 SKU 补货量，WS-7）",
+        [(1, "读三类静态数据 + 调步骤2 算法 + 出补货量表",
+          "hipop.replenishment.workflow:run_workflow_step")],
+        ["replenish"],
+    ),
 }
 
 

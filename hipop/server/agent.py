@@ -235,7 +235,8 @@ TOOLS = [
             "- wf5_sales_cycle_v2：基于现有 wf2/wf1/wf3 数据重算销售周期 + 补货决策\n"
             "- wf3_logistics_v2：从 ERP 拉物流货单 + 抓物流站节点（默认只扫近 60 天有销量的 SKU，~30 分钟；用户问『扫物流』走这个）\n"
             "- wf6_alerts_v2：物流告警生成（依赖 wf3 真数据；wf3 跑完再调）\n"
-            "用户说『拉/同步/刷新/重算/跑』数据时调本工具。**严禁选 v2 之外的 workflow，老 workflow 只读全局 env，会让多租户用户必崩**。\n"
+            "- wf4_replenish_suggest：补货建议（三类静态数据 → 每 SKU 补货量表，WS-7）；用户问『该补多少 / 算补货量 / 出补货清单』时选它\n"
+            "用户说『拉/同步/刷新/重算/跑』数据时调本工具。**除上面列出的之外严禁选其它 workflow，老 workflow 只读全局 env，会让多租户用户必崩**。\n"
             "**重要**：如果用户原始问题需要等数据跑完才能答（如『我该补货吗』而 wf5 陈旧），"
             "在 followup_prompt 填上『需要等工作流跑完后接续答的问题』，前端会在 task 完成后自动重发一轮 chat，"
             "你那时再用最新数据答最终结论。"
@@ -247,7 +248,8 @@ TOOLS = [
                     "type": "string",
                     "enum": ["refresh_all_v2", "wf2_products_v2", "wf2_sales_v2",
                              "wf1_stock_v2", "wf5_sales_cycle_v2",
-                             "wf3_logistics_v2", "wf6_alerts_v2"],
+                             "wf3_logistics_v2", "wf6_alerts_v2",
+                             "wf4_replenish_suggest"],
                 },
                 "followup_prompt": {
                     "type": "string",
