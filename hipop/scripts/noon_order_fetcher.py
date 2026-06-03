@@ -199,6 +199,36 @@ def _goto_report_page(page, report_page_url: str) -> None:
         " —— 疑似登录态失效/紫鸟扩展拦截，blocked")
 
 
+def _evaluate_order_page(page, api_url: str, body: dict, *, page_no: int,
+                         report_page: str, retries: int):
+    """对单页 POST 取数（`page.evaluate`），对页面导航/瞬时网络失败做受控重试。
+
+    Sales Dashboard 是 SPA：分页过程中页面可能发生客户端导航，销毁 JS 执行上下文
+    （`Execution context was destroyed, most likely because of a navigation`），或偶发
+    `TypeError: Failed to fetch`。此类失败**不丢页、不跳页**——重新把 page 导回同域报表页
+    恢复稳定上下文后，对**当前页**原样重试（同一 page_no，不会重复汇总）。重试用尽仍失败
+    才红灯 blocked（疑似真实登录态失效/接口改版，不静默吞、不回落旧值、不编数）。
+    """
+    last = None
+    for attempt in range(int(retries) + 1):
+        try:
+            return page.evaluate(_ORDER_FETCH_JS, {"url": api_url, "body": body})
+        except Exception as e:  # noqa: BLE001 — page 侧各类取数错统一受控重试/归 blocked
+            last = e
+            if attempt < int(retries) and report_page:
+                # 导航毁了上下文：回到同域报表页重建上下文再重试当前页。导航本身失败
+                # 不立即 raise（吞掉让下一轮重试/最终用尽时统一红灯），不在错误域上瞎 fetch。
+                try:
+                    _goto_report_page(page, report_page)
+                except LiveSourceUnavailable:
+                    pass
+    raise LiveSourceUnavailable(
+        f"noon 订单页取数失败（page.evaluate POST {api_url} page={page_no}，"
+        f"已重试 {int(retries)} 次仍失败）: {type(last).__name__}: {last} —— 疑似登录态"
+        "失效/接口改版/页面导航毁上下文，blocked，请参照 refresh-dbuyerp-token 流程在本机"
+        "紫鸟重登该店一次") from last
+
+
 def _fetch_raw_orders(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
     """在真实已登录 page 上抓 noon 订单原始记录 list（唯一外部边界）。
 
@@ -219,6 +249,10 @@ def _fetch_raw_orders(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
             "（KSA=SA）—— blocked，绝不默认国别")
     per_page = int(cfg.get("per_page") or 200)
     max_pages = int(cfg.get("max_pages") or 500)
+    # 分页过程中 SPA 导航/瞬时网络失败时，对当前页受控重试次数（不丢页、不跳页）。
+    # 显式区分 0（关重试）与缺省（None → 3）：0 is falsy，不能用 `or 3`。
+    _pr = cfg.get("page_retries")
+    page_retries = 3 if _pr is None else int(_pr)
     from_date, to_date = _date_window(int(cfg.get("lookback_days") or 90))
     records_path = cfg.get("records_path")
 
@@ -231,13 +265,8 @@ def _fetch_raw_orders(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
     while page_no <= max_pages:
         body = {"country_code": country, "page": page_no, "per_page": per_page,
                 "filters": {}, "from_date": from_date, "to_date": to_date}
-        try:
-            resp = page.evaluate(_ORDER_FETCH_JS, {"url": api_url, "body": body})
-        except Exception as e:  # noqa: BLE001 — page 侧各类取数错都归 blocked
-            raise LiveSourceUnavailable(
-                f"noon 订单页取数失败（page.evaluate POST {api_url} page={page_no}）: "
-                f"{type(e).__name__}: {e} —— 疑似登录态失效/接口改版，blocked，"
-                "请参照 refresh-dbuyerp-token 流程在本机紫鸟重登该店一次") from e
+        resp = _evaluate_order_page(page, api_url, body, page_no=page_no,
+                                    report_page=report_page, retries=page_retries)
         status = resp.get("status") if isinstance(resp, dict) else None
         if status is not None and int(status) != 200:
             raise LiveSourceUnavailable(

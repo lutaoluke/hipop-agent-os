@@ -79,11 +79,17 @@ class FakePage:
     evaluate(js, {url, body}) 返回 {status, json}；pages 给定则按 body.page 分页发 hits，
     否则单页发 payload（list 或 dict）。记录被 goto/evaluate 调到的 url/arg。
     """
-    def __init__(self, payload=None, *, pages=None, total=None, status=200):
+    def __init__(self, payload=None, *, pages=None, total=None, status=200,
+                 fail_pages=None, fail_exc_msg="Execution context was destroyed, "
+                 "most likely because of a navigation"):
         self.payload = payload
         self.pages = pages
         self.total = total
         self.status = status
+        # fail_pages: {page_no: 在该页前 N 次 evaluate 抛导航/网络错（模拟 SPA 上下文被毁）}。
+        self.fail_pages = dict(fail_pages or {})
+        self.fail_exc_msg = fail_exc_msg
+        self._page_attempts = {}
         self.evaluated = []
         self.goto_calls = []
 
@@ -91,9 +97,15 @@ class FakePage:
         self.goto_calls.append(url)
 
     def evaluate(self, js, arg=None):
+        page_no = (arg or {}).get("body", {}).get("page", 1)
+        # 先模拟「当前页前 N 次取数撞导航毁上下文」——抛真实 page.evaluate 同类错。
+        n_fail = self.fail_pages.get(page_no, 0)
+        seen = self._page_attempts.get(page_no, 0)
+        self._page_attempts[page_no] = seen + 1
+        if seen < n_fail:
+            raise RuntimeError(self.fail_exc_msg)  # 同 playwright.evaluate 抛的运行时错
         self.evaluated.append(arg)
         if self.pages is not None:
-            page_no = (arg or {}).get("body", {}).get("page", 1)
             hits = self.pages.get(page_no, [])
             return {"status": self.status, "json": {"hits": hits, "total": self.total}}
         return {"status": self.status, "json": self.payload}
@@ -222,9 +234,37 @@ def main():
                 fp.evaluated[0]["body"]["country_code"] == "SA" and \
                 fp.evaluated[0]["body"]["page"] == 1, \
                 f"POST body 契约不符: {fp.evaluated[0]}"
+
+            # 4e. 分页中 SPA 导航毁上下文（execution context destroyed）→ 回导报表页后
+            #     对**当前页**受控重试，不丢页/不跳页/不重复汇总；重试用尽才 blocked。
+            #     这是验门人两次复跑卡住的真实失败点（Sales Dashboard 第 3 页）。
+            cfg_retry = {"api_url": "https://x/api", "country_code": "SA",
+                         "per_page": 2, "report_page_url": "https://x/sales",
+                         "page_retries": 3}
+            F._orders_cfg = _cfg(cfg_retry)
+            # 第 3 页前 2 次取数撞「execution context destroyed」，第 3 次成功。
+            fp_retry = FakePage(pages={1: RAW_RECORDS[0:2], 2: RAW_RECORDS[2:4],
+                                       3: RAW_RECORDS[4:5]}, total=len(RAW_RECORDS),
+                                fail_pages={3: 2})
+            recs_r = F._fetch_raw_orders(fp_retry)
+            assert recs_r == RAW_RECORDS, \
+                f"导航失败重试后应仍汇总全量、不丢/不重复: {len(recs_r)} 行 {recs_r!r}"
+            # 每页只成功汇总一次（5 行无重复），且第 3 页因失败被多次重导报表页。
+            assert len(fp_retry.evaluated) == 3, \
+                f"成功取数应恰 3 次（每页一次，重试不重复汇总）: {len(fp_retry.evaluated)}"
+            assert fp_retry.goto_calls.count("https://x/sales") >= 2, \
+                f"第 3 页毁上下文后应回导报表页重建上下文再重试: {fp_retry.goto_calls}"
+            # 同款失败但 page_retries=0（即未修/关掉重试）→ 红灯 blocked（fail-then-pass 对照）。
+            F._orders_cfg = _cfg({**cfg_retry, "page_retries": 0})
+            fp_noretry = FakePage(pages={1: RAW_RECORDS[0:2], 2: RAW_RECORDS[2:4],
+                                         3: RAW_RECORDS[4:5]}, total=len(RAW_RECORDS),
+                                  fail_pages={3: 2})
+            _expect_red(lambda: F._fetch_raw_orders(fp_noretry),
+                        "page=3", "导航毁上下文且无重试 blocked")
         finally:
             F._orders_cfg = _orig_cfg
-        print("✓ _fetch_raw_orders：缺配置/缺国别/HTTP 错/结构变 → blocked；正常分页 POST 汇总全量")
+        print("✓ _fetch_raw_orders：缺配置/缺国别/HTTP 错/结构变 → blocked；正常分页 POST 汇总全量；"
+              "分页中导航毁上下文 → 回导报表页重试当前页恢复（不丢/不重复），重试用尽才 blocked")
 
         # ── 5. 注册接线 + live==CSV：register → run_live 真走 live 行 → 同一 _aggregate/_upsert ──
         # 5a. 改前（未注册）：run_live 无 producer + 无 CSV → 红灯回落失败（接线缺失死法）。
