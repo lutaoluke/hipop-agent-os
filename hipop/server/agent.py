@@ -366,6 +366,30 @@ TOOLS = [
         },
     },
     {
+        "name": "capture_feedback",
+        "description": (
+            "用户撞到你做不了 / 超出当前能力范围的事，且用户**确认要记成需求**时调本工具，"
+            "**真写入 feedback 表**（产品迭代会读这张表，需求不再石沉大海）。"
+            "\n触发时机：上一轮你回过『这个我做不了 / 超出范围』并 offer 了『要我记成需求吗』，"
+            "用户回『记一下 / 好 / 帮我记 / 提个需求』——本轮必须调本工具。"
+            "\n**严禁**不调本 tool 就说『已记下 / 已反馈给产品』——没写库 = 没记。"
+            "\n写失败工具会返 ok=False + error，此时如实告诉用户『没记成，等会儿再说一次』，"
+            "**绝不许假装记了**（报告即事实）。content 尽量保留用户原话。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string",
+                            "description": "用户的需求原话 / 诉求，尽量保留原文"},
+                "scene": {"type": "string",
+                          "description": "触发场景，如『想把销量导成 PDF 月报』『问能不能改商品价』"},
+                "category": {"type": "string",
+                             "enum": ["需求", "bug", "数据问题", "其他"], "default": "需求"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
         "name": "explain_status_enum",
         "description": (
             "用户问『5 个状态哪里来的 / 能加 X 状态吗 / 状态定义在哪 / 这是 ERP 内置还是 hipop 自己的字段』时调本工具。"
@@ -1136,6 +1160,47 @@ def _tool_confirm_proposal(proposal_id: str, user_decision: str) -> Dict:
     return _gov.confirm_proposal(proposal_id, user_decision, actor, TOOL_FUNCS)
 
 
+def tool_capture_feedback(content: str, scene: str = "", category: str = "需求") -> Dict:
+    """把撞限/超范围时用户确认的需求真写入 feedback 表（WS-26）。
+
+    报告即事实：写不进库就如实返 ok=False + error，**绝不返一个假的成功**。
+    并在写入后**回读一次**确认真落库（钉死占位假数据）。
+    """
+    from . import data as _d
+    tid = _get_tenant()
+    sc = _chat_scope.get() or {}
+    if not content or not str(content).strip():
+        return {"ok": False, "error": "empty_content",
+                "message": "没有可记录的需求内容 —— 请把诉求说清楚我再记。"}
+    cat = category or "需求"
+    try:
+        fid = _d.write_feedback(
+            content,
+            trigger_scene=scene or None,
+            category=cat,
+            user=sc.get("current_user") or sc.get("current_user_email"),
+            role=sc.get("current_role"),
+            store=sc.get("store"),
+            tenant_id=tid,
+        )
+    except Exception as e:
+        return {"ok": False,
+                "error": f"feedback_write_failed: {type(e).__name__}: {str(e)[:200]}",
+                "message": "没记成（写库失败），等会儿再跟我说一次这个需求。"}
+    # 回读确认真落库 —— 不信 write 的返回值，亲自查一次
+    saved = _d._fetch("SELECT id FROM feedback WHERE tenant_id=? AND id=?", (tid, fid))
+    if not saved:
+        return {"ok": False, "error": "feedback_not_persisted",
+                "message": "写库后回查不到，判定没记成；请稍后重试。"}
+    return {
+        "ok": True,
+        "feedback_id": fid,
+        "category": cat,
+        "message": f"已记成需求 #{fid}，产品会看到。",
+        "references": [{"table": "feedback", "where": f"tenant_id={tid} AND id={fid}"}],
+    }
+
+
 def tool_explain_status_enum(field: str = "alert_status") -> Dict:
     """告诉用户某个枚举字段的取值出处 + 是否能扩展。
     Luke 多次问『5 个状态哪里来的 / 能加状态吗』，Agent 必须能说清此事。
@@ -1200,6 +1265,7 @@ TOOL_FUNCS = {
     "query_order_live": tool_query_order_live,
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
+    "capture_feedback": tool_capture_feedback,
 }
 
 
@@ -1503,6 +1569,12 @@ scope: {scope}
 | 状态/字段哪来 / 5 个状态出处 / 能加 X 状态吗 / 是 ERP 字段还是 hipop 字段 | **explain_status_enum**（不要凭空说"系统写死"，必须真调拿 source 引用）|
 | 打开 X 页面 | navigate_user_to（禁编 URL）|
 | 发飞书 / 通知群 | notify_via_feishu（禁说"已发"）|
+| 撞到你做不了/超范围 → 用户回"记一下/提个需求/帮我记" | **capture_feedback**（真写 feedback 表；禁不调就说"已记下"；写失败如实报"没记成"）|
+
+## 撞限即捕获需求（WS-26）
+- 你回"做不到/超出范围"时，顺带 offer 一句"要我记成需求吗"（系统也会兜底补这句）。
+- 用户确认（记一下/好/提个需求）→ 本轮必须调 capture_feedback(content=用户诉求原话)。
+- capture_feedback 返 ok=False → 如实说"没记成，等会儿再说一次"，**绝不**假装记了。
 
 ## 死规矩（违反 = 事故）
 1. **业务数据先调 data_health_check**，不要凭空猜"X 天前更新"
@@ -1627,6 +1699,46 @@ def _clean_history(messages: List[Dict]) -> List[Dict]:
     return out
 
 
+# ── 反馈/需求捕获：撞限时确定性补一句 offer（WS-26）──────────────
+# 验收①要求 agent 回复『做不到/超范围』时**必含**一句 offer。靠 prompt 提醒不可靠，
+# 这里做成确定性后处理 hook：只认 Agent 自述能力受限的措辞（第一人称做不了 / 功能不支持），
+# 不碰数据陈述（如『库存撑不到下周』），避免污染正常回答路径（验收④）。
+_DEADEND_RE = _re.compile("|".join([
+    r"我(暂时|目前|这边|现在)?(做不了|做不到|无法|没法|帮不了|处理不了|实现不了|搞不定)",
+    r"(帮不了|做不了|做不到|满足不了|无法满足|无能为力)(你|您)",
+    r"超出(我|我的|当前|目前|系统)?.{0,4}(能力|范围|权限)",
+    r"不在(我|我的|当前|目前)?.{0,6}(能力|范围|功能)(范围|内|之内)?",
+    r"(这个|该|此)?功能(暂时|目前)?(还)?(不支持|没有|未上线|做不了|做不到)",
+    r"系统(暂时|目前)?(还)?(不支持|没有这个功能|不具备|做不了)",
+    r"暂(时)?(不|未)支持",
+    r"目前(还)?(做不到|不支持|无法|没有这个)",
+]))
+# offer 标记串：_OFFER_MARK 是 hook 补的话术里的固定串；_OFFER_SEEN 用于判定 LLM
+# 是否已经自己 offer 过（避免重复补 —— LLM 常自带「要我记成需求吗」）。
+_OFFER_MARK = "记成一条需求"
+_OFFER_LINE = "💡 要我把它记成一条需求反馈给产品吗？你回「记一下」我就转过去。"
+_OFFER_SEEN = ("记成需求", "记成一条需求", "记成反馈", "记成一条反馈",
+               "提个需求", "记下来当需求", "记录成需求")
+
+
+def _needs_feedback_offer(reply: str, tools_used: List[str]) -> bool:
+    """reply 表达了『我做不了/超范围』，且本轮没调过 capture_feedback、reply 里也还没 offer。"""
+    if not reply or not isinstance(reply, str):
+        return False
+    if "capture_feedback" in (tools_used or []):
+        return False            # 已经在记了，别再 offer
+    if any(m in reply for m in _OFFER_SEEN):
+        return False            # LLM 自己已经 offer 了，不重复
+    return bool(_DEADEND_RE.search(reply))
+
+
+def _maybe_append_feedback_offer(reply: str, tools_used: List[str]) -> str:
+    """撞限回复确定性补一句 offer；正常回复原样返回。"""
+    if _needs_feedback_offer(reply, tools_used):
+        return reply.rstrip() + "\n\n" + _OFFER_LINE
+    return reply
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -1675,6 +1787,11 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             f"⚠️ 我对这个回答的置信度较低（{int(confidence*100)}%），"
             "建议你核实关键数字，或换个更明确的问法。\n\n---\n\n"
         ) + final_text
+
+    # WS-26: 撞限（做不到/超范围）回复确定性补一句『要记成需求吗』offer。
+    # display 版 + 持久化版都补，保证下一轮用户回『记一下』时对话连贯。
+    final_text  = _maybe_append_feedback_offer(final_text, tools_used)
+    clean_reply = _maybe_append_feedback_offer(clean_reply, tools_used)
 
     # 写入 agent_actions（reference 系统）
     action_id = None
