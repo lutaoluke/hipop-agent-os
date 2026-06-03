@@ -67,12 +67,15 @@ def _run_wf1_noon_stock(task_id, tenant_id, actor, spec, progress, heartbeat, sa
     """Noon my inventory → v2 wf1_stock.noon_*（CSV/导表驱动，WS-10）。
 
     spec: {"file": <path>} 指定单文件；不给则扫 inbox/。
+
+    改完 noon_* 列后立刻重算合并快照（WS-12），让 total_stock 反映最新官方仓库存。
     """
-    from hipop.scripts import ingest_noon_stock_csv_v2
+    from hipop.scripts import ingest_noon_stock_csv_v2, merge_stock_snapshot_v2
     heartbeat()
     res = ingest_noon_stock_csv_v2.run_v2(tenant_id=tenant_id, file=spec.get("file"))
+    merge = merge_stock_snapshot_v2.run_v2(tenant_id=tenant_id)
     save_progress({"done": True, "result": str(res)[:200]})
-    return {"summary": f"wf1_noon_stock: {res}"}
+    return {"summary": f"wf1_noon_stock: {res}; merge: {merge}"}
 
 
 @register("wf1_inbound_staging_v2")
@@ -99,12 +102,32 @@ def _run_wf1_pending_inbound(task_id, tenant_id, actor, spec, progress, heartbea
     读 wf1_asn_lines_staging（WS-10 产出），按 ASN 状态计入 → 聚合 →
     部分 upsert 回 wf1_stock.pending_inbound_qty。消费端 wf_sales_cycle.run_v2
     已读该列（计入 immediate）。
+
+    改完 pending_inbound_qty 后立刻重算合并快照（WS-12），使最终 total_stock
+    含最新 pending（钉死「最终快照绕过 pending_inbound_qty 规则」死法）。
     """
-    from hipop.scripts import compute_pending_inbound_v2
+    from hipop.scripts import compute_pending_inbound_v2, merge_stock_snapshot_v2
     heartbeat()
     res = compute_pending_inbound_v2.run_v2(tenant_id=tenant_id)
+    merge = merge_stock_snapshot_v2.run_v2(tenant_id=tenant_id)
     save_progress({"done": True, "result": str(res)[:200]})
-    return {"summary": f"wf1_pending_inbound: {res}"}
+    return {"summary": f"wf1_pending_inbound: {res}; merge: {merge}"}
+
+
+@register("wf1_stock_merge_v2")
+def _run_wf1_stock_merge(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """合并 v2 当前库存快照 → wf1_stock.total_stock（确定性合并规则，WS-12）。
+
+    把官方仓(noon) + 海外仓 + 国内(义乌/东莞) + 送仓未上架(pending_inbound)
+    汇总成运营可用的当前库存快照，替代原本人工 Excel 合并；只重写 total_stock，
+    各来源列 + 追溯字段原样保留。接进 refresh_all_v2（ERP 库存之后），
+    noon/pending runner 改完来源列也各自调一次本合并。
+    """
+    from hipop.scripts import merge_stock_snapshot_v2
+    heartbeat()
+    res = merge_stock_snapshot_v2.run_v2(tenant_id=tenant_id)
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf1_stock_merge: {res}"}
 
 
 @register("wf1_stock_snapshot_v2")
@@ -218,6 +241,7 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
         ("wf2_products_v2", "ERP 商品库"),
         ("wf2_sales_v2", "ERP 销量价格"),
         ("wf1_stock_v2", "ERP 库存"),
+        ("wf1_stock_merge_v2", "库存快照合并"),
         ("wf5_sales_cycle_v2", "销售周期"),
         ("wf3_logistics_v2", "物流采集"),
         ("wf6_alerts_v2", "物流告警"),

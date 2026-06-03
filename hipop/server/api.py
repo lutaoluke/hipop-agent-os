@@ -668,6 +668,13 @@ WORKFLOW_REGISTRY = {
         [(1, "拉所有仓库存 + 写 wf1_stock v2", "scripts.ingest_erp_stock_v2:run_v2")],
         ["sales", "replenish"],
     ),
+    # WS-12：合并各来源 → wf1_stock.total_stock（含 pending_inbound）当前库存快照
+    "wf1_stock_merge_v2": (
+        "库存快照合并（官方仓+海外仓+国内+送仓未上架 → total_stock，per-tenant）",
+        [(1, "重算 wf1_stock.total_stock = 各来源列求和（含 pending_inbound）",
+          "scripts.merge_stock_snapshot_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
     # WS-10：Noon my inventory（导表/inbox 驱动）→ wf1_stock.noon_*
     "wf1_noon_stock_v2": (
         "Noon 官方仓库存（导表 → wf1_stock.noon_*，per-tenant）",
