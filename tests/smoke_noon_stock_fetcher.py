@@ -380,7 +380,32 @@ def main():
             f"回落须带 live 缺映射失败信号: {res_u}"
         print("✓ live 行缺 SKU 映射 → 不冒充 source=live：无 CSV 红灯 / 有 CSV 显式回落（source=csv_fallback）")
 
-        print("\n8/8 passed")
+        # ── 9. live qty 非数字/坏值 → 不冒充 source=live、不写 0 假库存（门2 返工点③）──
+        # 验门人打回：qty='not-a-number' 被 safe_int 静默转 0，写 0 库存却报 source=live 成功
+        # —— 把真实库存误清零却报实时成功。现在 live-only 严格 qty 校验拦在落库前。
+        bad_qty_raw = {**RAW_RECORDS[0], "quantity": "not-a-number"}  # SKU 映射在，但 qty 坏值
+        F.register_live_producer(page_factory=lambda t: FakePage([bad_qty_raw]),
+                                 raw_inventory_fn=lambda p: [dict(bad_qty_raw)])
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as empty_dir:
+            _expect_red(lambda: noon.run_live(TENANT, inbox=empty_dir),
+                        "qty", "live 坏 qty 无 CSV 红灯")
+        # 不写凭空行 + 关键：不得把 SKU-A 真实库存误清零（noon_* 仍 NULL，非 0）。
+        assert set(_dump()) == {"SKU-A"}, "live 坏 qty 红灯路径凭空写了库存行（应仅剩 ERP 种子行）"
+        a_after = _dump()["SKU-A"]
+        assert a_after["noon_total_qty"] is None and a_after["noon_saleable_qty"] is None, \
+            f"坏 qty 不得把 noon_* 写成 0（误清零真实库存）: {a_after}"
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "noon_inventory.csv")
+            _write_csv(csv_path)
+            res_q = noon.run_live(TENANT, file=csv_path)
+        assert res_q["source"] == "csv_fallback", f"live 坏 qty 有 CSV 应回落、绝不报 source=live: {res_q}"
+        assert res_q.get("live_error") and "qty" in res_q["live_error"], \
+            f"回落须带 live 坏 qty 失败信号: {res_q}"
+        print("✓ live qty 非数字/坏值 → 不冒充 source=live、不写 0 假库存：无 CSV 红灯 / 有 CSV 显式回落")
+
+        print("\n9/9 passed")
         return 0
     finally:
         F.unregister_live_producer()

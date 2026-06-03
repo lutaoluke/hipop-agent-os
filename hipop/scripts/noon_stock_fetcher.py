@@ -207,6 +207,33 @@ def _get_session(tenant_id, store_key: str, account: Optional[str]):
     return pb.get_platform_session(tenant_id, store_key, account=account)
 
 
+# ── live-only 严格数量校验（堵 safe_int 把坏值静默转 0 的假绿）────────────────
+def _assert_live_qty(raw_qty) -> None:
+    """live 行 qty 必须是可解析的非负数量，否则红灯 LiveSourceUnavailable（blocked）。
+
+    门2 返工③：ingest `safe_int()` 对不可解析数量静默转 0，会把「qty='not-a-number'」
+    当 0 库存写进 wf1_stock 并报 source=live 成功——等于把真实库存误清零却报实时成功。
+    缺失/空白的 qty 已由 `validate_row`（contract required）拦在前面；这里专打**存在但
+    非数字/坏值/负数**这一类，绝不让它走到 `_aggregate`→`safe_int`→写 0。
+
+    只校 live 路径（本函数仅在 fetcher 里调）；CSV `run_v2` 的旧宽松口径（safe_int 容错）
+    保持不动。
+    """
+    s = raw_qty.strip() if isinstance(raw_qty, str) else raw_qty
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        raise LiveSourceUnavailable(
+            f"live 行 qty 非数字/坏值: {raw_qty!r} —— 不可解析数量绝不静默当 0 库存写入"
+            "（会把真实库存误清零却报 live 成功），blocked")
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / inf
+        raise LiveSourceUnavailable(
+            f"live 行 qty 非有限数值: {raw_qty!r} —— blocked，不写 0 假库存")
+    if f < 0:
+        raise LiveSourceUnavailable(
+            f"live 行 qty 为负: {raw_qty!r} —— 负库存视为坏值，blocked，不写 0 假库存")
+
+
 # ── producer 工厂 + 注册 ────────────────────────────────────────────────
 def fetch_inventory_rows(tenant_id, *, store_key: str = DEFAULT_STORE_KEY,
                          account: Optional[str] = None, page=None,
@@ -216,7 +243,8 @@ def fetch_inventory_rows(tenant_id, *, store_key: str = DEFAULT_STORE_KEY,
     page=None（生产）→ `get_platform_session(tenant_id, store_key)` 拿真实 page（登录态
     失效则上抛 blocked）；smoke 注入 page / raw_inventory_fn 做确定性替身（同
     smoke_platform_session）。每行经 WS-34 `validate_row` 守门：缺必填 / 缺 SKU 主键 /
-    契约外字段 → 红灯 LiveSourceUnavailable，绝不写 0 假库存 / 编仓库 JSON。
+    契约外字段 → 红灯 LiveSourceUnavailable；再经 live-only `_assert_live_qty`：qty 非数字/
+    坏值/负 → 红灯，绝不让坏数量被 safe_int 静默转 0 写进库存。绝不写 0 假库存 / 编仓库 JSON。
     输出绑定真实 page（不接受预造 rows）。
     """
     if page is None:
@@ -227,6 +255,7 @@ def fetch_inventory_rows(tenant_id, *, store_key: str = DEFAULT_STORE_KEY,
     for raw in raw_records:
         row = to_contract_row(raw)
         _contract.validate_row(_contract.MY_INVENTORY, row)  # 缺字段/契约外字段红灯
+        _assert_live_qty(row.get("qty"))  # live-only：坏 qty 红灯，堵 safe_int 静默转 0
         rows.append(row)
     return rows
 
