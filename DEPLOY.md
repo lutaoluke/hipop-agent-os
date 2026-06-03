@@ -45,6 +45,36 @@ DB_URL=postgresql://hipop:hipop_dev_password@localhost:5432/hipop \
 - .cn 域名：阿里云购买备案服务（1-3 周），备案下来切阿里云 SAE 部署
 - alpha 阶段免备案先用 .com + Zeabur 香港节点，国内访问 200ms 级可接受
 
+## 紫鸟 web_driver 常驻（noon 官方仓取数前置）
+
+noon 等平台官方仓无程序化 API，取数走紫鸟超级浏览器接管已登录会话。`hipop/server/_platform_browser.py`
+的 `get_platform_session` 依赖紫鸟 **web_driver 模式常驻在 `127.0.0.1:18080`**。这条以前是口头
+"先手动 `open -na ziniao …`"，属隐性人工动作 —— 紫鸟退出 / 端口断 / Mac 重启后就静默断链。
+**不要再手动找 chromium debug port**：端口由紫鸟自动分配，业务侧一律走 `get_platform_session`。
+
+运维入口（本机 macOS，需已装并登录紫鸟客户端）：
+
+```bash
+# 真实健康检查：检 127.0.0.1:18080 + 每个 live session 的 CDP /json/version 可达性
+python3 -m hipop.scripts.ziniao_webdriver healthcheck
+
+# 手动拉起 / 重启（pkill -TERM -i ziniao + open -na … --run_type=web_driver --port=18080）
+python3 -m hipop.scripts.ziniao_webdriver start
+python3 -m hipop.scripts.ziniao_webdriver restart
+
+# 常驻守护：开机自启 + keepalive（断了自动 restart）
+bash hipop/launchd/install.sh install     # 装 com.hipop.ziniao（连同周期任务一并装）
+bash hipop/launchd/install.sh status      # 看是否在跑
+```
+
+- 进程层只负责把紫鸟 web_driver **拉起 / 守活**；紫鸟**账号认证**仍由每次调用带
+  company/username/password 完成（env `ZINIAO_COMPANY/ZINIAO_USERNAME/ZINIAO_PASSWORD`），
+  **不引入"紫鸟 token"状态**。
+- `healthcheck` 端口未监听时退出码 3（blocked）并打印拉起命令；缺紫鸟 app / 端口起不来 →
+  blocked，不静默假成功。
+- 旧的 `hipop/scripts/probe_ziniao_webdriver.py` 已 **deprecated**（手传 `debuggPort` 会被紫鸟
+  -10000 拒绝），运行只会转交本入口。
+
 ## 切换 LLM provider
 
 env 控制：
