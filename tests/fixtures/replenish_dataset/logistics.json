@@ -1,0 +1,7 @@
+{
+  "_doc": "静态数据源①·物流（在途量 + 待发货量），按 SKU 索引。来自物流工种的只读快照。步骤3 接线层把它和销量、库存按 SKU join 成三类输入，再喂给步骤2 算法。",
+  "by_sku": {
+    "TBJ0059A": {"in_transit_qty": 120, "pending_shipment_qty": 40},
+    "TBA0210A": {"in_transit_qty": 0, "pending_shipment_qty": 0}
+  }
+}
