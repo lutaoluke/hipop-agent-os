@@ -1085,16 +1085,42 @@ def invalidate_session(tenant_id, store_key) -> None:
         _drop_session((tenant_id, str(store_key)))
 
 
-def check_session_health() -> dict:
+def _state_needs_renewal(d: dict, now: float) -> bool:
+    """按**当前时间**与落盘的实测有效期确定性重算「是否该续登」——不信落盘那个
+    可能已过时的 `needs_renewal` 布尔（WS-47 验门红队：健康 state 跨过 suggested_relogin_at
+    后必须变红，否则 /health 错过主动续登窗口）。
+
+    判定（与 `_check_renewal` 同口径）：
+      - 有 `suggested_relogin_at`：now ≥ 它 → 需续登；
+      - 退一步只有 `cookie_expires_at`：now ≥ 到期 − renew_before → 需续登；
+      - 两者都没有（无任何实测有效期）：保守判需续登（拿不到有效期不当永久有效）。
+    """
+    suggested = d.get("suggested_relogin_at")
+    if suggested is not None:
+        try:
+            return now >= float(suggested)
+        except (TypeError, ValueError):
+            return True
+    exp = d.get("cookie_expires_at")
+    if exp is not None:
+        try:
+            return now >= float(exp) - _renew_before_seconds()
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
+def check_session_health(*, now: Optional[float] = None) -> dict:
     """扫所有 `~/hipop/ziniao_state_*.json`，汇总各店会话有效期 + needs_renewal 总开关。
 
     形态镜像 `_erp_auth.check_persist_token_expiry`：startup hook / /health 都可调，让
     每店 Noon 会话「还剩几天到期 / 是否该续登」可观测，到期前主动提示续登（参照
-    refresh-dbuyerp-token），而不是等取数时才 blocked。各店天数按各自实测 cookie 算，
-    绝不写死（WS-47 死法③）。
+    refresh-dbuyerp-token），而不是等取数时才 blocked。各店天数/续登判定均按**当前时间**
+    与各自实测 cookie 有效期重算（`now` 可注入便于断言），绝不写死、也绝不无条件信落盘
+    布尔（WS-47 死法③：占位/过时假数据）。
     """
     import glob
-    now = time.time()
+    now = time.time() if now is None else now
     results = []
     for path in sorted(glob.glob(os.path.join(_PERSIST_DIR, "ziniao_state_*.json"))):
         try:
@@ -1111,7 +1137,8 @@ def check_session_health() -> dict:
             "cookie_days_left": days_left,
             "checked_at": d.get("checked_at"),
             "suggested_relogin_at": d.get("suggested_relogin_at"),
-            "needs_renewal": bool(d.get("needs_renewal")),
+            "needs_renewal": _state_needs_renewal(d, now),
+            "needs_renewal_at_check": bool(d.get("needs_renewal")),  # 落盘时的判定（仅观测）
             "session_check": d.get("session_check"),
             "path": path,
         })

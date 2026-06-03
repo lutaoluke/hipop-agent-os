@@ -11,23 +11,29 @@
        state」；场景 4 钉死「check_session_health 真读这些字段」。
   ② 死代码短路 —— 只查紫鸟账号认证、不查每店 Noon login/cookie 有效期。
      → 场景 3 钉死「登录态 OK 但 cookie 临近到期 / 无有效期 → 仍 blocked + 续登」。
-  ③ 占位假数据 —— 写死 29 天 / 2026-07-02 当所有店默认值。
+  ③ 占位/过时假数据 —— 写死 29 天 / 2026-07-02 当默认值；或 health 只信落盘那个会过时的
+     needs_renewal 布尔、不按当前时间重算。
      → 场景 2 用 44158 基线（_npsid 到 2026-07-02）+ 另一到期不同的店，证明「建议续登时间
-       = 各店实测到期 − 提前量」按店各算、互不相同，绝非写死。
+       = 各店实测到期 − 提前量」按店各算、互不相同，绝非写死；
+     → 场景 5（验门红队洞）证明「落盘时健康的 state 跨过 suggested_relogin_at 后，
+       check_session_health 按当前时间确定性变红」，不无条件信落盘布尔。
 
-fail-then-pass 证明（两个 env 开关复刻两种死法）：
+fail-then-pass 证明（三个 env 开关复刻三种死法）：
   - 默认跑 → 全过。
   - SMOKE_HEALTH_NO_RECORD=1 → 把 `_save_state` 退回「不记录 cookie 有效期/建议续登」
     （死法①：状态写了但有效期没接线）→ 场景 1 的「state 含 cookie_expires_at /
     suggested_relogin_at」断言 FAIL。
   - SMOKE_HEALTH_STUB_RENEWAL=1 → 把 `_check_renewal` 退回「永远 ok」（死法②：只查账号、
     不查 cookie 有效期）→ 场景 3 的「临近到期 → blocked」断言 FAIL。
+  - SMOKE_HEALTH_TRUST_BOOL=1 → 把 `_state_needs_renewal` 退回「只信落盘布尔」（死法③：
+    过时假数据）→ 场景 5 的「跨过续登窗口必须变红」断言 FAIL。
   改动前（_check_renewal / cookie 有效期记录还不存在）整个文件 AttributeError 即全 fail。
 
 跑法：
   python3 tests/smoke_session_health.py
   SMOKE_HEALTH_NO_RECORD=1 python3 tests/smoke_session_health.py     # 看回归 fail
   SMOKE_HEALTH_STUB_RENEWAL=1 python3 tests/smoke_session_health.py  # 看回归 fail
+  SMOKE_HEALTH_TRUST_BOOL=1 python3 tests/smoke_session_health.py    # 看回归 fail
   （也被 make test 自动聚合）
 """
 import datetime
@@ -165,7 +171,7 @@ class _Checker:
 _ORIG = {n: getattr(pb, n) for n in (
     "_assert_webdriver_up", "list_stores", "start_browser", "_cdp_version",
     "_connect_cdp", "_safe_close", "_check_renewal", "_save_state",
-    "_renew_before_seconds")}
+    "_renew_before_seconds", "_state_needs_renewal")}
 
 
 def _restore():
@@ -191,6 +197,7 @@ def _save_state_no_health(store_id, store, cdp_url, port, exp, *,
 def run():
     no_record = os.environ.get("SMOKE_HEALTH_NO_RECORD") == "1"
     stub_renewal = os.environ.get("SMOKE_HEALTH_STUB_RENEWAL") == "1"
+    trust_bool = os.environ.get("SMOKE_HEALTH_TRUST_BOOL") == "1"
     check = _Checker()
 
     def _apply_deaths():
@@ -200,6 +207,9 @@ def run():
             pb._check_renewal = (lambda page, pcfg, now=None: pb.RenewalState(
                 kind="ok", cookie_name="_npsid", cookie_expires_at=None,
                 days_left=None, suggested_relogin_at=None, detail="stub"))
+        if trust_bool:
+            # 死法③复刻：health 无条件信落盘 needs_renewal 布尔，不按当前时间重算。
+            pb._state_needs_renewal = lambda d, now: bool(d.get("needs_renewal"))
 
     # ── ① 接线：成功路径把实测 cookie 有效期 + 建议续登时间落每店 state ──
     print("== ① 每店 state 记录实测会话有效期 + 建议续登时间 ==")
@@ -309,8 +319,44 @@ def run():
           f"got {due.get('cookie_days_left')}")
     check("needs_renewal 店标记 needs_renewal=True", due.get("needs_renewal") is True)
 
+    # ── ⑤ 验门红队洞：落盘时健康的 state 跨过建议续登时间后，health 必须按当前时间变红 ──
+    # （不能无条件信落盘 needs_renewal 布尔——否则 startup /health 错过主动续登窗口）
+    print("== ⑤ 健康 state 跨过 suggested_relogin_at → health 确定性变红（非信落盘布尔）==")
+    _restore()
+    _apply_deaths()
+    base = time.time()
+    s_stale = pb.Store(browser_id="STORE-STALE", browser_oauth="o",
+                       name="44158-NOON-SA", store_username="stale", account="a")
+    # 落盘当下：cookie 还剩 29 天、建议续登时间在未来 → 落盘 needs_renewal=False（健康）。
+    pb._save_state("STORE-STALE", s_stale, "http://127.0.0.1:9", 9, base + 600,
+                   renewal=pb.RenewalState("ok", "_npsid", base + 29 * 86400,
+                                           29.0, base + 24 * 86400, "ok"))
+    saved = json.load(open(pb._state_path("STORE-STALE")))
+    check("前提：落盘时 needs_renewal=False（当时健康）",
+          saved.get("needs_renewal") is False, f"got {saved.get('needs_renewal')}")
+
+    # 此刻按当前时间仍健康（未到 suggested）。
+    h_before = pb.check_session_health(now=base)
+    stale_b = next((s for s in h_before["stores"] if s["store_id"] == "STORE-STALE"), {})
+    check("到期前 29 天（未到建议续登）→ health 仍健康", stale_b.get("needs_renewal") is False,
+          f"got {stale_b.get('needs_renewal')}")
+
+    # 时间推进到「建议续登时间之后、实测到期之前」（如 base+25 天，cookie 还剩 4 天）。
+    future = base + 25 * 86400
+    h_after = pb.check_session_health(now=future)
+    stale_a = next((s for s in h_after["stores"] if s["store_id"] == "STORE-STALE"), {})
+    check("跨过 suggested_relogin_at（cookie 仍未到期）→ health 按当前时间变红",
+          stale_a.get("needs_renewal") is True, f"got {stale_a.get('needs_renewal')}")
+    check("跨过续登窗口后全局 needs_renewal=True", h_after["needs_renewal"] is True)
+    check("变红与落盘布尔无关：needs_renewal_at_check 仍是落盘时的 False",
+          stale_a.get("needs_renewal_at_check") is False,
+          f"got {stale_a.get('needs_renewal_at_check')}")
+
     _restore()
     print()
+    if trust_bool and check.failures:
+        print("  （SMOKE_HEALTH_TRUST_BOOL=1：_state_needs_renewal 退回只信落盘布尔 → "
+              "健康 state 跨过建议续登时间也不变红，这是预期的『改动前 fail』。去掉变量再跑应全过。）")
     if no_record and check.failures:
         print("  （SMOKE_HEALTH_NO_RECORD=1：_save_state 退回不记录 cookie 有效期 → "
               "状态写了但有效期没接线，这是预期的『改动前 fail』。去掉变量再跑应全过。）")
