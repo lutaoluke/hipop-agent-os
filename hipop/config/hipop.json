@@ -77,9 +77,14 @@
         "login_url_markers": ["/login", "/signin", "/sign-in", "login.noon", "identity.noon", "accounts.noon", "/auth"],
         "session_cookie": "_npsid",
         "orders": {
-          "_NOTE": "noon 订单实时抓取（WS-N2.1/WS-58）：api_url=已登录 page 同源 fetch 的真实订单接口，由运营首次 live 时核对后经 NOON_ORDER_API_URL 注入（绝不在仓库写死/猜 URL）；records_path=接口 JSON 走到订单记录 list 的键路径（缺省自动在常见容器键里找 list）。字段名→WS-34 契约键的映射钉在 noon_order_fetcher._NOON_ORDER_FIELD_MAP。",
-          "api_url": "${NOON_ORDER_API_URL}",
-          "records_path": null
+          "_NOTE": "noon 订单实时抓取（WS-N2.1/WS-58）：noon Sales Dashboard 接口（订单/销售明细，非凭据，故直接配真实 URL）。取数前先把 page 导到 report_page_url（同域，避开 CORS），再分页 POST api_url（body 含 country_code/page/per_page/filters/from_date/to_date），汇总 records_path（hits）。country_code 按销售主体国别：KSA=SA、UAE=AE。字段名→WS-34 契约键映射钉在 noon_order_fetcher._NOON_ORDER_FIELD_MAP（实测 hits 行键与契约同名）。",
+          "api_url": "https://reports.noon.partners/_vs/mp/mp-inventory-health-api-sales-dashboard/sales-dashboard/list",
+          "report_page_url": "https://reports.noon.partners/en/sales",
+          "country_code": "SA",
+          "per_page": 200,
+          "lookback_days": 90,
+          "max_pages": 500,
+          "records_path": ["hits"]
         }
       }
     }

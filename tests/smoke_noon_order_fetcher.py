@@ -74,14 +74,29 @@ _ORDER_COMPARE_COLS = ("partner_sku", "noon_sku", "item_nr", "order_date", "stat
 
 # ── 替身 page（同 smoke_platform_session 形态；只实现 evaluate）──────────────
 class FakePage:
-    """可控 page：evaluate(js, url) 返回预置 JSON；记录被调到的 url。"""
-    def __init__(self, payload):
+    """可控 page：复刻 Sales Dashboard 的 POST 取数契约（同 smoke_platform_session 替身 page）。
+
+    evaluate(js, {url, body}) 返回 {status, json}；pages 给定则按 body.page 分页发 hits，
+    否则单页发 payload（list 或 dict）。记录被 goto/evaluate 调到的 url/arg。
+    """
+    def __init__(self, payload=None, *, pages=None, total=None, status=200):
         self.payload = payload
+        self.pages = pages
+        self.total = total
+        self.status = status
         self.evaluated = []
+        self.goto_calls = []
+
+    def goto(self, url, **kw):
+        self.goto_calls.append(url)
 
     def evaluate(self, js, arg=None):
         self.evaluated.append(arg)
-        return self.payload
+        if self.pages is not None:
+            page_no = (arg or {}).get("body", {}).get("page", 1)
+            hits = self.pages.get(page_no, [])
+            return {"status": self.status, "json": {"hits": hits, "total": self.total}}
+        return {"status": self.status, "json": self.payload}
 
 
 def _extract_create(table: str) -> str:
@@ -174,28 +189,42 @@ def main():
             "item_nr", "fetch 缺必填红灯")
         print("✓ 关键字段缺失（item_nr）→ 红灯 LiveSourceUnavailable，不编造订单字段")
 
-        # ── 4. 接口/页面改版红灯：_fetch_raw_orders 走真函数（缺配置/结构变都 blocked）──
-        # 4a. 缺 api_url 配置 → blocked（绝不猜 URL）。
+        # ── 4. _fetch_raw_orders 走真函数：缺配置/HTTP 错/结构变 blocked，正常分页汇总 ──
         _orig_cfg = F._orders_cfg
-        F._orders_cfg = lambda store_key=F.DEFAULT_STORE_KEY: {}
+        _cfg = lambda d: (lambda store_key=F.DEFAULT_STORE_KEY: dict(d))
+        # 4a. 缺 api_url 配置 → blocked（绝不猜 URL）。
+        F._orders_cfg = _cfg({})
         try:
             _expect_red(lambda: F._fetch_raw_orders(FakePage([])),
                         "api_url", "缺接口配置 blocked")
-        finally:
-            F._orders_cfg = _orig_cfg
-        # 4b. 有 api_url 但返回结构非预期（dict 无 list 容器）→ blocked。
-        F._orders_cfg = lambda store_key=F.DEFAULT_STORE_KEY: {"api_url": "https://x/api"}
-        try:
+            # 4a'. 有 api_url 但缺国别 → blocked（绝不默认国别）。
+            F._orders_cfg = _cfg({"api_url": "https://x/api"})
+            _expect_red(lambda: F._fetch_raw_orders(FakePage([])),
+                        "country_code", "缺国别 blocked")
+            # 4b. 返回结构非预期（dict 无 list 容器）→ blocked。
+            F._orders_cfg = _cfg({"api_url": "https://x/api", "country_code": "SA"})
             _expect_red(lambda: F._fetch_raw_orders(FakePage({"unexpected": 1})),
                         "list", "接口结构变 blocked")
-            # 4c. 正常结构（list）→ 真走 page.evaluate 拿回 records。
-            fp = FakePage(RAW_RECORDS)
+            # 4c. HTTP 非 200 → blocked（登录态失效/接口改版，不回落旧值）。
+            _expect_red(lambda: F._fetch_raw_orders(FakePage([], status=403)),
+                        "HTTP 403", "HTTP 错 blocked")
+            # 4d. 正常分页：per_page=2 跨 3 页汇总 5 行，POST body 带 country/page。
+            F._orders_cfg = _cfg({"api_url": "https://x/api", "country_code": "SA",
+                                  "per_page": 2, "report_page_url": "https://x/sales"})
+            fp = FakePage(pages={1: RAW_RECORDS[0:2], 2: RAW_RECORDS[2:4],
+                                 3: RAW_RECORDS[4:5]}, total=len(RAW_RECORDS))
             recs = F._fetch_raw_orders(fp)
-            assert recs == RAW_RECORDS and fp.evaluated == ["https://x/api"], \
-                f"_fetch_raw_orders 应同源 fetch 配置 api_url 并返回 records: {fp.evaluated}"
+            assert recs == RAW_RECORDS, f"分页汇总应等于全量 records: {len(recs)}"
+            assert fp.goto_calls == ["https://x/sales"], \
+                f"取数前应先导到同域报表页（避 CORS）: {fp.goto_calls}"
+            assert len(fp.evaluated) == 3, f"per_page=2/total=5 应翻 3 页: {len(fp.evaluated)}"
+            assert fp.evaluated[0]["url"] == "https://x/api" and \
+                fp.evaluated[0]["body"]["country_code"] == "SA" and \
+                fp.evaluated[0]["body"]["page"] == 1, \
+                f"POST body 契约不符: {fp.evaluated[0]}"
         finally:
             F._orders_cfg = _orig_cfg
-        print("✓ 缺接口配置 / 接口结构变 → blocked 红灯；正常结构经 page.evaluate 取回 records")
+        print("✓ _fetch_raw_orders：缺配置/缺国别/HTTP 错/结构变 → blocked；正常分页 POST 汇总全量")
 
         # ── 5. 注册接线 + live==CSV：register → run_live 真走 live 行 → 同一 _aggregate/_upsert ──
         # 5a. 改前（未注册）：run_live 无 producer + 无 CSV → 红灯回落失败（接线缺失死法）。

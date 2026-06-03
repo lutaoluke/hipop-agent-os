@@ -130,14 +130,20 @@ def to_contract_row(raw: dict) -> dict:
 
 
 # ── 真 page → 真 rows 的唯一外部边界（smoke 注入替身）────────────────────────
-# page 侧取数：在已登录 page 上同源 fetch noon 订单接口，拿回 JSON。fetch 带
-# credentials='include' 复用紫鸟接管会话的 cookie；非 2xx / 解析失败都当登录态失效或
-# 接口改版 → blocked。本函数是本模块唯一碰真实 noon 页面/接口的地方。
+# page 侧取数：在已登录 page 上**同源** POST noon Sales Dashboard 接口（订单/销售明细），
+# 分页拿回 JSON {hits:[...], total}。fetch 带 credentials='include' 复用紫鸟接管会话的
+# cookie；非 2xx / 结构非预期都当登录态失效或接口改版 → blocked。
+# 同源约束：Sales 接口在 reports.noon.partners 域，catalog 落地页跨域 fetch 会被 CORS 拦，
+# 故取数前必须先把 page 导到 report_page_url（同域）。本函数 + _goto_report_page 是本模块
+# 唯一碰真实 noon 页面/接口的地方（smoke 用 raw_orders_fn 注入替身绕过）。
 _ORDER_FETCH_JS = """
-async (url) => {
-  const r = await fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}});
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return await r.json();
+async ({url, body}) => {
+  const r = await fetch(url, {method: 'POST', credentials: 'include',
+    headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+    body: JSON.stringify(body || {})});
+  let json = null;
+  try { json = await r.json(); } catch (e) { json = null; }
+  return {status: r.status, json: json};
 }
 """
 
@@ -145,8 +151,8 @@ async (url) => {
 def _walk_records(raw, records_path: Optional[list]):
     """从接口 JSON 走到订单记录 list。
 
-    records_path 给定 → 按键逐层走；否则 raw 本身是 list 直接用，或在常见容器键里
-    找第一个 list。走不到 list 交由调用方红灯（不强行造 list）。
+    records_path 给定 → 按键逐层走；否则 raw 本身是 list 直接用，或在常见容器键
+    （含 noon Sales 的 `hits`）里找第一个 list。走不到 list 交由调用方红灯（不强行造 list）。
     """
     if records_path:
         cur = raw
@@ -158,41 +164,98 @@ def _walk_records(raw, records_path: Optional[list]):
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
-        for k in ("data", "orders", "results", "rows", "items", "records"):
+        for k in ("hits", "data", "orders", "results", "rows", "items", "records"):
             v = raw.get(k)
             if isinstance(v, list):
                 return v
             if isinstance(v, dict):
-                for k2 in ("orders", "rows", "items", "records", "list"):
+                for k2 in ("orders", "rows", "items", "records", "list", "hits"):
                     if isinstance(v.get(k2), list):
                         return v[k2]
     return None
 
 
+def _date_window(lookback_days: int) -> tuple:
+    """订单取数日期窗 (from_date, to_date)，ISO date。"""
+    import datetime as _dt
+    today = _dt.date.today()
+    return (today - _dt.timedelta(days=max(1, lookback_days))).isoformat(), today.isoformat()
+
+
+def _goto_report_page(page, report_page_url: str) -> None:
+    """取数前把 page 导到订单/销售报表页（同域），否则跨域 fetch 被 CORS 拦。
+
+    冷 goto 被紫鸟扩展 abort 时重试一次；连续失败 → blocked（不在错误域上瞎 fetch）。
+    """
+    last = None
+    for _ in range(2):
+        try:
+            page.goto(report_page_url, wait_until="domcontentloaded", timeout=45000)
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise LiveSourceUnavailable(
+        f"导航 noon 订单报表页 {report_page_url} 失败: {type(last).__name__}: {last}"
+        " —— 疑似登录态失效/紫鸟扩展拦截，blocked")
+
+
 def _fetch_raw_orders(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
     """在真实已登录 page 上抓 noon 订单原始记录 list（唯一外部边界）。
 
-    缺接口配置 → blocked（绝不猜 URL）。fetch 失败 / 返回结构非预期 → blocked
-    （疑似登录态失效或接口改版，不静默吞、不回落旧值）。
+    流程：导到销售报表页（同域）→ 分页 POST Sales Dashboard 接口 → 汇总 `hits`。
+    缺接口/国别配置 → blocked（绝不猜 URL/国别）。HTTP 非 200 / 结构非预期 → blocked
+    （疑似登录态失效或接口改版，不静默吞、不回落旧值、不编数）。
     """
     cfg = _orders_cfg(store_key)
     api_url = (cfg.get("api_url") or "").strip()
     if not api_url:
         raise LiveSourceUnavailable(
             "缺 noon 订单接口配置 platform_browser.platforms.noon.orders.api_url"
-            "（首次 live 由运营核对真实订单接口后配置）—— blocked，绝不猜 URL/编数")
-    try:
-        raw = page.evaluate(_ORDER_FETCH_JS, api_url)
-    except Exception as e:  # noqa: BLE001 — page 侧各类取数错都归 blocked
+            " —— blocked，绝不猜 URL/编数")
+    country = (cfg.get("country_code") or "").strip()
+    if not country:
         raise LiveSourceUnavailable(
-            f"noon 订单页取数失败（page.evaluate fetch {api_url}）: "
-            f"{type(e).__name__}: {e} —— 疑似登录态失效/接口改版，blocked，"
-            "请参照 refresh-dbuyerp-token 流程在本机紫鸟重登该店一次") from e
-    records = _walk_records(raw, cfg.get("records_path"))
-    if not isinstance(records, list):
-        raise LiveSourceUnavailable(
-            f"noon 订单接口返回结构非预期（期望 records 为 list，得 "
-            f"{type(records).__name__}）—— 疑似页面/接口改版，blocked，不静默吞行")
+            "缺 noon 订单国别配置 platform_browser.platforms.noon.orders.country_code"
+            "（KSA=SA）—— blocked，绝不默认国别")
+    per_page = int(cfg.get("per_page") or 200)
+    max_pages = int(cfg.get("max_pages") or 500)
+    from_date, to_date = _date_window(int(cfg.get("lookback_days") or 90))
+    records_path = cfg.get("records_path")
+
+    report_page = (cfg.get("report_page_url") or "").strip()
+    if report_page:
+        _goto_report_page(page, report_page)
+
+    records: list = []
+    page_no = 1
+    while page_no <= max_pages:
+        body = {"country_code": country, "page": page_no, "per_page": per_page,
+                "filters": {}, "from_date": from_date, "to_date": to_date}
+        try:
+            resp = page.evaluate(_ORDER_FETCH_JS, {"url": api_url, "body": body})
+        except Exception as e:  # noqa: BLE001 — page 侧各类取数错都归 blocked
+            raise LiveSourceUnavailable(
+                f"noon 订单页取数失败（page.evaluate POST {api_url} page={page_no}）: "
+                f"{type(e).__name__}: {e} —— 疑似登录态失效/接口改版，blocked，"
+                "请参照 refresh-dbuyerp-token 流程在本机紫鸟重登该店一次") from e
+        status = resp.get("status") if isinstance(resp, dict) else None
+        if status is not None and int(status) != 200:
+            raise LiveSourceUnavailable(
+                f"noon 订单接口 HTTP {status}（{api_url} page={page_no}）—— 疑似登录态"
+                "失效/接口改版，blocked，绝不回落旧值/编数")
+        payload = resp.get("json") if isinstance(resp, dict) else resp
+        hits = _walk_records(payload, records_path)
+        if not isinstance(hits, list):
+            raise LiveSourceUnavailable(
+                f"noon 订单接口返回结构非预期（期望 records 为 list，得 "
+                f"{type(hits).__name__}；page={page_no}）—— 疑似页面/接口改版，blocked")
+        records.extend(hits)
+        total = payload.get("total") if isinstance(payload, dict) else None
+        if len(hits) < per_page:
+            break
+        if total is not None and len(records) >= int(total):
+            break
+        page_no += 1
     return records
 
 
