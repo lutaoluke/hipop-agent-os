@@ -107,6 +107,43 @@ def main():
             "空字符串应视同缺失红灯"
         print("  ✓ 必填/主键缺失逐项点名并 raise")
 
+        print("== ⑦ 契约外字段（自造）→ 红灯，不放行（防漂移）==")
+        # known 是唯一字段集；live row 私带契约外字段必须被 validate_row 拒。
+        bad_asn = {"asn_number": "ASN9", "qty": "3", "country_code": "SA",
+                   "partner_sku": "PSA1", "invented_future_field": "x"}
+        probs = C.row_problems(C.ASN, bad_asn)
+        assert any("未知字段 invented_future_field" in p for p in probs), \
+            f"自造字段应红灯: {probs}"
+        _expect_raise(lambda: C.validate_row(C.ASN, bad_asn),
+                      C.LiveSourceUnavailable, "ASN 带契约外字段")
+        # 合法行（全在 known 内）不应因此误伤
+        ok_asn = {"asn_number": "ASN9", "qty": "3", "country_code": "SA",
+                  "partner_sku": "PSA1"}
+        assert C.row_problems(C.ASN, ok_asn) == [], "合法 ASN 行不应被误判"
+        print("  ✓ 契约外字段红灯，known 内字段放行")
+
+        print("== ⑧ my_inventory producer 单一来源：stock 与 contract 同一注册表 ==")
+        # WS-34 收口红队点：stock runner 真实读的 producer 必须就是 contract 注册表，
+        # 否则「在 contract 注册」与「stock 实际读到」两套真相。双向校验。
+        import ingest_noon_stock_csv_v2 as S  # noqa: E402  （scripts 同级，已在 sys.path）
+        C.set_live_row_producer(C.MY_INVENTORY, None)
+        assert S.get_live_row_producer() is None, "清空后 stock 视图应为 None"
+
+        fn_stock = lambda tenant_id: []
+        S.set_live_row_producer(fn_stock)  # 经 stock 入口注册
+        assert C.get_live_row_producer(C.MY_INVENTORY) is fn_stock, \
+            "stock 注册后 contract 必须读到同一 fn（单一来源）"
+        assert C.MY_INVENTORY not in C.missing_live_producers(), \
+            "stock 注册后 contract.missing 不应再缺 my_inventory"
+
+        fn_contract = lambda tenant_id: []
+        C.set_live_row_producer(C.MY_INVENTORY, fn_contract)  # 经 contract 入口注册
+        assert S.get_live_row_producer() is fn_contract, \
+            "contract 注册后 stock runner 必须读到同一 fn（单一来源）"
+        C.set_live_row_producer(C.MY_INVENTORY, None)
+        assert S.get_live_row_producer() is None, "contract 清除后 stock 视图同步为 None"
+        print("  ✓ stock.set ↔ contract.get 双向一致，无两套真相")
+
         print("\n✓ noon 实时行契约 + 守门红灯 smoke 全过")
     finally:
         for k in C.KINDS:

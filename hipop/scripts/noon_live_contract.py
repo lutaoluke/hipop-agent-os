@@ -151,6 +151,12 @@ def row_problems(kind: str, row: dict) -> list[str]:
     if sku_keys and all(_blank(f) for f in sku_keys):
         problems.append("缺 SKU 主键来源（需 " + "/".join(sku_keys) + " 之一非空）")
 
+    # 契约漂移红灯：known 是该类唯一字段集（docstring 明示禁自造）。任何不在
+    # known 里的键 = live row 私自带了契约外字段 → 红灯，绝不放行冒充合规。
+    known = set(spec["known"])
+    for f in sorted(k for k in row.keys() if k not in known):
+        problems.append(f"未知字段 {f}（不在契约 known 集，禁自造）")
+
     return problems
 
 
