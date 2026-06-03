@@ -75,7 +75,12 @@
         "root_url": "https://noon-catalog.noon.partners/",
         "check_url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon",
         "login_url_markers": ["/login", "/signin", "/sign-in", "login.noon", "identity.noon", "accounts.noon", "/auth"],
-        "session_cookie": "_npsid"
+        "session_cookie": "_npsid",
+        "orders": {
+          "_NOTE": "noon 订单实时抓取（WS-N2.1/WS-58）：api_url=已登录 page 同源 fetch 的真实订单接口，由运营首次 live 时核对后经 NOON_ORDER_API_URL 注入（绝不在仓库写死/猜 URL）；records_path=接口 JSON 走到订单记录 list 的键路径（缺省自动在常见容器键里找 list）。字段名→WS-34 契约键的映射钉在 noon_order_fetcher._NOON_ORDER_FIELD_MAP。",
+          "api_url": "${NOON_ORDER_API_URL}",
+          "records_path": null
+        }
       }
     }
   },
