@@ -1105,6 +1105,24 @@ def get_platform_browser_cred_row(store_key: Optional[str] = None) -> Optional[D
     return rows[0]
 
 
+def sales_entities_for_mapping(active_only: bool = True) -> List[Dict]:
+    """列出 sales_entities 作为「平台浏览器 store → tenant/entity 映射」的**唯一真相源**。
+
+    每行带 tenant_id / alias / country / platform / store_name —— 供
+    `_platform_browser.resolve_store_entity` 把紫鸟 getBrowserList 枚举到的每个 store 解析
+    到唯一 (tenant_id, entity_alias)。**tenant_id 取自匹配到的行**，不是默认值——这正是
+    WS-46 契约要钉死的：缺匹配行时调用方必须 blocked，绝不默认塞 tenant=1/当前 entity。
+
+    隔离：PG 走 RLS（app.current_tenant），SQLite 无 RLS 返回全部行；store→entity 映射只
+    在「当前 tenant context 已设」的调用链里做（account 凭据本就 tenant-scoped）。
+    """
+    where = "WHERE active=1" if active_only else ""
+    return _fetch(
+        "SELECT tenant_id, alias, country, platform, store_name "
+        f"FROM sales_entities {where} ORDER BY tenant_id, alias"
+    )
+
+
 def set_action_status(action_id: int, status: str, by: str) -> dict:
     """采纳/拒绝 agent_action。status: adopted / rejected。
     带 tenant 校验（只能改自己租户的 action），adopted_by 由调用方从登录态传（不信前端）。

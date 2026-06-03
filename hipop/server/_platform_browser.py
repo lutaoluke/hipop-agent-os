@@ -335,6 +335,115 @@ def _require_oauth(s: Store, store_key) -> Store:
     return s
 
 
+# ════════════════════════════════════════════════════════════════════════
+# WS-46 (WS-33.0) · store → tenant/entity 映射契约
+# ════════════════════════════════════════════════════════════════════════
+# getBrowserList 枚举出的每个 store 必须能解析到**唯一**的 (tenant_id, entity_alias)，
+# 否则确定性红灯 blocked —— 绝不默认塞 tenant=1 或当前 entity（acceptance #2 的死法）。
+# 真相源是 `sales_entities`（data.sales_entities_for_mapping）；tenant_id 取自匹配到的行，
+# 不是默认值。映射规则全写进代码（确定性 verifier），不进 prompt/skill。
+#
+# 紫鸟 store 名常用国别俗称（KSA/UAE），而 sales_entities.country 用规范码（SA/AE）。
+# 这张别名表是唯一需要的人工映射事实，放在代码里钉死、可被 smoke 回归。
+_COUNTRY_ALIASES = {
+    "SA": "SA", "KSA": "SA", "SAU": "SA",
+    "AE": "AE", "UAE": "AE", "ARE": "AE",
+}
+
+
+@dataclass
+class StoreEntity:
+    """一个 store 解析到的归属。tenant_id 来自 sales_entities 匹配行，不是默认值。"""
+    store: Store
+    tenant_id: int
+    entity_alias: str
+    country: str
+    matched_on: str
+
+
+def _entity_rows(entities: Optional[list]) -> list:
+    """映射真相源：显式传入（smoke 注入）或从 data 层 sales_entities 读。"""
+    if entities is not None:
+        return entities
+    return _data.sales_entities_for_mapping() or []
+
+
+def _store_country(store: Store) -> set:
+    """从 store 标识（name / store_username / browser_id）抽出命中的规范国别码集合。
+    按词边界匹配（split 非字母），'USA' 不会误命中 'SA'。"""
+    text = f"{store.name} {store.store_username} {store.browser_id}"
+    toks = set(re.sub(r"[^A-Za-z]+", " ", text).upper().split())
+    return {canon for raw, canon in _COUNTRY_ALIASES.items() if raw in toks}
+
+
+def resolve_store_entity(store: Store, *, entities: Optional[list] = None) -> StoreEntity:
+    """把一个 store 解析到唯一 (tenant_id, entity_alias)，否则 blocked。
+
+    确定性规则：
+      1) 从 store 标识唯一确定规范国别码（命中 0 或 >1 个 → blocked，不猜）。
+      2) 在 sales_entities 里取该国别的行；若其中有平台名（entity.platform）出现在 store
+         标识里的行，则收窄到这些行（多平台同国别时按平台区分）。
+      3) 收窄后**恰好 1 行** → 映射成功，tenant_id/entity_alias 取自该行；0 或 >1 → blocked。
+    任何 blocked 分支都绝不回落 tenant=1 / 当前 entity（acceptance #2）。
+    """
+    rows = _entity_rows(entities)
+    countries = _store_country(store)
+    if len(countries) != 1:
+        raise PlatformBrowserError(
+            f"store name={store.name!r} browser_id={store.browser_id!r} 无法从标识唯一确定"
+            f"国别（命中 {sorted(countries)}）—— 缺映射，blocked，绝不默认塞 tenant/entity",
+            blocked=True)
+    country = next(iter(countries))
+
+    by_country = [r for r in rows if str(r.get("country") or "").upper() == country]
+    text_l = f"{store.name} {store.store_username} {store.browser_id}".lower()
+    by_platform = [r for r in by_country
+                   if str(r.get("platform") or "").lower() in text_l]
+    chosen = by_platform or by_country
+
+    if len(chosen) == 1:
+        r = chosen[0]
+        return StoreEntity(
+            store=store,
+            tenant_id=int(r["tenant_id"]),
+            entity_alias=r["alias"],
+            country=country,
+            matched_on=(f"country={country}"
+                        + (f",platform={r.get('platform')}" if by_platform else "")),
+        )
+    if not chosen:
+        raise PlatformBrowserError(
+            f"store name={store.name!r}（国别={country}）在 sales_entities 中无匹配 entity "
+            f"—— 缺映射，blocked，绝不默认塞 tenant=1/当前 entity", blocked=True)
+    raise PlatformBrowserError(
+        f"store name={store.name!r}（国别={country}）命中多个 entity "
+        f"{[r.get('alias') for r in chosen]} —— 映射不唯一，blocked，需更精确的平台/国别区分",
+        blocked=True)
+
+
+def map_stores(account: Optional[str] = None, *, port: Optional[int] = None,
+               store_key: Optional[str] = None,
+               entities: Optional[list] = None) -> tuple:
+    """枚举 account 下**全部** store 并逐店解析 tenant/entity。
+
+    返回 `(resolved, blocked)`：
+      - resolved: list[StoreEntity]，已唯一映射的店；
+      - blocked:  list[(Store, reason)]，缺映射/不唯一的店——调用方据此红灯，**绝不**
+        把它们悄悄塞进默认 tenant/entity。
+    本函数不抛错（除非连 store 都枚举不出来）——把成功与缺映射分开返回，让调用方既能
+    继续处理已映射的店，又能如实暴露缺映射的店。
+    """
+    stores = list_stores(account=account, port=port, store_key=store_key)
+    rows = _entity_rows(entities)
+    resolved, blocked = [], []
+    for s in stores:
+        try:
+            resolved.append(resolve_store_entity(s, entities=rows))
+        except PlatformBrowserError as e:
+            blocked.append((s, str(e)))
+    return resolved, blocked
+
+
 # ── startBrowser → debuggingPort ────────────────────────────────────
 def _build_start_browser_body(browser_oauth: str, run_mode: str, request_id: str) -> dict:
     """startBrowser 精确 schema。
