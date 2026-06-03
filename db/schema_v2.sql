@@ -225,20 +225,6 @@ CREATE TABLE IF NOT EXISTS wf6_replenishment_queue_v2 (
   PRIMARY KEY (tenant_id, entity_alias, partner_sku, order_no)
 );
 
--- 反馈/需求捕获（WS-26）— chat agent 撞限时把用户需求真落库，喂产品迭代
-CREATE TABLE IF NOT EXISTS feedback (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  tenant_id      BIGINT NOT NULL DEFAULT 1,
-  feedback_user  TEXT,                -- 提需求的人
-  user_role      TEXT,
-  trigger_scene  TEXT,                -- 触发场景（撞到啥做不了）
-  content        TEXT NOT NULL,       -- 用户原话/诉求
-  category       TEXT,                -- 需求 / bug / 数据问题 / 其他
-  store          TEXT,
-  created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON feedback(tenant_id, created_at);
-
 -- ============ tenant 配置（W2 已建 tenants 表，这里加 settings 列 + ERP 凭据 ============
 -- SQLite 不支持 ALTER TABLE ADD COLUMN IF NOT EXISTS，外面 _config 模块兼容判断
 

@@ -906,8 +906,10 @@ _feedback_ready = False
 def _ensure_feedback_table():
     """建 feedback 表（幂等）。PG 同时建 RLS policy（按 tenant 隔离，防越权串租户）。
 
-    生产/部署的真源在 db/schema_v2.sql + schema_v2_pg_extra.sql；这里的 ensure 让
-    本地 SQLite 开发 + 已跑起来的 PG 都能自举，smoke 不依赖谁先手动迁过库。
+    WS-26：feedback 表走**运行时自举**（与 _ensure_chat_table 同套路），不进
+    CODEOWNERS 锁定的 db/schema*.sql 主文件 —— 首次 write/read 时按需建表 + RLS，
+    SQLite 本地 / PG 部署都不依赖谁先手动迁库。建表是 CREATE TABLE IF NOT EXISTS
+    纯增量，不碰任何已有表。
     """
     global _feedback_ready
     if _feedback_ready:
