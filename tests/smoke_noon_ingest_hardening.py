@@ -3,10 +3,14 @@
 钉死 `ingest_noon_csv_v2.process_csv_v2` 的两条残留口径，它们在 WS-15/17 的
 `tests/smoke_sales_contract.py` 里没有被钉死：
 
-  test_currency_merge —— noon 路径必须把 CSV 的 currency 合并回 wf2_sku。
-      尤其 noon-only SKU 或 ERP 尚未先写 currency 的场景：改动前 process_csv_v2
-      只写 wf2_orders.currency，wf2_sku.currency 一直是 NULL（典型"占位假数据 /
-      接线缺失"）。改动后 noon 兜底补 currency；ERP 已写过的不被覆盖。
+  test_currency_merge —— noon 路径必须把 CSV 的 currency 合并回 wf2_sku，
+      且方向正确（ERP 优先、noon 只兜底补空）：
+        · noon-only SKU 或 ERP 尚未先写 currency 的场景：改动前 process_csv_v2
+          只写 wf2_orders.currency，wf2_sku.currency 一直是 NULL（典型"占位假数据 /
+          接线缺失"）。改动后 noon 兜底补 currency。
+        · ERP 已写过 currency 的场景：noon 不覆盖。为真正钉住方向，本 smoke 让
+          ERP=USD、noon CSV=SAR（二者不同），断言合并后仍为 USD。若 fixture 用
+          ERP==CSV（同值），即使代码 COALESCE 反向让 noon 覆盖也照样绿 —— 那是盲点。
 
   test_dedup —— (tenant_id, entity_alias, partner_sku, item_nr) 去重：同一 item_nr
       在二次导入或同一文件重复出现时必须 UPDATE 而非重复计数。wf2_orders 行数、
@@ -14,9 +18,12 @@
       已实现该行为，本 smoke 把它钉死，防回退。
 
 fail-then-pass 证明：
-  - test_currency_merge：改动前（process_csv_v2 不写 wf2_sku.currency）→ noon-only
-    SKU 的 currency 为 NULL → FAIL；改动后 → currency==CSV currency → PASS。
-    （本地用 `git stash` 还原 ingest 改动跑一次可见改动前 FAIL。）
+  - test_currency_merge（两个方向都钉死）：
+      · noon 兜底：改动前 process_csv_v2 不写 wf2_sku.currency → noon-only SKU 为
+        NULL → FAIL；改动后 → currency==CSV → PASS。
+      · ERP 优先：若把 ingest 的 `COALESCE(wf2_sku.currency, excluded.currency)`
+        反向成 `COALESCE(excluded.currency, wf2_sku.currency)`（noon 覆盖 ERP），
+        TBB0116A(ERP=USD) 会被 noon CSV(SAR) 覆盖成 SAR → FAIL；保持原向 → USD → PASS。
   - test_dedup：若把 wf2_orders 的 ON CONFLICT 退回成裸 INSERT（去重失效）→ 计数
     翻倍 → FAIL；保留去重 → PASS。
 
@@ -139,6 +146,14 @@ def test_currency_merge():
     ent = seed["entity"]
     tid, alias = ent["tenant_id"], ent["alias"]
 
+    # 关键：让 ERP currency ≠ noon CSV currency，才能真正钉死“ERP 优先”方向。
+    # ERP seed 写 USD，CSV(noon_SA_20260531.csv) 里 TBB0116A 的 currency_code=SAR。
+    # 合并后必须仍为 USD —— 若代码错误地让 noon 覆盖 ERP（COALESCE 反向），
+    # 结果会变 SAR，本断言即 FAIL。原 fixture ERP==CSV==SAR 时此分支永远绿，是盲点。
+    for s in seed["skus"]:
+        if s["partner_sku"] == "TBB0116A":
+            s["currency"] = "USD"
+
     conn = _fresh_db()
     _seed(conn, seed)
     ingest_noon_csv_v2.process_csv_v2(tid, CSV_PATH, conn, entity_alias=alias)
@@ -155,10 +170,11 @@ def test_currency_merge():
         check("noon-only.currency==SAR（noon 兜底写入，改动前为 NULL）",
               d["currency"] == "SAR", f"got {d['currency']!r}")
 
-    # ERP 已写过 currency 的 SKU：noon 不覆盖（ERP 优先）。
+    # ERP 已写过 currency(USD) 的 SKU：noon CSV(SAR) 不覆盖（ERP 优先）。
+    # ERP≠CSV，所以这条真正钉住方向 —— noon 若覆盖即变 SAR → FAIL。
     a = _row(conn, tid, alias, "TBB0116A")
-    check("ERP-priced TBB0116A.currency 保持 SAR（未被 noon 覆盖）",
-          a and a["currency"] == "SAR", f"got {a['currency'] if a else None!r}")
+    check("ERP-priced TBB0116A.currency 保持 USD（noon CSV 是 SAR，未被覆盖）",
+          a and a["currency"] == "USD", f"got {a['currency'] if a else None!r}")
 
     conn.close()
     return check.failures
