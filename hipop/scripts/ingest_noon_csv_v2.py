@@ -102,7 +102,7 @@ def _iter_csv_rows(path):
             yield row
 
 
-def _aggregate(rows, tenant_id, entity_alias=None):
+def _aggregate(rows, tenant_id, entity_alias=None, validate_kind=None):
     """行可迭代（CSV 解析行 / live fetcher 行，同形 dict）→ 落库 bucket。
 
     `rows` 是 dict 的可迭代对象（键 = noon 订单 CSV 列，即
@@ -114,6 +114,14 @@ def _aggregate(rows, tenant_id, entity_alias=None):
       - 传入（CSV 生产路径 / live 单主体）→ 所有行归该 entity，保持既有「一份
         noon 订单报表 = 一个销售主体」语义（与改前 process_csv_v2 完全一致）。
       - None → 按行 dest_country 路由 entity（对齐 stock 链 WS-N3.1 的按行国别路由）。
+
+    validate_kind（WS-35 门2 红队补洞，验收③「字段缺失红灯，不写默认值」）:
+      - None（CSV 生产路径）→ 保留对脏行/汇总行的宽松跳过：真 noon 后台导出常带
+        非订单行（合计行、缺 partner_sku/item_nr 的行），CSV 入口照旧 `continue`。
+      - noon_live_contract.ORDERS（live 路径）→ 每行先过 WS-34 `validate_row`：
+        缺必填（partner_sku/item_nr）/ 缺 SKU 主键 / 带契约外字段 → 立即
+        raise LiveSourceUnavailable（红灯），绝不静默吞坏行或写默认销量/金额。
+      聚合 + 落库口径两路完全一致；仅 live 入口加这道严格的契约门（不分叉）。
 
     返回 (bucket, n_rows, n_unmapped)：
       bucket = {alias: {"orders": [order_dict, ...], "sku_meta": {partner_sku: meta}}}
@@ -138,6 +146,10 @@ def _aggregate(rows, tenant_id, entity_alias=None):
         return ent["alias"] if ent else None
 
     for row in rows:
+        # live 路径：进聚合/落库前按 WS-34 contract 严格校验，坏行红灯（见 docstring
+        # validate_kind）。CSV 路径 validate_kind=None → 跳过此门，保留宽松跳过。
+        if validate_kind is not None:
+            _contract.validate_row(validate_kind, row)
         header_idx = build_header_index(list(row.keys()))
         partner_sku = get_col(row, header_idx, COLUMN_MAP["partner_sku"])
         item_nr     = get_col(row, header_idx, COLUMN_MAP["item_nr"])
@@ -402,11 +414,21 @@ def run_live(tenant_id: int, live_producer=None, allow_csv_fallback: bool = True
 
     print(f"\n=== noon order live ingest tenant={tenant_id}: {len(rows)} live rows ===",
           file=sys.stderr)
+    # live 行先过 WS-34 contract 校验（_aggregate 内 validate_kind=ORDERS，纯内存、
+    # 未开库连接）：任一行缺必填 / 带契约外字段 → LiveSourceUnavailable。视同「live 源
+    # 字段漂移/坏行」，与 producer 抛错同等处理 → 回落 CSV interim（同契约）或无 CSV 红灯。
+    # 校验在落库前 raise，故坏行绝不会写半截/默认值进 wf2_orders/wf2_sku。
+    try:
+        bucket, n_rows, n_unmapped = _aggregate(
+            rows, tenant_id, entity_alias=entity_alias, validate_kind=_contract.ORDERS)
+    except LiveSourceUnavailable as e:
+        return _csv_fallback_or_fail(
+            tenant_id, f"live 行不合 WS-34 contract: {e}",
+            allow_csv_fallback, file, inbox, entity_alias, dry_run)
     from server import data as _data
     _data.set_current_tenant(tenant_id)
     conn = _data.conn()
     try:
-        bucket, n_rows, n_unmapped = _aggregate(rows, tenant_id, entity_alias=entity_alias)
         counts = {} if dry_run else _upsert(conn, tenant_id, bucket)
     finally:
         conn.close()

@@ -289,7 +289,57 @@ def main():
         assert raised, "无 producer 且无 CSV → 必须红灯 raise"
         print("✓ 无 live producer（fetcher 未接入）→ 有 CSV 回落 / 无 CSV 红灯，绝不冒充成功")
 
-        print("\n7/7 passed")
+        # ── 8. 字段缺失/契约外字段的 live 坏行 → 红灯，绝不静默吞行（验收③）───────
+        # 门2 红队补洞：改前 `_aggregate` 对缺 item_nr 的 live 行只是 continue，返回
+        # ({},0,0) 不 raise；坏行被静默吞掉、库里凭空少单。这里钉死：
+        #   (a) live 路径经 WS-34 validate_row 校验，缺必填 / 契约外字段 → raise；
+        #   (b) CSV 路径仍宽松跳过（两路口径不分叉，仅 live 入口加严格门）；
+        #   (c) run_live 喂坏行：无 CSV → 红灯 raise 且库里无凭空行；有 CSV → 回落同契约。
+        good_row = dict(ORDER_ROWS[0])
+        missing_required = {**good_row, "item_nr": ""}       # 缺必填 item_nr
+        unknown_field    = {**good_row, "made_up_col": "x"}  # 带契约外字段
+
+        # (a) live 严格门：_aggregate(validate_kind=ORDERS) 对坏行 raise（指出问题字段）
+        for bad, why in ((missing_required, "item_nr"), (unknown_field, "made_up_col")):
+            raised = False
+            try:
+                noon._aggregate([dict(bad)], TENANT, entity_alias=ALIAS, validate_kind=C.ORDERS)
+            except noon.LiveSourceUnavailable as e:
+                raised = True
+                assert why in str(e), f"红灯异常应点名问题字段 {why}: {e}"
+            assert raised, f"live 坏行（{why}）必须经 contract 校验红灯，不得静默吞（验收③）"
+
+        # (b) CSV 口径不分叉：同一坏行无 validate_kind → 宽松跳过，返回空 bucket（不 raise）
+        b, nr, _ = noon._aggregate([dict(missing_required)], TENANT, entity_alias=ALIAS)
+        assert b == {} and nr == 0, f"CSV 路径应宽松跳过脏行（不红灯、不入账）: {b}, {nr}"
+
+        # (c1) run_live 坏行 + 无 CSV → 红灯 raise，库里无凭空订单/SKU（占位假数据死法）
+        bad_producer = lambda tenant_id: [dict(missing_required)]
+        _reset_db()
+        with tempfile.TemporaryDirectory() as empty_dir:
+            raised = False
+            try:
+                noon.run_live(TENANT, live_producer=bad_producer, inbox=empty_dir, entity_alias=ALIAS)
+            except noon.LiveSourceUnavailable as e:
+                raised = True
+                assert "contract" in str(e), f"红灯异常应标明 contract 校验失败: {e}"
+        assert raised, "run_live 收到坏 live 行且无 CSV 可回落时必须红灯 raise"
+        assert _dump("wf2_orders", "item_nr") == {}, "坏行红灯路径凭空写了订单行（占位假数据死法）"
+        assert _dump("wf2_sku", "partner_sku") == {}, "坏行红灯路径凭空写了 SKU 行（占位假数据死法）"
+
+        # (c2) run_live 坏行 + 有 CSV interim → 回落同一契约，落真实 CSV 数据（带失败信号）
+        _reset_db()
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "noon_orders.csv")
+            _write_csv(csv_path)
+            res_bad_fb = noon.run_live(TENANT, live_producer=bad_producer, file=csv_path, entity_alias=ALIAS)
+        assert res_bad_fb["source"] == "csv_fallback", f"坏 live 行应回落 CSV: {res_bad_fb}"
+        assert res_bad_fb.get("live_error") and "contract" in res_bad_fb["live_error"], \
+            f"回落必须带契约校验失败信号 live_error: {res_bad_fb}"
+        _assert_orders_equal(_dump("wf2_orders", "item_nr"), csv_orders, "bad-live-fallback-vs-csv")
+        print("✓ 字段缺失/契约外字段 live 坏行 → 红灯 raise，库里无凭空行；CSV 路径口径不分叉")
+
+        print("\n8/8 passed")
     finally:
         C.set_live_row_producer(C.ORDERS, None)
 
