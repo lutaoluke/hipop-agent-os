@@ -38,7 +38,11 @@ webdriver 前置（需常驻，别成隐性人工）：
 from __future__ import annotations
 
 import json
+import os
+import re
 import socket
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -381,3 +385,419 @@ def open_cdp_endpoint(store_key, account: Optional[str] = None, *,
     dbg = start_browser(store.browser_oauth, port=port)
     return CdpEndpoint(store=store, debugging_port=dbg,
                        cdp_url=f"http://127.0.0.1:{dbg}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# WS-33.3 · get_platform_session：实连 CDP + 三级回落 + 登录态 blocked
+# ════════════════════════════════════════════════════════════════════════
+# 系统入口 `get_platform_session(tenant_id, store_key) -> page`：调用方先
+# `data.set_current_tenant(tenant_id)`，本服务在 open_cdp_endpoint 之上加：
+#   ① `playwright.chromium.connect_over_cdp(cdp_url)` 接管真实已登录 page；
+#   ② 三级回落——内存 cache(TTL) → 磁盘 `~/hipop/ziniao_state_<store>.json`
+#      （含 debug/cdp/有效期/session 信息）→ webdriver `startBrowser`，过期必重启；
+#   ③ 冷 `goto` 被紫鸟扩展 abort → 先平台根域 warmup 再重试 warmup_retries 次；
+#   ④ 落平台登录页 / 缺会话 cookie → report blocked（refresh-dbuyerp-token 模式
+#      提示人工用紫鸟登一次），绝不 stub 登录态；
+#   ⑤ 缺紫鸟 webdriver / 缺会话 / CDP 连接失败 → blocked，不返回假 page。
+# 平台无关：noon 只是第一个 store_key / 平台根域配置，签名不含任何平台名。
+
+# 会话 state 持久化目录（每店一份）。可经 HIPOP_STATE_DIR 覆写（smoke 用临时目录）。
+_PERSIST_DIR = os.environ.get("HIPOP_STATE_DIR") or os.path.expanduser("~/hipop")
+
+_session_lock = threading.RLock()
+# (tenant_id, store_key) -> PlatformSession
+_session_cache: dict = {}
+# 可观测：navigate warmup/retry 计数（live log / smoke 据此证明 retry 路径被调用）。
+_NAV_STATS = {"attempts": 0, "warmups": 0, "aborts": 0}
+
+
+@dataclass
+class PlatformCfg:
+    """平台登录态检测规则（来自 config `platform_browser.platforms.<name>`）。"""
+    name: str
+    root_url: str
+    check_url: str
+    login_markers: list
+    session_cookie: Optional[str]
+
+
+@dataclass
+class LoginState:
+    """登录态判定结果。kind: 'ok' | 'login'（未登录/落登录页/缺会话）。"""
+    kind: str
+    detail: str
+
+
+@dataclass
+class PlatformSession:
+    """已接管的平台浏览器会话；`get_platform_session` 返回其 `.page`。
+    保留 browser/playwright 句柄避免被 GC，淘汰时 best-effort 断开。"""
+    page: object
+    store: Store
+    cdp_url: str
+    debugging_port: int
+    source: str               # 'memory' | 'disk' | 'webdriver'
+    exp: float
+    browser: object = field(default=None, repr=False)
+    pw: object = field(default=None, repr=False)
+
+
+# ── 平台配置 ────────────────────────────────────────────────────────────
+def _platform_browser_cfg() -> dict:
+    return load_config().get("platform_browser") or {}
+
+
+def _session_ttl() -> int:
+    return int(_platform_browser_cfg().get("session_ttl_seconds") or 600)
+
+
+def _warmup_retries() -> int:
+    return int(_platform_browser_cfg().get("warmup_retries") or 3)
+
+
+def _platform_cfg_for(store_key) -> PlatformCfg:
+    """store_key → 平台根域/登录检测配置。平台无关：按平台名子串命中（noon /
+    NOON-SA 都落 noon）；单平台部署时数字 store_key 也回落到唯一平台；都不命中
+    → blocked（不瞎猜根域）。"""
+    platforms = _platform_browser_cfg().get("platforms") or {}
+    if not platforms:
+        raise PlatformBrowserError(
+            "缺 config platform_browser.platforms —— 无法确定平台根域/登录检测规则",
+            blocked=True)
+    k = str(store_key).lower()
+    chosen = None
+    for name, pc in platforms.items():
+        if name.lower() in k or k in name.lower():
+            chosen = (name, pc)
+            break
+    if chosen is None and len(platforms) == 1:
+        chosen = next(iter(platforms.items()))
+    if chosen is None:
+        raise PlatformBrowserError(
+            f"store_key {store_key!r} 无法匹配任何平台根域配置 "
+            f"{list(platforms)} —— 绝不瞎猜", blocked=True)
+    name, pc = chosen
+    root = pc.get("root_url") or ""
+    if not root:
+        raise PlatformBrowserError(
+            f"平台 {name} 缺 root_url 配置", blocked=True)
+    return PlatformCfg(
+        name=name,
+        root_url=root,
+        check_url=pc.get("check_url") or root,
+        login_markers=list(pc.get("login_url_markers") or []),
+        session_cookie=pc.get("session_cookie"),
+    )
+
+
+# ── 进程层：webdriver 端口 / CDP /json/version 可达性 ──────────────────
+def _webdriver_listening(port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _assert_webdriver_up(port: Optional[int] = None) -> int:
+    """紫鸟 web_driver 进程层端口必须在听，否则 blocked（缺紫鸟，acceptance #5）。"""
+    p = port or _webdriver_port()
+    if not _webdriver_listening(p):
+        raise PlatformBrowserError(
+            f"紫鸟 web_driver 端口 127.0.0.1:{p} 未监听 —— 请先在本机启动紫鸟超级"
+            f"浏览器 web_driver 模式：open -na ziniao --args --run_type=web_driver "
+            f"--port={p}", blocked=True)
+    return p
+
+
+def _cdp_version(cdp_url: str, timeout: float = 3.0):
+    """GET `<cdp_url>/json/version` 验证 chromium debug 端口真实可达。返回 dict 或
+    None。tier1/tier2 据此判断会话/持久端口是否还活着（acceptance #1）。"""
+    try:
+        req = _urlreq.Request(cdp_url.rstrip("/") + "/json/version", method="GET")
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except (HTTPError, URLError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _session_alive(sess: "PlatformSession") -> bool:
+    """会话仍可复用：未过 TTL **且** CDP /json/version 真实可达。两者缺一即重拉——
+    绝不在 chromium 已没的情况下返回旧 page（死法·死代码短路）。"""
+    return time.time() < sess.exp and _cdp_version(sess.cdp_url) is not None
+
+
+# ── 磁盘持久化（每店一份） ──────────────────────────────────────────────
+def _store_id(store: Store) -> str:
+    return str(store.browser_id or store.store_username or store.name or "unknown")
+
+
+def _state_path(store_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.@-]", "_", str(store_id))
+    return os.path.join(_PERSIST_DIR, f"ziniao_state_{safe}.json")
+
+
+def _load_state(store_id: str) -> Optional[dict]:
+    """读 `~/hipop/ziniao_state_<store>.json`。仅当：未过 expires_at **且** 持久 debug
+    端口的 CDP 仍可达，才返回（可跳过 startBrowser 直接 reconnect）。过期/端口已死
+    → None（回落 webdriver 重新 start，acceptance #2）。"""
+    path = _state_path(store_id)
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    exp = d.get("expires_at")
+    if not exp or time.time() >= float(exp):
+        return None
+    cdp = d.get("cdp_url")
+    port = d.get("debugging_port")
+    if not cdp or not port or _cdp_version(cdp) is None:
+        return None
+    return d
+
+
+def _save_state(store_id: str, store: Store, cdp_url: str, port: int,
+                exp: float) -> None:
+    """落每店会话 state（含 debug/cdp/有效期/session 信息）。"""
+    try:
+        os.makedirs(_PERSIST_DIR, exist_ok=True)
+        data = {
+            "store_id": store_id,
+            "store_name": store.name,
+            "store_username": store.store_username,
+            "browser_id": store.browser_id,
+            "account": store.account,
+            "debugging_port": int(port),
+            "cdp_url": cdp_url,
+            "expires_at": float(exp),
+            "saved_at": time.time(),
+        }
+        path = _state_path(store_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # 持久化失败不致命——下次回落 webdriver 重启即可。
+
+
+# ── playwright 接管（可注入边界，供 smoke 替身） ──────────────────────────
+def _connect_cdp(cdp_url: str):
+    """`playwright.chromium.connect_over_cdp`。返回 (playwright, browser)；连接失败
+    → blocked，不返回假 page（acceptance #5）。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        raise PlatformBrowserError(
+            "playwright 未装：pip install playwright && playwright install chromium",
+            blocked=True) from e
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(cdp_url)
+    except Exception as e:  # noqa: BLE001 — playwright 各类连接错都归 blocked
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise PlatformBrowserError(
+            f"connect_over_cdp({cdp_url}) 失败：{e}", blocked=True) from e
+    return pw, browser
+
+
+def _acquire_page(browser):
+    """取被接管 chromium 的现存 page（紫鸟已登录的那个），没有则新建。"""
+    ctxs = list(getattr(browser, "contexts", None) or [])
+    if ctxs:
+        ctx = ctxs[0]
+        pages = list(getattr(ctx, "pages", None) or [])
+        return pages[0] if pages else ctx.new_page()
+    ctx = browser.new_context()
+    return ctx.new_page()
+
+
+def _is_nav_abort(err: Exception) -> bool:
+    """冷 goto 被紫鸟扩展 abort 的特征（net::ERR_ABORTED 等）。"""
+    s = str(err).lower()
+    return ("err_aborted" in s or "aborted" in s or "net::err" in s
+            or "frame was detached" in s)
+
+
+def _navigate_with_warmup(page, target_url: str, root_url: str,
+                          retries: Optional[int] = None) -> str:
+    """导航到 target_url；首次被紫鸟扩展 abort 时先平台根域 warmup 再重试 retries 次。
+    全程 abort → blocked。返回最终 url。`_NAV_STATS` 记录 attempts/warmups/aborts，
+    live log / smoke 据此证明 retry 路径被走过（acceptance #3）。"""
+    n = retries if retries is not None else _warmup_retries()
+    n = max(1, int(n))
+    last = None
+    for attempt in range(n):
+        _NAV_STATS["attempts"] += 1
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            return page.url
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not _is_nav_abort(e):
+                raise PlatformBrowserError(
+                    f"导航 {target_url} 失败（非 abort）：{e}", blocked=True) from e
+            _NAV_STATS["aborts"] += 1
+            # 先平台根域 warmup（让紫鸟扩展放行），再重试。
+            try:
+                _NAV_STATS["warmups"] += 1
+                page.goto(root_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:  # noqa: BLE001 — warmup 失败也继续重试 target
+                pass
+            time.sleep(0.5)
+    raise PlatformBrowserError(
+        f"导航 {target_url} 连续 {n} 次被紫鸟扩展 abort（已平台根域 warmup 重试）："
+        f"{last}", blocked=True)
+
+
+# ── 登录态检测（确定性规则，不进 prompt） ──────────────────────────────
+def _page_cookies(page) -> list:
+    try:
+        return list(page.context.cookies() or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _detect_login(page, pcfg: PlatformCfg) -> LoginState:
+    """落登录页（url 命中 login_markers）或缺会话 cookie → 'login'（未登录）。
+    两条都是代码判定的确定性规则，绝不靠模糊 prompt。"""
+    url = (getattr(page, "url", "") or "")
+    ul = url.lower()
+    for m in pcfg.login_markers:
+        if m and m.lower() in ul:
+            return LoginState("login", f"落登录页 url={url}")
+    if pcfg.session_cookie:
+        names = {c.get("name") for c in _page_cookies(page)}
+        if pcfg.session_cookie not in names:
+            return LoginState(
+                "login", f"缺会话 cookie {pcfg.session_cookie}（url={url}）")
+    return LoginState("ok", url)
+
+
+def _login_blocked_msg(pcfg: PlatformCfg, store_key, login: LoginState) -> str:
+    return (
+        f"平台 {pcfg.name} store_key={store_key!r} 未登录：{login.detail}。"
+        f"请在本机用紫鸟超级浏览器手动打开该店、登录平台一次（参照 "
+        f"refresh-dbuyerp-token 流程），登录后重试 —— 绝不 stub 登录态。")
+
+
+# ── 句柄回收 ────────────────────────────────────────────────────────────
+def _safe_close(pw, browser) -> None:
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if pw is not None:
+            pw.stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _drop_session(ck) -> None:
+    sess = _session_cache.pop(ck, None)
+    if sess is not None:
+        _safe_close(sess.pw, sess.browser)
+
+
+# ── 系统入口 ────────────────────────────────────────────────────────────
+def get_platform_session(tenant_id, store_key, *, account: Optional[str] = None,
+                         port: Optional[int] = None, force_refresh: bool = False):
+    """拿一个**已登录平台**的 Playwright page（平台无关，noon 是第一个 store_key）。
+
+    契约：调用方应已 `data.set_current_tenant(tenant_id)`；本入口同时把 tenant_id 作为
+    兜底设入 context（与 _erp_auth.get_erp_token_for_tenant 一致），但 `resolve_credentials`
+    全程不重设 tenant（WS-33.2 契约不变）。
+
+    三级回落（acceptance #2）：
+      1) 内存 cache(TTL)：仍在 TTL 内且 CDP /json/version 可达 → 直接复用旧 page；
+         过期 / chromium 已没 → 丢弃重拉（不返回旧/空 page）。
+      2) 磁盘 `~/hipop/ziniao_state_<store>.json`：未过期且持久 debug 端口 CDP 可达 →
+         跳过 startBrowser，直接 connect_over_cdp。
+      3) webdriver `startBrowser`：紫鸟自动分配端口 → connect_over_cdp。
+
+    登录态（acceptance #3/#4）：connect 后导航平台 check_url（冷 abort 先 warmup 再重试），
+    落登录页或缺会话 cookie → blocked + 人工登录提示。缺紫鸟 / 缺凭据 / CDP 连接失败 →
+    blocked（acceptance #5），绝不返回假 page。
+    """
+    if tenant_id is not None:
+        _data.set_current_tenant(tenant_id)  # 兜底；resolve_credentials 不重设
+
+    pcfg = _platform_cfg_for(store_key)
+    ck = (tenant_id, str(store_key))
+
+    with _session_lock:
+        # ── tier 1: 内存 cache ──
+        if not force_refresh:
+            sess = _session_cache.get(ck)
+            if sess is not None and _session_alive(sess):
+                return sess.page
+            if sess is not None:
+                _drop_session(ck)  # 过期 / CDP 已死 → 必须重拉
+
+        # 解析 store（getBrowserList，需 webdriver 在听；不 start 任何 chromium）。
+        _assert_webdriver_up(port)
+        stores = list_stores(account=account, port=port, store_key=store_key)
+        if not stores:
+            raise PlatformBrowserError(
+                f"account {account or _client_cfg().get('username')!r} 下没有任何 "
+                f"store —— 缺会话，无法取 page", blocked=True)
+        store = select_store(stores, store_key)
+        sid = _store_id(store)
+
+        # ── tier 2: 磁盘持久化 ──
+        ep = None
+        source = None
+        if not force_refresh:
+            st = _load_state(sid)
+            if st is not None:
+                ep = CdpEndpoint(store=store,
+                                 debugging_port=int(st["debugging_port"]),
+                                 cdp_url=st["cdp_url"])
+                source = "disk"
+
+        # ── tier 3: webdriver startBrowser（过期/无持久 → 重新 start）──
+        if ep is None:
+            dbg = start_browser(store.browser_oauth, port=port)
+            ep = CdpEndpoint(store=store, debugging_port=dbg,
+                             cdp_url=f"http://127.0.0.1:{dbg}")
+            source = "webdriver"
+
+        # 接管前先验 CDP 真实可达（绑定真实 debug port，不接受假端口）。
+        ver = _cdp_version(ep.cdp_url)
+        if ver is None:
+            raise PlatformBrowserError(
+                f"CDP {ep.cdp_url} 的 /json/version 不可达（{source} 端口已死）—— "
+                f"blocked，不返回假 page", blocked=True)
+
+        pw, browser = _connect_cdp(ep.cdp_url)
+        try:
+            page = _acquire_page(browser)
+            _navigate_with_warmup(page, pcfg.check_url, pcfg.root_url)
+            login = _detect_login(page, pcfg)
+        except Exception:
+            _safe_close(pw, browser)
+            raise
+        if login.kind != "ok":
+            _safe_close(pw, browser)
+            raise PlatformBrowserError(
+                _login_blocked_msg(pcfg, store_key, login), blocked=True)
+
+        exp = time.time() + _session_ttl()
+        _save_state(sid, store, ep.cdp_url, ep.debugging_port, exp)
+        _session_cache[ck] = PlatformSession(
+            page=page, store=store, cdp_url=ep.cdp_url,
+            debugging_port=ep.debugging_port, source=source, exp=exp,
+            browser=browser, pw=pw)
+        return page
+
+
+def invalidate_session(tenant_id, store_key) -> None:
+    """会话失效（页面被登出 / 端口换了）时清掉，下次重新接管。"""
+    with _session_lock:
+        _drop_session((tenant_id, str(store_key)))
