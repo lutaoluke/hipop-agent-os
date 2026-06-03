@@ -682,6 +682,14 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_noon_stock_csv_v2:run_v2")],
         ["sales", "replenish"],
     ),
+    # WS-N3.2：Noon FBN live 行 → wf1_stock.noon_*（与 wf1_noon_stock_v2 同款 ingest 契约，
+    # 但来源为 WS-N2 live row producer；取数失败回落 CSV interim，不写假数据）
+    "noon_live_ingest": (
+        "Noon 官方仓库存（live 行 → wf1_stock.noon_*，取数失败回落 CSV，per-tenant）",
+        [(1, "WS-N2 live row producer → 同一 _aggregate/_upsert → wf1_stock.noon_*（+合并快照）",
+          "scripts.ingest_noon_stock_csv_v2:run_live")],
+        ["sales", "replenish"],
+    ),
     # WS-11：ASN 送仓未上架 → wf1_stock.pending_inbound_qty（确定性状态规则）
     "wf1_pending_inbound_v2": (
         "送仓未上架（ASN 状态规则 → wf1_stock.pending_inbound_qty，供销售周期）",

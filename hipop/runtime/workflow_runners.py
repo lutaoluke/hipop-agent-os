@@ -78,6 +78,46 @@ def _run_wf1_noon_stock(task_id, tenant_id, actor, spec, progress, heartbeat, sa
     return {"summary": f"wf1_noon_stock: {res}; merge: {merge}"}
 
 
+@register("noon_live_ingest")
+def _run_noon_live_ingest(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """Noon FBN live 行 → v2 wf1_stock.noon_*（WS-N3.2）。
+
+    与 wf1_noon_stock_v2（CSV 入口）共用同一 `_aggregate`/`_upsert`（WS-N3.1 契约）；
+    本 runner 把 live 源接上：读 WS-N2 live row producer，喂同一 ingest。
+
+    取数失败（producer 未接入 / 抛错）→ 整链回落 CSV interim（同契约，不短路）；
+    无 CSV 可回落 → run_live raise LiveSourceUnavailable（红灯），绝不写 0 假数据。
+    改完 noon_* 列后立即重算合并快照（WS-12），让 total_stock 反映最新官方仓库存。
+
+    spec: {"file": <csv path>, "inbox": <dir>} 仅作 live 失败时的 CSV fallback 输入。
+    读写表见下方 .reads / .writes 声明（声明 == 真正部分 upsert 的 noon_* 四列）。
+    """
+    from hipop.scripts import ingest_noon_stock_csv_v2 as noon, merge_stock_snapshot_v2
+    heartbeat()
+    res = noon.run_live(
+        tenant_id=tenant_id,
+        file=(spec or {}).get("file"),
+        inbox=(spec or {}).get("inbox"),
+    )
+    merge = merge_stock_snapshot_v2.run_v2(tenant_id=tenant_id)
+    save_progress({"done": True, "source": res.get("source"), "result": str(res)[:200]})
+    return {"summary": f"noon_live_ingest [{res.get('source')}]: {res}; merge: {merge}"}
+
+
+# 读/写声明（机器可读，钉「接线缺失」死法）：声明的写列即 ingest 真正部分 upsert
+# 的 noon_* 四列；读覆盖 live 源 + CSV fallback 输入两条真实输入路径。
+_run_noon_live_ingest.reads = (
+    "noon_fbn_live_row_producer",   # WS-N2 live 源
+    "inbox:noon_inventory_csv",     # live 失败时的 CSV interim fallback 输入
+)
+_run_noon_live_ingest.writes = (
+    "wf1_stock.noon_total_qty",
+    "wf1_stock.noon_saleable_qty",
+    "wf1_stock.noon_unsaleable_qty",
+    "wf1_stock.noon_warehouses_json",
+)
+
+
 @register("wf1_inbound_staging_v2")
 def _run_wf1_inbound_staging(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """ERP 送仓/拣货 + Noon ASN → wf1_asn_lines_staging（供 WS-11，WS-10）。
