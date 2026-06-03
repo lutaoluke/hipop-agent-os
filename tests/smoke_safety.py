@@ -115,6 +115,35 @@ def test_global_blacklist_drops_legit_alias():
         "可撑天数 是真实字段 sellable_days 的人话，不该在全局黑名单"
 
 
+# ── smoke_chat case 11「拒绝刷新」：陈旧警示口径补同义词，但仍要求真报警示 ──
+def _refuse_refresh_case():
+    return next(c for c in smoke_chat.CASES if "用户拒绝刷新" in c.name)
+
+
+def test_case11_stale_synonyms_pass():
+    # 实跑两次 deepseek 各报了 "偏旧" / "有些旧"——都是合法陈旧警示，"旧" 词干应放行
+    c = _refuse_refresh_case()
+    for phrase in ("偏旧", "有些旧", "陈旧", "较旧"):
+        resp = {
+            "reply": f"noon 销量数据是 5 月 5 日的（{phrase}），但 ERP 库存是今天的，"
+                     f"可以用。KSA 当前 20 个 SKU 需要补货：…",
+            "tools_used": [], "workflow_task": None,
+        }
+        ok, reasons = smoke_chat.check(c, resp)
+        assert ok, f"Agent 已报陈旧（{phrase}）却被门误判: {reasons}"
+
+
+def test_case11_no_stale_warning_still_fails():
+    # 完全不提任何陈旧警示 → 必须仍 FAIL（不挖空：门仍要求陈旧警示）
+    c = _refuse_refresh_case()
+    resp = {
+        "reply": "KSA 当前 20 个 SKU 需要补货：SDA1874A 补 7 件、TBJ0059A 补 5 件…",
+        "tools_used": [], "workflow_task": None,
+    }
+    ok, _ = smoke_chat.check(c, resp)
+    assert not ok, "未报任何陈旧警示应被拦，但通过了（门被挖空）"
+
+
 if __name__ == "__main__":
     tests = [
         test_legit_sellable_days_with_anchor_passes,
@@ -126,6 +155,8 @@ if __name__ == "__main__":
         test_wf3_real_old_workflow_selection_still_fails,
         test_wf3_no_workflow_triggered_still_fails,
         test_global_blacklist_drops_legit_alias,
+        test_case11_stale_synonyms_pass,
+        test_case11_no_stale_warning_still_fails,
     ]
     failed = 0
     for t in tests:
