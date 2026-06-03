@@ -86,6 +86,11 @@
           "max_pages": 500,
           "page_retries": 3,
           "records_path": ["hits"]
+        },
+        "my_inventory": {
+          "_NOTE": "noon 可售库存实时抓取（WS-N2.2/WS-59）：api_url=已登录 page 同源 fetch 的真实 my inventory 接口，由运营首次 live 时核对后经 NOON_STOCK_API_URL 注入（绝不在仓库写死/猜 URL）；records_path=接口 JSON 走到库存记录 list 的键路径（缺省自动在常见容器键里找 list）。字段名→WS-34 契约键的映射钉在 noon_stock_fetcher._NOON_STOCK_FIELD_MAP。",
+          "api_url": "${NOON_STOCK_API_URL}",
+          "records_path": null
         }
       }
     }
