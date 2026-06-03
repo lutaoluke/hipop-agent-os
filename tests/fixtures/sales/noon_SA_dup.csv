@@ -1,0 +1,4 @@
+partner_sku,sku,item_nr,order_timestamp,status,fulfillment_model,offer_price,gmv_lcy,currency_code,dest_country,family,brand_code
+TBBDUP01,NOON-TBBDUP01-SA,PDUP001,2026-05-30 09:00:00,delivered,FBN,100.00 SAR,110.00 SAR,SAR,SA,FAM1,BR1
+TBBDUP01,NOON-TBBDUP01-SA,PDUP002,2026-05-29 09:00:00,delivered,FBN,100.00 SAR,108.00 SAR,SAR,SA,FAM1,BR1
+TBBDUP01,NOON-TBBDUP01-SA,PDUP001,2026-05-30 09:00:00,delivered,FBN,120.00 SAR,130.00 SAR,SAR,SA,FAM1,BR1

@@ -116,7 +116,7 @@ def process_csv_v2(tenant_id: int, path: str, conn,
             ))
             n += 1
 
-            # 累积 SKU 元信息（标题/图片/品牌 — CSV 第一行有）
+            # 累积 SKU 元信息（标题/图片/品牌/币种 — CSV 第一行有）
             if partner_sku not in sku_meta:
                 sku_meta[partner_sku] = {
                     "noon_sku":    noon_sku,
@@ -125,6 +125,7 @@ def process_csv_v2(tenant_id: int, path: str, conn,
                     "fulfillment": fulfillment,
                     "family":      get_col(row, header_idx, COLUMN_MAP["family"]),
                     "brand":       get_col(row, header_idx, COLUMN_MAP["brand"]),
+                    "currency":    currency,
                 }
 
         # 把 SKU 元信息 upsert 到 wf2_sku（首次见的 SKU 自动建条记录，之后只填空字段）
@@ -132,8 +133,8 @@ def process_csv_v2(tenant_id: int, path: str, conn,
             cur.execute("""
                 INSERT INTO wf2_sku
                   (tenant_id, entity_alias, partner_sku, noon_sku, title, image_url,
-                   fulfillment, family, brand, is_listed, imported_at)
-                VALUES (?,?,?,?,?,?,?,?,?,1, datetime('now','localtime'))
+                   fulfillment, family, brand, currency, is_listed, imported_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,1, datetime('now','localtime'))
                 ON CONFLICT(tenant_id, entity_alias, partner_sku) DO UPDATE SET
                   noon_sku    = COALESCE(wf2_sku.noon_sku,    excluded.noon_sku),
                   title       = COALESCE(wf2_sku.title,       excluded.title),
@@ -141,12 +142,16 @@ def process_csv_v2(tenant_id: int, path: str, conn,
                   fulfillment = COALESCE(wf2_sku.fulfillment, excluded.fulfillment),
                   family      = COALESCE(wf2_sku.family,      excluded.family),
                   brand       = COALESCE(wf2_sku.brand,       excluded.brand),
+                  -- ERP 优先：ERP 先写过 currency 就保留，noon 只补空缺
+                  -- （noon-only SKU 或 ERP 尚未写 currency 时由 noon 兜底）。
+                  currency    = COALESCE(wf2_sku.currency,    excluded.currency),
                   is_listed   = 1,
                   imported_at = datetime('now','localtime')
             """, (
                 tenant_id, alias, sku,
                 meta.get("noon_sku"), meta.get("title"), meta.get("image_url"),
                 meta.get("fulfillment"), meta.get("family"), meta.get("brand"),
+                meta.get("currency"),
             ))
 
         conn.commit()
