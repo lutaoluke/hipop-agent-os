@@ -133,6 +133,11 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
         (tenant_id, entity_alias),
     ).fetchall()
 
+    # 本次刷新写入时刻（localtime，与 verifiers._started_at_iso / data._date10 同口径）。
+    # 整批用同一时刻，保证「本 run 刷新过的行」时间戳一致 >= started_at。
+    import time as _time
+    refreshed_at = _time.strftime("%Y-%m-%d %H:%M:%S")
+
     # 列名 → index（sqlite description / PG RealDictRow 都支持转 dict）
     n = 0
     for raw in sku_rows:
@@ -185,7 +190,13 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
               forecast_10d        = ?,
               forecast_30d        = ?,
               anomalies_json      = ?,
-              order_item_nrs_json = ?
+              order_item_nrs_json = ?,
+              -- WS-21：本次评级/预测刷新必须推进 wf2_sku 写入时间，否则
+              -- data_health.erp_sales（读 MAX(imported_at)）与「刷新后数据变新」
+              -- 的口径不动 = 假新鲜（验门人打回点 2）。用 Python 本地时刻字符串绑参，
+              -- 与 verifiers._started_at_iso / data._date10 同口径（localtime），
+              -- 不用 CURRENT_TIMESTAMP（SQLite 返 UTC，跨 UTC+8 会比 started_at 还旧）。
+              imported_at         = ?
             WHERE tenant_id = ? AND entity_alias = ? AND partner_sku = ?
             """,
             (
@@ -199,6 +210,7 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
                 grade, fc["forecast_10d"], fc["forecast_30d"],
                 json.dumps(anomalies, ensure_ascii=False) if anomalies else None,
                 json.dumps(item_nrs, ensure_ascii=False) if item_nrs else None,
+                refreshed_at,
                 tenant_id, entity_alias, partner_sku,
             ),
         )

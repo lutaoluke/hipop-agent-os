@@ -182,9 +182,28 @@ def test_rbac_gate():
     return check.failures
 
 
-# ── 3. 按需 runner 功能 + verifier 真查（接线缺失/占位假数据死法）─────
+# ── 3. chat 触发面：run_workflow tool enum 含本 workflow（接线缺失死法）──
+def test_chat_tool_enum():
+    """验门人打回点 1：chat 的 run_workflow tool enum/说明不含本 workflow →
+    用户说『刷新/重算销量』时模型无法合法选它。读 agent.TOOLS 真查枚举（red→green）。"""
+    print("== test_chat_tool_enum ==")
+    from hipop.server import agent
+    check = _Checker()
+    rw = next((t for t in agent.TOOLS if t.get("name") == "run_workflow"), None)
+    check("agent.TOOLS 有 run_workflow tool", rw is not None)
+    if rw:
+        enum = rw["input_schema"]["properties"]["workflow"]["enum"]
+        check("chat run_workflow enum 含 wf2_sales_refresh_v2（chat 可合法触发）",
+              "wf2_sales_refresh_v2" in enum, f"enum={enum}")
+        check("tool 说明提到 wf2_sales_refresh_v2（模型知道何时选它）",
+              "wf2_sales_refresh_v2" in rw["description"])
+    return check.failures
+
+
+# ── 4. 按需 runner 功能 + verifier 真查（接线缺失/占位假数据/假新鲜度死法）─
 def test_on_demand_refresh():
     print("== test_on_demand_refresh ==")
+    import time
     from hipop.server import data
     from hipop.scripts import ingest_noon_csv_v2
     from hipop.runtime import workflow_runners, verifiers
@@ -199,19 +218,22 @@ def test_on_demand_refresh():
     _seed(conn, seed)
     # 灌现有 noon 订单（不再"上传新 CSV"，模拟订单已在库）
     ingest_noon_csv_v2.process_csv_v2(tid, CSV_PATH, conn, entity_alias=alias)
-    # 抹掉所有评级 → 模拟"订单在、评级没跑过/过期"
+    # 抹掉所有评级 + 把 imported_at 设旧 → 模拟"订单在、评级旧、未刷新"
     conn.execute("UPDATE wf2_sku SET sales_grade=NULL, forecast_10d=NULL, "
-                 "forecast_30d=NULL, total_orders=NULL WHERE tenant_id=?", (tid,))
+                 "forecast_30d=NULL, total_orders=NULL, "
+                 "imported_at='2020-01-01 00:00:00' WHERE tenant_id=?", (tid,))
     conn.commit()
     conn.close()
 
-    before = None
     cc = data.conn()
     before = _skus_with_orders(cc, tid, alias)
     cc.close()
     check("刷新前：有订单的 SKU 评级为空（待刷新）",
           all(v["sales_grade"] is None for v in before.values()) and len(before) >= 2,
           f"before={before}")
+
+    # started_at 必须取在 runner 之前 —— verifier 用它判「本 run 是否真推进 imported_at」
+    started_at = time.time() - 2
 
     # 跑按需 runner（生产路径：worker → get_runner → runner）
     runner = workflow_runners.get_runner("wf2_sales_refresh_v2")
@@ -229,26 +251,86 @@ def test_on_demand_refresh():
           all((v["total_orders"] or 0) > 0 for v in after.values()), f"after={after}")
 
     # verifier（worker 跑完会调）— happy path 全绿
-    import time
-    res = verifiers.run_verifier("wf2_sales_refresh_v2", "task-ws21", tid, time.time())
+    res = verifiers.run_verifier("wf2_sales_refresh_v2", "task-ws21", tid, started_at)
     check("run_verifier 非 None（verifier 接进 _VERIFIERS）", res is not None, f"res={res}")
     if res:
         check("verifier ok=True（链路全绿）", res["ok"] is True, f"res={res}")
         check("verifier evidence.graded_missing==0", res["evidence"]["graded_missing"] == 0,
               f"evidence={res['evidence']}")
+        check("verifier evidence.stale_unrefreshed==0（本 run 真推进了 imported_at）",
+              res["evidence"]["stale_unrefreshed"] == 0, f"evidence={res['evidence']}")
         check("verifier evidence.skus_with_orders>=2",
               res["evidence"]["skus_with_orders"] >= 2, f"evidence={res['evidence']}")
 
-    # 负向：人为抹掉一个有订单 SKU 的评级 → verifier 必须判 FAIL（不假绿）
+    # 负向①：人为抹掉一个有订单 SKU 的评级 → verifier 判 FAIL（拦死列/漏评级）
     cc = data.conn()
     one = sorted(after.keys())[0]
     cc.execute("UPDATE wf2_sku SET sales_grade=NULL WHERE tenant_id=? AND partner_sku=?",
                (tid, one))
     cc.commit(); cc.close()
-    bad = verifiers.run_verifier("wf2_sales_refresh_v2", "task-ws21", tid, time.time())
+    bad = verifiers.run_verifier("wf2_sales_refresh_v2", "task-ws21", tid, started_at)
     check("抹掉一个评级后 verifier ok=False（拦死列/漏评级）", bad["ok"] is False, f"bad={bad}")
     check("verifier 命中 graded_missing>=1", bad["evidence"]["graded_missing"] >= 1,
           f"evidence={bad['evidence']}")
+
+    # 负向②（验门人打回点 2 的死法）：评级齐全但 imported_at 是旧的（runner 这次没真刷）→
+    # verifier 必须判 FAIL（旧评级不冒充新刷新）。先重置回全绿，再把 imported_at 设旧。
+    cc = data.conn()
+    cc.execute("UPDATE wf2_sku SET sales_grade='C' WHERE tenant_id=? AND partner_sku=?",
+               (tid, one))  # 补回评级 → 评级齐全
+    cc.execute("UPDATE wf2_sku SET imported_at='2020-01-01 00:00:00' WHERE tenant_id=?", (tid,))
+    cc.commit(); cc.close()
+    stale = verifiers.run_verifier("wf2_sales_refresh_v2", "task-ws21", tid, time.time())
+    check("评级齐全但 imported_at 旧 → verifier ok=False（不把旧评级当新刷新）",
+          stale["ok"] is False, f"stale={stale}")
+    check("verifier 命中 stale_unrefreshed>=1 且 graded_missing==0（命中假新鲜度而非漏评级）",
+          stale["evidence"]["stale_unrefreshed"] >= 1
+          and stale["evidence"]["graded_missing"] == 0, f"evidence={stale['evidence']}")
+    return check.failures
+
+
+# ── 5. 新鲜度真推进：刷新后 data_health.erp_sales 时间戳前进（非"插入恰在今天"）──
+def test_freshness_advances():
+    """验门人打回点 2：证明『按需刷新后数据变新』—— 把 imported_at 压旧到 2020，
+    data_health 显示陈旧；跑刷新 runner 后 erp_sales 时间戳真前进到今天、stale_days 归 0。"""
+    print("== test_freshness_advances ==")
+    from hipop.server import data
+    from hipop.scripts import ingest_noon_csv_v2
+    from hipop.runtime import workflow_runners
+    check = _Checker()
+
+    seed = json.load(open(SEED_PATH, encoding="utf-8"))
+    ent = seed["entity"]
+    tid, alias = ent["tenant_id"], ent["alias"]
+    data.set_current_tenant(tid)
+
+    conn = _fresh_db(data)
+    _seed(conn, seed)
+    ingest_noon_csv_v2.process_csv_v2(tid, CSV_PATH, conn, entity_alias=alias)
+    # 压旧所有 wf2_sku.imported_at → 模拟"评级数据已陈旧"
+    conn.execute("UPDATE wf2_sku SET imported_at='2020-01-01 00:00:00' WHERE tenant_id=?", (tid,))
+    conn.commit()
+    conn.close()
+
+    data.set_current_tenant(tid)
+    h_before = data.get_data_health("KSA")["sources"]["erp_sales"]
+    check("刷新前：data_health.erp_sales 显示陈旧（latest=2020-01-01）",
+          h_before["latest"] == "2020-01-01", f"before={h_before}")
+    check("刷新前：stale_days 很大（>100）", (h_before["stale_days"] or 0) > 100,
+          f"before={h_before}")
+
+    # 跑按需刷新 runner
+    runner = workflow_runners.get_runner("wf2_sales_refresh_v2")
+    runner("task-ws21-fresh", tid, {"role": "ops"}, {}, {}, lambda: None, lambda p: None)
+
+    data.set_current_tenant(tid)
+    h_after = data.get_data_health("KSA")["sources"]["erp_sales"]
+    today = datetime.date.today().isoformat()
+    check("刷新后：erp_sales.latest 推进到今天（数据真变新，非'插入恰在今天'）",
+          h_after["latest"] == today, f"after={h_after}")
+    check("刷新后：stale_days 归 0", h_after["stale_days"] == 0, f"after={h_after}")
+    check("新鲜度时间戳确实前进（after > before）",
+          h_after["latest"] > h_before["latest"], f"before={h_before} after={h_after}")
     return check.failures
 
 
@@ -306,8 +388,9 @@ def test_upload_path_and_health():
 
 def run():
     failures = []
-    for t in (test_wiring_registered, test_rbac_gate,
-              test_on_demand_refresh, test_upload_path_and_health):
+    for t in (test_wiring_registered, test_rbac_gate, test_chat_tool_enum,
+              test_on_demand_refresh, test_freshness_advances,
+              test_upload_path_and_health):
         failures += t()
         print()
     if failures:
