@@ -50,6 +50,7 @@ run_workflow:
     - refresh_all_v2
     - wf2_products_v2
     - wf2_sales_v2
+    - wf2_sales_refresh_v2   # WS-21：按需销量刷新（现有 noon 订单 → 聚合 + 评级）
     - wf1_stock_v2
     - wf5_sales_cycle_v2
     - wf3_logistics_v2

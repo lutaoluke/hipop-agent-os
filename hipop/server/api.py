@@ -663,6 +663,13 @@ WORKFLOW_REGISTRY = {
         ],
         ["sales", "replenish"],
     ),
+    # WS-21：按需销量刷新 — 用现有 noon 订单重算窗口销量 + 评级/预测（不拉新 CSV/ERP）
+    "wf2_sales_refresh_v2": (
+        "按需销量刷新（现有 noon 订单 → 窗口聚合 + 评级/预测 → wf2_sku）",
+        [(1, "对每个有 noon 订单的 entity 重算 aggregate_sales_v2 + merge_entity_v2",
+          "workflows.wf_sales_static_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
     "wf1_stock_v2": (
         "ERP 库存（自动拉，per-tenant，国内+海外仓）",
         [(1, "拉所有仓库存 + 写 wf1_stock v2", "scripts.ingest_erp_stock_v2:run_v2")],

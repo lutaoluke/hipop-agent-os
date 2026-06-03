@@ -358,6 +358,67 @@ def _v_wf5(task_id, tenant_id, started_at, **kw):
     }
 
 
+@register("wf2_sales_refresh_v2")
+def _v_wf2_sales_refresh(task_id, tenant_id, started_at, **kw):
+    """按需销量刷新（WS-21）的验收 —— 用 PG/SQLite 真查 wf2_sku，证明
+    「现有 noon 订单 → 窗口聚合 → 评级」这条链真跑过、不是空过/死代码短路：
+
+      1. 接线证明：每个有 noon 订单（wf2_orders 里 partner_sku 出现过）的 SKU，
+         在 wf2_sku 必须落了 sales_grade（ABCD 之一）—— 评级 merge 真跑过、没漏。
+      2. 占位假数据闸门：有订单的 SKU 其 total_orders > 0 且 sales_grade 非 NULL，
+         否则 = 算了订单却没写评级（merge 漏接 / 死列）。
+
+    至少应有 1 个有订单的 SKU（否则该 tenant 根本没 noon 销量可刷，runner 空过）。
+    """
+    from hipop.server import data
+    data.set_current_tenant(tenant_id)
+
+    # 有 noon 订单的 SKU 总数（评级应覆盖的对象集合）
+    skus_with_orders = data._scalar(
+        "SELECT COUNT(*) FROM wf2_sku k WHERE k.tenant_id=? AND EXISTS ("
+        "  SELECT 1 FROM wf2_orders o WHERE o.tenant_id=k.tenant_id "
+        "  AND o.entity_alias=k.entity_alias AND o.partner_sku=k.partner_sku)",
+        (tenant_id,),
+    ) or 0
+
+    # 其中**漏评级**的（有订单却 sales_grade 为 NULL）—— 必须为 0
+    graded_missing = data._scalar(
+        "SELECT COUNT(*) FROM wf2_sku k WHERE k.tenant_id=? "
+        "AND (k.sales_grade IS NULL OR k.sales_grade='') AND EXISTS ("
+        "  SELECT 1 FROM wf2_orders o WHERE o.tenant_id=k.tenant_id "
+        "  AND o.entity_alias=k.entity_alias AND o.partner_sku=k.partner_sku)",
+        (tenant_id,),
+    ) or 0
+
+    # 有订单的 SKU 真落了 total_orders（聚合口径，钉占位假数据）
+    with_order_count = data._scalar(
+        "SELECT COUNT(*) FROM wf2_sku k WHERE k.tenant_id=? "
+        "AND COALESCE(k.total_orders,0) > 0 AND EXISTS ("
+        "  SELECT 1 FROM wf2_orders o WHERE o.tenant_id=k.tenant_id "
+        "  AND o.entity_alias=k.entity_alias AND o.partner_sku=k.partner_sku)",
+        (tenant_id,),
+    ) or 0
+
+    ok = skus_with_orders > 0 and graded_missing == 0 and with_order_count > 0
+    if ok:
+        verdict = (f"{skus_with_orders} 个有 noon 订单的 SKU 均已评级（sales_grade 非空）"
+                   f"、total_orders 已落库")
+    elif skus_with_orders == 0:
+        verdict = "0 个 SKU 有 noon 订单 — 按需刷新空过（无销量可刷/接线缺失）"
+    else:
+        verdict = (f"{graded_missing} 个有订单的 SKU 仍缺 sales_grade（评级没接上/死列）"
+                   if graded_missing else "有订单的 SKU 未落 total_orders（聚合没跑）")
+    return {
+        "ok": ok,
+        "evidence": {
+            "skus_with_orders": skus_with_orders,
+            "graded_missing": graded_missing,
+            "with_order_count": with_order_count,
+        },
+        "verdict": verdict,
+    }
+
+
 @register("wf3_logistics_v2")
 def _v_wf3(task_id, tenant_id, started_at, **kw):
     """物流采集 — 应该有 wf3_logistics_hub_v2 行 (至少 25% listed SKU)."""

@@ -206,3 +206,56 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
 
     conn.commit()
     return n
+
+
+def run_v2(tenant_id: int, conn=None, as_of=None) -> dict:
+    """按需 / 周期「销量刷新」编排（WS-21）。
+
+    对 tenant 下所有**已有 noon 订单**的 entity，重算窗口销量
+    (aggregate_sales_v2) + 合并 noon 视角契约字段 + 评级/预测 (merge_entity_v2)。
+
+    为什么单独有这个入口
+    --------------------
+    上传 noon CSV 走 api._run_pipeline_v2（CSV → ingest → aggregate → merge）；
+    但「不再上传新 CSV、只想用现有订单重刷一遍销量/评级」此前**没有任何注册入口**
+    （scheduler 的 refresh_all_v2 只拉 ERP 销量，从不重算 noon 聚合/评级）——
+    典型「接线缺失」：评级算法在、merge 在，却没人在按需/每周路径上调它。
+
+    本函数把「现有 wf2_orders → 窗口聚合 → 评级」这条链抽成一个可被
+    runner（按需 /run-workflow）与 refresh_all_v2（每周/每日 scheduler）共用的入口，
+    复用 upload pipeline 同一对函数 aggregate_sales_v2 / merge_entity_v2，
+    保证三条触发路径口径一致、不漂移。
+
+    conn 为 None 时自建连接（生产/runner 用）；传入则复用（测试/事务内用）。
+    """
+    from hipop.server import data as _data
+    try:
+        from hipop.scripts.ingest_noon_csv_v2 import aggregate_sales_v2
+    except ModuleNotFoundError:
+        from ingest_noon_csv_v2 import aggregate_sales_v2  # type: ignore
+
+    own = conn is None
+    if own:
+        _data.set_current_tenant(tenant_id)
+        conn = _data.conn()
+    try:
+        aliases = [
+            (r[0] if not isinstance(r, dict) else r["entity_alias"])
+            for r in conn.execute(
+                "SELECT DISTINCT entity_alias FROM wf2_orders WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchall()
+        ]
+        windows = 0
+        graded = 0
+        for alias in aliases:
+            windows += aggregate_sales_v2(tenant_id, alias, conn, as_of=as_of) or 0
+            graded += merge_entity_v2(tenant_id, alias, conn)
+        return {"entities": len(aliases), "windows_aggregated": windows,
+                "skus_graded": graded}
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
