@@ -8,6 +8,18 @@ staging 表 `wf1_asn_lines_staging` 的 DDL 写在代码里（ensure_staging_tab
 **不碰** CODEOWNERS 锁定的 db/schema*.sql。SQLite / PG 都用 CREATE TABLE
 IF NOT EXISTS，与 server.data._ensure_chat_table 同范式。
 
+本轮快照替换（避免历史残留 ASN 污染——验门人打回的洞）：
+- staging 不是历史累计账本，而是"**本次输入**的在途/送仓快照"。每次 run，
+  当某 `(source, entity_alias)` 第一次在本轮输入里出现时，先删掉该
+  `(tenant_id, source, entity_alias)` 的旧 staging 行，再灌本轮文件的行
+  （见 _process_file 的 `cleared` 参数）。
+- 这样昨天 Scheduled、今天文件里已消失或已 GRN Completed 的旧 ASN 不会留在
+  staging 里被 WS-11 继续算进 `pending_inbound_qty`；下游 `wf_sales_cycle.run_v2`
+  看到的就是本次快照口径，而不是 tenant 下 staging 全历史。
+- 删除按 `(tenant, source, entity_alias)` 精确收敛：本轮没碰到的 entity / source
+  原样保留（per-entity / per-source 各自独立刷新，互不影响）。同一轮多份文件喂
+  同一个 `(source, alias)` 时只在首次清一次，后续文件累加、不互删。
+
 签名：run_v2(tenant_id, noon_asn_file=None, erp_inbound_file=None, dry_run=False)
 
 两路输入（均按 partner_sku 对齐，平台 SKU 经 noon_sku_map 回 partner_sku）：
@@ -116,7 +128,27 @@ def _resolve_partner_sku(row, sku_map) -> tuple[str | None, str | None]:
     return None, noon_sku
 
 
-def _process_file(conn, tenant_id, path, source) -> dict:
+def _clear_snapshot(conn, tenant_id, source, alias) -> None:
+    """本轮快照替换：删掉该 (tenant, source, entity_alias) 的旧 staging 行。
+
+    在某 (source, alias) 本轮首次出现时调用一次，确保历史残留 ASN（已消失/
+    已完成的旧单）不会留在 staging 里被 WS-11 继续算进 pending_inbound_qty。
+    """
+    conn.execute(
+        f"DELETE FROM {STAGING_TABLE} "
+        f"WHERE tenant_id=? AND source=? AND entity_alias=?",
+        (tenant_id, source, alias),
+    )
+
+
+def _process_file(conn, tenant_id, path, source, cleared: set | None = None) -> dict:
+    """灌一份文件进 staging。
+
+    cleared: 本轮已做过快照替换的 (source, alias) 集合（跨同一轮多份文件共享），
+    None 时本函数自建一个（单文件调用语义不变）。每个 (source, alias) 本轮只清一次。
+    """
+    if cleared is None:
+        cleared = set()
     ent_cache: dict = {}
     sku_maps: dict[str, dict] = {}
     rows_in = written = unmapped = 0
@@ -144,6 +176,10 @@ def _process_file(conn, tenant_id, path, source) -> dict:
             if not (partner_sku and asn_number):
                 unmapped += 1
                 continue
+            # 本轮快照替换：该 (source, alias) 本轮首次写入前，先清掉旧 staging 行。
+            if (source, alias) not in cleared:
+                _clear_snapshot(conn, tenant_id, source, alias)
+                cleared.add((source, alias))
             conn.execute(sql, (
                 tenant_id, alias, source, asn_number, partner_sku, noon_sku,
                 safe_int(row.get("qty")),
@@ -188,12 +224,15 @@ def run_v2(tenant_id: int, noon_asn_file: str | None = None,
         ensure_staging_tables(conn)
         if dry_run:
             return result
+        # 本轮快照替换的去重集合：跨本轮所有文件共享，每个 (source, alias) 只清一次，
+        # 避免同一轮多份同 source 文件互相删掉对方刚灌进去的行。
+        cleared: set = set()
         for p in noon_files:
-            r = _process_file(conn, tenant_id, p, "noon_asn")
+            r = _process_file(conn, tenant_id, p, "noon_asn", cleared)
             result["noon_asn"] = {k: result["noon_asn"].get(k, 0) + v for k, v in r.items()}
             print(f"  noon_asn {os.path.basename(p)}: {r}", file=sys.stderr)
         for p in erp_files:
-            r = _process_file(conn, tenant_id, p, "erp_inbound")
+            r = _process_file(conn, tenant_id, p, "erp_inbound", cleared)
             result["erp_inbound"] = {k: result["erp_inbound"].get(k, 0) + v for k, v in r.items()}
             print(f"  erp_inbound {os.path.basename(p)}: {r}", file=sys.stderr)
     finally:

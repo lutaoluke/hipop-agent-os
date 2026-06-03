@@ -675,6 +675,13 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_noon_stock_csv_v2:run_v2")],
         ["sales", "replenish"],
     ),
+    # WS-11：ASN 送仓未上架 → wf1_stock.pending_inbound_qty（确定性状态规则）
+    "wf1_pending_inbound_v2": (
+        "送仓未上架（ASN 状态规则 → wf1_stock.pending_inbound_qty，供销售周期）",
+        [(1, "读 wf1_asn_lines_staging + 按状态计入 + 聚合 + 写 pending_inbound_qty",
+          "scripts.compute_pending_inbound_v2:run_v2")],
+        ["sales", "replenish"],
+    ),
     # WS-22：库存历史快照 — 按业务日冻结 wf1_stock → wf1_stock_history（供 WS-12 抽检）
     # spec 需带 {"as_of_date":"YYYY-MM-DD"}；走 runtime runner（spawn_task 传 spec）。
     "wf1_stock_snapshot_v2": (
