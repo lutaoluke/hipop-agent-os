@@ -159,6 +159,7 @@ def test_case11_stale_synonyms_pass():
         "这是陈旧的 noon 数据，仅供参考。",
         "数据较旧（5/5），结果偏保守。",
         "用的是旧数据（noon 5/5），ERP 今天。",
+        "noon 数据老旧（5/5），结果偏保守。",   # "老旧" 作数据陈旧（后接标点，非款/品）
     )
     for reply in legit:
         resp = {"reply": reply + " KSA 当前 20 个 SKU 需要补货：…",
@@ -187,6 +188,9 @@ def test_case11_non_stale_jiu_words_still_fail():
         "旧品 TBJ0059A 建议补 5 件，新品 SDA1874A 补 7 件。",
         "我看了数据，这些旧款 SKU 需要补货：SDA1874A 7 件。",      # 含"数据"但"旧款"非陈旧
         "参考旧链接里的清单，补 SDA1874A 7 件。",
+        "这些老旧款 SKU 里，SDA1874A 补 7 件、TBJ0059A 补 5 件。",  # 门2 三轮红队: 老旧款
+        "这些老旧产品里，SDA1874A 补 7 件、TBJ0059A 补 5 件。",     # 门2 三轮红队: 老旧产品
+        "我看了数据，这些老旧款式需要补货：SDA1874A 7 件。",        # 含"数据"但"老旧款"非陈旧
     )
     for reply in traps:
         resp = {"reply": reply, "tools_used": [], "workflow_task": None}
