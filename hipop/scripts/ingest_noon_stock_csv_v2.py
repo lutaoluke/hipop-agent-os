@@ -84,8 +84,26 @@ def _resolve_partner_sku(row, sku_map) -> str | None:
     return None
 
 
-def _aggregate(path, tenant_id):
-    """读 CSV → {entity_alias: {partner_sku: agg}}，并统计映射未命中行。"""
+def _iter_csv_rows(path):
+    """noon Inventory CSV → dict row 迭代器。
+
+    把 CSV 解析从聚合逻辑里抽出来：CSV 入口和 WS-N2 live fetcher 都产出
+    **同形 dict row**（键同 noon Inventory CSV 列），统一喂给 `_aggregate`，
+    避免 live 与 CSV 在聚合/落库口径上分叉。
+    """
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            yield row
+
+
+def _aggregate(rows, tenant_id):
+    """row 可迭代（CSV 解析行 / live fetcher 行，同形 dict）
+    → {entity_alias: {partner_sku: agg}}，并统计映射未命中行。
+
+    `rows` 是 dict 的可迭代对象（键同 noon Inventory CSV 列）；CSV 入口经
+    `_iter_csv_rows` 解析后喂这里，live 源直接喂同形 row，二者共用同一聚合 +
+    同一 `_upsert`，落库结果逐字段一致。
+    """
     bucket = defaultdict(lambda: defaultdict(lambda: {
         "noon_total_qty": 0,
         "noon_saleable_qty": 0,
@@ -98,41 +116,40 @@ def _aggregate(path, tenant_id):
     n_rows = 0
     n_unmapped = 0
 
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
-            n_rows += 1
-            country = (row.get("country_code") or "").strip().upper()
-            if not country:
-                continue
-            if country not in entities_by_country:
-                entities_by_country[country] = get_entity_by_country(tenant_id, country)
-            ent = entities_by_country[country]
-            if not ent:
-                continue  # 不在该 tenant 的销售主体白名单
-            alias = ent["alias"]
-            if alias not in sku_maps:
-                sku_maps[alias] = noon_sku_map(tenant_id, alias)
+    for row in rows:
+        n_rows += 1
+        country = (row.get("country_code") or "").strip().upper()
+        if not country:
+            continue
+        if country not in entities_by_country:
+            entities_by_country[country] = get_entity_by_country(tenant_id, country)
+        ent = entities_by_country[country]
+        if not ent:
+            continue  # 不在该 tenant 的销售主体白名单
+        alias = ent["alias"]
+        if alias not in sku_maps:
+            sku_maps[alias] = noon_sku_map(tenant_id, alias)
 
-            partner_sku = _resolve_partner_sku(row, sku_maps[alias])
-            if not partner_sku:
-                n_unmapped += 1
-                continue
+        partner_sku = _resolve_partner_sku(row, sku_maps[alias])
+        if not partner_sku:
+            n_unmapped += 1
+            continue
 
-            qty = safe_int(row.get("qty"))
-            inv_type = (row.get("inventory_type") or "").strip().lower()
-            agg = bucket[alias][partner_sku]
-            agg["noon_total_qty"] += qty
-            if inv_type in SALEABLE_TYPES:
-                agg["noon_saleable_qty"] += qty
-            else:
-                agg["noon_unsaleable_qty"] += qty
-            agg["warehouses"].append({
-                "warehouse_code": (row.get("warehouse_code") or "").strip(),
-                "qty": qty,
-                "inventory_type": inv_type,
-            })
-            if not agg["noon_sku"]:
-                agg["noon_sku"] = (row.get("noon_sku") or row.get("sku") or "").strip() or None
+        qty = safe_int(row.get("qty"))
+        inv_type = (row.get("inventory_type") or "").strip().lower()
+        agg = bucket[alias][partner_sku]
+        agg["noon_total_qty"] += qty
+        if inv_type in SALEABLE_TYPES:
+            agg["noon_saleable_qty"] += qty
+        else:
+            agg["noon_unsaleable_qty"] += qty
+        agg["warehouses"].append({
+            "warehouse_code": (row.get("warehouse_code") or "").strip(),
+            "qty": qty,
+            "inventory_type": inv_type,
+        })
+        if not agg["noon_sku"]:
+            agg["noon_sku"] = (row.get("noon_sku") or row.get("sku") or "").strip() or None
 
     return bucket, n_rows, n_unmapped
 
@@ -188,7 +205,9 @@ def run_v2(tenant_id: int, file: str | None = None,
     by_alias: dict[str, int] = {}
     try:
         for path in files:
-            bucket, n_rows, n_unmapped = _aggregate(path, tenant_id)
+            # CSV 生产路径也走 row 接口：解析成同形 dict row 后喂同一个
+            # `_aggregate`，与 live 源共用归一化 + `_upsert`（不分叉）。
+            bucket, n_rows, n_unmapped = _aggregate(_iter_csv_rows(path), tenant_id)
             total_rows += n_rows
             total_unmapped += n_unmapped
             print(f"  {os.path.basename(path)}: {n_rows} rows, "
