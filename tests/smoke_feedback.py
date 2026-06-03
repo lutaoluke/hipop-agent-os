@@ -116,20 +116,52 @@ def test_offer_not_repeated_after_capture():
     assert out == r, "已经记过需求了不该再 offer"
 
 
+def _role_bypasses_rls(data) -> bool:
+    """当前 PG 连接角色是否无条件绕过 RLS（superuser 或 BYPASSRLS）。
+
+    docker postgres 的 POSTGRES_USER 默认是 **superuser**（CI 正是如此），superuser
+    无条件 bypass RLS —— `FORCE ROW LEVEL SECURITY` 也拦不住。本机 hipop 是普通角色，
+    RLS 生效。故 RLS 兜底只在角色确实受约束时断言，避免本地/CI 环境分叉假红。
+    """
+    rows = data._fetch(
+        "SELECT (rolsuper OR rolbypassrls) AS bypass FROM pg_roles WHERE rolname=current_user"
+    )
+    return bool(rows and rows[0].get("bypass"))
+
+
 def test_feedback_tenant_isolation():
-    """红队·越权串租户：tenant=2 写的需求，tenant=1 查不到。"""
+    """红队·越权串租户：tenant=1 经**应用读路径**查不到 tenant=2 的需求。
+
+    真正的隔离保证是应用层每条读路径都带 `WHERE tenant_id=?`（get_feedback /
+    count_feedback / GET /api/feedback 都带），SQLite / 普通 PG / superuser PG 都成立，
+    不依赖 RLS（与仓库既有口径一致：'SQLite 无 RLS，多租户隔离靠 ORM 层显式 WHERE
+    tenant_id'）。RLS（FORCE+policy）是 PG 生产侧的额外兜底，仅在角色受约束时可断言。
+    """
     from hipop.server import agent, data
+    marker = "ONLY-TENANT-2-NEEDS [smoke-marker-WS26]"
     # tenant 2 写一条
     _set_chat_ctx(tid=2)
-    marker = "ONLY-TENANT-2-NEEDS [smoke-marker-WS26]"
     res2 = agent.tool_capture_feedback(content=marker, category="需求")
     assert res2.get("ok") is True, f"tenant=2 应能写自己的 feedback: {res2}"
-    # tenant 1 视角查不到 tenant 2 的需求
+
+    # ① 主保证（env 无关）：tenant=1 经 app 读路径 get_feedback 查不到 tenant=2 的
     _set_chat_ctx(tid=1)
-    leaked = data._fetch(
-        "SELECT id FROM feedback WHERE content=?", (marker,)
-    )
-    assert leaked == [], f"tenant=1 串到了 tenant=2 的需求（RLS 失效）: {leaked}"
+    t1 = data.get_feedback(tenant_id=1, limit=500)
+    assert all(marker not in (r.get("content") or "") for r in t1), \
+        "tenant=1 经 get_feedback 串到了 tenant=2 的需求（应用层 tenant 过滤失效）"
+
+    # ② 隔离不能把数据弄丢：tenant=2 自己读得到刚写的
+    _set_chat_ctx(tid=2)
+    t2 = data.get_feedback(tenant_id=2, limit=500)
+    assert any(marker in (r.get("content") or "") for r in t2), \
+        "tenant=2 读不到自己刚写的需求（过度隔离 / 写丢了）"
+
+    # ③ PG 生产兜底：角色受 RLS 约束时（非 superuser），裸查（无 WHERE tenant）也必须被
+    #    policy 挡住。CI 的 hipop 是 superuser → 跳过此层（已在 ① 用 app 路径钉死隔离）。
+    if data.is_postgres() and not _role_bypasses_rls(data):
+        _set_chat_ctx(tid=1)
+        leaked = data._fetch("SELECT id FROM feedback WHERE content=?", (marker,))
+        assert leaked == [], f"非 superuser PG 下 RLS 兜底失效，裸查串租户: {leaked}"
 
 
 def _cleanup_markers():
