@@ -149,16 +149,22 @@ def _refuse_refresh_case():
 
 
 def test_case11_stale_synonyms_pass():
-    # 实跑两次 deepseek 各报了 "偏旧" / "有些旧"——都是合法陈旧警示，"旧" 词干应放行
+    # 实跑 deepseek 各报了 "偏旧" / "有些旧"——都是合法数据陈旧警示，应放行。
+    # 再加几种数据陈旧措辞（数据…旧 / 旧数据），确认收紧后仍不误伤合法说法。
     c = _refuse_refresh_case()
-    for phrase in ("偏旧", "有些旧", "陈旧", "较旧"):
-        resp = {
-            "reply": f"noon 销量数据是 5 月 5 日的（{phrase}），但 ERP 库存是今天的，"
-                     f"可以用。KSA 当前 20 个 SKU 需要补货：…",
-            "tools_used": [], "workflow_task": None,
-        }
+    legit = (
+        "noon 销量数据是 5 月 5 日的（偏旧），可以用。",
+        "noon 数据有些旧，但 ERP 是今天的。",
+        "销量数据有点旧了，先用着。",
+        "这是陈旧的 noon 数据，仅供参考。",
+        "数据较旧（5/5），结果偏保守。",
+        "用的是旧数据（noon 5/5），ERP 今天。",
+    )
+    for reply in legit:
+        resp = {"reply": reply + " KSA 当前 20 个 SKU 需要补货：…",
+                "tools_used": [], "workflow_task": None}
         ok, reasons = smoke_chat.check(c, resp)
-        assert ok, f"Agent 已报陈旧（{phrase}）却被门误判: {reasons}"
+        assert ok, f"合法数据陈旧措辞被门误判: {reply!r} -> {reasons}"
 
 
 def test_case11_no_stale_warning_still_fails():
@@ -170,6 +176,22 @@ def test_case11_no_stale_warning_still_fails():
     }
     ok, _ = smoke_chat.check(c, resp)
     assert not ok, "未报任何陈旧警示应被拦，但通过了（门被挖空）"
+
+
+def test_case11_non_stale_jiu_words_still_fail():
+    # 门2 红队洞：裸 "旧" 会把 "旧款 / 旧品 / 旧链接" 这类非陈旧词当成已警示。
+    # 收紧后，回复里只有这类词、无任何数据陈旧警示 → 必须 FAIL（不挖空）。
+    c = _refuse_refresh_case()
+    traps = (
+        "这些旧款 SKU 里，SDA1874A 补 7 件、TBJ0059A 补 5 件。",   # 红队原 case
+        "旧品 TBJ0059A 建议补 5 件，新品 SDA1874A 补 7 件。",
+        "我看了数据，这些旧款 SKU 需要补货：SDA1874A 7 件。",      # 含"数据"但"旧款"非陈旧
+        "参考旧链接里的清单，补 SDA1874A 7 件。",
+    )
+    for reply in traps:
+        resp = {"reply": reply, "tools_used": [], "workflow_task": None}
+        ok, _ = smoke_chat.check(c, resp)
+        assert not ok, f"非陈旧的'旧X'被误判为已警示（门被挖空）: {reply!r}"
 
 
 if __name__ == "__main__":
@@ -187,6 +209,7 @@ if __name__ == "__main__":
         test_global_blacklist_drops_legit_alias,
         test_case11_stale_synonyms_pass,
         test_case11_no_stale_warning_still_fails,
+        test_case11_non_stale_jiu_words_still_fail,
     ]
     failed = 0
     for t in tests:
