@@ -64,17 +64,26 @@ class LiveSourceUnavailable(Exception):
 # **同形 dict row**（键同 noon Inventory CSV 列：country_code / sku|noon_sku|
 # partner_sku / warehouse_code / qty / inventory_type）。本任务不猜 WS-N2 字段，
 # 只定 row 形状契约（与 WS-N3.1 一致）；未注册（WS-N2 未 land）→ run_live 回落 CSV。
-_LIVE_ROW_PRODUCER = None
+#
+# WS-34 收口（单一来源）：my_inventory 的 producer 注册表 = noon_live_contract
+# 的统一注册表，**不**再各持一份。stock runner 这里的 set/get 是它的 my_inventory
+# 视图，与 noon_live_contract.set_live_row_producer(MY_INVENTORY, fn) 写读同一处。
+# 这样「在 contract 注册 / 在 stock 注册」两个方向看到的是同一真相，
+# missing_live_producers()/assert_live_producers_ready() 也据此判定，杜绝两套真相。
+import noon_live_contract as _contract  # noqa: E402  （scripts 同级模块，同 sales_entity_v2 导入方式）
 
 
 def set_live_row_producer(fn):
-    """注册 noon live row producer（WS-N2 接入点）。传 None 清除。"""
-    global _LIVE_ROW_PRODUCER
-    _LIVE_ROW_PRODUCER = fn
+    """注册 noon my_inventory live row producer（WS-N2 接入点）。传 None 清除。
+
+    单一来源 = noon_live_contract 的 my_inventory 注册表，避免 stock 与 contract
+    各持一份导致「统一 producer 接口」漂成两套真相。
+    """
+    _contract.set_live_row_producer(_contract.MY_INVENTORY, fn)
 
 
 def get_live_row_producer():
-    return _LIVE_ROW_PRODUCER
+    return _contract.get_live_row_producer(_contract.MY_INVENTORY)
 
 
 def safe_int(v):

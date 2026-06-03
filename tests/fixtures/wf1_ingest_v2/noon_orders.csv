@@ -1,0 +1,6 @@
+partner_sku,sku,item_nr,order_timestamp,status,fulfillment_model,offer_price,gmv_lcy,currency_code,dest_country
+SKU-A,ZSA001,IT100,2026-05-30 10:00:00,delivered,fbn,50.00,55.00,SAR,SA
+SKU-A,ZSA001,IT101,2026-05-30 11:00:00,cancelled,fbn,50.00,55.00,SAR,SA
+SKU-B,ZSA002,IT102,2026-05-31 09:00:00,delivered,fbn,30.00,33.00,SAR,SA
+SKU-B,ZSA002,IT103,2026-05-31 12:00:00,returned,fbn,30.00,33.00,SAR,SA
+SKU-C,ZAE001,IT104,2026-05-31 13:00:00,delivered,fbm,80.00,88.00,AED,AE
