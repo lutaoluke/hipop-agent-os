@@ -37,6 +37,12 @@ def list_runners() -> list[str]:
     return list(_RUNNERS.keys())
 
 
+# 生产入口加载即接线 noon live row producers（import 副作用，单一收口）。worker/api 运行任何
+# workflow 都会 import 本模块 → 连带加载 live_producers → 已就绪抓取器（WS-58 订单）的 live
+# producer 自动注册，run_live 默认走真抓取器、不再回落 CSV。详见 live_producers 模块。
+from . import live_producers as _live_producers  # noqa: E402,F401
+
+
 # ──────────────────────────────────────────────────────────────
 # 具体 runners — 逐个把 WORKFLOW_REGISTRY 里的 v2 workflow 接进来
 # ──────────────────────────────────────────────────────────────
