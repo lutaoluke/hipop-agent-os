@@ -47,8 +47,10 @@
         <tr>
           <th style="width:140px;">SKU</th>
           <th>商品</th>
+          <th style="width:64px;">售卖形式</th>
           <th style="width:80px;">趋势</th>
           <th style="width:80px;text-align:right;">利润率</th>
+          <th style="width:70px;text-align:right;">退货率</th>
           <th style="width:80px;text-align:right;">7日均销</th>
           <th style="width:90px;text-align:right;">可撑天数</th>
           <th style="width:80px;text-align:right;">在途</th>
@@ -61,12 +63,17 @@
           <tr>
             <td><b x-text="r.partner_sku"></b><br><span style="font-size:10px;color:var(--text-tertiary);" x-text="r.sales_grade || ''"></span></td>
             <td><div style="max-width:240px;font-size:12px;" x-text="(r.title || '').slice(0, 50)"></div></td>
+            <td><span style="font-size:11px;" x-text="r.fulfillment || '—'"></span></td>
             <td>
               <span class="pc-pill" :class="trendClass(r.trend)" x-text="r.trend || '—'"></span>
             </td>
             <td style="text-align:right;">
               <span :style="r.profit_rate < 10 ? 'color:var(--text-danger);font-weight:600;' : ''"
                     x-text="r.profit_rate !== null ? (r.profit_rate.toFixed(1) + '%') : '—'"></span>
+            </td>
+            <td style="text-align:right;">
+              <span :style="(r.return_rate != null && r.return_rate > 0.1) ? 'color:var(--text-danger);font-weight:600;' : ''"
+                    x-text="r.return_rate != null ? (r.return_rate * 100).toFixed(1) + '%' : '—'"></span>
             </td>
             <td style="text-align:right;" x-text="r.daily_rate !== null ? r.daily_rate.toFixed(1) : '—'"></td>
             <td style="text-align:right;">

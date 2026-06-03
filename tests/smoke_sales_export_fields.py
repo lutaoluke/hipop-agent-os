@@ -39,7 +39,7 @@ os.environ.pop("DB_URL", None)
 TID = 7                  # 主租户
 OTHER_TID = 99           # 越权对照租户
 ALIAS = "smoke_ksa"
-STORE = "SA"             # _resolve_entity_alias: SA → country SA
+STORE = "KSA"            # KSA → country SA（agent / data 两个 resolver 都认 KSA）
 
 _TMP = []
 
@@ -223,6 +223,36 @@ def run():
     check("销量评级 非空", bool(r.get("销量评级")), f"got {r.get('销量评级')!r}")
     check("10天预测 非空", r.get("10天预测") is not None, f"got {r.get('10天预测')!r}")
     check("30天预测 非空", r.get("30天预测") is not None, f"got {r.get('30天预测')!r}")
+
+    # ── 4. API 面（/api/sku-health 走的 data.get_sku_health）同源同字段 ──
+    #    证明 export 与 API 消费同一 v2 读取器 sales_output_rows（接线缺失死法守门）。
+    print("[api /sku-health]")
+    health = data.get_sku_health(STORE, urgency=None, limit=500, listing="all")
+    hh = [x for x in health if x.get("partner_sku") == "PSK-1"]
+    check("API 仅返主租户 SKU（越权不串）",
+          len(health) == 1 and len(hh) == 1,
+          f"len={len(health)} match={len(hh)}")
+    if hh:
+        h = hh[0]
+        # 全部输出字段（spec 的 key）都在 API 响应里，且值与 export 行一致（同源）
+        missing_api = [k for k, _hdr, _s in data.SALES_OUTPUT_SPEC if k not in h]
+        check("API 响应含全部输出字段 key",
+              not missing_api, f"missing={missing_api}")
+        check("API.国别==SA", h.get("country") == "SA", f"got {h.get('country')!r}")
+        check("API.订单号==ORD-A,ORD-B（同 export）",
+              h.get("order_no") == "ORD-A,ORD-B", f"got {h.get('order_no')!r}")
+        check("API.最新成交价==110（同源 wf2_orders）",
+              _approx(h.get("latest_customer_paid"), 110.0),
+              f"got {h.get('latest_customer_paid')!r}")
+        check("API.异常标记==price_mismatch", h.get("anomalies") == "price_mismatch",
+              f"got {h.get('anomalies')!r}")
+        check("API.总销售额==200", _approx(h.get("total_revenue"), 200.0),
+              f"got {h.get('total_revenue')!r}")
+        check("API.近120天销量==6", h.get("sales_120d") == 6, f"got {h.get('sales_120d')!r}")
+        # 与导出行对齐：同一字段两个面取值一致 = 同源铁证
+        check("API.商品最新售价 == export(100)",
+              _approx(h.get("latest_price"), r.get("商品最新售价")),
+              f"api={h.get('latest_price')!r} export={r.get('商品最新售价')!r}")
 
     return check.failures
 
