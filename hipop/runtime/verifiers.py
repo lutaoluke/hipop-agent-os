@@ -14,6 +14,7 @@ verify 结果会进 task.result_summary，FAIL 时 task.state = 'done_unverified
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Callable, Optional
 
@@ -46,6 +47,37 @@ def run_verifier(workflow: str, task_id: str, tenant_id: int, started_at: float)
 def _started_at_iso(epoch: float) -> str:
     """epoch → 'YYYY-MM-DD HH:MM:SS'（PG 比较用）"""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+# noon live ingest 数据新鲜度阈值（小时）。仓库此前无 noon 新鲜度先例，给默认
+# 26h（noon live 至少每日刷一次，留 ~2h 余量）。**可配置点**（优先级 高→低）：
+#   1. 调用方/测试显式传 max_age_hours（测试可控默认值）
+#   2. 环境变量 HIPOP_NOON_FRESHNESS_MAX_HOURS（运行参数）
+#   3. config/hipop.json → verifiers.noon_freshness_max_hours（配置）
+#   4. 本默认常量
+# 这是确定性 verifier 参数，**绝不写进 SYSTEM_PROMPT / skill** —— 改阈值改这里/配置，
+# 不靠 prompt 规则。
+DEFAULT_NOON_FRESHNESS_MAX_HOURS = 26.0
+
+
+def _noon_freshness_max_hours(override=None) -> float:
+    """解析 noon 新鲜度阈值（小时）。见 DEFAULT_NOON_FRESHNESS_MAX_HOURS 的优先级注释。"""
+    if override is not None:
+        return float(override)
+    env = os.environ.get("HIPOP_NOON_FRESHNESS_MAX_HOURS")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    try:
+        from hipop.scripts._config import load_config
+        cfg = (load_config().get("verifiers") or {}).get("noon_freshness_max_hours")
+        if cfg is not None:
+            return float(cfg)
+    except Exception:
+        pass
+    return DEFAULT_NOON_FRESHNESS_MAX_HOURS
 
 
 # ──────────────────────────────────────────────────────────────
@@ -115,6 +147,89 @@ def _v_wf1_stock(task_id, tenant_id, started_at, **kw):
         "ok": ok,
         "evidence": {"rows_updated_this_run": rows},
         "verdict": f"{rows} rows updated" if ok else "0 rows — ERP 库存接口可能没拉到",
+    }
+
+
+@register("noon_live_ingest")
+def _v_noon_live_ingest(task_id, tenant_id, started_at, max_age_hours=None, **kw):
+    """Noon live ingest（WS-N3.2 runner）跑完的验收 —— 用 PG/SQLite 真查 wf1_stock，
+    钉死三类坏数据，证明「live 行 → 同一 ingest 落库 → 消费端可读」的数据链是通的：
+
+      1. 数据一致性：noon_saleable_qty <= noon_total_qty（可售不可能超过总量）。
+      2. 数据新鲜度：有 noon 数据的行 updated_at 不得早于 now - N 小时（N 见
+         `_noon_freshness_max_hours`，来自配置/运行参数/测试可控默认，**不写进 prompt**）。
+         live 跑完所有 noon 行刚被重写 → 天然新鲜；过旧 = ingest 没真刷 / 死代码短路。
+      3. pending 非 NULL：**已知 SKU**（在 wf2_sku 里）且有 noon 数据的行，其
+         pending_inbound_qty 必须非 NULL —— 否则消费端 wf_sales_cycle.read_sales_v2 的
+         `immediate = noon_saleable + pending_inbound` 会静默把 NULL 当 0，
+         即时可售口径少算「送仓未上架」(占位假数据 / 接线缺失死法)。
+
+    另要求本 run 至少写了 1 行 noon 数据（updated_at >= started_at），证明 runner 真跑过、
+    不是空过冒充成功。max_age_hours 仅供测试覆写新鲜度阈值（验阈值是参数、非写死）。
+    """
+    from hipop.server import data
+    data.set_current_tenant(tenant_id)
+    run_cutoff = _started_at_iso(started_at)
+    max_hours = _noon_freshness_max_hours(max_age_hours)
+    stale_cutoff = _started_at_iso(time.time() - max_hours * 3600.0)
+
+    # 本 run 至少写了 noon 行（runner 真跑过，不是 0 行空过）
+    rows_this_run = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? "
+        "AND noon_total_qty IS NOT NULL AND updated_at >= ?",
+        (tenant_id, run_cutoff),
+    ) or 0
+
+    # 断言 1：noon_saleable_qty <= noon_total_qty（违反 = 坏数据，逐行 SQL 真比对）
+    saleable_gt_total = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? "
+        "AND noon_total_qty IS NOT NULL AND noon_saleable_qty IS NOT NULL "
+        "AND noon_saleable_qty > noon_total_qty",
+        (tenant_id,),
+    ) or 0
+
+    # 断言 2：noon 数据新鲜度 —— 有 noon 数据的行 updated_at 不得早于 now - N 小时
+    stale = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? "
+        "AND noon_total_qty IS NOT NULL AND (updated_at IS NULL OR updated_at < ?)",
+        (tenant_id, stale_cutoff),
+    ) or 0
+
+    # 断言 3：已知 SKU（在 wf2_sku）且有 noon 数据 → pending_inbound_qty 非 NULL
+    pending_null = data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock s WHERE s.tenant_id=? "
+        "AND s.noon_total_qty IS NOT NULL AND s.pending_inbound_qty IS NULL "
+        "AND EXISTS (SELECT 1 FROM wf2_sku k WHERE k.tenant_id=s.tenant_id "
+        "  AND k.entity_alias=s.entity_alias AND k.partner_sku=s.partner_sku)",
+        (tenant_id,),
+    ) or 0
+
+    ok = (rows_this_run > 0 and saleable_gt_total == 0
+          and stale == 0 and pending_null == 0)
+    if ok:
+        verdict = (f"{rows_this_run} 行 noon live 落库：saleable<=total、{max_hours:g}h 内新鲜、"
+                   f"已知 SKU pending 非 NULL（消费端 immediate 可读）")
+    elif rows_this_run == 0:
+        verdict = "0 行 noon 数据本 run 写入 — live ingest 没接上/空过"
+    else:
+        bad = []
+        if saleable_gt_total:
+            bad.append(f"{saleable_gt_total} 行 saleable>total")
+        if stale:
+            bad.append(f"{stale} 行 updated_at 超 {max_hours:g}h 未刷新")
+        if pending_null:
+            bad.append(f"{pending_null} 行已知 SKU pending_inbound_qty 仍为 NULL")
+        verdict = "坏数据被拦：" + "；".join(bad)
+    return {
+        "ok": ok,
+        "evidence": {
+            "rows_this_run": rows_this_run,
+            "saleable_gt_total": saleable_gt_total,
+            "stale_rows": stale,
+            "pending_null_known_sku": pending_null,
+            "freshness_max_hours": max_hours,
+        },
+        "verdict": verdict,
     }
 
 
