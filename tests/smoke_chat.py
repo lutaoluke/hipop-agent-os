@@ -65,19 +65,26 @@ CASES: List[Case] = [
             "数据.{0,15}全部.{0,15}是.{0,15}今天",
         ],
     ),
-    # ─── 商品总数（核心：真数 1418/1788/688）───
+    # ─── 商品总数（核心：真数）───
+    # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
+    # source of truth（PG，与 list_products 同口径）：
+    #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
+    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1798 /
+    #   listed_sku 1046 / unlisted_sku 752 / listed_prod 950 / unlisted_prod 494，
+    #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
+    #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
     Case(
-        name="商品总数（要 1418 product / 1788 SKU）",
+        name="商品总数（要 1424 product / 1798 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?418", r"1[,，]?788"],
+        must_contain=[r"1[,，]?424", r"1[,，]?798"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1046/742 或 product 维度 950/488）",
+        name="商品总数 + 上架未上架细分（SKU 维度 1046/752 或 product 维度 950/494）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        # 1418 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
-        must_contain=[r"1[,，]?418", r"1[,，]?046|742|950|488"],
+        # 1424 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
+        must_contain=[r"1[,，]?424", r"1[,，]?046|752|950|494"],
     ),
     # ─── 概览类 ───
     Case(
@@ -113,13 +120,19 @@ CASES: List[Case] = [
     ),
     # ─── 门控 tool（必须真调，不能编结果）───
     Case(
-        name="导出表格（必走 export_table，不能编 Excel 链接）",
+        # 防伪造的真正关口 = must_use_tools=["export_table"]（必须真调到工具）。
+        # export_table 真生成 xlsx 后返回相对下载链接 /api/download/<file>.xlsx，
+        # SYSTEM_PROMPT 要求 Agent 用 [文件名](download_url) markdown 渲染给用户——
+        # 所以**真实导出形态就含 .xlsx 链接**，旧的"禁 .xlsx 链接"断言与产品口径冲突。
+        # 改为正向断言真实导出形态（必含 /api/download/...xlsx 这个工具真产物路径），
+        # 同时保留"无 tool 凭空宣称已生成 Excel"的伪造守卫——不删关口、是收紧。
+        name="导出表格（必走 export_table，必含真实 /api/download xlsx 链接）",
         question="给我个补货表格 Excel 下载",
         must_use_tools=["export_table"],
+        must_contain=[r"/api/download/\S*\.xlsx"],   # 真实工具产物链接，非编造
         must_not_contain=[
-            "已为你生成.*Excel",
-            r"https?://[^\s)]*\.xlsx",
-            r"下载链接.*https?://",
+            "已为你生成.*Excel",          # 没真调工具不能这么宣称
+            r"下载链接.*https?://",        # 别贴一个凭空编的外链
         ],
     ),
     Case(
