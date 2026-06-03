@@ -157,6 +157,22 @@ def format_table(table: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def run_workflow_step(tenant_id: int = 1) -> List[dict]:
+    """WORKFLOW_REGISTRY 触发入口（runner 解析后调的就是这个 callable）。
+
+    把入口接上**真实触发面**：UI/chat/scheduler 经 `/run-workflow` → runner
+    `_resolve_callable("hipop.replenishment.workflow:run_workflow_step")` → 调到这里，
+    而不是只能单跑 CLI/smoke。证明算法在真实执行路径上被调到（防「接线缺失」死法）。
+
+    本圈只吃静态夹具（不接实时 ERP 拉数，见需求「不在本圈范围」），所以这里跑
+    内置数据集夹具走完整链：三类静态数据 → join → **步骤2 算法 compute_many** → 补货表。
+    接 `tenant_id` 只为兼容 runner 的传参探测；本圈静态数据不分租户，故未消费。
+    """
+    table = replenish_from_dataset_dir()
+    print(format_table(table))
+    return table
+
+
 def main(dataset_dir: str = DEFAULT_DATASET_DIR) -> List[dict]:
     table = replenish_from_dataset_dir(dataset_dir)
     print(format_table(table))
