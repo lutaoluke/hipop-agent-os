@@ -1,0 +1,7 @@
+[
+  {"country_code": "SA", "sku": "ZSA001", "warehouse_code": "whA", "qty": 10, "inventory_type": "saleable"},
+  {"country_code": "SA", "sku": "ZSA001", "warehouse_code": "whB", "qty": 5, "inventory_type": "unsaleable"},
+  {"country_code": "SA", "sku": "ZSA002", "warehouse_code": "whA", "qty": 20, "inventory_type": "saleable"},
+  {"country_code": "AE", "sku": "ZAE001", "warehouse_code": "whC", "qty": 7, "inventory_type": "saleable"},
+  {"country_code": "AE", "sku": "ZAE001", "warehouse_code": "whC", "qty": 3, "inventory_type": "unsaleable"}
+]

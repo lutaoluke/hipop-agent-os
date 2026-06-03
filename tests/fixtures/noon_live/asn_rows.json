@@ -1,0 +1,5 @@
+[
+  {"asn_number": "ASN-SA-7001", "partner_sku": "TBB0116A", "sku": "ZSA001", "qty": 100, "status": "in_transit", "country_code": "SA"},
+  {"asn_number": "ASN-SA-7001", "partner_sku": "TBB0220C", "sku": "ZSA002", "qty": 50, "status": "in_transit", "country_code": "SA"},
+  {"asn_number": "ASN-AE-9002", "partner_sku": "TBE0331D", "sku": "ZAE001", "qty": 30, "status": "received", "entity_alias": "hipop_uae"}
+]

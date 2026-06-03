@@ -1,0 +1,6 @@
+[
+  {"partner_sku": "TBB0116A", "sku": "ZSA001", "item_nr": "ORD-1001", "order_timestamp": "2026-05-30 10:15:00", "status": "delivered", "fulfillment_model": "FBN", "offer_price": "120.00 SAR", "gmv_lcy": "138.00 SAR", "currency_code": "SAR", "dest_country": "SA"},
+  {"partner_sku": "TBB0116A", "sku": "ZSA001", "item_nr": "ORD-1002", "order_timestamp": "2026-05-31 09:00:00", "status": "cancelled", "fulfillment_model": "FBN", "offer_price": "120.00 SAR", "gmv_lcy": "0.00 SAR", "currency_code": "SAR", "dest_country": "SA"},
+  {"partner_sku": "TBB0220C", "sku": "ZSA002", "item_nr": "ORD-1003", "order_timestamp": "2026-05-31 14:30:00", "status": "delivered", "fulfillment_model": "FBP", "offer_price": "85.50 SAR", "gmv_lcy": "98.30 SAR", "currency_code": "SAR", "dest_country": "SA"},
+  {"partner_sku": "TBE0331D", "sku": "ZAE001", "item_nr": "ORD-2001", "order_timestamp": "2026-05-29 18:45:00", "status": "customer initiated returns", "fulfillment_model": "FBN", "offer_price": "60.00 AED", "gmv_lcy": "69.00 AED", "currency_code": "AED", "dest_country": "AE"}
+]
