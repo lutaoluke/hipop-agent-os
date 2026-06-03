@@ -30,29 +30,71 @@ except ModuleNotFoundError:
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "hipop.db")
 
 
+# 价格差异判异阈值：相对差 >5% 且绝对差 >1 才算 price_mismatch。
+PRICE_MISMATCH_REL = 0.05
+PRICE_MISMATCH_ABS = 1.0
+
+
 def detect_anomalies(rec, noon_view):
     """
-    异常分两类：
-      1. noon 无该 SKU 订单：type=no_noon_orders（说明 noon CSV 不全或 SKU 已下架）
-      2. noon 有但跟 ERP 价格差异 >5%：type=price_mismatch
-    （销量 total_orders 不再对比，因为 ERP 字段含义是累计，跟 noon 时段窗口本就不可比）
+    noon vs ERP 异常检测（确定性规则，纯函数，供两条生产路径复用）。
+
+    异常分三类，全部写成**结构化字段**而非自由文案，便于看板/导出/下游消费：
+      1. no_noon_orders —— ERP 显示有动销（sales_180d>0）但 noon CSV 无该 SKU 订单。
+                           说明 noon 导出不全或 SKU 已下架。
+      2. price_mismatch —— noon 最新价 vs ERP 最新价相对差 >5%（且绝对差 >1）。
+      3. noon_only      —— noon CSV 里有该 SKU 订单，但 ERP 商品库无对应记录
+                           （erp_sku_id 为空）→ 漏建档 / 选品外采，需人工确认。
+
+    每条异常统一带：type / field / noon / erp / diff / source_window，
+    （销量窗口口径差异默认不比：ERP sales_* 是累计含义，与 noon 时段窗口本不可比；
+      若业务确认要比，须另起独立规则 + smoke，见 issue WS-18，不在此偷偷加。）
     """
     anomalies = []
+
+    # —— 1. noon 无该 SKU 订单 ——
     if not noon_view:
-        if (rec.get("sales_180d") or 0) > 0:
-            anomalies.append({"type": "no_noon_orders",
-                              "note": "ERP 显示有动销但 noon CSV 中无订单，建议补 noon 导出"})
+        erp_sales = rec.get("sales_180d") or 0
+        if erp_sales > 0:
+            anomalies.append({
+                "type": "no_noon_orders",
+                "field": "sales_180d",
+                "noon": 0,
+                "erp": erp_sales,
+                "diff": erp_sales,
+                "source_window": "sales_180d",
+                "note": "ERP 显示有动销但 noon CSV 中无订单，建议补 noon 导出",
+            })
         return anomalies
 
+    # —— 2. noon 有订单但 ERP 商品库无对应记录（noon-only）——
+    if not rec.get("erp_sku_id"):
+        n_orders = noon_view.get("total_orders") or 0
+        anomalies.append({
+            "type": "noon_only",
+            "field": "erp_sku_id",
+            "noon": n_orders,
+            "erp": None,
+            "diff": None,
+            "source_window": "all_orders",
+            "note": "noon 有订单但 ERP 商品库无此 SKU，建议补建档或确认外采",
+        })
+
+    # —— 3. noon 价 vs ERP 价差异 ——
     e_price = rec.get("latest_price")
     n_price = noon_view.get("latest_price")
     if e_price and n_price:
         diff = abs(e_price - n_price)
         base = max(abs(e_price), abs(n_price), 1)
-        if diff > 1 and diff / base > 0.05:
-            anomalies.append({"type": "price_mismatch",
-                              "field": "latest_price",
-                              "noon": n_price, "erp": e_price})
+        if diff > PRICE_MISMATCH_ABS and diff / base > PRICE_MISMATCH_REL:
+            anomalies.append({
+                "type": "price_mismatch",
+                "field": "latest_price",
+                "noon": n_price,
+                "erp": e_price,
+                "diff": round(diff, 4),
+                "source_window": "latest_order",
+            })
     return anomalies
 
 

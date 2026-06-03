@@ -237,6 +237,15 @@ def test_contract():
     check("anomalies 含 price_mismatch(noon=150,erp=200)",
           len(pm) == 1 and _approx(pm[0].get("noon"), 150.0)
           and _approx(pm[0].get("erp"), 200.0), f"got {anb!r}")
+    # 结构化字段必须明确写入（field / diff / source_window），不止 noon/erp
+    check("price_mismatch.field==latest_price",
+          pm and pm[0].get("field") == "latest_price",
+          f"got {pm[0].get('field') if pm else None!r}")
+    check("price_mismatch.diff==50.0", pm and _approx(pm[0].get("diff"), 50.0),
+          f"got {pm[0].get('diff') if pm else None!r}")
+    check("price_mismatch.source_window==latest_order",
+          pm and pm[0].get("source_window") == "latest_order",
+          f"got {pm[0].get('source_window') if pm else None!r}")
     nrsb = json.loads(b["order_item_nrs_json"]) if b["order_item_nrs_json"] else None
     check("order_item_nrs==[PSB001]", nrsb == ["PSB001"], f"got {nrsb!r}")
     for k, exp in _EXPECT_WIN["TBB0200X"].items():
@@ -248,14 +257,50 @@ def test_contract():
     check("product_id==PRD300", c["product_id"] == "PRD300", f"got {c['product_id']!r}")
     check("title==桌面收纳盒 Z 款", c["title"] == "桌面收纳盒 Z 款", f"got {c['title']!r}")
     anc = json.loads(c["anomalies_json"]) if c["anomalies_json"] else []
-    check("anomalies 含 no_noon_orders",
-          any(x.get("type") == "no_noon_orders" for x in anc), f"got {anc!r}")
+    nn = [x for x in anc if x.get("type") == "no_noon_orders"]
+    check("anomalies 含 no_noon_orders", len(nn) == 1, f"got {anc!r}")
+    # 结构化字段：field / noon / erp / source_window 明确写入（不止自由文案 note）
+    check("no_noon_orders.field==sales_180d",
+          nn and nn[0].get("field") == "sales_180d",
+          f"got {nn[0].get('field') if nn else None!r}")
+    check("no_noon_orders.noon==0", nn and nn[0].get("noon") == 0,
+          f"got {nn[0].get('noon') if nn else None!r}")
+    check("no_noon_orders.erp==8 (ERP seed sales_180d)",
+          nn and nn[0].get("erp") == 8, f"got {nn[0].get('erp') if nn else None!r}")
+    check("no_noon_orders.source_window==sales_180d",
+          nn and nn[0].get("source_window") == "sales_180d",
+          f"got {nn[0].get('source_window') if nn else None!r}")
     check("latest_customer_paid 为空（无 noon 订单）",
           c["latest_customer_paid"] is None, f"got {c['latest_customer_paid']!r}")
     check("order_item_nrs_json 为空（无 noon 订单）",
           c["order_item_nrs_json"] is None, f"got {c['order_item_nrs_json']!r}")
     check("sales_180d 保留 ERP seed=8（无 noon 订单不被覆盖）",
           c["sales_180d"] == 8, f"got {c['sales_180d']!r}")
+
+    # ── SKU 4: TBB0400N（noon CSV 有订单但 ERP 商品库无此 SKU → noon_only）──
+    # 不在 erp_seed_SA.json 里；process_csv_v2 应自动插入该 SKU 行，
+    # merge 后 anomalies_json 应含 noon_only。
+    d = _row(conn, tid, alias, "TBB0400N")
+    print("[TBB0400N]")
+    check("noon-only SKU 被 process_csv_v2 插入 wf2_sku", d is not None,
+          "row missing")
+    if d:
+        check("erp_sku_id 为空（确认是 noon-only，无 ERP 建档）",
+              d["erp_sku_id"] is None, f"got {d['erp_sku_id']!r}")
+        and4 = json.loads(d["anomalies_json"]) if d["anomalies_json"] else []
+        no = [x for x in and4 if x.get("type") == "noon_only"]
+        check("anomalies 含 noon_only", len(no) == 1, f"got {and4!r}")
+        check("noon_only.field==erp_sku_id",
+              no and no[0].get("field") == "erp_sku_id",
+              f"got {no[0].get('field') if no else None!r}")
+        check("noon_only.noon==1 (noon 订单数)",
+              no and no[0].get("noon") == 1,
+              f"got {no[0].get('noon') if no else None!r}")
+        check("noon_only.erp is None",
+              no and no[0].get("erp") is None,
+              f"got {no[0].get('erp') if no else '<missing>'!r}")
+        check("latest_price 被 noon 覆盖为 80.0", _approx(d["latest_price"], 80.0),
+              f"got {d['latest_price']!r}")
 
     conn.close()
     if check.failures and SKIP_MERGE:
