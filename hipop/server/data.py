@@ -1010,6 +1010,101 @@ def count_feedback(tenant_id: Optional[int] = None) -> int:
     return _scalar("SELECT COUNT(*) FROM feedback WHERE tenant_id=?", (tid,)) or 0
 
 
+# ── 平台浏览器（紫鸟）租户凭据（WS-33.2）──────────────────────────────
+# 形态对齐 tenant_erp_credentials + _crypto：不同 tenant/store 不共用明文，密文进库、
+# 解密在 _platform_browser 内做。走**运行时自举**（与 feedback/chat 同套路），不进
+# CODEOWNERS 锁定的 db/schema*.sql 主文件。RLS 按 tenant_id 隔离，防越权串租户。
+# store_key='*' 表示该 tenant 的默认紫鸟账号；具体 store_key 可给某店单独配账号。
+_platform_browser_cred_ready = False
+
+
+def ensure_platform_browser_cred_table():
+    """建 tenant_platform_browser_credentials 表（幂等）。PG 同时建 RLS policy。
+
+    纯增量 CREATE TABLE IF NOT EXISTS，不碰任何已有表 / 不动 db/schema*.sql。
+    """
+    global _platform_browser_cred_ready
+    if _platform_browser_cred_ready:
+        return
+    if is_postgres():
+        import psycopg2
+        # 裸连接做 DDL（建表 + RLS policy 需 owner 权限），不经 _PGConnWrapper。
+        raw = psycopg2.connect(DB_URL)
+        raw.autocommit = True
+        try:
+            with raw.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tenant_platform_browser_credentials (
+                        tenant_id        BIGINT NOT NULL,
+                        store_key        TEXT NOT NULL DEFAULT '*',
+                        provider         TEXT NOT NULL DEFAULT 'ziniao',
+                        company_enc      TEXT,
+                        username_enc     TEXT,
+                        password_enc     TEXT,
+                        web_driver_port  INT,
+                        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (tenant_id, store_key)
+                    )
+                """)
+                cur.execute("ALTER TABLE tenant_platform_browser_credentials "
+                            "ENABLE ROW LEVEL SECURITY")
+                cur.execute("ALTER TABLE tenant_platform_browser_credentials "
+                            "FORCE ROW LEVEL SECURITY")
+                cur.execute("DROP POLICY IF EXISTS tenant_isolation "
+                            "ON tenant_platform_browser_credentials")
+                cur.execute(
+                    "CREATE POLICY tenant_isolation ON tenant_platform_browser_credentials "
+                    "USING (tenant_id = current_setting('app.current_tenant', true)::BIGINT) "
+                    "WITH CHECK (tenant_id = current_setting('app.current_tenant', true)::BIGINT)"
+                )
+        finally:
+            raw.close()
+        _platform_browser_cred_ready = True
+        return
+    with conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tenant_platform_browser_credentials (
+                tenant_id        BIGINT NOT NULL,
+                store_key        TEXT NOT NULL DEFAULT '*',
+                provider         TEXT NOT NULL DEFAULT 'ziniao',
+                company_enc      TEXT,
+                username_enc     TEXT,
+                password_enc     TEXT,
+                web_driver_port  INTEGER,
+                updated_at       TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (tenant_id, store_key)
+            )
+        """)
+        c.commit()
+    _platform_browser_cred_ready = True
+
+
+def get_platform_browser_cred_row(store_key: Optional[str] = None) -> Optional[Dict]:
+    """按**当前 tenant context**取一行紫鸟凭据密文（不在此重设 tenant —— RLS/WHERE 用
+    调用链已设的 context）。
+
+    查找优先级：精确 (tenant, store_key) → tenant 默认行 (tenant, '*')。命中返回原始
+    密文行（company_enc/username_enc/password_enc/web_driver_port），解密由调用方做；
+    无 tenant context 或无行 → None（调用方决定回落 config 还是 blocked）。
+    """
+    tid = get_current_tenant()
+    if tid is None:
+        return None
+    ensure_platform_browser_cred_table()
+    keys = ["*"] if not store_key else [store_key, "*"]
+    rows = _fetch(
+        "SELECT tenant_id, store_key, provider, company_enc, username_enc, "
+        "password_enc, web_driver_port FROM tenant_platform_browser_credentials "
+        "WHERE tenant_id=? AND store_key IN (%s)" % ",".join("?" * len(keys)),
+        (tid, *keys),
+    )
+    if not rows:
+        return None
+    # 精确 store_key 优先于默认 '*'
+    rows.sort(key=lambda r: 0 if r.get("store_key") == store_key else 1)
+    return rows[0]
+
+
 def set_action_status(action_id: int, status: str, by: str) -> dict:
     """采纳/拒绝 agent_action。status: adopted / rejected。
     带 tenant 校验（只能改自己租户的 action），adopted_by 由调用方从登录态传（不信前端）。
