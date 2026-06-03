@@ -51,6 +51,32 @@ _NOON_COLS = ("noon_total_qty", "noon_saleable_qty",
               "noon_unsaleable_qty", "noon_warehouses_json")
 
 
+class LiveSourceUnavailable(Exception):
+    """live 取数失败 / 无 producer / 无 CSV 可回落 —— 明确的失败信号。
+
+    专门区别于「成功但 0 行」：取数挂了就红灯 raise，绝不让上游把
+    0 库存 / 空仓库 JSON 当成功落库（占位假数据死法）。
+    """
+
+
+# WS-N2 noon FBN live row producer 接入点。WS-N2 fetcher land 后调
+# set_live_row_producer(fn) 注册；fn(tenant_id) -> Iterable[dict]，产出
+# **同形 dict row**（键同 noon Inventory CSV 列：country_code / sku|noon_sku|
+# partner_sku / warehouse_code / qty / inventory_type）。本任务不猜 WS-N2 字段，
+# 只定 row 形状契约（与 WS-N3.1 一致）；未注册（WS-N2 未 land）→ run_live 回落 CSV。
+_LIVE_ROW_PRODUCER = None
+
+
+def set_live_row_producer(fn):
+    """注册 noon live row producer（WS-N2 接入点）。传 None 清除。"""
+    global _LIVE_ROW_PRODUCER
+    _LIVE_ROW_PRODUCER = fn
+
+
+def get_live_row_producer():
+    return _LIVE_ROW_PRODUCER
+
+
 def safe_int(v):
     if v in (None, ""):
         return 0
@@ -227,6 +253,78 @@ def run_v2(tenant_id: int, file: str | None = None,
         "skus": sum(by_alias.values()),
         "unmapped": total_unmapped,
         "by_alias": by_alias,
+    }
+    print(f"[done] {result}", file=sys.stderr)
+    return result
+
+
+def _csv_fallback_or_fail(tenant_id, reason, allow_csv_fallback,
+                          file, inbox, dry_run) -> dict:
+    """live 取数失败时的整链回落：走【同一】CSV ingest 契约
+    （run_v2 → _iter_csv_rows → _aggregate → _upsert），不短路、不写假数据。
+
+    - allow_csv_fallback=False，或无任何 CSV interim 可回落 → raise
+      LiveSourceUnavailable（红灯），绝不写 0 库存 / 空仓库 JSON 冒充成功。
+    - 有 CSV 可回落 → 落真实 CSV 数据，结果标 source=csv_fallback + live_error。
+    """
+    print(f"[noon_live_ingest] live 取数失败 → {reason}", file=sys.stderr)
+    if not allow_csv_fallback:
+        raise LiveSourceUnavailable(reason)
+    res = dict(run_v2(tenant_id, file=file, inbox=inbox, dry_run=dry_run))
+    if res.get("files", 0) == 0:
+        # 既取不到 live、又无 CSV interim → 没有任何真数据，不能冒充成功
+        raise LiveSourceUnavailable(
+            f"{reason}；且无 CSV interim 可回落（file/inbox 均无 inventory CSV）—— 不写假数据"
+        )
+    res["source"] = "csv_fallback"
+    res["live_error"] = reason
+    return res
+
+
+def run_live(tenant_id: int, live_producer=None, allow_csv_fallback: bool = True,
+             file: str | None = None, inbox: str | None = None,
+             dry_run: bool = False) -> dict:
+    """Noon FBN live 行 → v2 wf1_stock.noon_*（WS-N3.2）。
+
+    读：noon FBN live row producer（WS-N2 接入；未接入则回落 CSV interim）；
+        file / inbox 的 noon Inventory CSV（fallback 输入）。
+    写：wf1_stock.noon_total_qty / noon_saleable_qty / noon_unsaleable_qty /
+        noon_warehouses_json（部分 upsert，保护 ERP 列与 pending_inbound_qty）。
+
+    live 与 CSV 共用同一 `_aggregate`/`_upsert`（WS-N3.1 契约，不分叉）。
+    取数失败（无 producer / producer 抛错）→ 整链回落 CSV interim（同契约）；
+    无 CSV 可回落 → raise LiveSourceUnavailable，绝不写 0/空 JSON 冒充成功。
+    """
+    producer = live_producer or get_live_row_producer()
+    if producer is None:
+        return _csv_fallback_or_fail(
+            tenant_id, "无 live row producer（WS-N2 fetcher 未接入）",
+            allow_csv_fallback, file, inbox, dry_run)
+    try:
+        # 物化：把生成器里的取数错误在聚合前暴露出来（别让半截数据落库）
+        rows = list(producer(tenant_id))
+    except Exception as e:
+        return _csv_fallback_or_fail(
+            tenant_id, f"live producer 取数失败: {type(e).__name__}: {e}",
+            allow_csv_fallback, file, inbox, dry_run)
+
+    print(f"\n=== noon live ingest tenant={tenant_id}: {len(rows)} live rows ===",
+          file=sys.stderr)
+    _data.set_current_tenant(tenant_id)
+    conn = _data.conn()
+    try:
+        bucket, n_rows, n_unmapped = _aggregate(rows, tenant_id)
+        by_alias = {} if dry_run else _upsert(conn, tenant_id, bucket)
+    finally:
+        conn.close()
+    result = {
+        "source": "live",
+        "files": 0,
+        "rows": n_rows,
+        "skus": sum(by_alias.values()),
+        "unmapped": n_unmapped,
+        "by_alias": by_alias,
+        "live_error": None,
     }
     print(f"[done] {result}", file=sys.stderr)
     return result
