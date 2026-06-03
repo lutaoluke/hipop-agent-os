@@ -144,6 +144,29 @@ def main():
         assert S.get_live_row_producer() is None, "contract 清除后 stock 视图同步为 None"
         print("  ✓ stock.set ↔ contract.get 双向一致，无两套真相")
 
+        print("== ⑨ 跨 import 路径单一来源：两个 module 实例共享同一注册表 ==")
+        # WS-34 红队二次点：⑧ 只验「scripts 顶层 import」这一条路径内一致；但 runtime
+        # 用包路径 `from hipop.scripts import ...`，与脚本的 `import noon_live_contract`
+        # 是两个 module 对象。这里把同一文件以**另一个 module 名**再加载一次，复现
+        # 「两条 import 路径」的真实情形，断言注册表跨路径共享（否则 = 两套真相）。
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "noon_live_contract__altpath", C.__file__)
+        C2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(C2)
+        assert C2 is not C, "应是两个不同 module 对象（模拟两条 import 路径）"
+        C.set_live_row_producer(C.ORDERS, None)
+        fn_x = lambda tenant_id: []
+        C.set_live_row_producer(C.ORDERS, fn_x)        # 经路径①(C)注册
+        assert C2.get_live_row_producer(C2.ORDERS) is fn_x, \
+            "路径②(C2)必须读到路径①注册的同一 fn —— 跨 import 路径单一来源"
+        assert C2.MY_INVENTORY in C2.missing_live_producers(), \
+            "路径②的 missing 必须与共享注册表一致（仅 orders 已注册）"
+        C2.set_live_row_producer(C2.ORDERS, None)      # 经路径②(C2)清除
+        assert C.get_live_row_producer(C.ORDERS) is None, \
+            "路径②清除后路径①同步为 None —— 同一注册表，非两份"
+        print("  ✓ 两个 module 实例共享注册表，跨 import 路径单一来源")
+
         print("\n✓ noon 实时行契约 + 守门红灯 smoke 全过")
     finally:
         for k in C.KINDS:

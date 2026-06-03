@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import csv
+import types
 from typing import Callable, Iterable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,7 +97,22 @@ def _check_kind(kind: str) -> None:
 # ── live producer 注册表（WS-N2 抓取器接入点 / WS-38 收口判定入口）──────
 # producer 签名：fn(tenant_id: int) -> Iterable[dict]，每个 dict 是一条
 # 同形行(键见 ROW_CONTRACT[kind]['known'])。未注册 = 该类尚无实时来源。
-_PRODUCERS: dict[str, Callable[[int], Iterable[dict]]] = {}
+#
+# 单一来源加固（WS-34 红队点）：本模块会被以两种 import 路径加载——
+#   · `noon_live_contract`             （scripts 目录在 sys.path 顶层；脚本/smoke 用）
+#   · `hipop.scripts.noon_live_contract`（包路径；runtime workflow_runners 用）
+# Python 按 import 名缓存 module，两条路径 = 两个 module 对象 = 两份 _PRODUCERS
+# = 两套真相（在一条路径注册的 producer，另一条 get/missing 看不到）。这里把注册表
+# 锚到一个「import 路径无关」的进程级 holder（sys.modules 固定键），任一路径 set、
+# 另一路径都 get 得到，杜绝「统一 producer 接口」漂成两套真相。
+# 关键：下面所有读写只**原地 mutate** 这个 dict（pop/赋值键），从不重新绑定
+# `_PRODUCERS` 名 —— 故无论哪个 module 实例，名都指向同一 dict 对象。
+_REGISTRY_HOLDER = "_noon_live_contract_registry__singleton"
+if _REGISTRY_HOLDER not in sys.modules:
+    _holder = types.ModuleType(_REGISTRY_HOLDER)
+    _holder.PRODUCERS = {}
+    sys.modules[_REGISTRY_HOLDER] = _holder
+_PRODUCERS: dict[str, Callable[[int], Iterable[dict]]] = sys.modules[_REGISTRY_HOLDER].PRODUCERS
 
 
 def set_live_row_producer(kind: str, fn: Callable[[int], Iterable[dict]] | None) -> None:
