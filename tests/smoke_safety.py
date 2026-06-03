@@ -165,6 +165,8 @@ def test_case11_stale_synonyms_pass():
         "数据已经旧了，建议刷新。",              # 数据 + 连接字 + 旧
         "老旧数据仅供参考。",                    # 老旧 直接修饰 数据
         "旧的口径，数据偏保守。",                # 旧 紧贴 口径
+        "库存数据偏旧，建议刷新。",              # round5: 库存数据 + 偏旧（合法）
+        "用的是旧 noon 数据。",                  # 旧 + noon + 数据（间隔无产品对象）
     )
     for reply in legit:
         resp = {"reply": reply + " KSA 当前 20 个 SKU 需要补货：…",
@@ -211,6 +213,16 @@ def test_case11_non_stale_jiu_words_still_fail():
         # round4 自查：老旧的+对象 / 数据线很旧（数据线=产品）
         "这些老旧的款式，SDA1874A 补 7 件。",
         "数据线很旧，SDA1874A 补 7 件。",
+        # round5（码长首审）：数据名词在左、旧 修饰右边产品对象（镜像洞）
+        "库存旧机型数据补货。",          # "库存旧" 不是数据陈旧，旧 修饰 机型
+        "同步旧机型补 5 件。",
+        "口径旧版补货。",
+        # round5 自查（out-of-domain 也焊死）+ 同族新探
+        "较旧的车型方案，补 7 件。",
+        "老旧的页面布局，补 7 件。",
+        "库存旧版机型，补 7 件。",
+        "销量旧款图表，补 7 件。",
+        "数据旧链接补 7 件。",
     )
     for reply in traps:
         resp = {"reply": reply, "tools_used": [], "workflow_task": None}
