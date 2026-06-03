@@ -86,6 +86,13 @@
           "max_pages": 500,
           "page_retries": 3,
           "records_path": ["hits"]
+        },
+        "asn": {
+          "_NOTE": "noon 送仓/ASN 实时抓取（WS-N2.3/WS-60）。已探明：送仓入口在 FBN『Seller Lab』——My ASN & Storage = https://fbn.noon.partners/{locale}/asn?mp=noon（locale 含国别，KSA=en-sa / UAE=en-ae；_svc/sc-fbn/api/v1/partner/countries 返回 [SA,AE]）。但该列表页为 shipment 级（列：Shipment #/From-To Warehouse/Created-Scheduled-GRN At/Requests/Status），无 per-SKU/qty；WS-34 ASN 行契约需 per-line（asn_number/sku/qty/country_code）。per-line 明细源（shipment 详情 drill-in 或 fbnreports『ASN GRN Report』导出）待运营/参谋长确认 + 提供非空 KSA 样本后填 asn_url；当前账号 KSA+UAE 均 0 在途送仓，无法实测 per-line 字段。country_code 按主体国别（KSA=SA）。asn_url 为空 → 抓取器 blocked、live_producers 不自动接线（保留 CSV interim 回落，不红灯）。selectors 为表头驱动解析的 CSS 覆写（标准表无需配）。",
+          "asn_url": "",
+          "country_code": "SA",
+          "fbn_shipment_page_discovered": "https://fbn.noon.partners/en-sa/asn?mp=noon",
+          "selectors": {}
         }
       }
     }
