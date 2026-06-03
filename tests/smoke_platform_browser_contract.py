@@ -102,27 +102,37 @@ class _FakeZiniao(BaseHTTPRequestHandler):
             STATE.last_browser_list_body = body
             missing = [k for k in REQUIRED_AUTH_KEYS if not body.get(k)]
             if missing:
-                return self._send({"code": -1, "msg": f"missing {missing}"})
+                return self._send({"statusCode": -1, "err": f"missing {missing}"})
             # 每次旋转 browserOauth（模拟真实「每次取最新」），编号进 oauth 供断言。
             seq = STATE.browser_list_calls
             stores = []
             for s in _STORE_FIXTURE:
                 tag = "SA" if s["browserId"] == "26865530773075" else "AE"
                 stores.append({**s, "browserOauth": f"OAUTH-{tag}-{seq}"})
-            return self._send({"code": 0, "data": stores})
+            # 真实紫鸟 web_driver 形态：statusCode/err/browserList（顶层），非 code/data。
+            # WS-33.3 live 实测踩过：只认 code/data 会把真实 browserList 解析成 0 店。
+            return self._send({"statusCode": 0, "err": "", "browserList": stores})
 
         if action == "startBrowser":
             STATE.last_start_body = body
             # 死法②钉死：请求体任何层级出现 debug 端口入参 → -10000（复刻真实紫鸟）。
+            # 端口入参非法优先于鉴权判定（旧 probe 带 debuggPort 必拒，与有无鉴权无关）。
             if _has_forbidden_port(body):
-                return self._send({"code": -10000, "msg": "debugg port not allowed"})
+                return self._send({"statusCode": -10000, "err": "debugg port not allowed"})
+            # 真实紫鸟 startBrowser **必须**带鉴权三件套，缺则 -10003「参数不能为空
+            # （登录状态错误）」。WS-33.3 live 实测踩过：不带 auth 的 startBrowser 直接 -10003。
+            auth_missing = [k for k in ("company", "username", "password") if not body.get(k)]
+            if auth_missing:
+                return self._send({"statusCode": -10003,
+                                   "err": f"参数不能为空（登录状态错误）missing {auth_missing}"})
             oauth = body.get("browserOauth") or ""
             # 故意触发「缺 debuggingPort」错误路径的探针。
             if "NOPORT" in oauth:
-                return self._send({"code": 0, "data": {}})
-            return self._send({"code": 0, "data": {"debuggingPort": ASSIGNED_PORT}})
+                return self._send({"statusCode": 0, "err": "", "data": {}})
+            # 真实形态：debuggingPort 在顶层。
+            return self._send({"statusCode": 0, "err": "", "debuggingPort": ASSIGNED_PORT})
 
-        return self._send({"code": -1, "msg": f"unknown action {action}"})
+        return self._send({"statusCode": -1, "err": f"unknown action {action}"})
 
 
 def _has_forbidden_port(obj) -> bool:
@@ -255,6 +265,11 @@ def run():
                   f"body={json.dumps(sent, ensure_ascii=False)}")
             check("startBrowser action 正确", sent.get("action") == "startBrowser")
             check("startBrowser 带 browserOauth", bool(sent.get("browserOauth")))
+            # WS-33.3 live 实测：真实紫鸟 startBrowser 缺 company/username/password →
+            # -10003。钉死 body 必带鉴权三件套（不带则上面「返回端口」断言已 fail）。
+            check("startBrowser body 带鉴权三件套 company/username/password",
+                  all(sent.get(k) for k in ("company", "username", "password")),
+                  f"body={json.dumps(sent, ensure_ascii=False)}")
 
         print("== ⑤ open_cdp_endpoint 复用入口端到端（list→select→start 串通）==")
         try:
@@ -284,7 +299,7 @@ def run():
         legacy_body = _legacy_start_body("OAUTH-SA-1", "2", "rid")
         resp = pb._post(port, legacy_body)
         check("旧 probe（带 debuggPort）被 fake server 拒 -10000",
-              isinstance(resp, dict) and str(resp.get("code")) == "-10000",
+              isinstance(resp, dict) and str(pb._resp_code(resp)) == "-10000",
               f"got {resp}")
 
     finally:

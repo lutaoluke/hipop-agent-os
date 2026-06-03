@@ -222,19 +222,42 @@ def _get_browser_list(creds: "Credentials", port: Optional[int] = None) -> list:
     return _extract_entries(resp)
 
 
+def _resp_code(resp: dict):
+    """统一取响应状态码：真实紫鸟用 `statusCode`，fake/旧形态用 `code`。"""
+    for k in ("statusCode", "code", "status"):
+        if resp.get(k) is not None:
+            return resp.get(k)
+    return None
+
+
+def _resp_msg(resp: dict):
+    """统一取错误信息：真实紫鸟用 `err`，fake/旧形态用 `msg`。"""
+    return resp.get("err") or resp.get("msg") or resp
+
+
 def _extract_entries(resp) -> list:
-    """从多种可能的响应形态里抠出 store 列表（镜像 probe 的容错位置）。"""
+    """从多种可能的响应形态里抠出 store 列表（镜像 probe 的容错位置）。
+
+    真实紫鸟 web_driver 返回 `{"statusCode":0,"err":"","browserList":[...]}`；fake/旧形态
+    用 `{"code":0,"data":[...]}`。两套 key 都兼容；statusCode/code 非 0 → blocked（暴露
+    鉴权失败等，不静默当「没有店」）。
+    """
     if not isinstance(resp, dict):
         raise PlatformBrowserError(
             f"getBrowserList 返回非 JSON dict: {str(resp)[:200]}", blocked=True)
-    code = resp.get("code")
+    code = _resp_code(resp)
     if str(code) == "-10000":
         raise PlatformBrowserError(
-            f"getBrowserList 返回 -10000: {resp.get('msg') or resp}", blocked=True)
-    data = (resp.get("data") or resp.get("browsers")
+            f"getBrowserList 返回 -10000: {_resp_msg(resp)}", blocked=True)
+    if code is not None and str(code) not in ("0", "None"):
+        raise PlatformBrowserError(
+            f"getBrowserList 失败 statusCode={code}: {_resp_msg(resp)} "
+            f"（紫鸟鉴权失败 / company-username-password 不匹配？）", blocked=True)
+    data = (resp.get("browserList") or resp.get("data") or resp.get("browsers")
             or resp.get("list") or resp.get("result"))
     if isinstance(data, dict):
-        data = data.get("list") or data.get("data") or data.get("browsers")
+        data = (data.get("browserList") or data.get("list")
+                or data.get("data") or data.get("browsers"))
     return data if isinstance(data, list) else []
 
 
@@ -316,6 +339,11 @@ def _build_start_browser_body(browser_oauth: str, run_mode: str, request_id: str
     刻意**不含**任何 debug 端口入参——紫鸟会自动分配端口并在响应里返回 debuggingPort；
     手工塞 debuggPort/debugPort 等会被拒（-10000）。这条规则由 contract smoke 的 fake
     server 钉死，不是 prompt 约定。
+
+    注意：真实紫鸟 web_driver 的 startBrowser **要求 body 携带 company/username/password**
+    （缺则 -10003「参数不能为空（登录状态错误）」）。鉴权三件套由 `start_browser` 在调用前
+    经 `_with_auth` 合并进来（实测 applyAuth 不是必需，body 带鉴权即可 statusCode 0），这里
+    只保留与端口无关的精确 schema，签名维持三参不变（legacy contract smoke 替身依赖此签名）。
     """
     return {
         "action": "startBrowser",
@@ -326,6 +354,14 @@ def _build_start_browser_body(browser_oauth: str, run_mode: str, request_id: str
         },
         "requestId": request_id,
     }
+
+
+def _with_auth(body: dict, creds: "Credentials") -> dict:
+    """把紫鸟鉴权三件套合并进请求 body（startBrowser 真实必需；不覆盖已存在的键）。"""
+    body.setdefault("company", creds.company)
+    body.setdefault("username", creds.username)
+    body.setdefault("password", creds.password)
+    return body
 
 
 def _extract_debug_port(resp: dict):
@@ -341,26 +377,39 @@ def _extract_debug_port(resp: dict):
 
 
 def start_browser(browser_oauth: str, *, run_mode: str = "2",
-                  port: Optional[int] = None) -> int:
+                  port: Optional[int] = None, creds: "Optional[Credentials]" = None,
+                  store_key: Optional[str] = None,
+                  account: Optional[str] = None) -> int:
     """调 `startBrowser` 接管该 store 的 chromium，返回紫鸟分配的 debuggingPort。
 
     端口从**响应**解析，不写死 config 的 debug_port_default。返回 -10000 / 缺 debuggingPort
-    都按 blocked 抛错，不 stub。
+    都按 blocked 抛错，不 stub。请求 body 经 `_with_auth` 带紫鸟鉴权三件套（真实 startBrowser
+    必需；缺则 -10003 登录状态错误）；`creds` 未传则按 `resolve_credentials(store_key, account)`
+    解析（继承 tenant context，不重设）。
     """
     if not browser_oauth:
         raise PlatformBrowserError("startBrowser 缺 browserOauth", blocked=True)
     port = port or _webdriver_port()
+    if creds is None:
+        creds = resolve_credentials(store_key=store_key, account=account)
     body = _build_start_browser_body(browser_oauth, run_mode, _req_id())
+    body = _with_auth(body, creds)
     resp = _post(port, body)
     if not isinstance(resp, dict):
         raise PlatformBrowserError(
             f"startBrowser 返回非 JSON dict: {str(resp)[:200]}", blocked=True)
-    if str(resp.get("code")) == "-10000":
+    code = _resp_code(resp)
+    if str(code) == "-10000":
         raise PlatformBrowserError(
             f"startBrowser 返回 -10000（通常是传了非法入参，如 debug port）: "
-            f"{resp.get('msg') or resp}", blocked=True)
+            f"{_resp_msg(resp)}", blocked=True)
     dbg = _extract_debug_port(resp)
     if dbg is None:
+        # statusCode/code 非 0 且没拿到端口 → 暴露真实失败原因（不静默）。
+        if code is not None and str(code) not in ("0", "None"):
+            raise PlatformBrowserError(
+                f"startBrowser 失败 statusCode={code}: {_resp_msg(resp)}",
+                blocked=True)
         raise PlatformBrowserError(
             f"startBrowser 响应缺 debuggingPort: "
             f"{json.dumps(resp, ensure_ascii=False)[:300]}", blocked=True)
@@ -763,7 +812,8 @@ def get_platform_session(tenant_id, store_key, *, account: Optional[str] = None,
 
         # ── tier 3: webdriver startBrowser（过期/无持久 → 重新 start）──
         if ep is None:
-            dbg = start_browser(store.browser_oauth, port=port)
+            dbg = start_browser(store.browser_oauth, port=port,
+                                store_key=store_key, account=account)
             ep = CdpEndpoint(store=store, debugging_port=dbg,
                              cdp_url=f"http://127.0.0.1:{dbg}")
             source = "webdriver"

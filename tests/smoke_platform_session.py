@@ -128,7 +128,8 @@ class _Harness:
         pb._assert_webdriver_up = lambda port=None: port or 18080
         pb.list_stores = lambda account=None, *, port=None, store_key=None: [store]
 
-        def _start(oauth, *, run_mode="2", port=None):
+        def _start(oauth, *, run_mode="2", port=None, creds=None,
+                   store_key=None, account=None):
             self.start_calls += 1
             return self.assigned_port
         pb.start_browser = _start
