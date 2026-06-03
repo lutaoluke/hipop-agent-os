@@ -65,6 +65,19 @@
     "web_driver_port": 18080,
     "debug_port_default": 9223
   },
+  "platform_browser": {
+    "_NOTE": "平台无关的平台浏览器会话配置（WS-33.3）。session_ttl_seconds=内存 cache TTL；warmup_retries=冷 goto 被紫鸟扩展 abort 时先平台根域 warmup 再重试的次数。platforms 按平台名给登录态检测规则；store_key 含平台名子串即命中（noon / NOON-SA 均落 noon）。login_url_markers/session_cookie 由代码判定登录态，绝不进 prompt。",
+    "session_ttl_seconds": 600,
+    "warmup_retries": 3,
+    "platforms": {
+      "noon": {
+        "root_url": "https://noon-catalog.noon.partners/",
+        "check_url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon",
+        "login_url_markers": ["/login", "/signin", "/sign-in", "login.noon", "identity.noon", "accounts.noon", "/auth"],
+        "session_cookie": "_npsid"
+      }
+    }
+  },
   "logistics_tracking": {
     "义特无忧KSA": "http://tracking.nextsls.com/trace?app=61a0c12f69c1d654e75a49e6",
     "安时达KSA": "https://logistics.ontaskksad2d.com/#/home",
