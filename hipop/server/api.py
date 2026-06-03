@@ -960,3 +960,12 @@ def api_diag_db():
         "size_kb": (os.path.getsize(data.DB_PATH) // 1024) if os.path.exists(data.DB_PATH) else 0,
         "tables": [r["name"] for r in data._fetch("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")],
     }
+
+
+# ── 反馈/需求捕获（WS-26）消费端：产品读已捕获的需求 ──────────────
+@router.get("/feedback")
+def api_feedback(limit: int = 50, user: dict = Depends(_auth_mod.get_current_user)):
+    """列出本租户 chat agent 捕获的需求/反馈（最新在前）。tenant 由登录态派生，不接受前端冒充。"""
+    data.set_current_tenant(user.get("tenant_id"))
+    items = data.get_feedback(tenant_id=user.get("tenant_id"), limit=limit)
+    return {"count": len(items), "items": items}

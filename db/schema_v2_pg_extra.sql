@@ -52,6 +52,20 @@ CREATE TABLE IF NOT EXISTS tenant_feishu_credentials (
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- feedback（WS-26）AUTOINCREMENT → BIGSERIAL
+CREATE TABLE IF NOT EXISTS feedback (
+  id             BIGSERIAL PRIMARY KEY,
+  tenant_id      BIGINT NOT NULL,
+  feedback_user  TEXT,
+  user_role      TEXT,
+  trigger_scene  TEXT,
+  content        TEXT NOT NULL,
+  category       TEXT,
+  store          TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON feedback(tenant_id, created_at);
+
 -- seed
 INSERT INTO sales_entities
   (tenant_id, alias, country, platform, store_name, store_id, currency,
@@ -69,7 +83,8 @@ DECLARE
   v2_tables TEXT[] := ARRAY[
     'wf2_sku','wf2_orders','wf1_stock','wf1_stock_history','wf5_sales_cycle',
     'wf3_logistics_hub_v2','wf6_logistics_alerts_v2','wf6_replenishment_queue_v2',
-    'sales_entities','tenant_erp_credentials','tenant_feishu_credentials'
+    'sales_entities','tenant_erp_credentials','tenant_feishu_credentials',
+    'feedback'
   ];
   t TEXT;
 BEGIN

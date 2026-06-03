@@ -157,6 +157,44 @@ def test_chat_unknown_sku():
     assert s == 200 and d["reply"]
 
 
+def test_chat_feedback_offer_on_out_of_scope():
+    """WS-26 验收①：撞到做不了/超范围的事，回复必含一句『记成需求』offer。"""
+    s, b = _post("/api/chat", {
+        "messages": [{"role": "user", "content": "帮我把这个月销量做成 PPT 再发邮件给我老板"}],
+        "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营"},
+    }, timeout=90)
+    d = json.loads(b)
+    assert s == 200 and d["reply"]
+    # offer 可能来自确定性 hook（「记成一条需求」）或 LLM 自己（「记成需求/记成反馈」）
+    assert any(m in d["reply"] for m in ("记成一条需求", "记成需求", "记成反馈")), \
+        f"撞限回复没 offer 记需求: {d['reply'][:200]}"
+
+
+def test_chat_feedback_capture_persists():
+    """WS-26 验收②③：用户确认 → capture_feedback 真落库，能从 /api/feedback 查到。"""
+    s0, b0 = _get("/api/feedback")
+    before = json.loads(b0)["count"]
+    s, b = _post("/api/chat", {
+        "messages": [
+            {"role": "user", "content": "能不能把补货建议自动推到企业微信机器人？"},
+            {"role": "assistant",
+             "content": "这个我暂时做不了，目前没接企业微信。💡 要我把它记成一条需求反馈给产品吗？"},
+            {"role": "user", "content": "记一下：把补货建议自动推到企业微信机器人"},
+        ],
+        "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营"},
+    }, timeout=90)
+    d = json.loads(b)
+    assert s == 200 and d["reply"]
+    assert "capture_feedback" in (d.get("tools_used") or []), \
+        f"用户确认后没调 capture_feedback: tools_used={d.get('tools_used')}"
+    s2, b2 = _get("/api/feedback")
+    after = json.loads(b2)
+    assert after["count"] > before, "feedback 没增加（落库失败？）"
+    # LLM 可能改写原话，校验稳定关键词而非逐字
+    assert any("企业微信" in (it.get("content") or "") for it in after["items"]), \
+        "feedback 表查不到刚记的需求（关键词 企业微信）"
+
+
 def test_diag():
     s, b = _get("/api/diag/db")
     d = json.loads(b)

@@ -897,6 +897,117 @@ def write_agent_action(
         return cur._cur.lastrowid if hasattr(cur, "_cur") else cur.lastrowid
 
 
+# ── 反馈/需求捕获（WS-26）────────────────────────────────
+# chat agent 撞到做不了/超范围的事时，用户确认 → 真写入这张表，喂产品迭代。
+# 写不进库要 raise（绝不假装记了 —— 报告即事实）。
+_feedback_ready = False
+
+
+def _ensure_feedback_table():
+    """建 feedback 表（幂等）。PG 同时建 RLS policy（按 tenant 隔离，防越权串租户）。
+
+    生产/部署的真源在 db/schema_v2.sql + schema_v2_pg_extra.sql；这里的 ensure 让
+    本地 SQLite 开发 + 已跑起来的 PG 都能自举，smoke 不依赖谁先手动迁过库。
+    """
+    global _feedback_ready
+    if _feedback_ready:
+        return
+    if is_postgres():
+        import psycopg2
+        # 用裸连接做 DDL（建表 + RLS policy 需要 owner 权限），不经 _PGConnWrapper。
+        raw = psycopg2.connect(DB_URL)
+        raw.autocommit = True
+        try:
+            with raw.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS feedback (
+                        id             BIGSERIAL PRIMARY KEY,
+                        tenant_id      BIGINT NOT NULL,
+                        feedback_user  TEXT,
+                        user_role      TEXT,
+                        trigger_scene  TEXT,
+                        content        TEXT NOT NULL,
+                        category       TEXT,
+                        store          TEXT,
+                        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant "
+                            "ON feedback(tenant_id, created_at)")
+                cur.execute("ALTER TABLE feedback ENABLE ROW LEVEL SECURITY")
+                cur.execute("ALTER TABLE feedback FORCE ROW LEVEL SECURITY")
+                cur.execute("DROP POLICY IF EXISTS tenant_isolation ON feedback")
+                cur.execute(
+                    "CREATE POLICY tenant_isolation ON feedback "
+                    "USING (tenant_id = current_setting('app.current_tenant', true)::BIGINT) "
+                    "WITH CHECK (tenant_id = current_setting('app.current_tenant', true)::BIGINT)"
+                )
+        finally:
+            raw.close()
+        _feedback_ready = True
+        return
+    with conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id      BIGINT NOT NULL DEFAULT 1,
+                feedback_user  TEXT,
+                user_role      TEXT,
+                trigger_scene  TEXT,
+                content        TEXT NOT NULL,
+                category       TEXT,
+                store          TEXT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON feedback(tenant_id, created_at)")
+        c.commit()
+    _feedback_ready = True
+
+
+def write_feedback(content: str, *, trigger_scene: Optional[str] = None,
+                   category: str = "需求", user: Optional[str] = None,
+                   role: Optional[str] = None, store: Optional[str] = None,
+                   tenant_id: Optional[int] = None) -> int:
+    """把一条用户需求/反馈真写入 feedback 表，返回 row id。
+
+    写不进库**直接 raise**（调用方据此如实报错，绝不假装记了）。content 为空也 raise。
+    """
+    if not content or not str(content).strip():
+        raise ValueError("feedback content 不能为空")
+    _ensure_feedback_table()
+    tid = tenant_id or get_current_tenant() or 1
+    cols = "(tenant_id, feedback_user, user_role, trigger_scene, content, category, store)"
+    vals = (tid, user, role, trigger_scene, content, category, store)
+    if is_postgres():
+        with conn() as c:
+            cur = c.execute(f"INSERT INTO feedback {cols} VALUES (?,?,?,?,?,?,?) RETURNING id", vals)
+            row = cur.fetchone()
+            c.commit()
+            return row["id"] if isinstance(row, dict) else row[0]
+    with conn() as c:
+        cur = c.execute(f"INSERT INTO feedback {cols} VALUES (?,?,?,?,?,?,?)", vals)
+        c.commit()
+        return cur._cur.lastrowid if hasattr(cur, "_cur") else cur.lastrowid
+
+
+def get_feedback(tenant_id: Optional[int] = None, limit: int = 50) -> List[Dict]:
+    """列出本租户已捕获的需求/反馈（最新在前）。产品迭代/审计读这里。"""
+    _ensure_feedback_table()
+    tid = tenant_id or get_current_tenant() or 1
+    return _fetch(
+        "SELECT id, feedback_user, user_role, trigger_scene, content, category, store, created_at "
+        "FROM feedback WHERE tenant_id=? ORDER BY id DESC LIMIT ?",
+        (tid, limit),
+    )
+
+
+def count_feedback(tenant_id: Optional[int] = None) -> int:
+    _ensure_feedback_table()
+    tid = tenant_id or get_current_tenant() or 1
+    return _scalar("SELECT COUNT(*) FROM feedback WHERE tenant_id=?", (tid,)) or 0
+
+
 def set_action_status(action_id: int, status: str, by: str) -> dict:
     """采纳/拒绝 agent_action。status: adopted / rejected。
     带 tenant 校验（只能改自己租户的 action），adopted_by 由调用方从登录态传（不信前端）。
