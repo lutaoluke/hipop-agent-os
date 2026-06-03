@@ -110,6 +110,34 @@ def test_wf3_no_workflow_triggered_still_fails():
     assert not ok, "没真触发 workflow 应 FAIL"
 
 
+def test_wf3_wrong_v2_workflow_still_fails():
+    # 门2 红队洞：endswith("_v2") 会放行任意 v2。精确等值后，Agent 跑错别的 v2
+    # 工作流（wf6_alerts_v2 / wf2_products_v2）在"刷新物流"这条 case 下必须 FAIL。
+    c = _wf3_case()
+    for wrong in ("wf6_alerts_v2", "wf2_products_v2", "wf5_sales_cycle_v2"):
+        resp = {
+            "reply": "已触发物流刷新。",
+            "tools_used": ["run_workflow"],
+            "workflow_task": {"workflow": wrong},
+        }
+        ok, reasons = smoke_chat.check(c, resp)
+        assert not ok, f"跑错 v2 工作流 {wrong} 应被拦（精确等值），但通过了"
+        assert any(wrong in r for r in reasons), \
+            f"失败原因应点名跑错的 workflow {wrong}: {reasons}"
+
+
+def test_wf3_exact_correct_v2_passes():
+    # 精确正确的 wf3_logistics_v2 仍 PASS（不误伤正解）
+    c = _wf3_case()
+    resp = {
+        "reply": "好的，已触发物流采集刷新。",
+        "tools_used": ["run_workflow"],
+        "workflow_task": {"workflow": "wf3_logistics_v2"},
+    }
+    ok, reasons = smoke_chat.check(c, resp)
+    assert ok, f"精确正确的 wf3_logistics_v2 被误判: {reasons}"
+
+
 def test_global_blacklist_drops_legit_alias():
     assert "可撑天数" not in smoke_chat.GLOBAL_BLACKLIST, \
         "可撑天数 是真实字段 sellable_days 的人话，不该在全局黑名单"
@@ -154,6 +182,8 @@ if __name__ == "__main__":
         test_wf3_prose_mention_with_correct_v2_passes,
         test_wf3_real_old_workflow_selection_still_fails,
         test_wf3_no_workflow_triggered_still_fails,
+        test_wf3_wrong_v2_workflow_still_fails,
+        test_wf3_exact_correct_v2_passes,
         test_global_blacklist_drops_legit_alias,
         test_case11_stale_synonyms_pass,
         test_case11_no_stale_warning_still_fails,

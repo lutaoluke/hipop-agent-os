@@ -39,7 +39,7 @@ class Case:
     must_contain: List[str] = field(default_factory=list)        # reply 必须含
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
-    workflow_must_be_v2: bool = False                            # 真触发的 workflow 名必须以 _v2 结尾
+    expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
     timeout: int = 60
 
 
@@ -188,13 +188,14 @@ CASES: List[Case] = [
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
     # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
     # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的
-    # workflow 名**（workflow_task.workflow 必须以 _v2 结尾）—— 直接钉死"选对 workflow"
-    # 这个真关口，比扫散文更准、更强（纠正性提升，非挖空）。
+    # workflow 名**（workflow_task.workflow）—— 直接钉死"选对 workflow"这个真关口。
+    # 门2 红队补强：endswith("_v2") 太松（wf6_alerts_v2 / wf2_products_v2 会被放行），
+    # 收紧为**精确等值** wf3_logistics_v2，跑错别的 v2 工作流也必须判红。
     Case(
         name="刷新物流（必走 v2，禁老 wf3 全局 env）",
         question="帮我刷一下物流数据",
         must_use_tools=["run_workflow"],
-        workflow_must_be_v2=True,    # 真触发的 workflow 必须是 *_v2，老 workflow=选错
+        expected_workflow="wf3_logistics_v2",    # 精确等值；老 wf3 / 别的 v2 都=选错
         must_not_contain=[
             "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
         ],
@@ -286,13 +287,15 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
         if re.search(bw, reply):
             reasons.append(f"reply 含禁忌词: {bw!r}")
 
-    if c.workflow_must_be_v2:
+    if c.expected_workflow:
         wt = resp.get("workflow_task") or {}
         wf = wt.get("workflow") or ""
         if not wf:
             reasons.append("未真触发任何 workflow（workflow_task 为空）")
-        elif not wf.endswith("_v2"):
-            reasons.append(f"选错 workflow: {wf!r}（应为 *_v2，老 workflow 已禁）")
+        elif wf != c.expected_workflow:
+            reasons.append(
+                f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"
+                "老 wf3 / 其它 v2 工作流都=选错）")
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
