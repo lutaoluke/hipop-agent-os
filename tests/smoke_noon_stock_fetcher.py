@@ -337,7 +337,50 @@ def main():
         assert set(_dump()) == (EXPECT_SKUS | {"SKU-A"}), "回落应落真实 CSV 库存行"
         print("✓ 登录态失效 → blocked 上抛：无 CSV 红灯且库里无凭空行；有 CSV 回落同契约带失败信号")
 
-        print("\n6/6 passed")
+        # ── 7. live 源空回（0 行）→ 不冒充 source=live（门2 返工点①）──────────────
+        # 验门人打回：producer→[] 后 run_live 原样返回 {'source':'live','rows':0,...}，0 行假绿。
+        # 现在：无可落 SKU → 无 CSV 红灯（blocked）/ 有 CSV 显式回落（source=csv_fallback，不报 live）。
+        F.register_live_producer(page_factory=lambda t: FakePage([]),
+                                 raw_inventory_fn=lambda p: [])
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as empty_dir:
+            _expect_red(lambda: noon.run_live(TENANT, inbox=empty_dir),
+                        "空库存", "live 空回无 CSV 红灯")
+        assert set(_dump()) == {"SKU-A"}, \
+            "live 空回红灯路径凭空写了库存行（应仅剩 ERP 种子行）"
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "noon_inventory.csv")
+            _write_csv(csv_path)
+            res_e = noon.run_live(TENANT, file=csv_path)
+        assert res_e["source"] == "csv_fallback", f"live 空回有 CSV 应回落、绝不报 source=live: {res_e}"
+        assert res_e.get("live_error") and "空库存" in res_e["live_error"], \
+            f"回落须带 live 空回失败信号: {res_e}"
+        print("✓ live 空回（0 行）→ 不冒充 source=live：无 CSV 红灯 / 有 CSV 显式回落（source=csv_fallback）")
+
+        # ── 8. live 行平台 SKU 无法映射回 partner_sku → 不冒充 source=live（门2 返工点②）──
+        # 验门人打回：unmapped 行原只计数 continue，run_live 仍返回 {'source':'live','unmapped':1}。
+        # 现在：任一 live 行缺 wf2_sku 映射 → 无 CSV 红灯 / 有 CSV 显式回落，绝不只 unmapped++ 成功。
+        unmapped_raw = {**RAW_RECORDS[0], "skuCode": "ZUNKNOWN"}  # 平台 SKU 无 wf2_sku 映射
+        F.register_live_producer(page_factory=lambda t: FakePage([unmapped_raw]),
+                                 raw_inventory_fn=lambda p: [dict(unmapped_raw)])
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as empty_dir:
+            _expect_red(lambda: noon.run_live(TENANT, inbox=empty_dir),
+                        "无法映射回 partner_sku", "live 缺映射无 CSV 红灯")
+        assert set(_dump()) == {"SKU-A"}, \
+            "live 缺映射红灯路径凭空写了库存行（应仅剩 ERP 种子行）"
+        _reset_stock()
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "noon_inventory.csv")
+            _write_csv(csv_path)
+            res_u = noon.run_live(TENANT, file=csv_path)
+        assert res_u["source"] == "csv_fallback", f"live 缺映射有 CSV 应回落、绝不报 source=live: {res_u}"
+        assert res_u.get("live_error") and "无法映射回 partner_sku" in res_u["live_error"], \
+            f"回落须带 live 缺映射失败信号: {res_u}"
+        print("✓ live 行缺 SKU 映射 → 不冒充 source=live：无 CSV 红灯 / 有 CSV 显式回落（source=csv_fallback）")
+
+        print("\n8/8 passed")
         return 0
     finally:
         F.unregister_live_producer()
