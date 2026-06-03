@@ -191,6 +191,9 @@ def test_case11_non_stale_jiu_words_still_fail():
         "这些老旧款 SKU 里，SDA1874A 补 7 件、TBJ0059A 补 5 件。",  # 门2 三轮红队: 老旧款
         "这些老旧产品里，SDA1874A 补 7 件、TBJ0059A 补 5 件。",     # 门2 三轮红队: 老旧产品
         "我看了数据，这些老旧款式需要补货：SDA1874A 7 件。",        # 含"数据"但"老旧款"非陈旧
+        "这些旧款的数据都在表里，补 SDA1874A 7 件。",              # 自查: 旧款…数据 不算陈旧
+        "旧款数据线 SKU 补 5 件。",                                # 自查: 旧款数据线（商品）
+        "看了旧版口径，补 7 件。",                                  # 自查: 旧版口径（非数据陈旧）
     )
     for reply in traps:
         resp = {"reply": reply, "tools_used": [], "workflow_task": None}
