@@ -53,6 +53,11 @@ NOON_LOGIN_URL = "https://login.noon.partners/signin?return=catalog"
 ROOT_URL = "https://noon-catalog.noon.partners/"
 STORE_ID = "26865530773075"
 
+# 已登录店的 _npsid 是持久 cookie（实测 ~29 天到期）；给个远期 expires，避免落进 WS-47
+# 的续登窗口（renew_before_days=5）——本 smoke 只验三级回落/登录态，会话续登另见
+# smoke_session_health.py。
+_OK_NPSID = {"name": "_npsid", "value": "x", "expires": time.time() + 60 * 86400}
+
 
 # ── 替身 ────────────────────────────────────────────────────────────────
 class FakeError(Exception):
@@ -119,7 +124,7 @@ class _Harness:
         self.connect_calls = 0
         self.assigned_port = 9555
         self.cdp_reachable = True
-        self.page = FakePage(NOON_OK_URL, [{"name": "_npsid", "value": "x"}])
+        self.page = FakePage(NOON_OK_URL, [dict(_OK_NPSID)])
 
     def install(self):
         store = pb.Store(browser_id=STORE_ID, browser_oauth="OAUTH-LIVE",
@@ -265,7 +270,7 @@ def run():
     print("== ③ 冷 goto 被 abort → 平台根域 warmup 再重试 ==")
     _restore()
     h = _Harness()
-    h.page = FakePage(NOON_OK_URL, [{"name": "_npsid", "value": "x"}], abort_left=2)
+    h.page = FakePage(NOON_OK_URL, [dict(_OK_NPSID)], abort_left=2)
     h.install()
     if stub_login:
         pb._detect_login = lambda page, pcfg: pb.LoginState("ok", "stub")

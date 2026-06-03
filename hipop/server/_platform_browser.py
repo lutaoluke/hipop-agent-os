@@ -561,6 +561,12 @@ def open_cdp_endpoint(store_key, account: Optional[str] = None, *,
 #      提示人工用紫鸟登一次），绝不 stub 登录态；
 #   ⑤ 缺紫鸟 webdriver / 缺会话 / CDP 连接失败 → blocked，不返回假 page。
 # 平台无关：noon 只是第一个 store_key / 平台根域配置，签名不含任何平台名。
+#
+# WS-47 在此之上加「会话健康层」：登录态 OK 后再从**实测** session cookie（如 _npsid）
+# 算到期/建议续登时间，落进每店 state（cookie_expires_at/suggested_relogin_at/checked_at/
+# needs_renewal）；临近到期 / 无可读有效期 → blocked + 续登提示（镜像 refresh-dbuyerp-
+# token），绝不在临近到期时继续取数。`check_session_health()` 扫每店 state 供 /health
+# 与 startup 观测。续登窗口 renew_before_days 配置化，到期日按各店实测算，绝不写死。
 
 # 会话 state 持久化目录（每店一份）。可经 HIPOP_STATE_DIR 覆写（smoke 用临时目录）。
 _PERSIST_DIR = os.environ.get("HIPOP_STATE_DIR") or os.path.expanduser("~/hipop")
@@ -590,6 +596,21 @@ class LoginState:
 
 
 @dataclass
+class RenewalState:
+    """会话有效期/续登判定（WS-47）。kind: 'ok' | 'needs_renewal'。
+
+    所有时间字段从**实测** session cookie 算（不写死日期/天数），落进每店 state 文件，
+    供 `check_session_health` 观测、供运营按「建议续登时间」主动续登。
+    """
+    kind: str
+    cookie_name: Optional[str]
+    cookie_expires_at: Optional[float]   # 实测会话 cookie 到期（unix 秒）；None=无有效期/未知
+    days_left: Optional[float]
+    suggested_relogin_at: Optional[float]
+    detail: str
+
+
+@dataclass
 class PlatformSession:
     """已接管的平台浏览器会话；`get_platform_session` 返回其 `.page`。
     保留 browser/playwright 句柄避免被 GC，淘汰时 best-effort 断开。"""
@@ -614,6 +635,16 @@ def _session_ttl() -> int:
 
 def _warmup_retries() -> int:
     return int(_platform_browser_cfg().get("warmup_retries") or 3)
+
+
+def _renew_before_seconds() -> float:
+    """提前续登量（秒）：会话 cookie 还剩这么久到期时就进入「主动续登窗口」。
+    来自 config `platform_browser.renew_before_days`（默认 5 天）。这是**窗口大小**，
+    不是到期日——到期日按各店实测 cookie 算（WS-47 死法③：绝不写死 2026-07-02/29 天）。"""
+    days = _platform_browser_cfg().get("renew_before_days")
+    if days is None:
+        days = 5
+    return float(days) * 86400.0
 
 
 def _platform_cfg_for(store_key) -> PlatformCfg:
@@ -719,10 +750,19 @@ def _load_state(store_id: str) -> Optional[dict]:
 
 
 def _save_state(store_id: str, store: Store, cdp_url: str, port: int,
-                exp: float) -> None:
-    """落每店会话 state（含 debug/cdp/有效期/session 信息）。"""
+                exp: float, *, renewal: "Optional[RenewalState]" = None,
+                session_check: str = "ok") -> None:
+    """落每店会话 state（每店一份，按 store_id 命名——绝不只按 account 存一份，WS-47 死法①）。
+
+    记录两类有效期：
+      - `expires_at`：CDP 会话**复用** TTL（内存/磁盘 tier2 reconnect 用，秒级）；
+      - `cookie_*` / `suggested_relogin_at`：**实测** session cookie 的登录有效期（天级），
+        供续登判定与 `check_session_health` 观测。
+    外加 `checked_at`（最后实测登录态/cookie 的时间）与 `session_check`（本次检测结论）。
+    """
     try:
         os.makedirs(_PERSIST_DIR, exist_ok=True)
+        now = time.time()
         data = {
             "store_id": store_id,
             "store_name": store.name,
@@ -732,8 +772,18 @@ def _save_state(store_id: str, store: Store, cdp_url: str, port: int,
             "debugging_port": int(port),
             "cdp_url": cdp_url,
             "expires_at": float(exp),
-            "saved_at": time.time(),
+            "saved_at": now,
+            "checked_at": now,            # 最后一次真实检测登录态 / cookie 的时间
+            "session_check": session_check,
         }
+        if renewal is not None:
+            data.update({
+                "cookie_name": renewal.cookie_name,
+                "cookie_expires_at": renewal.cookie_expires_at,
+                "cookie_days_left": renewal.days_left,
+                "suggested_relogin_at": renewal.suggested_relogin_at,
+                "needs_renewal": renewal.kind == "needs_renewal",
+            })
         path = _state_path(store_id)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -846,6 +896,66 @@ def _login_blocked_msg(pcfg: PlatformCfg, store_key, login: LoginState) -> str:
         f"refresh-dbuyerp-token 流程），登录后重试 —— 绝不 stub 登录态。")
 
 
+# ── 会话有效期 / 续登判定（WS-47，确定性规则，不进 prompt） ─────────────────
+def _cookie_expiry(page, cookie_name: Optional[str]):
+    """从接管 page 的**真实** cookie 读会话 cookie（如 `_npsid`）的到期（unix 秒）。
+    返回 float 或 None（没找到 / session cookie / expires 不是正数 → 无有效期信息）。
+    各店有效期实测各异——绝不写死天数/日期（WS-47 死法③）。"""
+    if not cookie_name:
+        return None
+    for c in _page_cookies(page):
+        if c.get("name") == cookie_name:
+            exp = c.get("expires")
+            try:
+                exp = float(exp)
+            except (TypeError, ValueError):
+                return None
+            return exp if exp > 0 else None
+    return None
+
+
+def _check_renewal(page, pcfg: PlatformCfg, *, now: Optional[float] = None) -> RenewalState:
+    """从**实测** session cookie 到期算续登窗口（确定性规则，不写死日期）。
+
+    suggested_relogin_at = cookie 实测到期 − renew_before（提前量，主动续登）；
+    now ≥ suggested_relogin_at（含已过期）→ needs_renewal。会话 cookie 没有可读到期
+    （真 session cookie / 拿不到 expires）也算 needs_renewal——无法担保有效期，提示续登，
+    绝不当成「永久有效」放行（WS-47 死法②：不能只查紫鸟账号、不查每店 cookie 有效期）。
+    """
+    now = time.time() if now is None else now
+    name = pcfg.session_cookie
+    exp = _cookie_expiry(page, name)
+    if exp is None:
+        return RenewalState(
+            kind="needs_renewal", cookie_name=name, cookie_expires_at=None,
+            days_left=None, suggested_relogin_at=now,
+            detail=(f"会话 cookie {name!r} 无可读到期（session cookie / 拿不到 expires）"
+                    f"——无法担保有效期，建议续登" if name
+                    else "平台未配 session_cookie，无法核会话有效期"))
+    buffer = _renew_before_seconds()
+    suggested = exp - buffer
+    days_left = round((exp - now) / 86400.0, 1)
+    if now >= suggested:
+        return RenewalState(
+            kind="needs_renewal", cookie_name=name, cookie_expires_at=exp,
+            days_left=days_left, suggested_relogin_at=suggested,
+            detail=(f"会话 cookie {name} 实测剩 {days_left} 天到期，已进入提前 "
+                    f"{buffer / 86400:.0f} 天续登窗口"))
+    return RenewalState(
+        kind="ok", cookie_name=name, cookie_expires_at=exp, days_left=days_left,
+        suggested_relogin_at=suggested,
+        detail=f"会话 cookie {name} 实测剩 {days_left} 天到期")
+
+
+def _renew_blocked_msg(pcfg: PlatformCfg, store_key, renewal: RenewalState) -> str:
+    """续登提示，形态镜像 refresh-dbuyerp-token：是**每店 Noon 会话**临近到期，
+    不是「紫鸟 token 过期」（WS-47 死法④：此层不报紫鸟账号假状态）。"""
+    return (
+        f"平台 {pcfg.name} store_key={store_key!r} 会话需续登：{renewal.detail}。"
+        f"请在本机用紫鸟超级浏览器打开该店、重新登录一次（参照 refresh-dbuyerp-token "
+        f"流程），续登后重试 —— 绝不在临近到期时继续取数 / 返回旧 page。")
+
+
 # ── 句柄回收 ────────────────────────────────────────────────────────────
 def _safe_close(pw, browser) -> None:
     try:
@@ -950,8 +1060,18 @@ def get_platform_session(tenant_id, store_key, *, account: Optional[str] = None,
             raise PlatformBrowserError(
                 _login_blocked_msg(pcfg, store_key, login), blocked=True)
 
+        # 已登录 → 从**实测** session cookie 核会话有效期（WS-47）。无论是否临近到期都先
+        # 把健康状态落每店 state（可观测）；临近到期/无有效期 → blocked + 续登提示，绝不
+        # 返回旧/临近到期的 page 继续取数（acceptance #3）。
         exp = time.time() + _session_ttl()
-        _save_state(sid, store, ep.cdp_url, ep.debugging_port, exp)
+        renewal = _check_renewal(page, pcfg)
+        _save_state(sid, store, ep.cdp_url, ep.debugging_port, exp,
+                    renewal=renewal, session_check=renewal.kind)
+        if renewal.kind != "ok":
+            _safe_close(pw, browser)
+            raise PlatformBrowserError(
+                _renew_blocked_msg(pcfg, store_key, renewal), blocked=True)
+
         _session_cache[ck] = PlatformSession(
             page=page, store=store, cdp_url=ep.cdp_url,
             debugging_port=ep.debugging_port, source=source, exp=exp,
@@ -963,3 +1083,66 @@ def invalidate_session(tenant_id, store_key) -> None:
     """会话失效（页面被登出 / 端口换了）时清掉，下次重新接管。"""
     with _session_lock:
         _drop_session((tenant_id, str(store_key)))
+
+
+def _state_needs_renewal(d: dict, now: float) -> bool:
+    """按**当前时间**与落盘的实测有效期确定性重算「是否该续登」——不信落盘那个
+    可能已过时的 `needs_renewal` 布尔（WS-47 验门红队：健康 state 跨过 suggested_relogin_at
+    后必须变红，否则 /health 错过主动续登窗口）。
+
+    判定（与 `_check_renewal` 同口径）：
+      - 有 `suggested_relogin_at`：now ≥ 它 → 需续登；
+      - 退一步只有 `cookie_expires_at`：now ≥ 到期 − renew_before → 需续登；
+      - 两者都没有（无任何实测有效期）：保守判需续登（拿不到有效期不当永久有效）。
+    """
+    suggested = d.get("suggested_relogin_at")
+    if suggested is not None:
+        try:
+            return now >= float(suggested)
+        except (TypeError, ValueError):
+            return True
+    exp = d.get("cookie_expires_at")
+    if exp is not None:
+        try:
+            return now >= float(exp) - _renew_before_seconds()
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
+def check_session_health(*, now: Optional[float] = None) -> dict:
+    """扫所有 `~/hipop/ziniao_state_*.json`，汇总各店会话有效期 + needs_renewal 总开关。
+
+    形态镜像 `_erp_auth.check_persist_token_expiry`：startup hook / /health 都可调，让
+    每店 Noon 会话「还剩几天到期 / 是否该续登」可观测，到期前主动提示续登（参照
+    refresh-dbuyerp-token），而不是等取数时才 blocked。各店天数/续登判定均按**当前时间**
+    与各自实测 cookie 有效期重算（`now` 可注入便于断言），绝不写死、也绝不无条件信落盘
+    布尔（WS-47 死法③：占位/过时假数据）。
+    """
+    import glob
+    now = time.time() if now is None else now
+    results = []
+    for path in sorted(glob.glob(os.path.join(_PERSIST_DIR, "ziniao_state_*.json"))):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        exp = d.get("cookie_expires_at")
+        days_left = round((float(exp) - now) / 86400.0, 1) if exp else None
+        results.append({
+            "store": d.get("store_name") or d.get("store_id") or os.path.basename(path),
+            "store_id": d.get("store_id"),
+            "cookie": d.get("cookie_name"),
+            "cookie_days_left": days_left,
+            "checked_at": d.get("checked_at"),
+            "suggested_relogin_at": d.get("suggested_relogin_at"),
+            "needs_renewal": _state_needs_renewal(d, now),
+            "needs_renewal_at_check": bool(d.get("needs_renewal")),  # 落盘时的判定（仅观测）
+            "session_check": d.get("session_check"),
+            "path": path,
+        })
+    return {
+        "stores": results,
+        "needs_renewal": any(r["needs_renewal"] for r in results) if results else False,
+    }
