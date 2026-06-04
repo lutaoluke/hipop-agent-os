@@ -237,6 +237,40 @@ def test_no_inventory_data_is_explicitly_insufficient():
     assert "inventory" in candidate["missing_evidence"]
 
 
+def test_inventory_malformed_rows_returns_evidence_insufficient():
+    """N9: rows present but no parseable size/stock/sales → evidence_insufficient, missing_evidence preserved."""
+    records = [
+        _noon_record("ZMALF1000000", "24 inch expandable ABS luggage suitcase spinner", price=249, sold=30)
+    ]
+    malformed_inventory_rows = [
+        {
+            "partner_sku": "NO_SIGNAL_SKU",
+            "title": "some generic product",
+            "family": "bags_luggage",
+            "product_category_detail": "luggage",
+            "total_stock": None,
+            "sales_30d": None,
+        }
+    ]
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=_detail_provider,
+        feature_extractor=_feature_extractor,
+        supply_provider=_supply_provider,
+        ali_records=[_ali_record("16880001", "24 inch expandable ABS luggage suitcase spinner", 80)],
+        inventory_provider=lambda _country, _family: malformed_inventory_rows,
+    )
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == EVIDENCE_INSUFFICIENT, (
+        f"Expected evidence_insufficient but got {candidate['inventory']['state']!r}"
+    )
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert "inventory" in candidate["missing_evidence"], (
+        f"missing_evidence should contain 'inventory', got: {candidate['missing_evidence']}"
+    )
+
+
 def test_missing_external_evidence_is_explicit_not_dropped_or_faked():
     records = [
         _noon_record(
@@ -276,5 +310,7 @@ if __name__ == "__main__":
     print("  ✓ test_inventory_reverse_and_differentiation_feed_n11")
     test_no_inventory_data_is_explicitly_insufficient()
     print("  ✓ test_no_inventory_data_is_explicitly_insufficient")
+    test_inventory_malformed_rows_returns_evidence_insufficient()
+    print("  ✓ test_inventory_malformed_rows_returns_evidence_insufficient")
     test_missing_external_evidence_is_explicit_not_dropped_or_faked()
     print("  ✓ test_missing_external_evidence_is_explicit_not_dropped_or_faked")

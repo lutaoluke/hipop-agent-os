@@ -98,6 +98,17 @@ def _inventory_pressure(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _row_has_signal(row: dict[str, Any]) -> bool:
+    """Return True if a row has at least one usable size, stock, or sales signal."""
+    if _extract_size_inches(_row_text(row)) is not None:
+        return True
+    if _num(row.get("total_stock")) > 0:
+        return True
+    if _num(row.get("sales_30d")) > 0:
+        return True
+    return False
+
+
 def apply(records: list[ProductRecord], inventory_rows: list[dict[str, Any]] | None) -> dict[str, Any]:
     if not inventory_rows:
         for rec in records:
@@ -110,6 +121,23 @@ def apply(records: list[ProductRecord], inventory_rows: list[dict[str, Any]] | N
                 "triggered_rules": [],
             }
         return {"state": EVIDENCE_INSUFFICIENT, "n_inventory_rows": 0, "triggered_rules": []}
+
+    if not any(_row_has_signal(row) for row in inventory_rows):
+        for rec in records:
+            rec.policy_flags["inventory_reverse_constraint"] = {
+                "state": EVIDENCE_INSUFFICIENT,
+                "score_adjustment": 0.0,
+                "reasons": [],
+                "warnings": [],
+                "evidence": {"note": "inventory rows present but no parseable size/stock/sales signals"},
+                "triggered_rules": [],
+            }
+        return {
+            "state": EVIDENCE_INSUFFICIENT,
+            "n_inventory_rows": len(inventory_rows),
+            "n_malformed_rows": len(inventory_rows),
+            "triggered_rules": [],
+        }
 
     pressure = _inventory_pressure(inventory_rows)
     triggered = [pressure["rule_id"]] if pressure else []
