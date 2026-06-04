@@ -558,6 +558,41 @@ def test_selection_no_inventory_data_is_explicitly_insufficient():
     assert "inventory" in candidate["missing_evidence"]
 
 
+def test_selection_inventory_malformed_rows_returns_evidence_insufficient():
+    """N9: inventory rows present but no parseable size/stock/sales → evidence_insufficient, not sufficient."""
+    records = [
+        _selection_noon_record(
+            "MALF1",
+            "24 inch expandable ABS luggage suitcase spinner",
+            price=249,
+            sold=30,
+        )
+    ]
+    malformed_inventory_rows = [
+        {
+            "partner_sku": "NO_SIGNAL_SKU",
+            "title": "some generic product",
+            "family": "bags_luggage",
+            "product_category_detail": "luggage",
+            "total_stock": None,
+            "sales_30d": None,
+        }
+    ]
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: malformed_inventory_rows,
+    )
+
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == "evidence_insufficient", (
+        f"Expected evidence_insufficient but got {candidate['inventory']['state']!r}"
+    )
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert "inventory" in candidate["missing_evidence"], (
+        f"missing_evidence should contain 'inventory', got: {candidate['missing_evidence']}"
+    )
+
+
 def test_selection_phase1_evidence_insufficient_is_explicit_offline():
     from selection.l3_orchestration.production_pipeline import EVIDENCE_INSUFFICIENT
 
