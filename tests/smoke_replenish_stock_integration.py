@@ -5,31 +5,38 @@
 算进 current_pipeline）。本 smoke 不搭新连接，而是把它做端到端真实数据验收 + 钉死
 库存未就绪/不完整时的降级边界，三死法逐条堵死。
 
+关键设计（验门人返工点）：**所有降级断言都走真实运营入口**，不按 alias 旁路调
+`stock_readiness()`。运营真用的入口有三条,本 smoke 全覆盖、且都用 `ksa` store
+（解析到 hipop_ksa）构造 empty / incomplete 真实状态:
+  1. data 入口      `data.get_replenishment_view("ksa")`（页面/chat 共用的数据层）
+  2. HTTP 路由入口  `api.api_replenishment("ksa")`（/api/replenishment/{store} 处理函数）
+  3. chat 工具入口  `agent.tool_compute_replenishment("ksa")`（**强制**断言,缺 anthropic
+                    = 真失败,不 skip —— anthropic 是 requirements 声明依赖）
+  4. 页面模板契约   静态校验 module_replenish.html 真读 stock_status 并渲染未就绪告警条
+
 钉死的承重墙（DoD + 防三死法）：
 
 验收 1 · 端到端真实数据（happy / 防「占位假数据」「接线错位」）
-  同一 SKU：wf1_stock 真实库存高 → 补货建议为 0（管道充足）；
-  把同一 SKU 库存改成显著更低 → 补货建议数量 > 0 且更大。
-  并且这一变化必须传到**运营入口** get_replenishment_view（运营真看到的那份），
-  不是只在 wf5 表里变。证明「数值真随真实库存变」，不是假绿。
+  同一 SKU：wf1_stock 真实库存高 → 补货建议 0（管道充足）；改成显著更低 → 建议 > 0
+  且更大；并且这一变化传到运营入口（get_replenishment_view + HTTP 路由）的 rows，
+  证明「数值真随真实库存变」,不是假绿。
 
 验收 2 · 库存未就绪/不完整 降级（防「死代码短路」）
-  - 空库存（0 行）→ 运营入口明确「库存未就绪」(status=empty, ready=False)；
-  - 不完整库存（非空但覆盖率不足）→ 入口明确「库存不完整」(status=incomplete, ready=False)；
-  - 完整库存 → status=ready, ready=True；
-  绝不静默给 0 / 假确定建议：未就绪时 ready=False 必须出现在入口响应本身
-  （API / chat 同源），而不是只落在 run_v2 的 log。
+  - 空库存（0 行）→ 三条入口都 ready=False、status=empty、message 含「未就绪」；
+  - 不完整库存（非空但覆盖率不足）→ 三条入口都 ready=False、status=incomplete、含「不完整」；
+  - 完整库存但本周无需补货 → 三条入口 ready=True（rows 空 ≠ 未就绪，不误报）；
+  绝不静默给 0 / 假确定建议：未就绪时入口响应本身带 ready=False，不是只在 run_v2 log。
 
-fail-then-pass（改动前为何 FAIL）：
-  base commit 无 data.stock_readiness / data.get_replenishment_view，运营入口
-  对「空库存 / 不完整库存」与「真 0 需求」无从区分 → 验收 2 断言 import/属性即
-  FAIL；接上 readiness + 入口视图后 PASS。
+fail-then-pass（改动前为何 FAIL）：base commit 无 data.stock_readiness /
+get_replenishment_view，且 /api/replenishment、chat 工具不带就绪度 → 验收 2 在每条
+入口断言 import/属性/KeyError 即 FAIL；接上 readiness + 入口视图后 PASS。
 
 跑法：
   python3 tests/smoke_replenish_stock_integration.py     或   make test
   （纯 SQLite 临时库，固定 HIPOP_DB；不碰 PG / 不碰 live hipop.db / 不需要 server。）
 """
 import os
+import re
 import sys
 import json
 import tempfile
@@ -44,12 +51,11 @@ os.environ["HIPOP_DB"] = tempfile.NamedTemporaryFile(suffix="_ws62.db", delete=F
 os.environ.pop("DB_URL", None)
 
 TENANT = 1
-# 三个互不相干的销售主体，分别验「就绪 / 空 / 不完整」，避免互相污染。
-ENT_READY = {"alias": "hipop_ksa", "country": "SA"}
-ENT_EMPTY = {"alias": "hipop_empty", "country": "SA"}
-ENT_INCOMPLETE = {"alias": "hipop_part", "country": "SA"}
+KSA_STORE = "ksa"          # 运营入口用的 store code
+KSA_ALIAS = "hipop_ksa"    # _resolve_entity_for_store("ksa") → hipop_ksa（schema 预置,SA）
+SENS_SKU = "TBSENS001"     # 验收 1 的目标 SKU：库存变 → 建议变
 
-SENS_SKU = "TBSENS001"   # 验收 1 的目标 SKU：库存变 → 建议变
+TMPL_PATH = os.path.join(REPO, "hipop", "server", "templates", "module_replenish.html")
 
 
 class _Checker:
@@ -64,6 +70,7 @@ class _Checker:
             print(f"  ✗ {name} {detail}")
 
 
+# ── DB / 种子 helpers ────────────────────────────────────────────────
 def _init_db():
     from hipop.server import data
     data.set_current_tenant(TENANT)
@@ -81,21 +88,20 @@ def _init_db():
     conn.close()
 
 
-def _seed_entity(ent):
+def _reset_ksa():
+    """清空 hipop_ksa 的业务数据,让每个场景独立从 ksa store 入口构造真实状态。"""
     from hipop.server import data
     conn = data.conn()
-    conn.execute(
-        "INSERT INTO sales_entities (tenant_id, alias, country, platform, store_name, "
-        "store_id, currency, active) VALUES (?,?,?,?,?,?,?,1)",
-        (TENANT, ent["alias"], ent["country"], "noon", f"store_{ent['alias']}",
-         "s1", "SAR"),
-    )
+    for t in ("wf2_sku", "wf1_stock", "wf5_sales_cycle", "wf6_replenishment_queue_v2"):
+        conn.execute(f"DELETE FROM {t} WHERE tenant_id=? AND entity_alias=?",
+                     (TENANT, KSA_ALIAS))
+    conn.execute("DELETE FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (TENANT,))
     conn.commit()
     conn.close()
 
 
-def _add_sku(alias, sku, *, listed=1, sales=False, stock=None):
-    """插一个 wf2_sku；可选灌销量与 wf1_stock 行。stock=None 表示**不建库存行**（缺覆盖）。"""
+def _add_sku(sku, *, listed=1, sales=False, stock=None):
+    """插一个 wf2_sku（hipop_ksa）；可选灌销量与 wf1_stock 行。stock=None → 不建库存行。"""
     from hipop.server import data
     conn = data.conn()
     if sales:
@@ -107,23 +113,22 @@ def _add_sku(alias, sku, *, listed=1, sales=False, stock=None):
         "INSERT INTO wf2_sku (tenant_id, entity_alias, partner_sku, title, is_listed, "
         "latest_price, latest_profit_rate, sales_10d, sales_30d, sales_60d, sales_180d) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (TENANT, alias, sku, f"商品 {sku}", listed, 99.0, profit, s10, s30, s60, s180),
+        (TENANT, KSA_ALIAS, sku, f"商品 {sku}", listed, 99.0, profit, s10, s30, s60, s180),
     )
     if stock is not None:
         conn.execute(
             "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, noon_saleable_qty, "
             "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            (TENANT, alias, sku, stock, 0, 0, 0, 0, stock),
+            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock),
         )
     conn.commit()
     conn.close()
 
 
-def _add_hub(alias_country_sku, avg_days=30):
+def _add_hub(sku, avg_days=30):
     """给某 SKU 建一条 wf3 物流 hub 行（KSA），提供 completed_avg_total_days → avg_transit。"""
     from hipop.server import data
-    sku = alias_country_sku
     groups = [{
         "country": "KSA", "completed_avg_total_days": avg_days,
         "in_transit_qty": 0, "in_transit_batches": [], "completed_batches": [],
@@ -138,149 +143,176 @@ def _add_hub(alias_country_sku, avg_days=30):
     conn.close()
 
 
-def _set_stock(alias, sku, qty):
+def _set_stock(sku, qty):
     from hipop.server import data
     conn = data.conn()
     conn.execute(
         "UPDATE wf1_stock SET noon_saleable_qty=?, total_stock=? "
         "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
-        (qty, qty, TENANT, alias, sku),
+        (qty, qty, TENANT, KSA_ALIAS, sku),
     )
     conn.commit()
     conn.close()
 
 
-def _run_wf5(alias):
+def _run_wf5():
     from hipop.workflows import wf_sales_cycle
-    return wf_sales_cycle.run_v2(TENANT, entity_aliases=[alias], verbose=False)
+    return wf_sales_cycle.run_v2(TENANT, entity_aliases=[KSA_ALIAS], verbose=False)
 
 
-def _wf5_weekly_total(alias, sku):
+def _wf5_weekly_total(sku):
     from hipop.server import data
     conn = data.conn()
     r = conn.execute(
         "SELECT weekly_total_replenish FROM wf5_sales_cycle "
         "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
-        (TENANT, alias, sku),
+        (TENANT, KSA_ALIAS, sku),
     ).fetchone()
     conn.close()
     return (r["weekly_total_replenish"] if r else None)
 
 
-# ── 验收 1 · 端到端真实数据：库存变 → 建议变（运营入口同步变）───────────
+# ── 真实运营入口 helpers（不旁路 stock_readiness）─────────────────────
+def _view():
+    """data 入口：页面/chat 共用的数据层视图。"""
+    from hipop.server import data
+    data.set_current_tenant(TENANT)
+    return data.get_replenishment_view(KSA_STORE, limit=200)
+
+
+def _http():
+    """HTTP 路由入口：/api/replenishment/{store} 的处理函数本体。"""
+    from hipop.server import api, data
+    data.set_current_tenant(TENANT)
+    return api.api_replenishment(KSA_STORE, limit=200)
+
+
+def _chat():
+    """chat 工具入口：tool_compute_replenishment（强制,不 skip）。"""
+    from hipop.server import agent
+    return agent.tool_compute_replenishment(KSA_STORE, limit=200)
+
+
+def _assert_not_ready_all_entries(check, expect_status, expect_word):
+    """三条入口 + 数据契约都必须呈现未就绪/不完整,不静默 0。"""
+    v = _view()
+    h = _http()
+    c = _chat()
+    for label, resp in (("data 入口 get_replenishment_view", v),
+                        ("HTTP 路由 api_replenishment", h),
+                        ("chat 工具 tool_compute_replenishment", c)):
+        st = resp.get("stock_status")
+        check(f"[{label}] 带 stock_status", st is not None, list(resp.keys()))
+        if st is None:
+            continue
+        check(f"[{label}] ready=False（不静默当 0 建议）", st.get("ready") is False, st)
+        check(f"[{label}] status={expect_status}", st.get("status") == expect_status, st)
+        check(f"[{label}] message 含『{expect_word}』", expect_word in (st.get("message") or ""), st)
+    # data 入口与 HTTP 路由必须同形（页面/chat 据此渲染）
+    check("HTTP 路由与 data 入口同形(stock_status+rows)",
+          set(h.keys()) >= {"stock_status", "rows"} and isinstance(h["rows"], list), list(h.keys()))
+
+
+# ── 验收 1 · 端到端真实数据：库存变 → 建议变（运营入口 rows 同步变）──────
 def test_stock_change_changes_replenishment():
     print("== test_stock_change_changes_replenishment (验收 1: 数值真随真实库存变) ==")
-    from hipop.server import data
     check = _Checker()
-
-    # 就绪主体：>=10 个上架 SKU 且各有库存行（满足 run_v2 上游非空 + readiness ready）。
-    # 其中目标 SKU 带销量 + 物流 hub，使补货量真由 current_pipeline 决定。
+    _reset_ksa()
+    # >=10 个上架 SKU 且各有库存行（满足 run_v2 上游非空 + readiness ready）。
     for i in range(12):
-        _add_sku(ENT_READY["alias"], f"FILL{i:03d}", sales=False, stock=500)
-    _add_sku(ENT_READY["alias"], SENS_SKU, sales=True, stock=400)
+        _add_sku(f"FILL{i:03d}", sales=False, stock=500)
+    _add_sku(SENS_SKU, sales=True, stock=400)
     _add_hub(SENS_SKU, avg_days=30)
 
     # 高库存（400 ≥ 目标管道 (30+7)*10=370）→ 管道充足 → 建议 0
-    _set_stock(ENT_READY["alias"], SENS_SKU, 400)
-    _run_wf5(ENT_READY["alias"])
-    qty_high = _wf5_weekly_total(ENT_READY["alias"], SENS_SKU)
-    rows_high = data.get_replenishment_view("ksa", limit=200)["rows"]
-    in_high = any(r["partner_sku"] == SENS_SKU for r in rows_high)
+    _set_stock(SENS_SKU, 400)
+    _run_wf5()
+    qty_high = _wf5_weekly_total(SENS_SKU)
+    view_high = _view()
+    http_high = _http()
+    in_view_high = any(r["partner_sku"] == SENS_SKU for r in view_high["rows"])
+    in_http_high = any(r["partner_sku"] == SENS_SKU for r in http_high["rows"])
 
     # 低库存（50 ≪ 目标）→ 管道缺口大 → 建议 > 0
-    _set_stock(ENT_READY["alias"], SENS_SKU, 50)
-    _run_wf5(ENT_READY["alias"])
-    qty_low = _wf5_weekly_total(ENT_READY["alias"], SENS_SKU)
-    rows_low = data.get_replenishment_view("ksa", limit=200)["rows"]
-    low_row = next((r for r in rows_low if r["partner_sku"] == SENS_SKU), None)
+    _set_stock(SENS_SKU, 50)
+    _run_wf5()
+    qty_low = _wf5_weekly_total(SENS_SKU)
+    view_low = _view()
+    low_row = next((r for r in view_low["rows"] if r["partner_sku"] == SENS_SKU), None)
 
     check("高库存时 wf5 建议为 0（管道充足）", qty_high == 0, f"qty_high={qty_high}")
     check("低库存时 wf5 建议 > 0（管道缺口）", (qty_low or 0) > 0, f"qty_low={qty_low}")
     check("库存变化真改变了建议数量（非写死/非假绿）",
           qty_low != qty_high, f"qty_high={qty_high} qty_low={qty_low}")
-    check("高库存时运营入口不把它列为必补", in_high is False)
-    check("低库存时运营入口列出它且数量一致",
-          low_row is not None and low_row["qty"] == qty_low,
-          f"low_row={low_row} qty_low={qty_low}")
+    check("高库存时 data 入口不列它为必补", in_view_high is False)
+    check("高库存时 HTTP 路由不列它为必补", in_http_high is False)
+    check("低库存时 data 入口列出它且数量一致",
+          low_row is not None and low_row["qty"] == qty_low, f"low_row={low_row} qty_low={qty_low}")
+    check("就绪态入口 ready=True", view_low["stock_status"]["ready"] is True, view_low["stock_status"])
     return check.failures
 
 
-# ── 验收 2 · 空库存：运营入口明确「库存未就绪」───────────────────────
-def test_empty_stock_surfaces_not_ready():
-    print("== test_empty_stock_surfaces_not_ready (验收 2: 空库存降级) ==")
-    from hipop.server import data
+# ── 验收 2 · 空库存：三条运营入口都明确「库存未就绪」───────────────────
+def test_empty_stock_surfaces_not_ready_at_all_entry_points():
+    print("== test_empty_stock_surfaces_not_ready_at_all_entry_points (验收 2: 空库存降级) ==")
     check = _Checker()
+    _reset_ksa()
+    for i in range(15):  # 有上架 SKU,但**完全没有** wf1_stock 行
+        _add_sku(f"EMP{i:03d}", sales=True, stock=None)
 
-    _seed_entity(ENT_EMPTY)
-    for i in range(15):  # 有上架 SKU，但**完全没有** wf1_stock 行
-        _add_sku(ENT_EMPTY["alias"], f"EMP{i:03d}", sales=True, stock=None)
-
-    # 用 country=SA 的第二主体没法靠 store 名解析（store→entity 走 country 唯一）。
-    # 这里直接按 alias 验 readiness（入口解析逻辑由 ready 主体的 e2e 覆盖）。
-    st = data.stock_readiness(TENANT, ENT_EMPTY["alias"])
-    check("空库存 readiness 不就绪", st["ready"] is False, st)
-    check("空库存 status=empty", st["status"] == "empty", st)
-    check("message 明确『未就绪』而非静默 0", "未就绪" in st["message"], st)
-    check("readiness 自带覆盖统计（listed/stock_rows 真读）",
+    _assert_not_ready_all_entries(check, expect_status="empty", expect_word="未就绪")
+    # 空库存时 rows 为空,但绝不能被读成「0 需求」—— 上面 ready=False 已钉死
+    check("空库存时 data 入口 rows 为空(但 ready=False,非静默 0)", _view()["rows"] == [], _view()["rows"])
+    st = _view()["stock_status"]
+    check("readiness 自带真读证据(listed=15/stock_rows=0)",
           st["listed_skus"] == 15 and st["stock_rows"] == 0, st)
     return check.failures
 
 
-# ── 验收 2 · 不完整库存：运营入口明确「库存不完整」─────────────────────
-def test_incomplete_stock_surfaces_not_ready():
-    print("== test_incomplete_stock_surfaces_not_ready (验收 2: 不完整库存降级) ==")
-    from hipop.server import data
+# ── 验收 2 · 不完整库存：三条运营入口都明确「库存不完整」─────────────────
+def test_incomplete_stock_surfaces_not_ready_at_all_entry_points():
+    print("== test_incomplete_stock_surfaces_not_ready_at_all_entry_points (验收 2: 不完整库存降级) ==")
     check = _Checker()
-
-    _seed_entity(ENT_INCOMPLETE)
-    # 20 个上架 SKU，只有 14 个有库存行 → 覆盖率 0.70 < 0.8，但行数 14 ≥ 10（非全空）
+    _reset_ksa()
+    # 20 个上架 SKU,只有 14 个有库存行 → 覆盖率 0.70 < 0.8,但行数 14 ≥ 10（非全空）
     for i in range(20):
-        has_stock = i < 14
-        _add_sku(ENT_INCOMPLETE["alias"], f"PRT{i:03d}", sales=True,
-                 stock=300 if has_stock else None)
+        _add_sku(f"PRT{i:03d}", sales=True, stock=300 if i < 14 else None)
 
-    st = data.stock_readiness(TENANT, ENT_INCOMPLETE["alias"])
-    check("不完整库存 readiness 不就绪", st["ready"] is False, st)
-    check("不完整库存 status=incomplete", st["status"] == "incomplete", st)
-    check("非全空（stock_rows≥10）也被识别为不完整",
+    _assert_not_ready_all_entries(check, expect_status="incomplete", expect_word="不完整")
+    st = _view()["stock_status"]
+    check("非全空(stock_rows≥10)也被识别为不完整",
           st["stock_rows"] >= 10 and st["coverage"] < 0.8, st)
-    check("message 明确『不完整』", "不完整" in st["message"], st)
     return check.failures
 
 
-# ── 就绪态对照：完整库存 → ready=True（防把正常态误报降级）──────────────
-def test_ready_stock_is_ready():
-    print("== test_ready_stock_is_ready (就绪态对照) ==")
-    from hipop.server import data
+# ── 就绪态对照：完整库存但本周无需补货 → ready=True（防把正常态误报降级）────
+def test_ready_stock_no_false_positive():
+    print("== test_ready_stock_no_false_positive (就绪态对照,空 rows ≠ 未就绪) ==")
     check = _Checker()
-    st = data.stock_readiness(TENANT, ENT_READY["alias"])
-    check("完整库存 status=ready", st["status"] == "ready", st)
-    check("完整库存 ready=True", st["ready"] is True, st)
-    check("覆盖率达标", st["coverage"] >= 0.8, st)
+    _reset_ksa()
+    for i in range(15):  # 完整覆盖 + 无销量 → 不会产生补货建议(rows 空),但库存就绪
+        _add_sku(f"RDY{i:03d}", sales=False, stock=500)
+    _run_wf5()
+
+    for label, resp in (("data 入口", _view()), ("HTTP 路由", _http()), ("chat 工具", _chat())):
+        st = resp["stock_status"]
+        check(f"[{label}] 就绪 status=ready", st["status"] == "ready", st)
+        check(f"[{label}] 就绪 ready=True", st["ready"] is True, st)
+    check("就绪态 data 入口 rows 可为空(管道充足,非未就绪)", isinstance(_view()["rows"], list))
     return check.failures
 
 
-# ── 入口同源：API 视图 + chat 工具都带 readiness（防降级只覆盖 runner）────
-def test_entry_points_carry_readiness():
-    print("== test_entry_points_carry_readiness (入口同源 readiness) ==")
-    from hipop.server import data
+# ── 页面模板契约：补货页真读 stock_status 并渲染未就绪告警条 ──────────────
+def test_template_surfaces_readiness():
+    print("== test_template_surfaces_readiness (页面模板契约) ==")
     check = _Checker()
-
-    view = data.get_replenishment_view("ksa", limit=10)
-    check("API 视图含 stock_status", "stock_status" in view, list(view.keys()))
-    check("API 视图含 rows", "rows" in view and isinstance(view["rows"], list))
-    check("ksa（就绪主体）入口 ready=True", view["stock_status"]["ready"] is True, view["stock_status"])
-
-    # chat 工具同源（anthropic 不可用时跳过该断言，保证 make test 健壮）
-    try:
-        from hipop.server import agent
-    except Exception as e:  # pragma: no cover
-        print(f"  (skip chat tool 断言: agent 导入失败 {e})")
-        return check.failures
-    res = agent.tool_compute_replenishment("ksa", limit=10)
-    check("chat 工具响应含 stock_status（与 API 同源）", "stock_status" in res, list(res.keys()))
-    check("chat 工具 stock_status.ready 与入口一致",
-          res.get("stock_status", {}).get("ready") is True, res.get("stock_status"))
+    with open(TMPL_PATH, encoding="utf-8") as f:
+        html = f.read()
+    check("模板从 /api/replenishment 响应取 stock_status", "stock_status" in html, "no stock_status")
+    check("模板取 rows 字段", re.search(r"\.rows", html) is not None)
+    check("模板按 stockStatus.ready 渲染(就绪度真被消费)", "stockStatus" in html and "ready" in html)
+    check("模板渲染未就绪/不完整告警条(message)",
+          ("库存未就绪" in html or "库存不完整" in html) and "message" in html, "no banner")
     return check.failures
 
 
@@ -288,14 +320,14 @@ if __name__ == "__main__":
     import traceback
 
     _init_db()
-    # ENT_READY = hipop_ksa 由 schema_v2.sql 预置（含 hipop_uae），无需再 seed。
+    # hipop_ksa / hipop_uae 由 schema_v2.sql 预置;每个测试用 _reset_ksa 独立构造状态。
 
     tests = [
         test_stock_change_changes_replenishment,
-        test_empty_stock_surfaces_not_ready,
-        test_incomplete_stock_surfaces_not_ready,
-        test_ready_stock_is_ready,
-        test_entry_points_carry_readiness,
+        test_empty_stock_surfaces_not_ready_at_all_entry_points,
+        test_incomplete_stock_surfaces_not_ready_at_all_entry_points,
+        test_ready_stock_no_false_positive,
+        test_template_surfaces_readiness,
     ]
     failed = 0
     for t in tests:
