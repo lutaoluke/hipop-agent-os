@@ -233,6 +233,32 @@ def test_listing_provider_exception_returns_evidence_insufficient():
     assert result.get("error") == "noon_listing_provider_failed"
 
 
+def test_listing_provider_partial_exception_returns_evidence_insufficient():
+    """Partial fetch: first keyword succeeds, second keyword raises → must still be evidence_insufficient."""
+    ok_record = _base_record()
+
+    def _partial_listing(keyword, _country):
+        if keyword == "ok":
+            return [ok_record]
+        raise RuntimeError("fake failure")
+
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=_partial_listing,
+        detail_provider=None,
+        feature_extractor=None,
+        supply_provider=None,
+        ali_records=[],
+        keywords=["ok", "bad"],
+    )
+
+    assert result["status"] == EVIDENCE_INSUFFICIENT, (
+        f"expected evidence_insufficient, got {result['status']!r} — "
+        "partial listing failure must not silently produce ok"
+    )
+    assert result.get("error") == "noon_listing_provider_failed"
+
+
 if __name__ == "__main__":
     test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes()
     print("  ✓ test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes")
@@ -244,3 +270,5 @@ if __name__ == "__main__":
     print("  ✓ test_feature_extractor_exception_returns_evidence_insufficient")
     test_listing_provider_exception_returns_evidence_insufficient()
     print("  ✓ test_listing_provider_exception_returns_evidence_insufficient")
+    test_listing_provider_partial_exception_returns_evidence_insufficient()
+    print("  ✓ test_listing_provider_partial_exception_returns_evidence_insufficient")

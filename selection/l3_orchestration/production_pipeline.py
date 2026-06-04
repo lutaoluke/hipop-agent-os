@@ -310,7 +310,7 @@ def run_ksa_luggage_noon(
             fetched.extend(listing_provider(keyword, country))
         except Exception as exc:
             fetch_errors.append({"keyword": keyword, "error": type(exc).__name__})
-    if fetch_errors and not fetched:
+    if fetch_errors:
         summaries["noon_fetch"] = {
             "keywords": expanded_keywords,
             "n_records": 0,
