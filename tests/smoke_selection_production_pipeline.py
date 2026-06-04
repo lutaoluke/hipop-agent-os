@@ -81,15 +81,36 @@ def _detail_provider(records):
     return {"n_ok": len(records), "n_fail": 0}
 
 
+def _mature_detail_provider(records):
+    for rec in records:
+        rec.policy_flags["detail"] = {
+            "highlights": ["extra strong ABS shell", "360 spinner wheels", "TSA lock"],
+            "specifications": {"Material": "ABS"},
+            "reviews_summary": {
+                "recent_1y_ratio": 0.3,
+                "dates_spread_days": 720,
+                "dates_count_visible": 10,
+            },
+            "variants": [],
+        }
+    return {"n_ok": len(records), "n_fail": 0}
+
+
 def _feature_extractor(records):
     for rec in records:
-        rec.inferred_features = ["材质_ABS", "尺寸_20寸", "功能_万向轮", "功能_TSA锁"]
+        features = ["万向轮", "TSA锁"]
+        if "expandable" in rec.title.lower():
+            features.append("拓展层")
+        if "cup holder" in rec.title.lower():
+            features.append("咖啡杯架")
+        size = 24 if "24 inch" in rec.title.lower() else 20
+        rec.inferred_features = [f"材质_ABS", f"尺寸_{size}寸"] + [f"功能_{f}" for f in features]
         rec.policy_flags["n6_extracted"] = {
             "material": "ABS",
-            "size_inches": [20],
+            "size_inches": [size],
             "pieces": 1,
             "color_main": "green",
-            "features": ["万向轮", "TSA锁"],
+            "features": features,
             "return_risk_signal": [],
         }
     return {"n_updated": len(records), "n_not_found": 0}
@@ -115,9 +136,19 @@ def test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes():
     result = run_ksa_luggage_noon(
         seed="luggage",
         listing_provider=lambda _keyword, _country: records,
-        detail_provider=_detail_provider,
+        detail_provider=_mature_detail_provider,
         feature_extractor=_feature_extractor,
         supply_provider=_supply_provider,
+        inventory_provider=lambda _country, _family: [
+            {
+                "partner_sku": "HIPOP20NORMAL",
+                "title": "20 inch ABS hardside luggage suitcase spinner",
+                "family": "bags_luggage",
+                "product_category_detail": "20 inch luggage",
+                "total_stock": 20,
+                "sales_30d": 15,
+            }
+        ],
         ali_records=[_ali_record("16880001", "20 inch ABS luggage suitcase spinner", 80)],
     )
 
@@ -132,8 +163,78 @@ def test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes():
     assert all(c["profit"].get("verdict") for c in result["candidates"])
     assert all(c["overall_v3"].get("tier_overall") for c in result["candidates"])
 
-    for node in ("N1", "noon_fetch", "N3", "N4", "N5", "N5.5", "N6", "N7", "N10", "N11_v3"):
+    for node in ("N1", "noon_fetch", "N3", "N4", "N5", "N5.5", "N6", "N7", "N8", "N9", "N10", "N11_v3"):
         assert node in result["node_trace"], result["node_trace"]
+
+
+def test_inventory_reverse_and_differentiation_feed_n11():
+    records = [
+        _noon_record("ZREG20000000", "20 inch ABS hardside luggage suitcase spinner", price=199, sold=90),
+        _noon_record(
+            "ZEXP24000000",
+            "24 inch expandable ABS luggage suitcase spinner wheels with cup holder",
+            price=259,
+            sold=90,
+        ),
+    ]
+    inventory_rows = [
+        {
+            "partner_sku": "HIPOP20BACKLOG",
+            "title": "20 inch ABS hardside luggage suitcase spinner",
+            "family": "bags_luggage",
+            "product_category_detail": "20 inch luggage",
+            "total_stock": 420,
+            "noon_saleable_qty": 180,
+            "overseas_total_qty": 120,
+            "yiwu_qty": 70,
+            "dongguan_qty": 50,
+            "sales_30d": 3,
+            "sales_grade": "low",
+        }
+    ]
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=_mature_detail_provider,
+        feature_extractor=_feature_extractor,
+        supply_provider=_supply_provider,
+        ali_records=[_ali_record("16880001", "24 inch expandable ABS luggage suitcase spinner", 80)],
+        inventory_provider=lambda _country, _family: inventory_rows,
+    )
+    by_sku = {row["sku_id"]: row for row in result["candidates"]}
+
+    for node in ("N8", "N9", "N11_v3"):
+        assert node in result["node_trace"], result["node_trace"]
+
+    exp24 = by_sku["ZEXP24000000"]
+    reg20 = by_sku["ZREG20000000"]
+    signal_ids = {s["id"] for s in exp24["differentiation"]["signals"]}
+    assert {"expandable_layer", "cup_holder", "spinner_wheels"} <= signal_ids
+    assert exp24["inventory"]["score_adjustment"] > 0
+    assert reg20["inventory"]["score_adjustment"] < 0
+    assert exp24["overall_v3"]["breakdown"]["differentiation_pct"] > reg20["overall_v3"]["breakdown"]["differentiation_pct"]
+    assert exp24["overall_v3"]["breakdown"]["inventory_pct"] > reg20["overall_v3"]["breakdown"]["inventory_pct"]
+    assert exp24["overall_v3"]["score"] > reg20["overall_v3"]["score"]
+
+
+def test_no_inventory_data_is_explicitly_insufficient():
+    records = [
+        _noon_record("ZNOSTOCK0000", "24 inch expandable ABS luggage suitcase spinner", price=249, sold=30)
+    ]
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=_detail_provider,
+        feature_extractor=_feature_extractor,
+        supply_provider=_supply_provider,
+        ali_records=[_ali_record("16880001", "24 inch expandable ABS luggage suitcase spinner", 80)],
+        inventory_provider=lambda _country, _family: [],
+    )
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == EVIDENCE_INSUFFICIENT
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert candidate["inventory"]["reasons"] == []
+    assert "inventory" in candidate["missing_evidence"]
 
 
 def test_missing_external_evidence_is_explicit_not_dropped_or_faked():
@@ -171,5 +272,9 @@ def test_missing_external_evidence_is_explicit_not_dropped_or_faked():
 if __name__ == "__main__":
     test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes()
     print("  ✓ test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes")
+    test_inventory_reverse_and_differentiation_feed_n11()
+    print("  ✓ test_inventory_reverse_and_differentiation_feed_n11")
+    test_no_inventory_data_is_explicitly_insufficient()
+    print("  ✓ test_no_inventory_data_is_explicitly_insufficient")
     test_missing_external_evidence_is_explicit_not_dropped_or_faked()
     print("  ✓ test_missing_external_evidence_is_explicit_not_dropped_or_faked")

@@ -1,7 +1,7 @@
 """Production entry for KSA luggage/noon selection.
 
 This module wires the existing selection nodes into one repeatable path:
-N1 -> noon fetch -> N3 -> N4 -> N5 -> N5.5 -> N5.6 -> N6 -> N7 -> N10 -> N11 v3.
+N1 -> noon fetch -> N3 -> N4 -> N5 -> N5.5 -> N5.6 -> N6 -> N7 -> N8 -> N9 -> N10 -> N11 v3.
 
 External evidence is intentionally modeled as a first-class state. When a
 caller has no detail/image/N6/1688 evidence, the candidate stays visible with
@@ -23,6 +23,10 @@ from selection.l3_orchestration.nodes.n4_price_analysis import (
 from selection.l3_orchestration.nodes.n5_5_is_rising import apply_is_rising
 from selection.l3_orchestration.nodes.n5_6_sku_group import apply_grouping
 from selection.l3_orchestration.nodes.n5_sales_normalize import normalize as normalize_sales
+from selection.l3_orchestration.nodes.n8_differentiation_score import apply as apply_differentiation
+from selection.l3_orchestration.nodes.n9_inventory_reverse_constraint import (
+    apply as apply_inventory_reverse_constraint,
+)
 from selection.l3_orchestration.nodes.n11_price_bucket_score_v3 import apply_v3
 
 
@@ -32,6 +36,7 @@ ListingProvider = Callable[[str, str], list[ProductRecord]]
 DetailProvider = Callable[[list[ProductRecord]], dict[str, Any]]
 FeatureExtractor = Callable[[list[ProductRecord]], dict[str, Any]]
 SupplyProvider = Callable[[list[ProductRecord]], list[dict[str, Any]]]
+InventoryProvider = Callable[[str, Optional[str]], list[dict[str, Any]]]
 
 
 def _default_noon_listing_provider(keyword: str, country: str) -> list[ProductRecord]:
@@ -67,6 +72,12 @@ def _default_detail_provider(records: list[ProductRecord]) -> dict[str, Any]:
         total_credits += int(detail.get("credits_used") or 0)
         n_ok += 1
     return {"n_ok": n_ok, "n_fail": n_fail, "total_credits": total_credits}
+
+
+def _default_inventory_provider(country: str, family: Optional[str]) -> list[dict[str, Any]]:
+    from selection.l2_knowledge import hipop_adapter
+
+    return hipop_adapter.get_inventory_summary(country=country, family=family)
 
 
 def _mark_missing(rec: ProductRecord, key: str, reason: str) -> None:
@@ -201,6 +212,34 @@ def _apply_profit(records: list[ProductRecord], ali_records: Optional[list[Produ
     return result
 
 
+def _apply_inventory(
+    records: list[ProductRecord],
+    inventory_provider: Optional[InventoryProvider],
+    country: str,
+    family: Optional[str],
+) -> dict[str, Any]:
+    if inventory_provider is None:
+        for rec in records:
+            _mark_missing(rec, "inventory", "inventory_provider not configured")
+        return apply_inventory_reverse_constraint(records, [])
+
+    try:
+        rows = inventory_provider(country, family) or []
+    except Exception as exc:
+        for rec in records:
+            _mark_missing(rec, "inventory", f"inventory provider failed: {type(exc).__name__}")
+        return apply_inventory_reverse_constraint(records, [])
+
+    result = apply_inventory_reverse_constraint(records, rows)
+    if result.get("state") == EVIDENCE_INSUFFICIENT:
+        for rec in records:
+            _mark_missing(rec, "inventory", "inventory provider returned no usable rows")
+    else:
+        for rec in records:
+            _clear_missing(rec, "inventory")
+    return result
+
+
 def _apply_price(records: list[ProductRecord], country: str) -> dict[str, Any]:
     try:
         return analyze_price(records, country=country, family="bags_luggage")
@@ -260,6 +299,10 @@ def _candidate_dict(rec: ProductRecord) -> dict[str, Any]:
             "n6_extracted": rec.policy_flags.get("n6_extracted") or {},
             "group": rec.policy_flags.get("group_aggregated") or {},
         },
+        "differentiation": rec.policy_flags.get("differentiation")
+        or {"state": EVIDENCE_INSUFFICIENT, "score": 0.0, "signals": []},
+        "inventory": rec.policy_flags.get("inventory_reverse_constraint")
+        or {"state": EVIDENCE_INSUFFICIENT, "score_adjustment": 0.0, "reasons": [], "warnings": []},
         "supply": rec.policy_flags.get("supply")
         or {"status": EVIDENCE_INSUFFICIENT if "supply_1688" in missing else "unknown"},
         "profit": profit,
@@ -276,6 +319,7 @@ def run_ksa_luggage_noon(
     detail_provider: Optional[DetailProvider] = _default_detail_provider,
     feature_extractor: Optional[FeatureExtractor] = None,
     supply_provider: Optional[SupplyProvider] = None,
+    inventory_provider: Optional[InventoryProvider] = _default_inventory_provider,
     ali_records: Optional[list[ProductRecord]] = None,
     keywords: Optional[list[str]] = None,
 ) -> dict[str, Any]:
@@ -323,6 +367,12 @@ def run_ksa_luggage_noon(
 
     node_trace.append("N7")
     summaries["N7"] = _apply_supply(candidates, supply_provider)
+
+    node_trace.append("N8")
+    summaries["N8"] = apply_differentiation(candidates)
+
+    node_trace.append("N9")
+    summaries["N9"] = _apply_inventory(candidates, inventory_provider, country, "bags_luggage")
 
     node_trace.append("N10")
     summaries["N10"] = _apply_profit(candidates, ali_records)

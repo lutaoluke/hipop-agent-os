@@ -23,9 +23,11 @@ from typing import Optional
 from selection.l1_normalize.product_record import ProductRecord
 
 
-WEIGHT_SALES = 0.50
-WEIGHT_RATING = 0.25
-WEIGHT_FEATURE = 0.25
+WEIGHT_SALES = 0.42
+WEIGHT_RATING = 0.20
+WEIGHT_FEATURE = 0.18
+WEIGHT_DIFFERENTIATION = 0.12
+WEIGHT_INVENTORY = 0.08
 
 TIER_PCT_CUTS = [(0.10, "一档"), (0.30, "二档"), (0.60, "三档"), (1.01, "四档")]
 
@@ -42,6 +44,16 @@ def _features_count(rec):
     n6 = rec.policy_flags.get("n6_extracted") or {}
     feats = n6.get("features") or []
     return len(feats)
+
+
+def _differentiation_score(rec):
+    diff = rec.policy_flags.get("differentiation") or {}
+    return float(diff.get("score") or 0.0)
+
+
+def _inventory_adjustment(rec):
+    inv = rec.policy_flags.get("inventory_reverse_constraint") or {}
+    return float(inv.get("score_adjustment") or 0.0)
 
 
 def _quantile_cuts(values: list[float], n_buckets: int) -> list[float]:
@@ -86,7 +98,8 @@ def apply_v3(records: list[ProductRecord], *,
       {"track":"mature"/"rising"/"dropped",
        "tier_overall":"一档/二档/三档/四档/drop",
        "score":float, "bucket":int, "bucket_rank":int, "bucket_size":int,
-       "bucket_pct":float, "breakdown":{sales_pct,rating_pct,feature_pct}}
+       "bucket_pct":float,
+       "breakdown":{sales_pct,rating_pct,feature_pct,differentiation_pct,inventory_pct}}
     """
     mature_recs: list[ProductRecord] = []
     rising_recs: list[ProductRecord] = []
@@ -144,10 +157,12 @@ def apply_v3(records: list[ProductRecord], *,
     tier_counts = Counter()
 
     for bi, brecs in by_bucket.items():
-        # bucket 内: 月销量分位 + rating × log10(count) 分位 + feature 分位
+        # bucket 内: 月销量分位 + rating × log10(count) 分位 + feature/N8/N9 分位
         sales_arr = sorted(float(r.sales_signal.raw_value) for r in brecs)
         rating_arr = sorted(_rating_score(r.reviews.get("avg"), r.reviews.get("count")) for r in brecs)
         feature_arr = sorted(float(_features_count(r)) for r in brecs)
+        differentiation_arr = sorted(_differentiation_score(r) for r in brecs)
+        inventory_arr = sorted(_inventory_adjustment(r) for r in brecs)
 
         scored = []
         for r in brecs:
@@ -156,17 +171,24 @@ def apply_v3(records: list[ProductRecord], *,
                 _rating_score(r.reviews.get("avg"), r.reviews.get("count")), rating_arr,
             )
             feature_pct = _percentile_of(float(_features_count(r)), feature_arr)
+            differentiation_pct = _percentile_of(_differentiation_score(r), differentiation_arr)
+            inventory_pct = _percentile_of(_inventory_adjustment(r), inventory_arr)
             score = (
                 WEIGHT_SALES * sales_pct
                 + WEIGHT_RATING * rating_pct
                 + WEIGHT_FEATURE * feature_pct
+                + WEIGHT_DIFFERENTIATION * differentiation_pct
+                + WEIGHT_INVENTORY * inventory_pct
             )
-            scored.append((score, r, sales_pct, rating_pct, feature_pct))
+            scored.append((
+                score, r, sales_pct, rating_pct, feature_pct,
+                differentiation_pct, inventory_pct,
+            ))
 
         # bucket 内 score 降序
         scored.sort(key=lambda x: -x[0])
         n_b = len(scored)
-        for rank, (score, r, sp, rp, fp) in enumerate(scored, 1):
+        for rank, (score, r, sp, rp, fp, dp, ip) in enumerate(scored, 1):
             pct_in_bucket = (rank - 1) / max(1, n_b)
             tier = _tier_from_pct(pct_in_bucket)
             r.policy_flags["overall_v3"] = {
@@ -181,6 +203,8 @@ def apply_v3(records: list[ProductRecord], *,
                     "sales_pct": round(sp, 3),
                     "rating_pct": round(rp, 3),
                     "feature_pct": round(fp, 3),
+                    "differentiation_pct": round(dp, 3),
+                    "inventory_pct": round(ip, 3),
                 },
                 "_feats": {
                     "unit_price": float(r.price.get("value")),
@@ -188,6 +212,8 @@ def apply_v3(records: list[ProductRecord], *,
                     "rating": r.reviews.get("avg"),
                     "review_count": r.reviews.get("count"),
                     "features_n": _features_count(r),
+                    "differentiation_score": _differentiation_score(r),
+                    "inventory_adjustment": _inventory_adjustment(r),
                 },
             }
             tier_counts[tier] += 1
