@@ -107,7 +107,12 @@ def _run_noon_live_ingest(task_id, tenant_id, actor, spec, progress, heartbeat, 
     )
     merge = merge_stock_snapshot_v2.run_v2(tenant_id=tenant_id)
     save_progress({"done": True, "source": res.get("source"), "result": str(res)[:200]})
-    return {"summary": f"noon_live_ingest [{res.get('source')}]: {res}; merge: {merge}"}
+    # source 顶层回传，供 refresh_all_v2 判断「真走 live / 显式回落 csv / blocked」，
+    # 不靠解析 summary 字符串（钉死「静默回落 CSV 冒充迁移完成」假绿死法）。
+    return {
+        "summary": f"noon_live_ingest [{res.get('source')}]: {res}; merge: {merge}",
+        "source": res.get("source"),
+    }
 
 
 # 读/写声明（机器可读，钉「接线缺失」死法）：声明的写列即 ingest 真正部分 upsert
@@ -121,6 +126,44 @@ _run_noon_live_ingest.writes = (
     "wf1_stock.noon_saleable_qty",
     "wf1_stock.noon_unsaleable_qty",
     "wf1_stock.noon_warehouses_json",
+)
+
+
+@register("noon_orders_live_ingest")
+def _run_noon_orders_live_ingest(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """Noon 订单 live 行 → v2 wf2_orders / wf2_sku（WS-35/WS-58 socket）。
+
+    与 CSV 入口（process_csv_v2）共用同一 `_aggregate`/`_upsert`（WS-35 契约，不分叉）；
+    本 runner 把 live 源接上：读 WS-N2.1/WS-58 live row producer，喂同一 ingest。
+
+    取数失败（producer 未接入 / 抛错 / 坏行）→ 整链回落 CSV interim（同契约，不短路），
+    结果标 source=csv_fallback + live_error；无 CSV 可回落 → run_live raise
+    LiveSourceUnavailable（红灯），绝不写默认销量/金额冒充成功。
+
+    spec: {"file": <csv path>, "inbox": <dir>} 仅作 live 失败时的 CSV fallback 输入。
+    读写表见下方 .reads / .writes 声明。
+    """
+    from hipop.scripts import ingest_noon_csv_v2 as noon
+    heartbeat()
+    res = noon.run_live(
+        tenant_id=tenant_id,
+        file=(spec or {}).get("file"),
+        inbox=(spec or {}).get("inbox"),
+    )
+    save_progress({"done": True, "source": res.get("source"), "result": str(res)[:200]})
+    return {
+        "summary": f"noon_orders_live_ingest [{res.get('source')}]: {res}",
+        "source": res.get("source"),
+    }
+
+
+_run_noon_orders_live_ingest.reads = (
+    "noon_orders_live_row_producer",  # WS-N2.1/WS-58 live 源
+    "inbox:noon_orders_csv",          # live 失败时的 CSV interim fallback 输入
+)
+_run_noon_orders_live_ingest.writes = (
+    "wf2_orders",
+    "wf2_sku",
 )
 
 
@@ -279,42 +322,101 @@ def _run_test_sleep(task_id, tenant_id, actor, spec, progress, heartbeat, save_p
 
 @register("refresh_all_v2")
 def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
-    """全量刷新 — 串行跑 wf2_products → wf2_sales → wf1_stock → wf5 → wf3 → wf6。
+    """全量刷新 — 串行跑 ERP + noon 实时 ingest → 分析，无需任何手工 CSV（WS-32.5）。
+
+    步序（在对应 ERP ingest 之后、依赖它的分析步之前插入 noon 实时 ingest 两步）：
+      wf2_products → wf2_sales → noon 订单实时 → wf1_stock → noon 可售库存实时
+      → 库存快照合并 → wf5（销售周期/补货）→ wf3（物流）→ wf6（告警）
+
+    在途/送仓（ASN）口径不接 noon live：由已有 ERP 链（wf1_stock + WS-10/11
+    pending_inbound_qty）覆盖，本编排不动它（WS-60 已取消）。
+
+    noon 实时步三态（钉死「迁移完成 ≠ 没报错」假绿死法）：
+      - source==live：真走实时行（迁移目标态）。
+      - source==csv_fallback：实时取数失败但有 CSV interim → 显式回落，结果标
+        [csv_fallback] + live_error；summary 报「未走 live」，允许继续（验收③）。
+      - raise LiveSourceUnavailable（无 live 又无 CSV 回落）→ 记 blocked，并**跳过
+        依赖 noon 的分析步**（wf5 销售周期/补货），绝不拿空/旧数据产出虚假补货结论。
 
     Chunked checkpoint：每个 step 完了写 progress.steps_done，重启从下一个 step 续。
     """
+    # kind：erp（ERP ingest，与 noon 无关）/ noon_live（noon 实时 ingest）/
+    #       analysis_needs_noon（消费 noon 数据的分析步，noon blocked 时必须跳过）/
+    #       analysis（不依赖 noon 的分析步，noon blocked 也照跑）。
     steps = [
-        ("wf2_products_v2", "ERP 商品库"),
-        ("wf2_sales_v2", "ERP 销量价格"),
-        ("wf1_stock_v2", "ERP 库存"),
-        ("wf1_stock_merge_v2", "库存快照合并"),
-        ("wf5_sales_cycle_v2", "销售周期"),
-        ("wf3_logistics_v2", "物流采集"),
-        ("wf6_alerts_v2", "物流告警"),
+        ("wf2_products_v2", "ERP 商品库", "erp"),
+        ("wf2_sales_v2", "ERP 销量价格", "erp"),
+        ("noon_orders_live_ingest", "noon 订单实时", "noon_live"),
+        ("wf1_stock_v2", "ERP 库存", "erp"),
+        ("noon_live_ingest", "noon 可售库存实时", "noon_live"),
+        ("wf1_stock_merge_v2", "库存快照合并", "erp"),
+        ("wf5_sales_cycle_v2", "销售周期", "analysis_needs_noon"),
+        ("wf3_logistics_v2", "物流采集", "analysis"),
+        ("wf6_alerts_v2", "物流告警", "analysis"),
     ]
     steps_done = set(progress.get("steps_done", []))
     failures = list(progress.get("failures", []))
+    noon_sources = dict(progress.get("noon_sources", {}))
+    noon_blocked = list(progress.get("noon_blocked", []))
+    skipped = list(progress.get("skipped", []))
 
-    for step_workflow, step_name in steps:
+    def _checkpoint(current):
+        save_progress({
+            "steps_done": list(steps_done),
+            "failures": failures,
+            "noon_sources": noon_sources,
+            "noon_blocked": noon_blocked,
+            "skipped": skipped,
+            "current_step": current,
+        })
+
+    for step_workflow, step_name, kind in steps:
         if step_workflow in steps_done:
             print(f"[refresh_all_v2] skip {step_workflow} (already done)", flush=True)
+            continue
+        # 依赖 noon 的分析步：任一 noon 实时步 blocked（无 live、无 CSV 回落）→ 跳过它，
+        # 不拿空/旧数据产虚假补货/销量结论（验收③：blocked 不编数）。
+        if kind == "analysis_needs_noon" and noon_blocked:
+            reason = f"upstream noon blocked: {noon_blocked}"
+            print(f"[refresh_all_v2] SKIP {step_workflow}（{reason}，不产虚假分析结论）", flush=True)
+            skipped.append({"step": step_workflow, "reason": reason})
+            _checkpoint(step_workflow)
             continue
         print(f"[refresh_all_v2] → {step_workflow} ({step_name})", flush=True)
         heartbeat()
         try:
             sub_runner = get_runner(step_workflow)
-            sub_runner(task_id, tenant_id, actor, {}, {}, heartbeat, lambda p: None)
+            res = sub_runner(task_id, tenant_id, actor, {}, {}, heartbeat, lambda p: None) or {}
             steps_done.add(step_workflow)
+            if kind == "noon_live":
+                src = res.get("source")
+                noon_sources[step_workflow] = src
+                if src != "live":
+                    print(f"[refresh_all_v2] ⚠ {step_workflow} 未走 live（source={src}，"
+                          f"显式回落 CSV interim）", flush=True)
         except Exception as e:
             failures.append({"step": step_workflow, "error": str(e)[:200]})
             print(f"[refresh_all_v2] {step_workflow} FAILED: {e}", flush=True)
-        save_progress({
-            "steps_done": list(steps_done),
-            "failures": failures,
-            "current_step": step_workflow,
-        })
+            if kind == "noon_live":
+                # 无 live 又无 CSV 可回落（LiveSourceUnavailable）→ blocked，标记以跳过
+                # 下游依赖 noon 的分析步，绝不让它用空/旧数据假绿。
+                noon_blocked.append(step_workflow)
+                print(f"[refresh_all_v2] {step_workflow} BLOCKED（无 live、无 CSV 回落）→ "
+                      f"将跳过依赖 noon 的分析步", flush=True)
+        _checkpoint(step_workflow)
 
+    n_live = sum(1 for s in noon_sources.values() if s == "live")
+    n_fallback = sum(1 for s in noon_sources.values() if s == "csv_fallback")
+    summary = (f"refresh_all: {len(steps_done)}/{len(steps)} steps done, "
+               f"{len(failures)} failed; noon live={n_live}/{len(noon_sources)}")
+    if n_fallback:
+        summary += f", csv_fallback={n_fallback}（未走 live，见 noon_sources）"
+    if noon_blocked:
+        summary += (f"; BLOCKED noon={noon_blocked} → 跳过依赖 noon 的分析步"
+                    f"{[s['step'] for s in skipped]}（不产虚假结论）")
     return {
-        "summary": f"refresh_all: {len(steps_done)}/{len(steps)} steps done, "
-                   f"{len(failures)} failed"
+        "summary": summary,
+        "noon_sources": noon_sources,
+        "noon_blocked": noon_blocked,
+        "skipped": skipped,
     }
