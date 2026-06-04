@@ -1,0 +1,51 @@
+domain: countries
+name: noon
+seeded_from: "§A 步骤 3/7 + Luke 业务原文"
+
+# 注意: noon 是平台不是国家, 但路径名沿用 §9 设计 (countries/ 实际是 markets/).
+# 真正的国家维度 (UAE/SA) 走 market_meta + pricing_table.yaml
+
+params:
+  # 半托管价段差硬上限 (§A 步骤 3)
+  half_managed_price_band_max_ratio: 1.5
+  # 法定 VAT (informational; 利润核算用 pricing_table.yaml)
+  legal_vat_rate_ksa: 0.15
+  legal_vat_rate_uae: 0.05
+
+rules:
+  # ── 颜色偏好 (§A 步骤 7) ────────────────────────────────
+  # 中东偏白黑绿. 这是 soft_preference (Luke: "国别硬约束先不要, 不想把品都变单调")
+  - id: noon_color_preference_mena
+    mode: soft_preference
+    scope: ["color", "title"]
+    pattern_groups:
+      "白":    {weight: +0.15}
+      "white": {weight: +0.15}
+      "黑":    {weight: +0.15}
+      "black": {weight: +0.15}
+      "绿":    {weight: +0.2, note: "沙特国旗色, 加分"}
+      "green": {weight: +0.2}
+    pattern_type: contains
+    reason: "§A 步骤 7: 中东偏好白/黑/绿 (沙特国旗色直接加分)"
+    seeded_at: 2026-05-06
+
+  # ── 平台政策 (§A 步骤 7) ────────────────────────────────
+  # noon 包容度最高, 没有特别 hard_ban 规则 (LV/乐高在 _global 已有)
+  - id: noon_tolerance_policy_note
+    mode: meta_template
+    note: |
+      §A 步骤 7: noon 包容度最高 — 仿大牌可上 (除 _global 禁单 LV 等), 玩具枪可上.
+      → N3 节点对 noon 不需额外严格过滤
+    seeded_at: 2026-05-06
+
+  # ── 销量徽章映射 (§A 步骤 4 — 归一层用) ──────────────────
+  - id: noon_sales_badge_mapping
+    mode: meta_template
+    note: |
+      noon 商品卡片销量徽章语义 (按强度排序):
+        "Selling out fast"           → tier=top (最强信号)
+        "X+ sold recently"           → tier=high (有具体数字, 接近 30 天总销量)
+        "Lowest price in 30 days"    → 价格信号 (不是销量)
+        "Free Delivery"              → 物流信号 (不是销量)
+        无任何销量字段                → tier=low (§A 步骤 4: '没有销量字段 = 销售情况不好')
+    seeded_at: 2026-05-06

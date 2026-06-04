@@ -1,0 +1,60 @@
+# 定价表 (国家 × 类目): 佣金率 / VAT 实算口径 / 头程系数
+# 来源: 项目根目录 定价表.xlsx (阿联酋 / 沙特 两 sheet)
+#
+# 🚨 VAT 双口径:
+#   - 法定 VAT (国家税): UAE=0.05 / KSA=0.15  (用于 N1 给 LLM 解释场景, 非利润核算)
+#   - 平台代收落到卖家结算的"卖家承担份额" (定价表实算): UAE=0.015 / KSA=0.039
+#     → N10 利润核算用这个, 不用法定 VAT (会少算/多算)
+#
+# 备注 (待 Luke 确认): UAE 1.5% / KSA 3.9% 这套是 noon 平台代收税在卖家结算单
+# 落出来的份额, 不是国家法定 VAT. 写定价表的人 (Luke 团队的小龙虾) 是按这套算
+# 毛利率的 (定价表 sheet 里 0.835 / 0.811 系数已经折算过 15% 佣金 + 这个 VAT 份额).
+
+countries:
+  uae:
+    legal_vat_rate: 0.05
+    platform_vat_share_seller: 0.015
+    currency: AED
+
+  ksa:
+    legal_vat_rate: 0.15
+    platform_vat_share_seller: 0.039
+    currency: SAR
+
+# 平台佣金率
+platforms:
+  noon:
+    default_commission_rate: 0.15   # 定价表实算用 0.835 = 1 - 0.15 - 0.015 (UAE)
+    # 类目级佣金率: 待 Luke 提供 (定价表里没分类目, 只有总系数)
+    by_category: {}
+
+  amazon_me:
+    default_commission_rate: 0.15   # 估算, 待 Luke 确认
+    by_category: {}
+
+# 头程运费 (RMB → 国家本币)
+# 定价表内备注: "标准件 < 2kg, UAE 8.5-10.5 / KSA 6-8.5 区间; 大件 < 2kg UAE 11 / KSA 8.5-9"
+headforward_shipping:
+  uae:
+    standard_under_2kg_aed: [8.5, 10.5]
+    oversize_under_2kg_aed: [11, 11]
+  ksa:
+    standard_under_2kg_sar: [6, 8.5]
+    oversize_under_2kg_sar: [8.5, 9]
+
+# 仓储费 (按月)
+warehouse_fees:
+  uae:
+    fbn_per_item_aed: 0.476     # 官方仓 0.476 AED/件/月 (定价表)
+    overseas_relative: 0.667    # 海外仓约官方仓的 2/3
+  ksa:
+    fbn_per_item_sar: 0.7151    # 官方仓 0.7151 SAR/件/月 (定价表)
+    overseas_relative: 0.667
+
+# 汇率 (实证 ~0.52, 月度更新)
+exchange_rates:
+  rmb_to_sar: 0.52
+  rmb_to_aed: 0.51
+
+# 推广成本 (售价占比, 估算)
+promo_rate: 0.02
