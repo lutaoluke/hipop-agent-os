@@ -231,6 +231,7 @@ TOOLS = [
             "- refresh_all_v2：全量刷新（商品→销量→库存→销售周期→物流→告警），用户说『拉/同步/刷』全部数据时优先用\n"
             "- wf2_products_v2：只拉 ERP 商品库（写 wf2_sku）\n"
             "- wf2_sales_v2：拉商品库 + 销量价格 6 时间窗（写 wf2_sku）\n"
+            "- wf2_sales_refresh_v2：用现有 noon 订单重算窗口销量 + 评级/预测（不拉新 CSV/ERP，秒级）；用户说『刷新销量 / 重算销量 / 重新评级』时选它\n"
             "- wf1_stock_v2：拉 ERP 6 仓库存（写 wf1_stock）\n"
             "- wf5_sales_cycle_v2：基于现有 wf2/wf1/wf3 数据重算销售周期 + 补货决策\n"
             "- wf3_logistics_v2：从 ERP 拉物流货单 + 抓物流站节点（默认只扫近 60 天有销量的 SKU，~30 分钟；用户问『扫物流』走这个）\n"
@@ -247,6 +248,7 @@ TOOLS = [
                 "workflow": {
                     "type": "string",
                     "enum": ["refresh_all_v2", "wf2_products_v2", "wf2_sales_v2",
+                             "wf2_sales_refresh_v2",
                              "wf1_stock_v2", "wf5_sales_cycle_v2",
                              "wf3_logistics_v2", "wf6_alerts_v2",
                              "wf4_replenish_suggest"],

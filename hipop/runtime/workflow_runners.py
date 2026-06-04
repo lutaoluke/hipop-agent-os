@@ -256,6 +256,36 @@ def _run_wf2_sales(task_id, tenant_id, actor, spec, progress, heartbeat, save_pr
     return {"summary": f"wf2_sales: {res}"}
 
 
+@register("wf2_sales_refresh_v2")
+def _run_wf2_sales_refresh(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """按需「销量刷新」（WS-21）— 用现有 wf2_orders 重算窗口销量 + 评级/预测 → wf2_sku。
+
+    不拉新 CSV、不登 ERP：把「上传 noon CSV」之后才会跑的 aggregate + grade 抽成
+    一个可单独触发的入口（运营在 UI/chat 点「刷新销量」，或 refresh_all_v2 每周自动调）。
+    与上传管道复用 wf_sales_static_v2.run_v2（同一 aggregate_sales_v2 / merge_entity_v2），
+    口径不漂移。读写表见下方 .reads / .writes 声明。
+    """
+    from hipop.workflows import wf_sales_static_v2
+    heartbeat()
+    res = wf_sales_static_v2.run_v2(tenant_id=tenant_id)
+    save_progress({"done": True, "result": str(res)[:200]})
+    return {"summary": f"wf2_sales_refresh: {res}"}
+
+
+# 读/写声明（机器可读，钉「接线缺失」死法）：读 wf2_orders（noon 订单明细）+ wf2_sku
+# （取现有 SKU 行），写回 wf2_sku 的窗口销量 + 评级/预测/契约字段。
+_run_wf2_sales_refresh.reads = (
+    "wf2_orders",
+    "wf2_sku",
+)
+_run_wf2_sales_refresh.writes = (
+    "wf2_sku.sales_10d", "wf2_sku.sales_30d", "wf2_sku.sales_60d",
+    "wf2_sku.sales_90d", "wf2_sku.sales_120d", "wf2_sku.sales_180d",
+    "wf2_sku.sales_grade", "wf2_sku.forecast_10d", "wf2_sku.forecast_30d",
+    "wf2_sku.total_revenue", "wf2_sku.return_rate", "wf2_sku.anomalies_json",
+)
+
+
 @register("wf3_logistics_v2")
 def _run_wf3_logistics(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """物流采集 — 真正"长任务"场景（255-1000 SKU × ERP 拉单 + playwright，~30 分钟）。
@@ -347,6 +377,7 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
         ("wf2_products_v2", "ERP 商品库", "erp"),
         ("wf2_sales_v2", "ERP 销量价格", "erp"),
         ("noon_orders_live_ingest", "noon 订单实时", "noon_live"),
+        ("wf2_sales_refresh_v2", "noon 销量聚合 + 评级", "analysis_needs_noon"),  # WS-21：每周/每日也重算 noon 评级
         ("wf1_stock_v2", "ERP 库存", "erp"),
         ("noon_live_ingest", "noon 可售库存实时", "noon_live"),
         ("wf1_stock_merge_v2", "库存快照合并", "erp"),
