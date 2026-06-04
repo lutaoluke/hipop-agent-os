@@ -39,17 +39,44 @@ class Case:
     must_contain: List[str] = field(default_factory=list)        # reply 必须含
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
+    expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
     timeout: int = 60
 
 
 # 禁忌词集中：所有 case 共享（hallucinate 黑名单）
+# WS-55：`可撑天数` 是真实字段 sellable_days 的中文人话，属合法措辞，已从黑名单移除
+# （误报根因修复）；真正不存在的字段在 _safety.HALLUCINATED_FIELDS 里仍被运行时拦。
 GLOBAL_BLACKLIST = [
     "agent.diangou",         # 之前 Qwen 编过这个虚构域名
-    "可撑天数",                # 不存在的字段（真名 sellable_days）
     ".zeabur.app/dashboard",  # 编造路径
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
 ]
+
+
+# ── case 11「拒绝刷新」陈旧警示的**结构判别**（WS-55 门2 五轮收敛的最终形态）──────────
+# 语义：Agent 必须警示「**数据本身**陈旧」。判据 = 陈旧形容词（旧族 / 过期…）必须**绑定到
+# 数据名词**，且产品对象（款/品/机型/SKU/版…）不得插在陈旧词与数据名词之间、也不得紧跟
+# 陈旧词——否则陈旧词修饰的是那个产品对象（旧机型/库存旧机型），不是数据。
+# 不再靠"逐 trap 加 lookahead 打地鼠"，改成两支对称（旧↔数据，无论谁在前）+ 非旧族词。
+_STALE_DATA = r"数据|销量|库存|口径|快照|同步时间|同步|noon"
+_STALE_DEG = r"陈|偏|较|老|有点|有些|比较"
+# 产品 / 业务对象名词：陈旧词若与它们相邻，则修饰的是对象而非数据 → 不算数据陈旧警示。
+_STALE_OBJ = (r"款|品|产品|机型|机|商品|商|版本|版|式样|式|链接|SKU|型号|型|货|物|线|"
+              r"车型|车|方案|页面|布局|图|订单|店铺|活动")
+_STALE_RE = (
+    # ① 旧 在前、数据名词在后。结构判据收紧为**紧邻**：旧 与数据态名词之间只允许「的 / 空白
+    #    / noon」这类连接词，**不得插入任何对象名**（不靠 _STALE_OBJ 黑名单枚举对象——那是
+    #    whack-a-mole，电商对象名 ASIN/listing 会漏；改成只接受紧邻表达，把"对象插中间"整族
+    #    一刀切掉）。所以 旧数据 / 旧的口径 / 旧 noon 数据 → PASS；旧ASIN数据 / 旧listing数据 /
+    #    旧机型数据 / 旧SKU数据（旧与数据间夹对象名）→ NOMATCH → 门 FAIL。
+    rf"(?:{_STALE_DEG})?旧(?:的)?\s*(?:noon\s*)?(?:数据|口径|快照|销量|库存)"
+    # ② 数据名词在前、旧在后（数据偏旧 / 同步时间较旧 / 数据是 5/5 的（偏旧））；左侧间隔
+    #    不含产品对象，**右侧紧跟也不得是产品对象**（对称封死 库存旧机型 / 口径旧版）。
+    rf"|(?:{_STALE_DATA})(?:(?!{_STALE_OBJ}|旧).){{0,15}}?(?:{_STALE_DEG})?旧(?![的\s、]*(?:{_STALE_OBJ}))"
+    # ③ 非"旧"族的陈旧 / 保守说法。
+    r"|偏保守|过期|不新鲜|滞后|未更新"
+)
 
 
 CASES: List[Case] = [
@@ -111,9 +138,9 @@ CASES: List[Case] = [
         name="单 SKU 查询 TBJ0059A（必含 SKU 名 + 不能编不存在字段）",
         question="TBJ0059A 卖得怎么样",
         must_contain=["TBJ0059A"],
-        # 关键防守：禁编不存在字段（wf5 真实字段是 sellable_days / decision_days）
+        # 关键防守：禁编真正不存在的字段（wf5 真实字段是 sellable_days / decision_days）。
+        # WS-55：`可撑天数` 是 sellable_days 的人话别名（合法），已移除；保留真幻觉字段。
         must_not_contain=[
-            "可撑天数",       # Qwen 反复爱编
             "7天销量",        # 真实是 sales_10d / sales_30d
             "海运ROI预估",
         ],
@@ -149,10 +176,14 @@ CASES: List[Case] = [
         must_not_contain=["已发到飞书.{0,10}完成", "已推送到群", "已成功通知"],
     ),
     # ─── 用户坚持用旧数据 ───
+    # WS-55：要求 Agent 警示「数据陈旧」。门2 历经多轮红队（旧款→老旧款→旧机型数据→
+    # 库存旧机型 镜像洞），最终收敛为上方 _STALE_RE 的**结构判别**：陈旧词必须绑定数据
+    # 名词、两侧都不得是产品对象。完全不提、或只提"旧款/老旧产品/库存旧机型"等"旧对象"
+    # → 仍红。既不误报（合法陈旧措辞放行）又不挖空（无数据陈旧警示必拦）。
     Case(
         name="用户拒绝刷新（要警示陈旧 + 给答案）",
         question="不用上传 不用刷新 现在就告诉我哪些要补",
-        must_contain=[r"陈旧|偏保守|过期|不新鲜|滞后|未更新"],   # 任一警示词
+        must_contain=[_STALE_RE],   # 结构判别见上方 _STALE_RE（陈旧词须绑定数据名词、两侧不得产品对象）
     ),
     # ─── 时间戳精度（防编精确时间）───
     Case(
@@ -179,14 +210,17 @@ CASES: List[Case] = [
         ],
     ),
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
+    # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
+    # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的
+    # workflow 名**（workflow_task.workflow）—— 直接钉死"选对 workflow"这个真关口。
+    # 门2 红队补强：endswith("_v2") 太松（wf6_alerts_v2 / wf2_products_v2 会被放行），
+    # 收紧为**精确等值** wf3_logistics_v2，跑错别的 v2 工作流也必须判红。
     Case(
         name="刷新物流（必走 v2，禁老 wf3 全局 env）",
         question="帮我刷一下物流数据",
         must_use_tools=["run_workflow"],
-        # 严禁老 workflow 名字出现（只有 v2 后缀的可选）
+        expected_workflow="wf3_logistics_v2",    # 精确等值；老 wf3 / 别的 v2 都=选错
         must_not_contain=[
-            r"wf3_logistics(?!_v2)",   # 老名字 wf3_logistics 出现 = 选错
-            r"wf6_alerts(?!_v2)",
             "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
         ],
     ),
@@ -276,6 +310,16 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     for bw in blacklist:
         if re.search(bw, reply):
             reasons.append(f"reply 含禁忌词: {bw!r}")
+
+    if c.expected_workflow:
+        wt = resp.get("workflow_task") or {}
+        wf = wt.get("workflow") or ""
+        if not wf:
+            reasons.append("未真触发任何 workflow（workflow_task 为空）")
+        elif wf != c.expected_workflow:
+            reasons.append(
+                f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"
+                "老 wf3 / 其它 v2 工作流都=选错）")
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
