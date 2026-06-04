@@ -1,0 +1,66 @@
+domain: countries
+name: _global
+seeded_from: "§A 步骤 7 + Luke 业务原文"
+
+# 跨平台跨国家铁律. 极少, 仅法务 / 商标 / 显著合规.
+# 一切不在这里的"经验" → 进 categories/* 或 countries/<name>.yaml 当 soft_preference
+
+rules:
+  # ── 商标 / 版权 (硬规则, 多平台都不能上) ──────────────────
+  - id: global_brand_lv_ban
+    mode: hard_ban
+    scope: ["brand", "title"]
+    pattern: ["LV", "Louis Vuitton", "路易威登"]
+    pattern_type: contains
+    reason: "奢侈品商标, 任何平台都不可上架"
+    promoted_at: 2026-05-06
+    promoted_by: "luke_handover_§A_step7"
+
+  - id: global_lego_minifigure_ban
+    mode: hard_ban
+    scope: ["title", "category"]
+    pattern: ["乐高小人偶", "Lego minifigure", "LEGO 人仔", "Lego 人物"]
+    pattern_type: contains
+    reason: "§A 步骤 7: Lego 集团对小人偶版权追诉激烈, 任何平台都不碰"
+    promoted_at: 2026-05-06
+    promoted_by: "luke_handover_§A_step7"
+
+  - id: global_lego_brand_mindshare
+    mode: brand_mindshare
+    scope: ["title", "category"]
+    pattern: ["乐高", "LEGO"]
+    pattern_type: contains
+    note: |
+      §A 步骤 2: '乐高直接定义了积木这个品类' — 这不是 hard_ban,
+      是品牌心智识别. N3 节点要标记 policy_flags.brand_mindshare='lego'
+      让上层知道"积木类目的进入门槛极高", 但不淘汰候选 (Luke 可能选别的差异化进入).
+    seeded_at: 2026-05-06
+
+  # 国际行李箱品牌 (Luke 反馈 2026-05-11): 不 hard_ban, 改标注.
+  # 跟卖 vs 找差异化白牌 — 让选品 agent 知道这是品牌, 后续在 wf2/wf3 决定策略.
+  - id: global_luggage_intl_brand_marker
+    mode: brand_marker
+    scope: ["title", "brand"]
+    pattern:
+      - American Tourister
+      - Samsonite
+      - Delsey
+      - Tumi
+      - Rimowa
+      - Travelpro
+      - Briggs & Riley
+      - Eagle Creek
+      - Victorinox
+      - Antler
+      - Heys
+      - It Luggage
+    pattern_type: contains
+    reason: "国际行李箱品牌, 标注让 wf2/wf3 决定跟卖 vs 差异化"
+    promoted_at: 2026-05-11
+    promoted_by: "luke_review_brand_marker"
+
+# 严格平台 — 这些平台政策严, 一旦上传违规会有更高惩罚, N3 节点要警惕
+strict_platforms:
+  - shein
+  - tiktok
+  # noon 包容度最高, amazon_me 中等, 都不在严格清单

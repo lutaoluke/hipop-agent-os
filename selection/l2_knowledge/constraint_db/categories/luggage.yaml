@@ -1,0 +1,184 @@
+domain: categories
+name: luggage
+seeded_from: "§A 步骤 5/6/8/9 + Luke 业务原文"
+
+# 行李箱 know-how — 接手 CC 看到这就知道行李箱的选品 know-how 不重新调研.
+# 模式: hard_ban 只用于法务/平台违规. 业务经验全部 soft_preference.
+
+params:
+  # 高销尺寸 (§A 步骤 5)
+  hot_sizes_inches: [20, 24]
+  # 起量颜色 (§A 步骤 5)
+  rising_colors: ["莫兰迪绿", "莫兰迪色", "muted-green", "olive"]
+  # 反卷信号 (§2 反卷规则)
+  cost_estimate_factor: 0.9   # 1688 列表展示价 ×0.9 估采购成本
+
+# N6 LLM 抽取 schema (Luke 2026-05-11: yaml-driven, 跨品类通用)
+n6_extract_schema:
+  fields:
+    - name: material
+      type: enum
+      values: ["ABS+PC", "ABS", "PC", "铝框", "软箱", "未知"]
+      hint: 看主图硬箱纹理 + 标题 ABS/PC/铝框/softside/hardside. 标题 'Hardside' → ABS 或 PC, 看图再判. 不确定 '未知'.
+      tag_prefix: "材质"
+    - name: size_inches
+      type: list[int]
+      hint: 标题 14/18/20/24/28 寸数字. set 含多个尺寸 (e.g. "14/20/24/28") 全列出.
+      tag_prefix: "尺寸"
+      tag_suffix: "寸"
+    - name: pieces
+      type: int
+      hint: 标题 "X-piece" / "set of N" / "N pcs" 抽. 单只 = 1.
+      tag_prefix: "pieces"
+    - name: color_main
+      type: str
+      hint: 主图主色调. 标题色名优先. 沙特国旗色 = 绿白色系 (加分).
+      tag_prefix: "颜色"
+    - name: features
+      type: list[str]
+      hint: 拓展层 / 万向轮 / TSA锁 / USB / 咖啡杯架 / 前置开口 等. 仅列真见过.
+      tag_prefix: "功能"
+    - name: return_risk_signal
+      type: list[str]
+      hint: 看到 "可拆装/分体/多配件/拆卸" 标 "分体". 套装件数≥4 标 "多配件". 售价超常规标 "高客单价".
+
+# N1 流量词扩展 — 实证 'luggage' 关键词 96% 召回 set, 'carry on luggage'
+# 100% 召回单只 + 销量数字 4× 提升. 多关键词并行抓 + 去重.
+# ⚠️ 删除 'travel bag': Luke 实证它泛化错, 召回 duffel/gym/旅行包等不相关品.
+search_keywords:
+  - luggage              # 总词, 套装为主
+  - luggage set          # 显式套装
+  - carry on luggage     # 单只 + 销量数字密
+  - suitcase             # 单只单 + 少 set
+  - trolley bag          # 中东叫法
+  - cabin luggage        # 登机款
+  - hardside luggage     # 材质特点词
+
+# 标题相关性硬过滤 (N3.5 入选门槛, 通用算法).
+# 进入候选池的硬门槛: title 必含至少一个 inclusion_keywords AND 不含任何 exclusion_keywords.
+# 任何新品类只要在 yaml 配这两 list 即生效, 不写死品类逻辑.
+inclusion_keywords:    # 标题命中其一才算"是该品类"
+  - luggage
+  - suitcase
+  - trolley
+  - cabin
+  - spinner
+  - hardside
+  - softside
+  - 行李箱
+  - 拉杆箱
+  - 旅行箱
+  - check-in           # check-in luggage / check-in bag
+  - carry-on
+  - carry on
+
+# search_query alignment (Luke 2026-05-12 加, §A 步骤 4):
+# 标题必须跟当前 search_query 意图对齐, 防止 SEO stuffing 污染.
+search_query_alignment:
+  - kw: "luggage"
+    title_must_contain: ["luggage", "suitcase", "trolley", "spinner", "hardside", "softside", "checked", "carry on", "carry-on", "cabin"]
+  - kw: "luggage set"
+    title_must_contain: ["set", "piece", "pcs", "件套"]
+  - kw: "carry on luggage"
+    title_must_contain: ["carry on", "carry-on", "cabin", "boarding", "20"]
+  - kw: "suitcase"
+    title_must_contain: ["suitcase", "luggage", "trolley", "spinner", "hardside"]
+  - kw: "trolley bag"
+    title_must_contain: ["trolley", "luggage", "suitcase", "spinner"]
+  - kw: "cabin luggage"
+    title_must_contain: ["cabin", "carry on", "carry-on", "boarding", "20"]
+  - kw: "hardside luggage"
+    title_must_contain: ["hardside", "hard side", "hard case", "abs", "pc", "polycarbonate"]
+
+exclusion_keywords:    # 标题含任一直接 drop (不是行李箱)
+  - duffel
+  - duffle
+  - gym bag
+  - gym
+  - brasilia            # nike duffel 系列
+  - backpack
+  - handbag
+  - shoulder bag
+  - sling bag
+  - tote
+  - laptop bag
+  - garment bag
+  - cosmetic case        # 化妆箱不算 luggage
+  - makeup case
+  - briefcase
+  # 配件/收纳类 (不是行李箱主体)
+  - organizer            # luggage organizer 是收纳袋, 不是箱子
+  - packing cube
+  - luggage cart         # 拖车
+  - hand truck           # DUNISO Folding Hand Truck 这种工具
+  - extendable handle    # cart 配件常见词
+  # 中文
+  - 双肩包
+  - 手提包
+  - 旅行包               # 跟"旅行箱"相反, 通常指软包
+  - 收纳袋
+  - 化妆箱
+
+rules:
+  # ── 材质硬度 (§A 步骤 7) ─────────────────────────────────
+  - id: luggage_material_hardness
+    mode: soft_preference
+    scope: ["material", "title"]
+    pattern_groups:
+      "ABS+PC":  {weight: +0.4, note: "复合最硬, 推荐"}
+      "ABS":     {weight: +0.2, note: "硬"}
+      "铝框":    {weight: +0.3, note: "结实, 高端化"}
+      "PC":      {weight: -0.2, note: "最软, 不耐摔"}
+    pattern_type: contains
+    reason: "§A 步骤 7: 行李箱材质硬度 PC < ABS < ABS+PC"
+    seeded_at: 2026-05-06
+
+  # ── 拓展层 = 双重价值 (§A 步骤 8) ───────────────────────
+  - id: luggage_expandable_layer
+    mode: soft_preference
+    scope: ["title", "feature"]
+    pattern: ["拓展层", "expandable", "扩展层", "可扩容"]
+    pattern_type: contains
+    weight: +0.5
+    reason: "§A 步骤 8: 拓展层既是商品新卖点, 又能跟其他商品嵌套发货降物流费. 双重价值, 物流嵌套套走 20 寸库存的关键"
+    seeded_at: 2026-05-06
+
+  # ── 功能性差异化点 (§A 步骤 8) ──────────────────────────
+  - id: luggage_functional_features
+    mode: soft_preference
+    scope: ["title", "feature"]
+    pattern_groups:
+      "前置开口":   {weight: +0.2}
+      "充电口":     {weight: +0.2, note: "USB / 电源接口"}
+      "USB":        {weight: +0.2}
+      "咖啡杯架":   {weight: +0.15}
+      "万向轮":     {weight: +0.15}
+      "弹簧":       {weight: +0.15, note: "承重弹簧轮"}
+      "密码锁":     {weight: +0.1}
+      "TSA":        {weight: +0.1, note: "海关锁"}
+    pattern_type: contains
+    reason: "§A 步骤 8: 颜值 + 功能差异化候选挖掘. 这些功能在评论/详情图反复提及"
+    seeded_at: 2026-05-06
+
+  # ── 颜色偏好 (§A 步骤 5 / 7) ────────────────────────────
+  # 注意: §A 提的"中东偏白/黑/绿"是 soft_preference, 不是 hard_ban.
+  # Luke 反馈: "国别硬约束先不要, 作为知识库逐步积累, 不想把品都变单调"
+  - id: luggage_color_morandi_rising
+    mode: soft_preference
+    scope: ["color", "title"]
+    pattern: ["莫兰迪", "muted", "雾", "雾霾"]
+    pattern_type: contains
+    weight: +0.3
+    reason: "§A 步骤 5: 近期起量颜色, 莫兰迪色更好卖"
+    seeded_at: 2026-05-06
+
+  # ── 库存反向约束模板 (§A 步骤 9) ────────────────────────
+  # 这条是元规则, 不直接命中, 给 N9 节点知道"行李箱怎么做反向约束"
+  - id: luggage_inventory_reverse_template
+    mode: meta_template
+    note: |
+      §A 步骤 9: 库存反向约束 = 不选最赚钱, 是消化既有库存劣势.
+      行李箱专用模板:
+        IF wf1_*_stock 里 20 寸 SKU 库存 > 阈值
+        THEN N4 价格带不再选 20 寸 ; N7 1688 搜尺寸过滤=24 寸 ; N8 拓展层成必选差异化点 (因为能套走 20 寸库存)
+    seeded_at: 2026-05-06
