@@ -313,13 +313,19 @@ def _selection_detail_provider(records):
 
 def _selection_feature_extractor(records):
     for rec in records:
-        rec.inferred_features = ["材质_ABS", "尺寸_20寸", "功能_万向轮", "功能_TSA锁"]
+        features = ["万向轮", "TSA锁"]
+        if "expandable" in rec.title.lower():
+            features.append("拓展层")
+        if "cup holder" in rec.title.lower():
+            features.append("咖啡杯架")
+        size = 24 if "24 inch" in rec.title.lower() else 20
+        rec.inferred_features = [f"材质_ABS", f"尺寸_{size}寸"] + [f"功能_{f}" for f in features]
         rec.policy_flags["n6_extracted"] = {
             "material": "ABS",
-            "size_inches": [20],
+            "size_inches": [size],
             "pieces": rec.policy_flags.get("pack_size") or 1,
             "color_main": "green",
-            "features": ["万向轮", "TSA锁"],
+            "features": features,
             "return_risk_signal": [],
         }
     return {"n_updated": len(records), "n_not_found": 0}
@@ -361,8 +367,13 @@ def _selection_ali_record(offer_id, title, unit_rmb=80):
 def _selection_fixture_result(records, *, detail_provider=_selection_detail_provider,
                               feature_extractor=_selection_feature_extractor,
                               supply_provider=_selection_supply_provider,
-                              ali_records=None):
+                              ali_records=None,
+                              inventory_provider=None):
     from selection.l3_orchestration.production_pipeline import run_ksa_luggage_noon
+
+    kwargs = {}
+    if inventory_provider is not None:
+        kwargs["inventory_provider"] = inventory_provider
 
     return run_ksa_luggage_noon(
         seed="luggage",
@@ -377,6 +388,7 @@ def _selection_fixture_result(records, *, detail_provider=_selection_detail_prov
             _selection_ali_record("1688-rising", "20 inch cabin hardside luggage spinner carry on suitcase"),
             _selection_ali_record("1688-brand", "American Tourister hardside luggage spinner suitcase"),
         ] if ali_records is None else ali_records,
+        **kwargs,
     )
 
 
@@ -460,6 +472,90 @@ def test_selection_phase1_deterministic_rules_run_in_production_path():
 
     for node in ("N3", "N4", "N5", "N5.5", "N6", "N7", "N10", "N11_v3"):
         assert node in result["node_trace"], result["node_trace"]
+
+
+def test_selection_inventory_reverse_and_differentiation_feed_n11():
+    records = [
+        _selection_noon_record(
+            "REG20",
+            "20 inch ABS hardside luggage suitcase spinner",
+            price=199,
+            sold=90,
+            rating=4.6,
+            reviews=100,
+        ),
+        _selection_noon_record(
+            "EXP24",
+            "24 inch expandable ABS luggage suitcase spinner wheels with cup holder",
+            price=259,
+            sold=90,
+            rating=4.6,
+            reviews=100,
+        ),
+    ]
+
+    inventory_rows = [
+        {
+            "partner_sku": "HIPOP20BACKLOG",
+            "title": "20 inch ABS hardside luggage suitcase spinner",
+            "family": "bags_luggage",
+            "product_category_detail": "20 inch luggage",
+            "total_stock": 420,
+            "noon_saleable_qty": 180,
+            "overseas_total_qty": 120,
+            "yiwu_qty": 70,
+            "dongguan_qty": 50,
+            "sales_30d": 3,
+            "sales_grade": "low",
+        }
+    ]
+
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: inventory_rows,
+    )
+    by_sku = {row["sku_id"]: row for row in result["candidates"]}
+
+    for node in ("N8", "N9", "N11_v3"):
+        assert node in result["node_trace"], result["node_trace"]
+
+    exp24 = by_sku["EXP24"]
+    reg20 = by_sku["REG20"]
+
+    exp_signal_ids = {s["id"] for s in exp24["differentiation"]["signals"]}
+    assert {"expandable_layer", "cup_holder", "spinner_wheels"} <= exp_signal_ids
+    assert exp24["inventory"]["state"] == "sufficient"
+    assert exp24["inventory"]["score_adjustment"] > 0
+    assert any("20寸" in reason for reason in exp24["inventory"]["reasons"])
+
+    assert reg20["inventory"]["score_adjustment"] < 0
+    assert reg20["inventory"]["warnings"]
+
+    exp_breakdown = exp24["overall_v3"]["breakdown"]
+    assert exp_breakdown["differentiation_pct"] > reg20["overall_v3"]["breakdown"]["differentiation_pct"]
+    assert exp_breakdown["inventory_pct"] > reg20["overall_v3"]["breakdown"]["inventory_pct"]
+    assert exp24["overall_v3"]["score"] > reg20["overall_v3"]["score"]
+
+
+def test_selection_no_inventory_data_is_explicitly_insufficient():
+    records = [
+        _selection_noon_record(
+            "NOSTOCK1",
+            "24 inch expandable ABS luggage suitcase spinner",
+            price=249,
+            sold=30,
+        )
+    ]
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: [],
+    )
+
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == "evidence_insufficient"
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert candidate["inventory"]["reasons"] == []
+    assert "inventory" in candidate["missing_evidence"]
 
 
 def test_selection_phase1_evidence_insufficient_is_explicit_offline():
