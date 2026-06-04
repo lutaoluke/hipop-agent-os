@@ -690,6 +690,15 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_noon_stock_csv_v2:run_live")],
         ["sales", "replenish"],
     ),
+    # WS-35/WS-58：Noon 订单 live 行 → wf2_orders/wf2_sku（与 ingest_noon_csv_v2 CSV 入口同款
+    # _aggregate/_upsert 契约，来源为 WS-N2.1 live row producer；取数失败回落 CSV interim，不编数）。
+    # 与 noon_live_ingest 同为可独立触发（运营重登 noon 后单独重跑订单），并被 refresh_all_v2 编排。
+    "noon_orders_live_ingest": (
+        "Noon 订单（live 行 → wf2_orders/wf2_sku，取数失败回落 CSV，per-tenant）",
+        [(1, "WS-N2.1 live row producer → 同一 _aggregate/_upsert → wf2_orders/wf2_sku",
+          "scripts.ingest_noon_csv_v2:run_live")],
+        ["sales", "replenish"],
+    ),
     # WS-11：ASN 送仓未上架 → wf1_stock.pending_inbound_qty（确定性状态规则）
     "wf1_pending_inbound_v2": (
         "送仓未上架（ASN 状态规则 → wf1_stock.pending_inbound_qty，供销售周期）",
@@ -731,16 +740,21 @@ WORKFLOW_REGISTRY = {
           "workflows.wf6_alerts_v2:run_v2")],
         ["logistics", "replenish"],
     ),
-    # 全套：商品+销量+库存+销售周期+物流占位+告警 一键跑
+    # 全套：商品+销量+(noon订单实时)+库存+(noon库存实时)+快照合并+销售周期+物流+告警 一键跑。
+    # 真实执行走 runtime runner（workflow_runners:_run_refresh_all，spawn_task 路径）；本 steps
+    # 仅供前端 SSE 渲染 / 审计的步数与标签展示，须与 runner 实际步序一致（WS-32.5 接入 noon 实时）。
     "refresh_all_v2": (
-        "完整刷新（商品→销量→库存→销售周期→物流→告警）",
+        "完整刷新（商品→销量→noon订单实时→库存→noon库存实时→快照合并→销售周期→物流→告警）",
         [
             (1, "ERP 商品库", "scripts.ingest_erp_products_v2:run_v2"),
             (2, "ERP 销量价格", "scripts.ingest_erp_sales_v2:run_v2"),
-            (3, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
-            (4, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
-            (5, "物流在途占位", "workflows.wf3_logistics_v2:run_v2"),
-            (6, "物流告警", "workflows.wf6_alerts_v2:run_v2"),
+            (3, "noon 订单实时（→ wf2_orders/wf2_sku）", "scripts.ingest_noon_csv_v2:run_live"),
+            (4, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
+            (5, "noon 可售库存实时（→ wf1_stock.noon_*）", "scripts.ingest_noon_stock_csv_v2:run_live"),
+            (6, "库存快照合并（→ total_stock）", "scripts.merge_stock_snapshot_v2:run_v2"),
+            (7, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
+            (8, "物流在途", "workflows.wf3_logistics_v2:run_v2"),
+            (9, "物流告警", "workflows.wf6_alerts_v2:run_v2"),
         ],
         ["sales", "replenish", "logistics"],
     ),
