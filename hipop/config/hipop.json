@@ -66,15 +66,32 @@
     "debug_port_default": 9223
   },
   "platform_browser": {
-    "_NOTE": "平台无关的平台浏览器会话配置（WS-33.3）。session_ttl_seconds=内存 cache TTL；warmup_retries=冷 goto 被紫鸟扩展 abort 时先平台根域 warmup 再重试的次数。platforms 按平台名给登录态检测规则；store_key 含平台名子串即命中（noon / NOON-SA 均落 noon）。login_url_markers/session_cookie 由代码判定登录态，绝不进 prompt。",
+    "_NOTE": "平台无关的平台浏览器会话配置（WS-33.3 / WS-47）。session_ttl_seconds=内存 cache TTL；warmup_retries=冷 goto 被紫鸟扩展 abort 时先平台根域 warmup 再重试的次数；renew_before_days=会话 cookie 还剩这么多天到期时进入主动续登窗口（窗口大小，非到期日；各店到期日按实测 cookie 算，绝不写死 29 天/2026-07-02）。platforms 按平台名给登录态检测规则；store_key 含平台名子串即命中（noon / NOON-SA 均落 noon）。login_url_markers/session_cookie 由代码判定登录态，绝不进 prompt。",
     "session_ttl_seconds": 600,
     "warmup_retries": 3,
+    "renew_before_days": 5,
     "platforms": {
       "noon": {
         "root_url": "https://noon-catalog.noon.partners/",
         "check_url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon",
         "login_url_markers": ["/login", "/signin", "/sign-in", "login.noon", "identity.noon", "accounts.noon", "/auth"],
-        "session_cookie": "_npsid"
+        "session_cookie": "_npsid",
+        "orders": {
+          "_NOTE": "noon 订单实时抓取（WS-N2.1/WS-58）：noon Sales Dashboard 接口（订单/销售明细，非凭据，故直接配真实 URL）。取数前先把 page 导到 report_page_url（同域，避开 CORS），再分页 POST api_url（body 含 country_code/page/per_page/filters/from_date/to_date），汇总 records_path（hits）。country_code 按销售主体国别：KSA=SA、UAE=AE。字段名→WS-34 契约键映射钉在 noon_order_fetcher._NOON_ORDER_FIELD_MAP（实测 hits 行键与契约同名）。page_retries：分页中 SPA 导航毁上下文（execution context destroyed）/瞬时 Failed to fetch 时，回导报表页后对当前页受控重试的次数。",
+          "api_url": "https://reports.noon.partners/_vs/mp/mp-inventory-health-api-sales-dashboard/sales-dashboard/list",
+          "report_page_url": "https://reports.noon.partners/en/sales",
+          "country_code": "SA",
+          "per_page": 200,
+          "lookback_days": 90,
+          "max_pages": 500,
+          "page_retries": 3,
+          "records_path": ["hits"]
+        },
+        "my_inventory": {
+          "_NOTE": "noon 可售库存实时抓取（WS-N2.2/WS-59）：api_url=已登录 page 同源 fetch 的真实 my inventory 接口，由运营首次 live 时核对后经 NOON_STOCK_API_URL 注入（绝不在仓库写死/猜 URL）；records_path=接口 JSON 走到库存记录 list 的键路径（缺省自动在常见容器键里找 list）。字段名→WS-34 契约键的映射钉在 noon_stock_fetcher._NOON_STOCK_FIELD_MAP。",
+          "api_url": "${NOON_STOCK_API_URL}",
+          "records_path": null
+        }
       }
     }
   },

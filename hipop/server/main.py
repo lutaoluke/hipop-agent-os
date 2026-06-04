@@ -125,8 +125,24 @@ def _startup_selfcheck():
         except Exception as e:
             print(f"[startup] token check skipped: {e}", flush=True)
 
+    def _session_check():
+        """每店 Noon 平台会话有效期检查（WS-47），镜像 dbuyerp token 检查。"""
+        try:
+            from server import _platform_browser as _pb
+            status = _pb.check_session_health()
+            if status.get("needs_renewal"):
+                stale = [s for s in status["stores"] if s["needs_renewal"]]
+                print(f"[startup] ⚠️ Noon 平台会话临近到期/需续登: {stale}", flush=True)
+                print(f"[startup]    → 用紫鸟超级浏览器重登该店（参照 refresh-dbuyerp-token）", flush=True)
+            elif status.get("stores"):
+                days = [f"{s['store']}={s['cookie_days_left']}d" for s in status['stores']]
+                print(f"[startup] ✓ Noon 平台会话 healthy: {days}", flush=True)
+        except Exception as e:
+            print(f"[startup] session check skipped: {e}", flush=True)
+
     threading.Thread(target=_smoke, daemon=True).start()
     threading.Thread(target=_token_check, daemon=True).start()
+    threading.Thread(target=_session_check, daemon=True).start()
 
 
 # ── 每日自动刷新（APScheduler）───────────────────────────
@@ -163,9 +179,15 @@ def health():
         erp_token = _erp_auth.check_persist_token_expiry()
     except Exception as e:
         erp_token = {"error": str(e)[:200]}
+    try:
+        from server import _platform_browser as _pb
+        platform_session = _pb.check_session_health()
+    except Exception as e:
+        platform_session = {"error": str(e)[:200]}
     return {
         "status": "ok",
-        "erp_token": erp_token,  # {tokens: [...], needs_refresh: bool}
+        "erp_token": erp_token,            # {tokens: [...], needs_refresh: bool}
+        "platform_session": platform_session,  # {stores: [...], needs_renewal: bool}
     }
 
 

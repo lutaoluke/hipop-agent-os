@@ -320,9 +320,30 @@ def run_live(tenant_id: int, live_producer=None, allow_csv_fallback: bool = True
     print(f"\n=== noon live ingest tenant={tenant_id}: {len(rows)} live rows ===",
           file=sys.stderr)
     _data.set_current_tenant(tenant_id)
+    bucket, n_rows, n_unmapped = _aggregate(rows, tenant_id)
+
+    # ── live 源完整性守门（落库前红灯；验收③ + 死法「空回/缺映射冒充 live 成功」）──────
+    # WS-59 门2 返工：原先无条件组装 source="live"，导致两类假绿——
+    #   ① live 源空回（producer→0 行 / 全部行国别不在销售主体白名单）→ bucket 无可落 SKU；
+    #   ② live 行平台 SKU 无法映射回 partner_sku（缺 wf2_sku）→ 只 unmapped++ 后照样成功。
+    # 两类都「没有可信真库存可落」，绝不冒充 source=live。交既有 `_csv_fallback_or_fail` 统一
+    # 处理：有 CSV interim → 显式回落（source=csv_fallback + live_error，summary 即报「没走
+    # live」）；无 CSV → raise LiveSourceUnavailable（blocked）。**只守 live 路径**——run_v2(CSV)
+    # 仍按原口径宽松跳过 unmapped（运营导表是另一信任模型），故不动 `_aggregate`/`_upsert`。
+    if n_unmapped > 0:
+        return _csv_fallback_or_fail(
+            tenant_id, f"live 有 {n_unmapped} 行平台 SKU 无法映射回 partner_sku"
+            "（缺 wf2_sku 映射）—— 不只 unmapped++ 冒充 live 成功",
+            allow_csv_fallback, file, inbox, dry_run)
+    n_skus_live = sum(len(skus) for skus in bucket.values())
+    if n_skus_live == 0:
+        return _csv_fallback_or_fail(
+            tenant_id, "live 无任何可落库存行（noon my inventory 空回 / 登录态失效 / "
+            "全部行国别不在销售主体白名单）—— 不写空库存冒充 live 成功",
+            allow_csv_fallback, file, inbox, dry_run)
+
     conn = _data.conn()
     try:
-        bucket, n_rows, n_unmapped = _aggregate(rows, tenant_id)
         by_alias = {} if dry_run else _upsert(conn, tenant_id, bucket)
     finally:
         conn.close()
