@@ -495,6 +495,134 @@ def test_selection_phase1_evidence_insufficient_is_explicit_offline():
     assert candidate["sales"]["tier_in_query"] is not None
 
 
+def test_selection_phase1_1688_text_fallback_keeps_supply_candidate():
+    from selection.l3_orchestration.nodes.n7_1688_supply import (
+        ImageSearchFailed,
+        build_1688_supply_provider,
+    )
+
+    records = [
+        _selection_noon_record(
+            "TEXTFB1",
+            "20 inch ABS hardside luggage suitcase spinner TSA lock",
+            price=199,
+            sold=35,
+            search_query="carry on luggage",
+        )
+    ]
+
+    def image_search(_query):
+        raise ImageSearchFailed("image search top results below threshold")
+
+    def text_search(query_text, _query):
+        assert "carry on luggage" in query_text
+        assert "abs" in query_text.lower()
+        return [
+            {
+                "offer_id": "1688-text-1",
+                "title": "20 inch ABS hardside luggage suitcase spinner TSA lock",
+                "price": 80,
+                "image_url": "https://cbu01.alicdn.com/text-1.jpg",
+                "score": 0.82,
+            }
+        ]
+
+    result = _selection_fixture_result(
+        records,
+        supply_provider=build_1688_supply_provider(
+            image_search_provider=image_search,
+            text_search_provider=text_search,
+        ),
+        ali_records=[],
+    )
+
+    candidate = result["candidates"][0]
+    assert "supply_1688" not in candidate["missing_evidence"]
+    assert candidate["supply"]["status"] == "sufficient"
+    assert candidate["supply"]["match_source"] == "text_fallback"
+    assert candidate["supply"]["offers"][0]["match_source"] == "text_fallback"
+    assert candidate["supply"]["offers"][0]["confidence"] in ("high", "medium")
+
+
+def test_selection_phase1_1688_login_unavailable_is_evidence_insufficient():
+    from selection.l3_orchestration.production_pipeline import EVIDENCE_INSUFFICIENT
+    from selection.l3_orchestration.nodes.n7_1688_supply import (
+        LoginRequired,
+        build_1688_supply_provider,
+    )
+
+    records = [
+        _selection_noon_record(
+            "LOGIN1",
+            "20 inch ABS hardside luggage suitcase spinner TSA lock",
+            price=199,
+            sold=35,
+        )
+    ]
+
+    def image_search(_query):
+        raise LoginRequired("1688 login required")
+
+    provider = build_1688_supply_provider(
+        image_search_provider=image_search,
+        text_search_provider=lambda _query_text, _query: [],
+    )
+    result = _selection_fixture_result(records, supply_provider=provider, ali_records=[])
+
+    candidate = result["candidates"][0]
+    assert candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert "supply_1688" in candidate["missing_evidence"]
+    assert candidate["supply"]["status"] == EVIDENCE_INSUFFICIENT
+    assert candidate["supply"]["reason_code"] == "login_required"
+    assert "Chrome profile" in candidate["supply"]["action_required"]
+
+
+def test_selection_phase1_1688_low_similarity_not_high_confidence_same_match():
+    from selection.l3_orchestration.nodes.n7_1688_supply import (
+        ImageSearchFailed,
+        build_1688_supply_provider,
+    )
+
+    records = [
+        _selection_noon_record(
+            "LOWMATCH1",
+            "20 inch ABS hardside luggage suitcase spinner TSA lock",
+            price=199,
+            sold=35,
+        )
+    ]
+
+    def image_search(_query):
+        raise ImageSearchFailed("image search empty")
+
+    def text_search(_query_text, _query):
+        return [
+            {
+                "offer_id": "1688-low-1",
+                "title": "soft travel duffel gym bag with shoulder strap",
+                "price": 35,
+                "image_url": "https://cbu01.alicdn.com/low-1.jpg",
+                "score": 0.28,
+            }
+        ]
+
+    result = _selection_fixture_result(
+        records,
+        supply_provider=build_1688_supply_provider(
+            image_search_provider=image_search,
+            text_search_provider=text_search,
+        ),
+        ali_records=[],
+    )
+
+    supply = result["candidates"][0]["supply"]
+    assert supply["status"] == "low_match"
+    assert supply["match_source"] == "text_fallback"
+    assert supply["confidence"] == "low"
+    assert supply["is_same_design_high_confidence"] is False
+    assert supply["offers"][0]["verdict"] != "inquiry"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []
