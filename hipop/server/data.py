@@ -199,6 +199,97 @@ def stock_history_dates(tenant_id: int, entity_alias: Optional[str] = None) -> L
         return stock_history.list_dates(c, tenant_id, entity_alias)
 
 
+# ── 销量「最后输出数据」字段口径（WS-20 / WS-14-6）──────────────────
+# 替代人工 Excel 汇总表。这是销量输出口径的**单一事实源**：export / /api/sku-health /
+# （未来）飞书 sync 全部走 sales_output_rows() 这一个 v2 读取器，证明三处消费的是
+# 同一份 wf2_sku / wf2_orders（按 tenant+entity 过滤），不再各写各的（接线缺失死法）。
+# 每项 = (输出列 key, 中文表头, 来源)：
+#   entity  → sales_entities（同 tenant+entity）
+#   wf2_sku → 动态分析层最终口径（wf_sales_static_v2.merge_entity_v2 从 wf2_orders 算出）
+#   derived → 由 wf2_sku 的 JSON 列就地派生（订单号=order_item_nrs_json；异常标记=anomalies_json）
+SALES_OUTPUT_SPEC = [
+    ("country",              "国别",        "entity"),
+    ("store_name",           "店铺名",      "entity"),
+    ("product_id",           "主SKU",       "wf2_sku"),
+    ("partner_sku",          "PSKU",        "wf2_sku"),
+    ("total_orders",         "订单量",      "wf2_sku"),
+    ("order_no",             "订单号",      "derived"),
+    ("title",                "商品标题",    "wf2_sku"),
+    ("fulfillment",          "售卖形式",    "wf2_sku"),
+    ("latest_price",         "商品最新售价", "wf2_sku"),
+    ("avg_price",            "平均售价",    "wf2_sku"),
+    ("latest_customer_paid", "最新成交价",  "wf2_sku"),
+    ("latest_profit_rate",   "最新利润率",  "wf2_sku"),
+    ("return_rate",          "退货率",      "wf2_sku"),
+    ("cancel_rate",          "取消率",      "wf2_sku"),
+    ("latest_order_date",    "最新出单日期", "wf2_sku"),
+    ("sales_10d",            "近10天销量",  "wf2_sku"),
+    ("sales_30d",            "近30天销量",  "wf2_sku"),
+    ("sales_60d",            "近60天销量",  "wf2_sku"),
+    ("sales_90d",            "近90天销量",  "wf2_sku"),
+    ("sales_120d",           "近120天销量", "wf2_sku"),
+    ("sales_180d",           "近180天销量", "wf2_sku"),
+    ("total_revenue",        "总销售额",    "wf2_sku"),
+    ("anomalies",            "异常标记",    "derived"),
+    ("sales_grade",          "销量评级",    "wf2_sku"),
+    ("forecast_10d",         "10天预测",    "wf2_sku"),
+    ("forecast_30d",         "30天预测",    "wf2_sku"),
+]
+# 实际从 wf2_sku SELECT 的列（含派生用的原始 JSON 列）
+_SALES_OUTPUT_WF2_COLS = [k for k, _h, src in SALES_OUTPUT_SPEC if src == "wf2_sku"] + [
+    "order_item_nrs_json", "anomalies_json",
+]
+
+
+def _assemble_sales_output_row(r: Dict, country, store_name) -> Dict:
+    """单行 wf2_sku → 输出行：补 国别/店铺名，派生 订单号 / 异常标记。原地补字段并返回。"""
+    r["country"] = country
+    r["store_name"] = store_name
+    # 订单号：order_item_nrs_json（来源 wf2_orders 的 item_nr 集合）展开成逗号串
+    try:
+        nrs = json.loads(r.get("order_item_nrs_json") or "[]")
+    except (ValueError, TypeError):
+        nrs = []
+    r["order_no"] = ",".join(str(x) for x in nrs) if nrs else None
+    # 异常标记：anomalies_json 摘成 type 串（noon vs ERP），空则留空
+    try:
+        anoms = json.loads(r.get("anomalies_json") or "[]")
+    except (ValueError, TypeError):
+        anoms = []
+    r["anomalies"] = ";".join(
+        str(a.get("type", a)) if isinstance(a, dict) else str(a) for a in anoms
+    ) if anoms else None
+    return r
+
+
+def sales_output_rows(tenant_id: int, entity_alias: str, listing: str = "all",
+                      sales_only: bool = False) -> List[Dict]:
+    """销量输出口径的单一 v2 读取器：wf2_sku（tenant+entity 过滤）+ sales_entities。
+
+    export / API / 飞书 sync 共用本函数 → 三处消费同一数据源。返回行含 SALES_OUTPUT_SPEC
+    全部 key（国别/店铺名 + wf2_sku 字段 + 派生 订单号/异常标记）。
+    """
+    where = ["tenant_id=?", "entity_alias=?"]
+    params: list = [tenant_id, entity_alias]
+    if listing == "listed":
+        where.append("is_listed=1")
+    elif listing == "unlisted":
+        where.append("(is_listed=0 OR is_listed IS NULL)")
+    if sales_only:
+        where.append("COALESCE(sales_180d,0) > 0")
+    sql = (f"SELECT {','.join(_SALES_OUTPUT_WF2_COLS)} FROM wf2_sku "
+           f"WHERE {' AND '.join(where)} "
+           f"ORDER BY COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC")
+    rows = _fetch(sql, tuple(params))
+    ent = _fetch(
+        "SELECT country, store_name FROM sales_entities WHERE tenant_id=? AND alias=? LIMIT 1",
+        (tenant_id, entity_alias),
+    )
+    country = ent[0]["country"] if ent else None
+    store_name = ent[0]["store_name"] if ent else None
+    return [_assemble_sales_output_row(r, country, store_name) for r in rows]
+
+
 # ── SKU 健康（销售/库存模块）────────────────────────────────
 def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30,
                     listing: str = "listed") -> List[Dict]:
@@ -242,6 +333,16 @@ def get_sku_health(store: str, urgency: Optional[str] = None, limit: int = 30,
             r["profit_rate"] = round(r["latest_profit_rate"] * 100, 1)
         else:
             r["profit_rate"] = None
+
+    # WS-20：把「最后输出数据」全字段并进 /api/sku-health 响应，与 export 同源
+    # （sales_output_rows 是唯一 v2 读取器）。dashboard 专有字段（trend/days_left/
+    # profit_rate 等）不在 spec 里，不会被覆盖。
+    out_map = {o["partner_sku"]: o for o in sales_output_rows(tid, alias, listing=listing)}
+    for r in rows:
+        o = out_map.get(r.get("partner_sku"))
+        if o:
+            for k, _h, _s in SALES_OUTPUT_SPEC:
+                r[k] = o.get(k)
 
     # 排序：异常 > 急速下降 > 利润低
     def score(r):

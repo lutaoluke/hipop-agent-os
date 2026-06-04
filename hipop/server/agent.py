@@ -700,16 +700,14 @@ def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
                 "latest_order_date", "is_listed"]
         order_by = "COALESCE(sales_180d,0) DESC"
     elif view in ("sales", "sku_health"):
-        w = [f"tenant_id={tid}", f"entity_alias='{alias}'"]
-        if listing == "listed": w.append("is_listed=1")
-        elif listing == "unlisted": w.append("(is_listed=0 OR is_listed IS NULL)")
-        if sales_only: w.append("COALESCE(sales_180d,0) > 0")
-        where = " AND ".join(w)
-        cols = ["partner_sku", "title", "is_listed", "sales_10d", "sales_30d",
-                "sales_60d", "sales_90d", "sales_180d", "latest_price", "avg_price",
-                "latest_profit_rate", "cost_price", "currency", "brand",
-                "product_category_detail", "latest_order_date"]
-        order_by = "COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC"
+        # WS-20：导出「最后输出数据」全字段，替代人工 Excel 汇总。
+        # 口径与读取器统一在 data.sales_output_rows（与 /api/sku-health 同源），
+        # 确定性规则不堆在本文件（见 CODEOWNERS 说明）。
+        from . import data as _d
+        rows = _d.sales_output_rows(tid, alias, listing=listing, sales_only=sales_only)
+        cols = [k for k, _h, _s in _d.SALES_OUTPUT_SPEC]
+        headers = [h for _k, h, _s in _d.SALES_OUTPUT_SPEC]
+        return _write_xlsx_and_return(rows, f"{view}_{store}", filter_desc, cols, headers)
     elif view == "replenish":
         from . import data as _d
         rows = _d._fetch(
@@ -740,8 +738,13 @@ def tool_export_table(view: str, format: str = "excel", filter_desc: str = "",
 
 
 def _write_xlsx_and_return(rows: list, name_prefix: str, filter_desc: str = "",
-                             cols: list = None) -> Dict:
-    """统一 xlsx 写盘 + 返下载链接 helper。"""
+                             cols: list = None, headers: list = None) -> Dict:
+    """统一 xlsx 写盘 + 返下载链接 helper。
+
+    cols    决定取值用的 row dict key（顺序即列顺序）。
+    headers 可选，写表头时用的展示名（与 cols 一一对应，长度须相等）；
+            缺省退回 cols 自身（向后兼容老调用）。
+    """
     import os, time
     from datetime import datetime
     from openpyxl import Workbook
@@ -760,10 +763,13 @@ def _write_xlsx_and_return(rows: list, name_prefix: str, filter_desc: str = "",
     fname = f"{name_prefix}_{ts}.xlsx"
     fpath = os.path.join(export_dir, fname)
 
+    if not headers or len(headers) != len(cols):
+        headers = cols
+
     wb = Workbook()
     ws = wb.active
     ws.title = name_prefix[:30]
-    ws.append(cols)
+    ws.append(headers)
     for r in rows:
         if isinstance(r, dict):
             ws.append([r.get(c) for c in cols])
