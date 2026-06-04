@@ -180,6 +180,9 @@ def test_case11_stale_synonyms_pass():
         "数据较旧，SKU 需要补 5 件。",
         "数据偏旧。SKU 列表如下。",
         "库存数据较旧，款式很多。",
+        # round7：紧邻收紧后，合法"旧 紧邻数据名词"仍放行（含连接词 的/空白/noon）
+        "旧的销量数据（5/5），先用着。",        # 旧+的+销量数据（紧邻）
+        "旧 库存还是 5 月的，建议刷新。",       # 旧+空格+库存
     )
     for reply in legit:
         resp = {"reply": reply + " KSA 当前 20 个 SKU 需要补货：…",
@@ -244,6 +247,13 @@ def test_case11_non_stale_jiu_words_still_fail():
         "同步的旧 SKU 数据补 5 件。",
         "口径里旧、SKU 补货。",          # 顿号（码长 [的\s] 补丁漏的那条，已用 [的\s、] 焊死）
         "数据里旧　机型补货。",          # 全角空格
+        # round7（验门人 03:12，真实 head 953faa2）：电商对象名（ASIN/listing 等）不在任何
+        # 对象黑名单里，"旧在前"分支的 .{0,N} 间隔让它们跨到"数据"冒充陈旧警示。结构收紧为
+        # "旧 紧邻数据态名词"后，旧与数据间夹的对象名一律 NOMATCH → FAIL（不挖空，不靠黑名单）。
+        "旧ASIN数据里，SDA1874A 补 7 件。",
+        "旧listing数据里，SDA1874A 补 7 件。",
+        "旧 ASIN 数据里，补 7 件。",      # 空格分隔的对象名也不得跨
+        "旧的SKU数据里，补 5 件。",       # 的+对象名+数据：旧修饰 SKU，非数据
     )
     for reply in traps:
         resp = {"reply": reply, "tools_used": [], "workflow_task": None}
