@@ -238,6 +238,7 @@ def _candidate_dict(rec: ProductRecord) -> dict[str, Any]:
         "evidence_state": evidence_state,
         "missing_evidence": missing,
         "relevance": rec.policy_flags.get("relevance_check") or {},
+        "brand_marker": rec.policy_flags.get("brand_marker") or {},
         "price": {
             "value": rec.price.get("value"),
             "currency": rec.price.get("currency"),

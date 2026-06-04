@@ -6,6 +6,8 @@ from pathlib import Path
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 BASE = "http://127.0.0.1:8765"
 
 
@@ -247,6 +249,250 @@ def test_screenshots_exist():
     base = str(REPO_ROOT / "hipop" / "logs" / "screenshots")
     files = sorted(f for f in os.listdir(base) if f.endswith(".png"))
     assert len(files) >= 7, f"only {len(files)} screenshots"
+
+
+def _selection_noon_record(
+    sku,
+    title,
+    *,
+    price,
+    sold=None,
+    raw_text=None,
+    brand=None,
+    image=True,
+    rating=4.5,
+    reviews=80,
+    search_query="luggage",
+):
+    from selection.l1_normalize.product_record import ProductRecord, SalesSignal
+
+    return ProductRecord(
+        id=f"noon_sa:{sku}",
+        platform="noon_sa",
+        url=f"https://www.noon.com/saudi-en/{sku}/p",
+        title=title,
+        brand=brand,
+        category_path=["luggage"],
+        images=[f"https://img.nooncdn.com/{sku}.jpg"] if image else [],
+        price={"value": price, "currency": "SAR"},
+        sales_signal=SalesSignal(
+            type="absolute_count" if sold is not None else "unknown",
+            raw_value=sold,
+            raw_text=raw_text or (f"{int(sold)}+ sold recently" if sold is not None else None),
+            source="fixture",
+            confidence=0.9 if sold is not None else 0.0,
+            tier_in_query=None if sold is not None else "low",
+        ),
+        reviews={"avg": rating, "count": reviews},
+        policy_flags={"country": "ksa", "search_query": search_query},
+    )
+
+
+def _selection_detail_provider(records):
+    for rec in records:
+        if rec.id.endswith("RISING1"):
+            summary = {
+                "recent_1y_ratio": 0.92,
+                "dates_spread_days": 110,
+                "dates_count_visible": 12,
+            }
+        else:
+            summary = {
+                "recent_1y_ratio": 0.35,
+                "dates_spread_days": 730,
+                "dates_count_visible": 12,
+            }
+        rec.policy_flags["detail"] = {
+            "highlights": ["ABS shell", "spinner wheels", "TSA lock"],
+            "specifications": {"Material": "ABS", "Size": "20 inch"},
+            "reviews_summary": summary,
+            "variants": [],
+        }
+    return {"n_ok": len(records), "n_fail": 0}
+
+
+def _selection_feature_extractor(records):
+    for rec in records:
+        rec.inferred_features = ["材质_ABS", "尺寸_20寸", "功能_万向轮", "功能_TSA锁"]
+        rec.policy_flags["n6_extracted"] = {
+            "material": "ABS",
+            "size_inches": [20],
+            "pieces": rec.policy_flags.get("pack_size") or 1,
+            "color_main": "green",
+            "features": ["万向轮", "TSA锁"],
+            "return_risk_signal": [],
+        }
+    return {"n_updated": len(records), "n_not_found": 0}
+
+
+def _selection_supply_provider(records):
+    return [
+        {
+            "record_id": rec.id,
+            "status": "sufficient",
+            "offers": [{"offer_id": "1688-fixture", "verdict": "inquiry"}],
+        }
+        for rec in records
+    ]
+
+
+def _selection_ali_record(offer_id, title, unit_rmb=80):
+    from selection.l1_normalize.product_record import ProductRecord, SalesSignal
+
+    pack_size = 4 if "4-piece" in title else 1
+    return ProductRecord(
+        id=f"alibaba_1688:{offer_id}",
+        platform="alibaba_1688",
+        url=f"https://detail.1688.com/offer/{offer_id}.html",
+        title=title,
+        brand=None,
+        category_path=["luggage"],
+        images=[f"https://cbu01.alicdn.com/{offer_id}.jpg"],
+        price={"value": unit_rmb, "currency": "CNY"},
+        sales_signal=SalesSignal(type="unknown", source="fixture", tier_in_query="low"),
+        policy_flags={
+            "relevance_check": {"passed": True, "reason": "fixture"},
+            "pack_size": pack_size,
+            "unit_price": unit_rmb,
+        },
+    )
+
+
+def _selection_fixture_result(records, *, detail_provider=_selection_detail_provider,
+                              feature_extractor=_selection_feature_extractor,
+                              supply_provider=_selection_supply_provider,
+                              ali_records=None):
+    from selection.l3_orchestration.production_pipeline import run_ksa_luggage_noon
+
+    return run_ksa_luggage_noon(
+        seed="luggage",
+        keywords=["luggage"],
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=detail_provider,
+        feature_extractor=feature_extractor,
+        supply_provider=supply_provider,
+        ali_records=[
+            _selection_ali_record("1688-positive", "20 inch ABS hardside luggage suitcase spinner"),
+            _selection_ali_record("1688-pack4", "20 inch 4-piece ABS hardside luggage suitcase spinner set"),
+            _selection_ali_record("1688-rising", "20 inch cabin hardside luggage spinner carry on suitcase"),
+            _selection_ali_record("1688-brand", "American Tourister hardside luggage spinner suitcase"),
+        ] if ali_records is None else ali_records,
+    )
+
+
+def test_selection_phase1_deterministic_rules_run_in_production_path():
+    records = [
+        _selection_noon_record(
+            "POSITIVE1",
+            "20 inch ABS hardside luggage suitcase spinner",
+            price=199,
+            sold=95,
+        ),
+        _selection_noon_record(
+            "PACK4",
+            "20 inch 4-piece ABS hardside luggage suitcase spinner set",
+            price=749,
+            sold=40,
+        ),
+        _selection_noon_record(
+            "RISING1",
+            "20 inch cabin hardside luggage spinner carry on suitcase",
+            price=229,
+            sold=None,
+            rating=4.7,
+            reviews=18,
+        ),
+        _selection_noon_record(
+            "BRAND1",
+            "American Tourister hardside luggage spinner suitcase",
+            brand="American Tourister",
+            price=310,
+            sold=30,
+        ),
+        _selection_noon_record(
+            "CART1",
+            "folding luggage cart hand truck with extendable handle",
+            price=55,
+            sold=120,
+        ),
+        _selection_noon_record(
+            "DUFFEL1",
+            "travel duffel bag with shoulder strap",
+            price=89,
+            sold=70,
+        ),
+        _selection_noon_record(
+            "ORG1",
+            "luggage organizer packing cube travel set",
+            price=49,
+            sold=60,
+        ),
+        _selection_noon_record(
+            "BAN1",
+            "LV hardside luggage suitcase spinner",
+            brand="LV",
+            price=699,
+            sold=10,
+        ),
+    ]
+
+    result = _selection_fixture_result(records)
+    by_sku = {row["sku_id"]: row for row in result["candidates"]}
+    dropped = {row["id"].split(":", 1)[1]: row["reason"] for row in result["dropped"]}
+
+    assert "POSITIVE1" in by_sku
+    assert "CART1" in dropped and "luggage cart" in dropped["CART1"].lower()
+    assert "DUFFEL1" in dropped and "duffel" in dropped["DUFFEL1"].lower()
+    assert "ORG1" in dropped and "organizer" in dropped["ORG1"].lower()
+    assert "BAN1" in dropped and "hard_ban" in dropped["BAN1"]
+
+    assert by_sku["PACK4"]["price"]["pack_size"] == 4
+    assert by_sku["PACK4"]["price"]["unit_price_sar"] == 187
+
+    assert by_sku["RISING1"]["sales"]["type"] == "unknown"
+    assert by_sku["RISING1"]["sales"]["tier_in_query"] == "low"
+    assert by_sku["RISING1"]["sales"]["is_rising"] is True
+    assert by_sku["RISING1"]["overall_v3"]["track"] == "rising"
+
+    assert by_sku["BRAND1"]["relevance"]["passed"] is True
+    assert by_sku["BRAND1"]["brand_marker"]["brand"] == "American Tourister"
+    assert by_sku["BRAND1"]["overall_v3"].get("track") != "dropped"
+
+    for node in ("N3", "N4", "N5", "N5.5", "N6", "N7", "N10", "N11_v3"):
+        assert node in result["node_trace"], result["node_trace"]
+
+
+def test_selection_phase1_evidence_insufficient_is_explicit_offline():
+    from selection.l3_orchestration.production_pipeline import EVIDENCE_INSUFFICIENT
+
+    records = [
+        _selection_noon_record(
+            "NOEVID1",
+            "20 inch hardside luggage suitcase spinner",
+            price=189,
+            sold=18,
+            image=False,
+            reviews=20,
+        )
+    ]
+    result = _selection_fixture_result(
+        records,
+        detail_provider=None,
+        feature_extractor=None,
+        supply_provider=None,
+        ali_records=[],
+    )
+
+    assert result["status"] == EVIDENCE_INSUFFICIENT
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert "detail" in candidate["missing_evidence"]
+    assert "image" in candidate["missing_evidence"]
+    assert "n6_features" in candidate["missing_evidence"]
+    assert "supply_1688" in candidate["missing_evidence"]
+    assert candidate["profit"]["verdict"] == EVIDENCE_INSUFFICIENT
+    assert candidate["sales"]["tier_in_query"] is not None
 
 
 if __name__ == "__main__":

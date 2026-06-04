@@ -104,12 +104,17 @@ def apply_v3(records: list[ProductRecord], *,
             dropped[rc.get("reason", "relevance")[:40]] += 1
             continue
         cls = (rec.policy_flags.get("sorftime") or {}).get("classification", {})
-        if cls.get("is_rising"):
+        is_rising = (
+            bool(cls.get("is_rising"))
+            or bool(rec.sales_signal.is_rising)
+            or bool((rec.policy_flags.get("group_aggregated") or {}).get("any_rising"))
+        )
+        if is_rising:
             rising_recs.append(rec)
             rec.policy_flags["overall_v3"] = {
                 "track": "rising", "tier_overall": "rising",
                 "score": rec.sales_signal.raw_value or 0.0,    # rising 表内按月销排序
-                "rising_evidence": cls.get("rising_evidence"),
+                "rising_evidence": cls.get("rising_evidence") or rec.sales_signal.rising_evidence,
             }
         else:
             mature_recs.append(rec)
