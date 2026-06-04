@@ -463,6 +463,103 @@ def get_replenishment(store: str, limit: int = 50) -> List[Dict]:
     return rows[:limit]
 
 
+# ── 库存就绪度（WS-62 确定性规则 · 单一事实源）──────────────────────
+# 「库存 → 补货 → 运营入口」合流的降级边界：补货链路与运营入口必须能区分
+#   (a) 库存未就绪/不完整  vs  (b) 真的 0 需求（管道充足）。
+# 否则会出「库存空 → 建议静默全 0 → 运营以为充足」的死代码短路（5/12 事故）。
+# 本判定是唯一定义，wf5 计算端（run_v2）与所有运营入口（API / 页面 / chat）共用 —
+# 保证降级在每个入口一致呈现、无法旁路。纯确定性：只查表行数 / 覆盖率，不读 prompt。
+_STOCK_READINESS_MIN_ROWS = 10        # 全空门槛（与 wf5 run_v2 上游空保护对齐）
+_STOCK_READINESS_COVERAGE_MIN = 0.8   # 覆盖率门槛：上架 SKU 中有库存行的比例
+
+
+def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
+    """库存就绪度判定（确定性，单一事实源）。
+
+    返回 dict:
+      status   : ready | empty | incomplete | no_skus
+      ready    : bool（status == 'ready'）
+      listed_skus / stock_rows / covered_skus / coverage / noon_pulled_rows : 证据
+      message  : 给运营看的一句话（未就绪/不完整时说清下一步）
+
+    判定（按优先级）:
+      no_skus    : 该主体无上架 SKU（先跑 wf2 商品 ingest）
+      empty      : wf1_stock 行数 < MIN_ROWS（库存未就绪，先刷新库存）
+      incomplete : 覆盖率 < COVERAGE_MIN（部分 SKU 缺库存行），
+                   或所有库存行 noon 可售数皆为 NULL（noon 库存未拉取）
+      ready      : 其余
+    NULL vs 0 的区分很关键：noon_saleable_qty IS NULL = 没拉到（未就绪），
+    = 0 = 拉到了且确实为零（真就绪），不能把后者当未就绪。
+    """
+    def _r(status, ready, message, listed, stock_rows, covered, coverage, noon_pulled):
+        return {
+            "status": status, "ready": ready, "message": message,
+            "listed_skus": int(listed), "stock_rows": int(stock_rows),
+            "covered_skus": int(covered), "coverage": coverage,
+            "noon_pulled_rows": int(noon_pulled),
+        }
+
+    if not entity_alias:
+        return _r("no_skus", False, "未能解析销售主体（store→entity）", 0, 0, 0, 0.0, 0)
+
+    listed = _scalar(
+        "SELECT COUNT(*) FROM wf2_sku WHERE tenant_id=? AND entity_alias=? AND is_listed=1",
+        (tenant_id, entity_alias),
+    ) or 0
+    stock_rows = _scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
+        (tenant_id, entity_alias),
+    ) or 0
+    covered = _scalar(
+        "SELECT COUNT(*) FROM wf2_sku w2 JOIN wf1_stock s "
+        "ON w2.tenant_id=s.tenant_id AND w2.entity_alias=s.entity_alias "
+        "AND w2.partner_sku=s.partner_sku "
+        "WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.is_listed=1",
+        (tenant_id, entity_alias),
+    ) or 0
+    noon_pulled = _scalar(
+        "SELECT COUNT(*) FROM wf1_stock "
+        "WHERE tenant_id=? AND entity_alias=? AND noon_saleable_qty IS NOT NULL",
+        (tenant_id, entity_alias),
+    ) or 0
+    coverage = round(covered / listed, 3) if listed else 0.0
+
+    if listed == 0:
+        return _r("no_skus", False, "该主体暂无上架 SKU，请先跑 wf2 商品 ingest",
+                  listed, stock_rows, covered, coverage, noon_pulled)
+    if stock_rows < _STOCK_READINESS_MIN_ROWS:
+        return _r("empty", False,
+                  f"库存未就绪：wf1_stock 仅 {stock_rows} 行（<{_STOCK_READINESS_MIN_ROWS}），"
+                  f"请先刷新库存（wf1 ingest）再看补货建议",
+                  listed, stock_rows, covered, coverage, noon_pulled)
+    if coverage < _STOCK_READINESS_COVERAGE_MIN:
+        return _r("incomplete", False,
+                  f"库存不完整：{listed} 个上架 SKU 中仅 {covered} 个有库存"
+                  f"（覆盖率 {coverage:.0%}），补货建议可能偏低，请补全 wf1 ingest",
+                  listed, stock_rows, covered, coverage, noon_pulled)
+    if noon_pulled == 0:
+        return _r("incomplete", False,
+                  f"库存不完整：{stock_rows} 行库存均无 noon 可售数（noon 库存未拉取），"
+                  f"请刷新 noon 库存",
+                  listed, stock_rows, covered, coverage, noon_pulled)
+    return _r("ready", True, "库存已就绪",
+              listed, stock_rows, covered, coverage, noon_pulled)
+
+
+def get_replenishment_view(store: str, limit: int = 50) -> Dict:
+    """补货建议「运营入口视图」：库存就绪度 + 建议行（同一响应里）。
+
+    WS-62：把「库存未就绪/不完整」钉进入口响应本身，杜绝静默 0 —— 看着没补货 SKU
+    时，运营能区分「管道充足（ready）」和「库存没刷新/不全（not ready）」两种情况。
+    所有 v2 运营入口（HTTP API、chat 工具）走本函数取同一份就绪度。
+    """
+    tid, alias = _resolve_entity_for_store(store)
+    return {
+        "stock_status": stock_readiness(tid, alias),
+        "rows": get_replenishment(store, limit=limit),
+    }
+
+
 # ── 模块今日重点（7+1 模块卡片）──────────────────────────
 def get_module_summaries(store: str) -> List[Dict]:
     """聚合所有模块的'今日重点'（v2 表 + tenant 隔离）"""

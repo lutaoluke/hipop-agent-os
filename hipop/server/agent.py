@@ -521,7 +521,11 @@ def tool_scope_overview(store: str) -> Dict:
 def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
-    rows = _data.get_replenishment(store, limit=limit)
+    # WS-62：与 HTTP 入口同源——带库存就绪度。库存未就绪/不完整时，chat 不能把
+    # 空建议当成「不用补货」，必须如实说「库存未就绪/不完整」（防死代码短路）。
+    view = _data.get_replenishment_view(store, limit=limit)
+    stock_status = view["stock_status"]
+    rows = view["rows"]
     items = [{
         "sku": r["partner_sku"], "title": r["title"], "qty": r["qty"],
         "urgency": r["urgency_level"], "daily_rate": r["daily_rate"], "trend": r["trend"],
@@ -529,6 +533,7 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     } for r in rows]
     return {
         "store": store, "count": len(items), "items": items,
+        "stock_status": stock_status,
         "references": [
             {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0"},
             {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
