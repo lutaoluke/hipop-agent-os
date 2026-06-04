@@ -54,6 +54,15 @@ def test_legit_sellable_days_no_anchor_passes():
     assert not any("可撑天数" in w for w in warns), f"误报: {warns}"
 
 
+def test_legit_official_warehouse_stock_passes():
+    # Luke 验收口径：「官方仓库存」是合法仓别说法（非编造字段），不得被反幻觉拦。
+    for reply in ("官方仓库存还有 1200 件，建议补货。",
+                  "noon 官方仓的可售库存 809 个 SKU。"):
+        out, warns = _safety.sanitize_reply(reply, [])
+        assert not warns, f"合法『官方仓库存』被误报为幻觉: {reply!r} -> {warns}"
+        assert not out.startswith("⚠️"), f"不该加幻觉 banner: {out[:60]}"
+
+
 # ── 真幻觉字段：无任何真实字段背书，必须仍拦（不挖空门）────────────────────
 def test_real_hallucinated_field_still_flagged():
     _, warns = _safety.sanitize_reply("该 SKU 海运ROI预估 18%，推荐物流方式空运。", [])
@@ -167,6 +176,10 @@ def test_case11_stale_synonyms_pass():
         "旧的口径，数据偏保守。",                # 旧 紧贴 口径
         "库存数据偏旧，建议刷新。",              # round5: 库存数据 + 偏旧（合法）
         "用的是旧 noon 数据。",                  # 旧 + noon + 数据（间隔无产品对象）
+        # round6 clause-break：陈旧词收尾、产品对象另起一句（标点分隔）→ 仍是合法警示
+        "数据较旧，SKU 需要补 5 件。",
+        "数据偏旧。SKU 列表如下。",
+        "库存数据较旧，款式很多。",
     )
     for reply in legit:
         resp = {"reply": reply + " KSA 当前 20 个 SKU 需要补货：…",
@@ -223,6 +236,14 @@ def test_case11_non_stale_jiu_words_still_fail():
         "库存旧版机型，补 7 件。",
         "销量旧款图表，补 7 件。",
         "数据旧链接补 7 件。",
+        # round6（码长首审）：旧 右侧用**空白/顿号**接产品对象（连接符缺口），全 in-domain
+        # 词、无任何数据陈旧警示 → 必 FAIL。
+        "销量里旧 SKU 补 5 件。",
+        "库存里旧 机型补 7 件。",
+        "数据里旧  SKU 补货。",          # 双空格
+        "同步的旧 SKU 数据补 5 件。",
+        "口径里旧、SKU 补货。",          # 顿号（码长 [的\s] 补丁漏的那条，已用 [的\s、] 焊死）
+        "数据里旧　机型补货。",          # 全角空格
     )
     for reply in traps:
         resp = {"reply": reply, "tools_used": [], "workflow_task": None}
@@ -234,6 +255,7 @@ if __name__ == "__main__":
     tests = [
         test_legit_sellable_days_with_anchor_passes,
         test_legit_sellable_days_no_anchor_passes,
+        test_legit_official_warehouse_stock_passes,
         test_real_hallucinated_field_still_flagged,
         test_alias_in_fabrication_context_still_flagged,
         test_timestamp_guard_intact,
