@@ -100,7 +100,12 @@ def _apply_detail(records: list[ProductRecord], detail_provider: Optional[Detail
         for rec in records:
             _mark_missing(rec, "detail", "detail_provider not configured")
         return {"n_ok": 0, "n_fail": len(records), "configured": False}
-    result = detail_provider(records) or {}
+    try:
+        result = detail_provider(records) or {}
+    except Exception as exc:
+        for rec in records:
+            _mark_missing(rec, "detail", f"detail_provider raised: {type(exc).__name__}")
+        return {"n_ok": 0, "n_fail": len(records), "error": type(exc).__name__}
     for rec in records:
         detail = rec.policy_flags.get("detail") or {}
         if detail.get("highlights") or detail.get("specifications") or detail.get("reviews_summary"):
@@ -115,7 +120,12 @@ def _apply_features(records: list[ProductRecord], feature_extractor: Optional[Fe
         for rec in records:
             _mark_missing(rec, "n6_features", "feature_extractor not configured")
         return {"n_updated": 0, "n_not_found": 0, "configured": False}
-    result = feature_extractor(records) or {}
+    try:
+        result = feature_extractor(records) or {}
+    except Exception as exc:
+        for rec in records:
+            _mark_missing(rec, "n6_features", f"feature_extractor raised: {type(exc).__name__}")
+        return {"n_updated": 0, "n_not_found": len(records), "error": type(exc).__name__}
     for rec in records:
         if rec.policy_flags.get("n6_extracted") or rec.inferred_features:
             _clear_missing(rec, "n6_features")
@@ -294,8 +304,21 @@ def run_ksa_luggage_noon(
 
     fetched: list[ProductRecord] = []
     node_trace.append("noon_fetch")
-    for keyword in expanded_keywords:
-        fetched.extend(listing_provider(keyword, country))
+    try:
+        for keyword in expanded_keywords:
+            fetched.extend(listing_provider(keyword, country))
+    except Exception as exc:
+        return {
+            "status": EVIDENCE_INSUFFICIENT,
+            "country": country,
+            "category": category,
+            "seed": seed,
+            "node_trace": node_trace,
+            "summaries": {"noon_fetch": {"error": type(exc).__name__, "keywords": expanded_keywords}},
+            "candidates": [],
+            "dropped": [],
+            "error": f"listing_provider raised: {type(exc).__name__}",
+        }
     records = _dedupe_by_id(fetched)
     summaries["noon_fetch"] = {"keywords": expanded_keywords, "n_records": len(records)}
 

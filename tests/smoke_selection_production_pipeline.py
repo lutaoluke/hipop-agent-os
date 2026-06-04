@@ -168,8 +168,79 @@ def test_missing_external_evidence_is_explicit_not_dropped_or_faked():
     assert candidate["profit"]["verdict"] == EVIDENCE_INSUFFICIENT
 
 
+def test_detail_provider_raises_returns_evidence_insufficient():
+    records = [
+        _noon_record("ZEEE555555555", "20 inch ABS hardside luggage spinner", price=199, sold=50),
+    ]
+
+    def _raising_detail(recs):
+        raise RuntimeError("fake failure")
+
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=_raising_detail,
+        feature_extractor=None,
+        supply_provider=None,
+        ali_records=[],
+    )
+
+    assert result["status"] == EVIDENCE_INSUFFICIENT
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert "detail" in candidate["missing_evidence"]
+
+
+def test_feature_extractor_raises_returns_evidence_insufficient():
+    records = [
+        _noon_record("ZFFF666666666", "20 inch ABS hardside luggage spinner", price=199, sold=50),
+    ]
+
+    def _raising_extractor(recs):
+        raise RuntimeError("fake failure")
+
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=lambda _keyword, _country: records,
+        detail_provider=_detail_provider,
+        feature_extractor=_raising_extractor,
+        supply_provider=None,
+        ali_records=[],
+    )
+
+    assert result["status"] == EVIDENCE_INSUFFICIENT
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert "n6_features" in candidate["missing_evidence"]
+
+
+def test_listing_provider_raises_returns_evidence_insufficient():
+    def _raising_listing(keyword, country):
+        raise RuntimeError("fake failure")
+
+    result = run_ksa_luggage_noon(
+        seed="luggage",
+        listing_provider=_raising_listing,
+        detail_provider=None,
+        feature_extractor=None,
+        supply_provider=None,
+        ali_records=[],
+    )
+
+    assert result["status"] == EVIDENCE_INSUFFICIENT
+    assert result["candidates"] == []
+
+
 if __name__ == "__main__":
     test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes()
     print("  ✓ test_complete_fixture_produces_sku_candidates_and_calls_confirmed_nodes")
     test_missing_external_evidence_is_explicit_not_dropped_or_faked()
     print("  ✓ test_missing_external_evidence_is_explicit_not_dropped_or_faked")
+    test_detail_provider_raises_returns_evidence_insufficient()
+    print("  ✓ test_detail_provider_raises_returns_evidence_insufficient")
+    test_feature_extractor_raises_returns_evidence_insufficient()
+    print("  ✓ test_feature_extractor_raises_returns_evidence_insufficient")
+    test_listing_provider_raises_returns_evidence_insufficient()
+    print("  ✓ test_listing_provider_raises_returns_evidence_insufficient")
