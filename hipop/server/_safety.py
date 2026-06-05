@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 import re
-from typing import Tuple, List
+from typing import List, Optional, Tuple
 
 # 已知合法域名（可以出现在 reply 里的）
 ALLOWED_DOMAINS = {
@@ -106,7 +106,35 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
+# T36: 任务号提及模式（8位小写十六进制前缀）
+_TASK_ID_MENTION_RE = re.compile(r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：]*([0-9a-f]{8})\b')
+
+
+def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
+    """T36: reply 中出现未由 run_workflow 工具返回的 task_id → banner。
+
+    只信 tool_log 里 name=="run_workflow" 条目的 task_id；其他工具
+    （query_sku、query_order_live 等）返回的 task_id 不能洗白任务号声明。
+    """
+    warns: List[str] = []
+    mentioned = set(_TASK_ID_MENTION_RE.findall(reply))
+    if not mentioned:
+        return warns
+    # T36 防伪关键：只有 run_workflow 工具调用返回的 task_id 才算真实任务号
+    real_ids = {
+        t["task_id"] for t in (tool_log or [])
+        if t.get("name") == "run_workflow" and t.get("task_id")
+    }
+    fake = mentioned - real_ids
+    if fake:
+        warns.append(
+            f"⚠️ Agent 回复中出现了未由 run_workflow 工具返回的任务号 "
+            f"({', '.join(sorted(fake))}) — 这些 task_id 可能是编造的"
+        )
+    return warns
+
+
+def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
     if not reply:
@@ -115,6 +143,7 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
+    warnings.extend(_check_fake_task_ids(reply, tool_log or []))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)
