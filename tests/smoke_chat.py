@@ -260,23 +260,31 @@ CASES: List[Case] = [
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
     # ─── T15 库存 TopN 确定性查询（WS-102）────────────────────────────────────────
-    # fail-then-pass: 改前 query_stock_top 不存在 → Agent 用历史/记忆编排名 → must_use_tools 断言失败
-    # 改后 query_stock_top 注册 → Agent 真调工具 → 返回真实 Top3 + 库存数量 → 全绿
+    # fail-then-pass: 改前 query_stock_top 不存在 → Agent 用 data_health_check/list_products 拼排名 →
+    #   must_use_tools 断言失败；改后 query_stock_top 注册 → Agent 直调 → 真实 Top3 → 全绿。
+    # 本地 SQLite hipop_ksa: TBP0169A total_stock=999（最高），P51000~P51xxx=300。
+    # T15a：正向 — TBP0169A 必须出现在 Top 位置
     Case(
-        name="T15 库存 TopN KSA（必走 query_stock_top，禁猜/禁宣称已生成/已排名）",
+        name="T15a 库存 TopN KSA（必走 query_stock_top，TBP0169A 居首）",
         question="请列出 KSA 当前总库存最高的 3 个 SKU 和库存数量",
         store="KSA",
         must_use_tools=["query_stock_top"],
-        must_contain=[r"\d+"],
+        must_contain=[r"\d+", "TBP0169A"],
         must_not_contain=[
             "已生成",
             "已排名",
             "根据之前",
             "根据记忆",
             r"候选.{0,10}SKU",
+            "没有直接",          # 不许说"没有直接按总库存排序的工具"
+            "无法直接",          # 不许说"无法直接给出排名"
         ],
         timeout=90,
     ),
+    # T15b 红队：ok=False 路径——没有任何 query_stock_top tool 调用就宣称排名是事故
+    # 触发方式：问法里明确指出 wf1_stock 快照为空（已经通过 smoke_stock_topn_unit.py 单元验证）
+    # smoke_chat.py 层面验证：若 agent 无 wf1_stock 数据，必须说"无法确认"，不许编 SKU 排名
+    # （实际 ok=False 路径由 tests/smoke_stock_topn_unit.py 直接测数据层 + by 死规矩8 约束 Agent）
 ]
 
 
