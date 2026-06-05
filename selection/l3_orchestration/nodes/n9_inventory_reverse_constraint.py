@@ -99,14 +99,15 @@ def _inventory_pressure(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _row_has_signal(row: dict[str, Any]) -> bool:
-    """Return True if a row has at least one usable size, stock, or sales signal."""
-    if _extract_size_inches(_row_text(row)) is not None:
-        return True
-    if _num(row.get("total_stock")) > 0:
-        return True
-    if _num(row.get("sales_30d")) > 0:
-        return True
-    return False
+    """Return True only when a row has BOTH a parseable size AND parseable stock/sales.
+
+    _inventory_pressure() aggregates by size and measures pressure via stock/sales.
+    A row missing either dimension cannot contribute to that calculation; treating it
+    as sufficient would mask the real evidence gap (AND, not OR).
+    """
+    has_size = _extract_size_inches(_row_text(row)) is not None
+    has_quantity = _num(row.get("total_stock")) > 0 or _num(row.get("sales_30d")) > 0
+    return has_size and has_quantity
 
 
 def apply(records: list[ProductRecord], inventory_rows: list[dict[str, Any]] | None) -> dict[str, Any]:

@@ -56,14 +56,21 @@ class CostBreakdown:
     purchase_rmb: float          # 1688 采购成本 RMB (unit_price × 0.9)
     purchase_sar: float          # 采购成本 SAR
     shipping_sar: float          # 头程
+    fulfillment_fee_sar: float   # FBN 配送费
     warehouse_sar: float         # 仓储
     promo_sar: float             # 推广
     platform_fee_sar: float      # 佣金 + 平台 VAT 份额
+    seller_receivable_sar: float # 定价表 I 列回款
+    seller_settlement_vat_sar: float # 回款口径 VAT 扣减
     total_cost_sar: float        # 全部成本
     revenue_sar: float           # 售价 (单价 SAR)
     net_profit_sar: float        # 净利
     profit_rate: float           # 毛利率
     verdict: str                 # PROFIT_OK / PROFIT_LOW_BUT_VALUABLE / PROFIT_KILL
+    commission_rate: float       # 实际佣金率
+    commission_source: str       # category / default
+    platform_vat_share: float    # 平台 VAT 份额
+    low_margin: bool             # <20% 黄牌/风险标记
 
 
 def _yaml_param(yaml_dict: dict, *keys, default=None):
@@ -75,8 +82,77 @@ def _yaml_param(yaml_dict: dict, *keys, default=None):
     return cur if cur is not None else default
 
 
+def _category_keys(category: Optional[str]) -> list[str]:
+    if not category:
+        return []
+    text = str(category).lower().replace("-", "_").replace(" ", "_")
+    keys = [text]
+    if "suitcase" in text:
+        keys.append("suitcase")
+    if "luggage" in text or "suitcase" in text:
+        keys.append("luggage")
+    out = []
+    for key in keys:
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _commission_config(pricing_table: dict, *, platform: str, country: str,
+                       category: Optional[str]) -> dict:
+    platform_cfg = _yaml_param(pricing_table, "platforms", platform, default={}) or {}
+    for key in _category_keys(category):
+        country_entry = _yaml_param(
+            platform_cfg, "by_country", country, "by_category", key, default=None,
+        )
+        entry = country_entry
+        if entry is None:
+            entry = _yaml_param(platform_cfg, "by_category", key, default=None)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            rate = entry.get("commission_rate")
+            source = entry.get("source")
+        else:
+            rate = entry
+            source = None
+        if rate is not None:
+            return {
+                "rate": float(rate),
+                "source": "category",
+                "source_note": source or f"{platform}/{country}/{key}",
+                "category_key": key,
+            }
+    return {
+        "rate": float(platform_cfg.get("default_commission_rate", 0.15)),
+        "source": "default",
+        "source_note": f"{platform} default_commission_rate",
+        "category_key": None,
+    }
+
+
+def _fulfillment_fee(pricing_table: dict, *, platform: str, country: str,
+                     category: Optional[str], is_oversize: bool) -> float:
+    key_suffix = "_luggage_sar" if country == "ksa" else "_luggage_aed"
+    category_is_luggage = any(k in {"luggage", "suitcase"} for k in _category_keys(category))
+    if category_is_luggage:
+        if is_oversize:
+            key = f"oversize{key_suffix}"
+        else:
+            key = f"default{key_suffix}"
+        return float(_yaml_param(
+            pricing_table, "fulfillment_fees", platform, country, key, default=0.0,
+        ) or 0.0)
+    return 0.0
+
+
 def estimate_cost(unit_price_rmb: float, *, country: str = "ksa",
                   platform: str = "noon", is_oversize: bool = False,
+                  category: Optional[str] = None,
+                  shipping_rmb: Optional[float] = None,
+                  fulfillment_fee_sar: Optional[float] = None,
+                  warehouse_sar: Optional[float] = None,
+                  purchase_cost_factor: Optional[float] = None,
                   pricing_table: Optional[dict] = None) -> dict:
     """
     通用算法估单 SKU 全成本. 任何参数从 pricing_table.yaml 读, 不写死.
@@ -85,7 +161,11 @@ def estimate_cost(unit_price_rmb: float, *, country: str = "ksa",
         pricing_table = kb_loader.load_pricing_table()
     luggage_params = kb_loader.load().params.get(("categories", "luggage"), {}) or {}
 
-    cost_factor = luggage_params.get("cost_estimate_factor", 0.9)   # §A tip 1 列表价×0.9
+    if purchase_cost_factor is None:
+        # 定价表/结算单传入 shipping_rmb 时, unit_price_rmb 是已确认采购价;
+        # 生产粗估路径才用 1688 列表价 ×0.9.
+        purchase_cost_factor = 1.0 if shipping_rmb is not None else luggage_params.get("cost_estimate_factor", 0.9)
+    cost_factor = purchase_cost_factor
     rmb_to_sar = _yaml_param(pricing_table, "exchange_rates", "rmb_to_sar", default=DEFAULT_RMB_TO_SAR)
 
     purchase_rmb = unit_price_rmb * cost_factor
@@ -96,14 +176,28 @@ def estimate_cost(unit_price_rmb: float, *, country: str = "ksa",
         ship_range = _yaml_param(pricing_table, "headforward_shipping", country, "oversize_under_2kg_sar", default=[8.5, 9])
     else:
         ship_range = _yaml_param(pricing_table, "headforward_shipping", country, "standard_under_2kg_sar", default=[6, 8.5])
-    shipping_sar = sum(ship_range) / 2
+    shipping_sar = float(shipping_rmb) * rmb_to_sar if shipping_rmb is not None else sum(ship_range) / 2
+
+    if fulfillment_fee_sar is None:
+        fulfillment_fee_sar = _fulfillment_fee(
+            pricing_table, platform=platform, country=country,
+            category=category, is_oversize=is_oversize,
+        )
 
     # 仓储
-    warehouse_sar = _yaml_param(pricing_table, "warehouse_fees", country, "fbn_per_item_sar", default=0.7151)
+    if warehouse_sar is None:
+        warehouse_sar = _yaml_param(pricing_table, "warehouse_fees", country, "fbn_per_item_sar", default=0.7151)
 
     # 平台费率
-    commission = _yaml_param(pricing_table, "platforms", platform, "default_commission_rate", default=0.15)
+    commission_cfg = _commission_config(
+        pricing_table, platform=platform, country=country, category=category,
+    )
+    commission = commission_cfg["rate"]
     vat_share = _yaml_param(pricing_table, "countries", country, "platform_vat_share_seller", default=0.039)
+    receivable_vat_share = _yaml_param(
+        pricing_table, "countries", country, "seller_receivable_vat_share", default=vat_share,
+    )
+    legal_vat_rate = _yaml_param(pricing_table, "countries", country, "legal_vat_rate", default=0.0)
 
     # 推广 (yaml 没就用 2% 默认)
     promo_rate = _yaml_param(pricing_table, "promo_rate", default=0.02)
@@ -112,10 +206,16 @@ def estimate_cost(unit_price_rmb: float, *, country: str = "ksa",
         "purchase_rmb": round(purchase_rmb, 2),
         "purchase_sar": round(purchase_sar, 2),
         "shipping_sar": round(shipping_sar, 2),
-        "warehouse_sar": round(warehouse_sar, 2),
+        "fulfillment_fee_sar": round(float(fulfillment_fee_sar), 2),
+        "warehouse_sar": round(float(warehouse_sar), 2),
         "promo_rate": promo_rate,
         "commission": commission,
+        "commission_source": commission_cfg["source"],
+        "commission_source_note": commission_cfg["source_note"],
+        "commission_category_key": commission_cfg["category_key"],
         "platform_vat_share": vat_share,
+        "seller_receivable_vat_share": receivable_vat_share,
+        "legal_vat_rate": legal_vat_rate,
         "_rmb_to_sar": rmb_to_sar,
     }
 
@@ -123,13 +223,36 @@ def estimate_cost(unit_price_rmb: float, *, country: str = "ksa",
 def calculate_profit(revenue_sar: float, unit_price_rmb: float, *,
                      country: str = "ksa", platform: str = "noon",
                      is_oversize: bool = False,
+                     category: Optional[str] = None,
+                     shipping_rmb: Optional[float] = None,
+                     fulfillment_fee_sar: Optional[float] = None,
+                     warehouse_sar: Optional[float] = None,
+                     purchase_cost_factor: Optional[float] = None,
                      pricing_table: Optional[dict] = None) -> CostBreakdown:
     """全成本核算 + 黄牌判定."""
     c = estimate_cost(unit_price_rmb, country=country, platform=platform,
-                      is_oversize=is_oversize, pricing_table=pricing_table)
+                      is_oversize=is_oversize, category=category,
+                      shipping_rmb=shipping_rmb,
+                      fulfillment_fee_sar=fulfillment_fee_sar,
+                      warehouse_sar=warehouse_sar,
+                      purchase_cost_factor=purchase_cost_factor,
+                      pricing_table=pricing_table)
     promo_sar = revenue_sar * c["promo_rate"]
     platform_fee_sar = revenue_sar * (c["commission"] + c["platform_vat_share"])
-    total = c["purchase_sar"] + c["shipping_sar"] + c["warehouse_sar"] + promo_sar + platform_fee_sar
+    seller_receivable_sar = (
+        revenue_sar
+        - revenue_sar * c["commission"]
+        - revenue_sar * c["seller_receivable_vat_share"]
+        - promo_sar
+        - c["warehouse_sar"]
+        - c["fulfillment_fee_sar"]
+    )
+    seller_settlement_vat_sar = seller_receivable_sar * c["legal_vat_rate"]
+    total = (
+        c["purchase_sar"] + c["shipping_sar"] + c["fulfillment_fee_sar"]
+        + c["warehouse_sar"] + promo_sar + platform_fee_sar
+        + seller_settlement_vat_sar
+    )
     net = revenue_sar - total
     rate = net / revenue_sar if revenue_sar > 0 else 0
 
@@ -140,11 +263,17 @@ def calculate_profit(revenue_sar: float, unit_price_rmb: float, *,
 
     return CostBreakdown(
         purchase_rmb=c["purchase_rmb"], purchase_sar=c["purchase_sar"],
-        shipping_sar=c["shipping_sar"], warehouse_sar=c["warehouse_sar"],
+        shipping_sar=c["shipping_sar"], fulfillment_fee_sar=c["fulfillment_fee_sar"],
+        warehouse_sar=c["warehouse_sar"],
         promo_sar=round(promo_sar, 2), platform_fee_sar=round(platform_fee_sar, 2),
+        seller_receivable_sar=round(seller_receivable_sar, 3),
+        seller_settlement_vat_sar=round(seller_settlement_vat_sar, 3),
         total_cost_sar=round(total, 2), revenue_sar=revenue_sar,
         net_profit_sar=round(net, 2), profit_rate=round(rate, 3),
-        verdict=verdict,
+        verdict=verdict, commission_rate=c["commission"],
+        commission_source=c["commission_source"],
+        platform_vat_share=c["platform_vat_share"],
+        low_margin=rate < PROFIT_OK_THRESHOLD,
     )
 
 
@@ -338,6 +467,15 @@ def find_1688_matches(noon_rec: ProductRecord, ali_recs: list[ProductRecord],
     return matches[:max_results]
 
 
+def _infer_profit_category(rec: ProductRecord) -> Optional[str]:
+    category_path = [str(x).lower() for x in (rec.category_path or [])]
+    title = (rec.title or "").lower()
+    for key in ("suitcase", "luggage"):
+        if any(key in item for item in category_path) or key in title:
+            return key
+    return category_path[0] if category_path else None
+
+
 # ── 主入口 ────────────────────────────────────────────────────
 
 def apply_profit(noon_records: list[ProductRecord],
@@ -433,9 +571,11 @@ def apply_profit(noon_records: list[ProductRecord],
         ali_rec, sim = best_ali
         ali_unit_rmb = best_unit_rmb
 
+        profit_category = _infer_profit_category(rec)
         cb = calculate_profit(revenue, ali_unit_rmb,
                               country=country, platform="noon",
-                              is_oversize=is_oversize, pricing_table=pt)
+                              is_oversize=is_oversize,
+                              category=profit_category, pricing_table=pt)
 
         # 反卷检查: 1688 最低成本 / noon 售价 比例
         cost_ratio = cb.total_cost_sar / revenue
@@ -449,10 +589,17 @@ def apply_profit(noon_records: list[ProductRecord],
             "purchase_rmb": cb.purchase_rmb,
             "purchase_sar": cb.purchase_sar,
             "shipping_sar": cb.shipping_sar,
+            "fulfillment_fee_sar": cb.fulfillment_fee_sar,
             "warehouse_sar": cb.warehouse_sar,
             "promo_sar": cb.promo_sar,
             "platform_fee_sar": cb.platform_fee_sar,
+            "seller_receivable_sar": cb.seller_receivable_sar,
+            "seller_settlement_vat_sar": cb.seller_settlement_vat_sar,
             "total_cost_sar": cb.total_cost_sar,
+            "commission": cb.commission_rate,
+            "commission_source": cb.commission_source,
+            "platform_vat_share": cb.platform_vat_share,
+            "low_margin": cb.low_margin,
             "matched_1688_offer_id": ali_rec.id.split(":", 1)[1],
             "matched_1688_unit_rmb": ali_unit_rmb,
             "matched_1688_title": (ali_rec.title or "")[:100],
