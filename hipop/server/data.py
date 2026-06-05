@@ -471,6 +471,7 @@ def get_replenishment(store: str, limit: int = 50) -> List[Dict]:
 # 保证降级在每个入口一致呈现、无法旁路。纯确定性：只查表行数 / 覆盖率，不读 prompt。
 _STOCK_READINESS_MIN_ROWS = 20         # 未就绪门槛：wf1_stock 少于 20 行先刷库存
 _STOCK_READINESS_COVERAGE_MIN = 0.95   # 覆盖率门槛：上架 SKU 中有库存行的比例
+_STOCK_READINESS_NOON_COVERAGE_MIN = 0.50  # Noon 拉取覆盖率门槛：上架 SKU 中 noon 可售数非 NULL 的比例
 _STOCK_READINESS_MAX_AGE_HOURS = 72    # 时效门槛：源库存 ingest 时间超过 3 天即不可计算
 
 
@@ -499,9 +500,10 @@ def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
     """库存就绪度判定（确定性，单一事实源）。
 
     返回 dict:
-      status   : ready | empty | incomplete | no_skus
+      status   : ready | empty | incomplete | partial_noon | no_skus
       ready    : bool（status == 'ready'）
-      listed_skus / stock_rows / covered_skus / coverage / noon_pulled_rows /
+      listed_skus / stock_rows / covered_skus / coverage /
+      noon_pulled_rows / noon_coverage /
       stock_source_imported_at / stock_age_hours : 证据
       message  : 给运营看的一句话（未就绪/不完整时说清下一步）
 
@@ -509,19 +511,22 @@ def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
       no_skus    : 该主体无上架 SKU（先跑 wf2 商品 ingest）
       empty      : wf1_stock 行数 < MIN_ROWS（库存未就绪，先刷新库存）
       incomplete : 源库存 ingest 时间超过 MAX_AGE_HOURS，
-                   或覆盖率 < COVERAGE_MIN（部分 SKU 缺库存行），
-                   或所有库存行 noon 可售数皆为 NULL（noon 库存未拉取）
+                   或覆盖率 < COVERAGE_MIN（部分 SKU 缺库存行）
+      partial_noon : 上架 SKU 中 noon 可售数拉取覆盖率 < NOON_COVERAGE_MIN
       ready      : 其余
     NULL vs 0 的区分很关键：noon_saleable_qty IS NULL = 没拉到（未就绪），
     = 0 = 拉到了且确实为零（真就绪），不能把后者当未就绪。
     """
-    def _r(status, ready, message, listed, stock_rows, covered, coverage, noon_pulled,
+    def _r(status, ready, message, listed, stock_rows, covered, coverage,
+           noon_pulled, noon_coverage=0.0,
            stock_source_imported_at=None, stock_age_hours=None):
         return {
             "status": status, "ready": ready, "message": message,
             "listed_skus": int(listed), "stock_rows": int(stock_rows),
             "covered_skus": int(covered), "coverage": coverage,
             "noon_pulled_rows": int(noon_pulled),
+            "noon_coverage": noon_coverage,
+            "noon_coverage_min": _STOCK_READINESS_NOON_COVERAGE_MIN,
             "stock_source_imported_at": str(stock_source_imported_at) if stock_source_imported_at else None,
             "stock_age_hours": stock_age_hours,
             "freshness_max_hours": _STOCK_READINESS_MAX_AGE_HOURS,
@@ -546,8 +551,11 @@ def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
         (tenant_id, entity_alias),
     ) or 0
     noon_pulled = _scalar(
-        "SELECT COUNT(*) FROM wf1_stock "
-        "WHERE tenant_id=? AND entity_alias=? AND noon_saleable_qty IS NOT NULL",
+        "SELECT COUNT(*) FROM wf2_sku w2 JOIN wf1_stock s "
+        "ON w2.tenant_id=s.tenant_id AND w2.entity_alias=s.entity_alias "
+        "AND w2.partner_sku=s.partner_sku "
+        "WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.is_listed=1 "
+        "AND s.noon_saleable_qty IS NOT NULL",
         (tenant_id, entity_alias),
     ) or 0
     stock_source_imported_at = _scalar(
@@ -555,6 +563,7 @@ def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
         (tenant_id, entity_alias),
     )
     coverage = round(covered / listed, 3) if listed else 0.0
+    noon_coverage = round(noon_pulled / listed, 3) if listed else 0.0
     stock_source_dt = _stock_readiness_dt(stock_source_imported_at)
     stock_age_hours = None
     if stock_source_dt is not None:
@@ -566,35 +575,36 @@ def stock_readiness(tenant_id: int, entity_alias: str) -> Dict:
     if listed == 0:
         return _r("no_skus", False, "该主体暂无上架 SKU，请先跑 wf2 商品 ingest",
                   listed, stock_rows, covered, coverage, noon_pulled,
-                  stock_source_imported_at, stock_age_hours)
+                  noon_coverage, stock_source_imported_at, stock_age_hours)
     if stock_rows < _STOCK_READINESS_MIN_ROWS:
         return _r("empty", False,
                   f"库存未就绪：wf1_stock 仅 {stock_rows} 行（<{_STOCK_READINESS_MIN_ROWS}），"
                   f"请先刷新库存（wf1 ingest）再看补货建议",
                   listed, stock_rows, covered, coverage, noon_pulled,
-                  stock_source_imported_at, stock_age_hours)
+                  noon_coverage, stock_source_imported_at, stock_age_hours)
     if stock_source_dt is None or (stock_age_hours is not None and stock_age_hours > _STOCK_READINESS_MAX_AGE_HOURS):
         age_text = f"{stock_age_hours:.1f} 小时" if stock_age_hours is not None else "未知"
         return _r("incomplete", False,
                   f"库存数据未更新或不完整：源库存 ingest 时间超过 3 天（age={age_text}），"
                   f"请先刷新库存（wf1 ingest）再计算补货建议",
                   listed, stock_rows, covered, coverage, noon_pulled,
-                  stock_source_imported_at, stock_age_hours)
+                  noon_coverage, stock_source_imported_at, stock_age_hours)
     if coverage < _STOCK_READINESS_COVERAGE_MIN:
         return _r("incomplete", False,
                   f"库存数据未更新或不完整：{listed} 个上架 SKU 中仅 {covered} 个有库存"
                   f"（覆盖率 {coverage:.0%}），请补全 wf1 ingest 后再计算补货建议",
                   listed, stock_rows, covered, coverage, noon_pulled,
-                  stock_source_imported_at, stock_age_hours)
-    if noon_pulled == 0:
-        return _r("incomplete", False,
-                  f"库存数据未更新或不完整：{stock_rows} 行库存均无 noon 可售数（noon 库存未拉取），"
-                  f"请刷新 noon 库存",
+                  noon_coverage, stock_source_imported_at, stock_age_hours)
+    if noon_coverage < _STOCK_READINESS_NOON_COVERAGE_MIN:
+        return _r("partial_noon", False,
+                  f"库存数据未更新或不完整：{listed} 个上架 SKU 中仅 {noon_pulled} 个拉到 noon 可售数"
+                  f"（noon 覆盖率 {noon_coverage:.0%}，低于 {_STOCK_READINESS_NOON_COVERAGE_MIN:.0%}），"
+                  f"请刷新 noon 库存后再计算补货建议",
                   listed, stock_rows, covered, coverage, noon_pulled,
-                  stock_source_imported_at, stock_age_hours)
+                  noon_coverage, stock_source_imported_at, stock_age_hours)
     return _r("ready", True, "库存已就绪",
               listed, stock_rows, covered, coverage, noon_pulled,
-              stock_source_imported_at, stock_age_hours)
+              noon_coverage, stock_source_imported_at, stock_age_hours)
 
 
 def get_replenishment_view(store: str, limit: int = 50) -> Dict:

@@ -27,6 +27,7 @@
   - 不完整库存（94% 覆盖率或源库存 ingest 超过 3 天未更新）→ 三条入口都
     ready=False、status=incomplete、含「不完整」；
   - 红队：源库存 ingest 已 stale,但 rollup 脚本刷新了 wf1_stock.updated_at → 仍 not-ready；
+  - 红队：库存行覆盖 95%,但 Noon 只拉到 1% → partial_noon,仍 not-ready；
   - 完整库存但本周无需补货 → 三条入口 ready=True（rows 空 ≠ 未就绪，不误报）；
   绝不静默给 0 / 假确定建议：未就绪时入口响应本身带 ready=False，不是只在 run_v2 log。
 
@@ -104,7 +105,11 @@ def _reset_ksa():
     conn.close()
 
 
-def _add_sku(sku, *, listed=1, sales=False, stock=None, imported_at=None, updated_at=None):
+_SAME_AS_STOCK = object()
+
+
+def _add_sku(sku, *, listed=1, sales=False, stock=None,
+             noon_saleable_qty=_SAME_AS_STOCK, imported_at=None, updated_at=None):
     """插一个 wf2_sku（hipop_ksa）；可选灌销量与 wf1_stock 行。stock=None → 不建库存行。"""
     from hipop.server import data
     conn = data.conn()
@@ -123,11 +128,13 @@ def _add_sku(sku, *, listed=1, sales=False, stock=None, imported_at=None, update
         now_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         imported_at = imported_at or updated_at or now_ts
         updated_at = updated_at or imported_at
+        if noon_saleable_qty is _SAME_AS_STOCK:
+            noon_saleable_qty = stock
         conn.execute(
             "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, noon_saleable_qty, "
             "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock, imported_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock, imported_at, updated_at),
+            (TENANT, KSA_ALIAS, sku, noon_saleable_qty, 0, 0, 0, 0, stock, imported_at, updated_at),
         )
     conn.commit()
     conn.close()
@@ -359,6 +366,28 @@ def test_rollup_updated_at_does_not_fake_source_freshness():
     return check.failures
 
 
+# ── 红队 · Noon 仅部分拉到不得被 1 行非 NULL 假绿 ────────────────────
+def test_partial_noon_coverage_surfaces_not_ready():
+    print("== test_partial_noon_coverage_surfaces_not_ready (红队: Noon 部分仓未拉假绿) ==")
+    check = _Checker()
+    _reset_ksa()
+    fresh_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    for i in range(100):
+        stock = 300 if i < 95 else None
+        noon_qty = 300 if i == 0 else None
+        _add_sku(f"NOON{i:03d}", sales=True, stock=stock,
+                 noon_saleable_qty=noon_qty, imported_at=fresh_ts, updated_at=fresh_ts)
+
+    _assert_not_ready_all_entries(check, expect_status="partial_noon", expect_word="noon")
+    st = _view()["stock_status"]
+    check("Noon 覆盖率只 1/100 时必须 partial_noon",
+          st["status"] == "partial_noon" and st["noon_pulled_rows"] == 1, st)
+    wf5 = _run_wf5()
+    check("run_v2 进入计算前硬拦 partial_noon",
+          wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["status"] == "partial_noon", wf5)
+    return check.failures
+
+
 # ── 就绪态对照：完整库存但本周无需补货 → ready=True（防把正常态误报降级）────
 def test_ready_stock_no_false_positive():
     print("== test_ready_stock_no_false_positive (就绪态对照,空 rows ≠ 未就绪) ==")
@@ -403,6 +432,7 @@ if __name__ == "__main__":
         test_incomplete_stock_surfaces_not_ready_at_all_entry_points,
         test_stale_stock_surfaces_not_ready_at_all_entry_points,
         test_rollup_updated_at_does_not_fake_source_freshness,
+        test_partial_noon_coverage_surfaces_not_ready,
         test_ready_stock_no_false_positive,
         test_template_surfaces_readiness,
     ]
