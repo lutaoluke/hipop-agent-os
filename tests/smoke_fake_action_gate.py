@@ -132,6 +132,38 @@ def test_notify_feishu_not_proof_of_query():
         f"notify_via_feishu 被当成查询证据，漏拦: {warns}"
 
 
+# ── 对象级证据：查询工具必须能证明声明对象 ────────────────────────────────
+
+def test_query_order_not_proof_of_product_inventory():
+    """query_order 不能作为'查了商品/库存'的证据。"""
+    tool_log = [{"name": "query_order", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了你的商品，库存都正常。", ["query_order"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"query_order 被当成商品/库存查询证据，漏拦: {warns}"
+
+
+def test_data_health_not_proof_of_sku_inventory():
+    """data_health_check 不能作为'查了具体 SKU 库存'的证据。"""
+    tool_log = [{"name": "data_health_check", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了这个SKU，库存有30件。", ["data_health_check"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"data_health_check 被当成 SKU/库存查询证据，漏拦: {warns}"
+
+
+def test_scope_overview_not_proof_of_sku_inventory():
+    """scope_overview 不能作为'查了具体 SKU 库存'的证据。"""
+    tool_log = [{"name": "scope_overview", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了这个SKU，库存有30件。", ["scope_overview"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"scope_overview 被当成 SKU/库存查询证据，漏拦: {warns}"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -149,6 +181,9 @@ if __name__ == "__main__":
         test_export_table_not_proof_of_query,
         test_run_workflow_not_proof_of_query,
         test_notify_feishu_not_proof_of_query,
+        test_query_order_not_proof_of_product_inventory,
+        test_data_health_not_proof_of_sku_inventory,
+        test_scope_overview_not_proof_of_sku_inventory,
     ]
     failed = 0
     for t in tests:

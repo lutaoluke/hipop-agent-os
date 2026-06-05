@@ -106,57 +106,104 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-# 能证明"查了商品/数据"的工具集合（显式白名单，不是"非list_products的任意工具"）
-_DATA_QUERY_TOOLS = frozenset({
-    "list_products",        # 需要 limit>0
-    "query_sku",
-    "query_order",
-    "scope_overview",
-    "compute_replenishment",
-    "data_health_check",
-})
+# 声明对象 -> 能证明该对象被查询过的工具。不要用"任意数据工具"互相背书。
+_CLAIM_TOOL_MAP = {
+    "product_sku": frozenset({"list_products", "query_sku"}),
+    "order": frozenset({"query_order"}),
+    "store_overview": frozenset({"scope_overview", "compute_replenishment", "data_health_check"}),
+}
+
+_QUERY_ACTION_RE = r"(?:我|已)?(?:再次|重新)?(?:查了一下|查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
 
 
-def _has_real_data_query(tools_used: list, tool_log=None) -> bool:
-    """检查本轮是否有真实数据查询工具调用。"""
-    for tool_name in tools_used:
-        if tool_name not in _DATA_QUERY_TOOLS:
-            continue  # 非查询工具，跳过
-        if tool_name == "list_products":
-            if tool_log:
-                for t in tool_log:
-                    if t.get("name") == "list_products":
-                        args = t.get("args") or {}
-                        if isinstance(args, dict) and args.get("limit", 1) > 0:
-                            return True
-            # 有 list_products 但没 tool_log（降级保守处理）→ 也不信，要求 limit>0
+def _claim_match(reply: str, keywords: str, gap: int = 15):
+    return re.search(
+        rf"{_QUERY_ACTION_RE}.{{0,{gap}}}(?P<object>{keywords})",
+        reply,
+        re.IGNORECASE,
+    )
+
+
+def _list_products_has_rows(tool_log) -> bool:
+    if not tool_log:
+        return False
+    for t in tool_log:
+        if t.get("name") != "list_products":
             continue
-        return True  # 白名单里其他工具 = 合法查询证据
+        args = t.get("args") or {}
+        if not isinstance(args, dict):
+            continue
+        limit = args.get("limit", 1)
+        try:
+            if int(limit) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _has_claim_evidence(claim_type: str, tools_used: List[str], tool_log=None) -> bool:
+    allowed_tools = _CLAIM_TOOL_MAP[claim_type]
+    tool_names = set(tools_used or [])
+    if tool_log:
+        tool_names.update(t.get("name") for t in tool_log if t.get("name"))
+
+    for tool_name in tool_names:
+        if tool_name not in allowed_tools:
+            continue
+        if tool_name == "list_products":
+            if _list_products_has_rows(tool_log):
+                return True
+            continue
+        return True
     return False
 
 
 def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -> List[str]:
     """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。"""
     warns = []
-    claimed_query = re.search(
-        r"(我|已)?(再次|重新)?(查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
-        r".{0,15}(商品|产品|SKU|sku|数据|库存|ERP|erp|全部货|所有货)",
-        reply, re.IGNORECASE
+    claimed_product_sku = _claim_match(
+        reply,
+        r"商品|产品|SKU|sku|库存|ERP|erp|全部货|所有货",
     )
-    if claimed_query and not _has_real_data_query(tools_used, tool_log):
+    claimed_order_query = _claim_match(reply, r"货单|订单|order", gap=10)
+    claimed_store_overview = _claim_match(
+        reply,
+        r"店铺数据|补货数据|数据新鲜度|数据健康|你的数据|数据",
+    )
+
+    product_is_primary_claim = (
+        claimed_product_sku
+        and (
+            not claimed_store_overview
+            or claimed_product_sku.start("object") <= claimed_store_overview.start("object")
+        )
+    )
+    if product_is_primary_claim and not _has_claim_evidence("product_sku", tools_used, tool_log):
         warns.append(
             "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
             "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"
         )
 
-    claimed_order_query = re.search(
-        r"(我|已)?(查了|已查|查好了|看了).{0,10}(货单|订单|order)",
-        reply, re.IGNORECASE
-    )
-    if claimed_order_query and "query_order" not in tools_used:
+    if claimed_order_query and not _has_claim_evidence("order", tools_used, tool_log):
         warns.append(
             "⚠️ Agent 声称已查货单/订单，但没有调用 query_order — 这是 hallucinate"
         )
+
+    if claimed_store_overview:
+        broad_pos = claimed_store_overview.start("object")
+        has_specific_claim_before_broad = any(
+            m and m.start("object") <= broad_pos
+            for m in (claimed_product_sku, claimed_order_query)
+        )
+        if (
+            not has_specific_claim_before_broad
+            and not _has_claim_evidence("store_overview", tools_used, tool_log)
+        ):
+            warns.append(
+                "⚠️ Agent 声称已查询/拉取店铺或补货数据，但没有对应工具调用证据"
+                "（scope_overview / compute_replenishment / data_health_check 均未调用）— 这是 hallucinate"
+            )
     return warns
 
 
