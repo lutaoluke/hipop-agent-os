@@ -12,17 +12,23 @@
     a) write_chat_message 正常写入 SQLite 后能 read-back（基线正确性）。
     b) write_chat_message 抛异常时，api 层落库块必须打印日志（不再静默 pass）。
 
+  ③（新）真 API smoke — TestClient 走完整 ASGI 栈：
+    POST /api/chat → GET /api/chat-history/<store>，user+agent 消息 role/who/content
+    均落库可读；agent 回复落库失败时真实 api.py handler 打印 [chat persist error]。
+
 fail-then-pass 开关:
-  SMOKE_PERSIST_BREAK_DYNAMIC=1  → 把 is_postgres 退回「读模块变量」
-    → 场景 1「import 后设 DB_URL → is_postgres 应返 True」FAIL（复刻死法①）
-  SMOKE_PERSIST_SILENT_FAIL=1   → 把 api 层落库块退回「except: pass」
-    → 场景 3「write 失败必须打印日志」FAIL（复刻死法②）
-  改动前（is_postgres 读模块变量 / except pass 还在）整体跑即全 FAIL。
+  SMOKE_PERSIST_BREAK_DYNAMIC=1     → 把 is_postgres 退回「读模块变量」→ 场景1 FAIL
+  SMOKE_PERSIST_SILENT_FAIL=1       → 把 api 层落库块退回「except: pass」→ 场景3 FAIL
+  SMOKE_PERSIST_API_BREAK=1         → stub write_chat_message 为 no-op → 场景5 FAIL
+  SMOKE_PERSIST_API_SILENT_FAIL=1   → 让 API 路径落库 except 静默 → 场景6 FAIL
+  改动前整体跑全 FAIL。
 
 跑法:
   python3 tests/smoke_chat_persist.py
-  SMOKE_PERSIST_BREAK_DYNAMIC=1 python3 tests/smoke_chat_persist.py   # 看回归 fail
-  SMOKE_PERSIST_SILENT_FAIL=1 python3 tests/smoke_chat_persist.py     # 看回归 fail
+  SMOKE_PERSIST_BREAK_DYNAMIC=1 python3 tests/smoke_chat_persist.py
+  SMOKE_PERSIST_SILENT_FAIL=1 python3 tests/smoke_chat_persist.py
+  SMOKE_PERSIST_API_BREAK=1 python3 tests/smoke_chat_persist.py
+  SMOKE_PERSIST_API_SILENT_FAIL=1 python3 tests/smoke_chat_persist.py
   （也被 make test 自动聚合）
 """
 import os
@@ -170,6 +176,216 @@ def test_conn_uses_dynamic_db_url():
             pass
 
 
+def test_api_chat_round_trip_testclient():
+    """DoD #2 真 API smoke: POST /api/chat → GET /api/chat-history 断言 role/who/content 落库.
+
+    走完整 ASGI 栈（中间件/路由/落库全走），stub agent.chat 避免真 LLM 调用。
+
+    注：app 内部用 server.* 命名空间（main.py 把 hipop/ 插入 sys.path），
+    必须通过 sys.modules['server.*'] 取模块引用才能正确打桩。
+
+    fail-then-pass:
+      SMOKE_PERSIST_API_BREAK=1 → stub write_chat_message 为 no-op → history 空 → FAIL
+      默认跑 → 正常落库 → history 含 user+agent 两条 → PASS
+    """
+    from fastapi.testclient import TestClient
+
+    # import main 触发 server.* 模块加载（main.py 会往 sys.path 插 hipop/）
+    from hipop.server.main import app  # noqa: F401 — side-effect: loads server.*
+    # main.py dotenv 可能通过 setdefault 重设 DB_URL；清掉，强制走 SQLite
+    saved_db_url = os.environ.get("DB_URL")
+    os.environ.pop("DB_URL", None)
+    os.environ["AUTH_LOCKDOWN"] = "0"
+
+    import server.data as _sdata  # hipop/ 现在在 sys.path
+    import server.agent as _sagent
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _f:
+        tmp_db = _f.name
+
+    original_db = _sdata.DB_PATH
+    _sdata.DB_PATH = tmp_db
+
+    original_chat = _sagent.chat
+
+    def _stub_chat(msgs, scope):
+        return {
+            "reply": "stub_agent_reply [smoke-WS75-api]",
+            "clean_reply": "stub_agent_reply [smoke-WS75-api]",
+            "references": [],
+            "action_id": None,
+            "tag": "",
+            "workflow_task": None,
+            "tools_used": [],
+            "provider": "mock",
+            "confidence": 1.0,
+            "hallucination_warnings": [],
+        }
+
+    original_write = _sdata.write_chat_message
+
+    if os.environ.get("SMOKE_PERSIST_API_BREAK"):
+        def _noop_write(store, role, who, content, **kwargs):
+            return 0
+        _sdata.write_chat_message = _noop_write
+
+    _sagent.chat = _stub_chat
+    try:
+        client = TestClient(app, raise_server_exceptions=True)
+        user_content = "smoke_user_msg [WS75-api-round-trip]"
+
+        r = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": user_content}],
+            "scope": {"store": "SMKSTORE"},
+        })
+        assert r.status_code == 200, (
+            f"POST /api/chat 返回 {r.status_code}: {r.text[:200]}"
+        )
+        assert r.json().get("reply"), f"reply 字段为空: {r.json()}"
+
+        h = client.get("/api/chat-history/SMKSTORE")
+        assert h.status_code == 200, (
+            f"GET /api/chat-history/SMKSTORE 返回 {h.status_code}: {h.text[:200]}"
+        )
+        msgs = h.json()
+        assert isinstance(msgs, list), f"chat-history 返回非 list: {msgs}"
+
+        if os.environ.get("SMOKE_PERSIST_API_BREAK"):
+            # 死法：write 是 no-op → 无落库 → 此处故意 FAIL（复刻死法）
+            assert len(msgs) >= 2, (
+                "（SMOKE_PERSIST_API_BREAK 模式）write_chat_message 是 no-op → "
+                "history 为空 → 此处 FAIL，证明落库是必要路径"
+            )
+
+        assert len(msgs) >= 2, (
+            f"期望 ≥2 条消息 (user+agent)，实得 {len(msgs)}: {msgs}"
+        )
+        roles = {m.get("role") for m in msgs}
+        assert "user" in roles, f"缺 user role: {msgs}"
+        assert "agent" in roles, f"缺 agent role: {msgs}"
+
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
+        assert any(m.get("content") == user_content for m in user_msgs), (
+            f"user 消息内容未落库: {user_msgs}"
+        )
+        agent_msgs = [m for m in msgs if m.get("role") == "agent"]
+        assert any("stub_agent_reply" in (m.get("content") or "") for m in agent_msgs), (
+            f"agent 消息内容未落库: {agent_msgs}"
+        )
+        for m in msgs:
+            for field in ("role", "who", "content"):
+                assert field in m, f"消息缺字段 {field!r}: {m}"
+    finally:
+        _sagent.chat = original_chat
+        _sdata.write_chat_message = original_write
+        _sdata.DB_PATH = original_db
+        os.environ.pop("AUTH_LOCKDOWN", None)
+        os.environ.pop("DB_URL", None)
+        if saved_db_url is not None:
+            os.environ["DB_URL"] = saved_db_url
+        try:
+            os.unlink(tmp_db)
+        except OSError:
+            pass
+
+
+def test_api_chat_persist_error_handler_testclient():
+    """DoD #4 真 API smoke: agent 回复落库失败 → 真实 api.py except 块打印 [chat persist error].
+
+    通过 TestClient 注入 write_chat_message 失败，捕获 stdout，断言真实 handler（api.py
+    line 1069）打印日志 — 不是模拟打印，是真实 ASGI 路径里的 except 块。
+
+    fail-then-pass:
+      SMOKE_PERSIST_API_SILENT_FAIL=1 → 让 except 块静默（no-op）→ 无日志 → FAIL
+      默认跑 → except 块打印 → 捕获到 '[chat persist error]' → PASS
+    """
+    from fastapi.testclient import TestClient
+
+    from hipop.server.main import app  # noqa: F401
+    saved_db_url = os.environ.get("DB_URL")
+    os.environ.pop("DB_URL", None)
+    os.environ["AUTH_LOCKDOWN"] = "0"
+
+    import server.data as _sdata
+    import server.agent as _sagent
+    import server.api as _sapi
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _f:
+        tmp_db = _f.name
+
+    original_db = _sdata.DB_PATH
+    _sdata.DB_PATH = tmp_db
+    original_chat = _sagent.chat
+    original_write = _sdata.write_chat_message
+
+    _sagent.chat = lambda msgs, scope: {
+        "reply": "stub_for_persist_error_test",
+        "clean_reply": "stub_for_persist_error_test",
+        "references": [],
+        "action_id": None,
+        "tag": "",
+        "workflow_task": None,
+        "tools_used": [],
+        "provider": "mock",
+        "confidence": 1.0,
+        "hallucination_warnings": [],
+    }
+
+    def _failing_write(store, role, who, content, **kwargs):
+        if role == "agent":
+            raise RuntimeError("db boom injected [smoke-WS75-api-persist]")
+        return original_write(store, role, who, content, **kwargs)
+
+    _sdata.write_chat_message = _failing_write
+
+    # SMOKE_PERSIST_API_SILENT_FAIL=1: 把 server.api 模块的 print 覆盖为 no-op，
+    # 模拟「except: pass」的静默行为 — 此时捕获不到日志 → 断言 FAIL（死法复刻）。
+    _api_print_attr_added = False
+    if os.environ.get("SMOKE_PERSIST_API_SILENT_FAIL"):
+        _sapi.print = lambda *a, **k: None   # 遮蔽 builtin print（仅在 server.api 模块）
+        _api_print_attr_added = True
+
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        r = client.post("/api/chat", json={
+            "messages": [{"role": "user", "content": "smoke persist error test [WS75]"}],
+            "scope": {"store": "SMKSTORE2"},
+        })
+    finally:
+        sys.stdout = old_stdout
+        if _api_print_attr_added:
+            del _sapi.print   # 恢复 builtin print
+        _sagent.chat = original_chat
+        _sdata.write_chat_message = original_write
+        _sdata.DB_PATH = original_db
+        os.environ.pop("AUTH_LOCKDOWN", None)
+        os.environ.pop("DB_URL", None)
+        if saved_db_url is not None:
+            os.environ["DB_URL"] = saved_db_url
+        try:
+            os.unlink(tmp_db)
+        except OSError:
+            pass
+
+    assert r.status_code == 200, (
+        f"POST /api/chat 应返 200 即便落库失败，实得 {r.status_code}"
+    )
+    logged = captured.getvalue()
+
+    assert "chat persist error" in logged, (
+        f"agent 回复落库失败必须打印 '[chat persist error]' 日志，"
+        f"实际 stdout: {logged!r}。"
+        "检查 api.py agent 回复落库的 except 块是否已改为打印（"
+        "SMOKE_PERSIST_API_SILENT_FAIL=1 时故意 FAIL 用于验证死法）"
+    )
+    assert "RuntimeError" in logged, (
+        f"日志应含异常类型 RuntimeError，实际: {logged!r}"
+    )
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -177,6 +393,8 @@ if __name__ == "__main__":
         test_write_chat_message_round_trip,
         test_chat_persist_error_logged_not_silently_swallowed,
         test_conn_uses_dynamic_db_url,
+        test_api_chat_round_trip_testclient,
+        test_api_chat_persist_error_handler_testclient,
     ]
     failed = 0
     for t in tests:
