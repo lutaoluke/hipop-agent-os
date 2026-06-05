@@ -1695,12 +1695,19 @@ def _fix_stock_breakdown_reply(reply: str, tool_log: list) -> str:
     """T11 deterministic verifier: if query_stock_breakdown returned found=False but reply
     lacks the required stock-not-found phrasing, prepend the standard notice."""
     import re as _re_local
+    import json as _json_local
     _NOT_FOUND_RE = _re_local.compile(r"无数据|未刷新|未接入|无行|没有记录|找不到|无库存记录")
     for t in tool_log:
         if (t.get("name") == "query_stock_breakdown"
                 and t.get("result_found") is False
                 and not _NOT_FOUND_RE.search(reply)):
-            sku = (t.get("args") or {}).get("sku", "该 SKU")
+            raw_args = t.get("args") or {}
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = _json_local.loads(raw_args)
+                except Exception:
+                    raw_args = {}
+            sku = raw_args.get("sku", "该 SKU") if isinstance(raw_args, dict) else "该 SKU"
             prefix = f"{sku} 在库存系统无库存记录（该 SKU 未接入或未刷新），如需查询请确认 SKU 是否已录入库存系统。\n\n"
             return prefix + reply
     return reply

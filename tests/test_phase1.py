@@ -1259,6 +1259,17 @@ def test_t11_stock_breakdown_not_found_verifier_injects_standard_phrase():
     assert out_noop == "该SKU未刷新，请稍后。", "已含标准口径不应再次插入"
 
 
+def test_t11_stock_breakdown_not_found_verifier_openai_str_args():
+    """_fix_stock_breakdown_reply: OpenAI provider stores args as JSON string — must not crash."""
+    import re, json
+    from hipop.server.agent import _fix_stock_breakdown_reply
+    # OpenAI shape: args is a raw JSON string, not a dict
+    tool_log = [{"name": "query_stock_breakdown", "args": json.dumps({"sku": "OAI_MISS"}), "result_found": False}]
+    out = _fix_stock_breakdown_reply("查不到记录，要不帮你确认。", tool_log)
+    assert re.search(r"无数据|未刷新|未接入|无行|没有记录|找不到|无库存记录", out), \
+        f"OpenAI str-args: 应含标准口径: {out[:200]}"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []
