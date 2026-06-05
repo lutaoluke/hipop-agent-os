@@ -65,7 +65,11 @@ def _get_client():
 TOOLS = [
     {
         "name": "query_sku",
-        "description": "查 SKU 的健康情况（趋势、利润率、库存可撑天数、在途、告警）。最多 3 个 SKU。",
+        "description": (
+            "查 SKU 的健康情况（趋势、利润率、库存可撑天数、在途、告警、取消率、退货率）。最多 3 个 SKU。"
+            "cancel_rate / return_rate 来自 wf2_sku；若字段为 None（未刷新），必须明确告知用户"
+            "「当前不可确认」，**不得报 0% 或推断质量稳定**。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -420,7 +424,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     for sku in skus[:3]:
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
-                   w2.sales_30d, w2.sales_10d, w2.latest_price,
+                   w2.sales_30d, w2.sales_10d, w2.sales_180d, w2.latest_price,
+                   w2.total_orders, w2.cancel_rate, w2.return_rate,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
                    h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
@@ -436,6 +441,12 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             out.append({"sku": sku, "found": False})
             continue
         r = rows[0]
+        cancel_rate = r["cancel_rate"]
+        return_rate = r["return_rate"]
+        rates_note = (
+            "cancel_rate/return_rate 当前不可确认（noon 订单未刷新），不得报 0% 或推断质量稳定"
+            if (cancel_rate is None or return_rate is None) else None
+        )
         out.append({
             "sku": sku,
             "found": True,
@@ -444,6 +455,11 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "profit_rate_pct": round((r["latest_profit_rate"] or 0) * 100, 1),
             "sales_30d": r["sales_30d"],
             "sales_10d": r["sales_10d"],
+            "sales_180d": r["sales_180d"],
+            "total_orders": r["total_orders"],
+            "cancel_rate": cancel_rate,
+            "return_rate": return_rate,
+            "rates_note": rates_note,
             "daily_rate": r["daily_rate"],
             "urgency": r["urgency"],
             "ops_advice": r["ops_advice"],
@@ -1603,6 +1619,7 @@ scope: {scope}
 5. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
 6. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
 7. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
+8. **cancel_rate / return_rate = None 必须明告「当前不可确认」**：query_sku 返回 rates_note 时，必须原文转告用户。**禁止**把 None 当 0%、禁止据此下「质量稳定」结论。数据可确认时（cancel_rate 非 None）才可引用。
 
 ## 长期偏好沉淀
 - 用户明确说"以后都这么办" / "记住" / "默认 X" → 调 tenant_notes_append
