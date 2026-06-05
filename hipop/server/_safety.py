@@ -106,7 +106,44 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
+def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -> List[str]:
+    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。"""
+    warns = []
+    claimed_query = re.search(
+        r"(我|已)?(再次|重新)?(查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
+        r".{0,15}(商品|产品|SKU|sku|数据|库存|ERP|erp|全部货|所有货)",
+        reply, re.IGNORECASE
+    )
+    if claimed_query:
+        has_real_list = False
+        if "list_products" in tools_used:
+            if tool_log:
+                for t in tool_log:
+                    if t.get("name") == "list_products":
+                        args = t.get("args") or {}
+                        if isinstance(args, dict) and args.get("limit", 1) > 0:
+                            has_real_list = True
+            else:
+                has_real_list = True
+        has_sku_query = "query_sku" in tools_used
+        if not has_real_list and not has_sku_query:
+            warns.append(
+                "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
+                "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"
+            )
+
+    claimed_order_query = re.search(
+        r"(我|已)?(查了|已查|查好了|看了).{0,10}(货单|订单|order)",
+        reply, re.IGNORECASE
+    )
+    if claimed_order_query and "query_order" not in tools_used:
+        warns.append(
+            "⚠️ Agent 声称已查货单/订单，但没有调用 query_order — 这是 hallucinate"
+        )
+    return warns
+
+
+def sanitize_reply(reply: str, tools_used: List[str], tool_log=None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
     if not reply:
@@ -115,6 +152,7 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
+    warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)
