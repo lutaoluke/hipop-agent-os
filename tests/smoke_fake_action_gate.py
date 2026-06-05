@@ -304,6 +304,22 @@ def test_is_substantive_action_mixed_true():
         "混合工具（含非 list_products）应返回 True"
 
 
+# ── 第8轮：GPT provider raw JSON string args 跨 provider 兼容 ────────────────
+
+def test_is_substantive_action_gpt_string_args_positive():
+    """GPT provider 传 string args with limit>0 → True（真实查询，非计数）。"""
+    tool_log = [{"name": "list_products", "args": '{"store":"KSA","limit":20}'}]
+    assert _safety._is_substantive_action(tool_log), \
+        "GPT string args limit=20 应为 True（真实查询）"
+
+
+def test_is_substantive_action_gpt_string_args_zero():
+    """GPT provider 传 string args with limit=0 → False（只计数，非真执行）。"""
+    tool_log = [{"name": "list_products", "args": '{"store":"KSA","limit":0}'}]
+    assert not _safety._is_substantive_action(tool_log), \
+        "GPT string args limit=0 应为 False（只计数）"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -338,6 +354,8 @@ if __name__ == "__main__":
         test_is_substantive_action_limit_positive_true,
         test_is_substantive_action_other_tool_true,
         test_is_substantive_action_mixed_true,
+        test_is_substantive_action_gpt_string_args_positive,
+        test_is_substantive_action_gpt_string_args_zero,
     ]
     failed = 0
     for t in tests:

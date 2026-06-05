@@ -133,15 +133,27 @@ def _claim_match(reply: str, keywords: str, gap: int = 15):
     )
 
 
+def _normalize_args(args) -> dict:
+    """Normalize tool args to dict — GPT provider stores raw JSON string, Anthropic stores dict."""
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        import json
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
 def _list_products_has_rows(tool_log) -> bool:
     if not tool_log:
         return False
     for t in tool_log:
         if t.get("name") != "list_products":
             continue
-        args = t.get("args") or {}
-        if not isinstance(args, dict):
-            continue
+        args = _normalize_args(t.get("args") or {})
         limit = args.get("limit", 1)
         try:
             if int(limit) > 0:
@@ -235,8 +247,8 @@ def _is_substantive_action(tool_log: list) -> bool:
     for t in (tool_log or []):
         if t.get("name") != "list_products":
             return True
-        args = t.get("args") or {}
-        if isinstance(args, dict) and args.get("limit", 1) > 0:
+        args = _normalize_args(t.get("args") or {})
+        if args.get("limit", 1) > 0:
             return True
     return False
 
