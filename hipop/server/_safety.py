@@ -134,6 +134,38 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
     return warns
 
 
+_WORKFLOW_SUCCESS_RE = re.compile(
+    r"(已触发|已启动|已开始|再次触发|✅.*工作流|工作流.*✅|"
+    r"任务.{0,10}(提交|启动|成功)|已让.{0,5}系统|"
+    r"后台.{0,5}(任务|正在跑|处理中)|后台跑了|正在刷新|已经在.{0,5}后台)"
+)
+
+
+def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
+    """T36-S3: run_workflow 返回 ok=False 但 reply 声称成功 → banner。
+
+    文案与事实解耦：tool_log 里记录了失败的工作流调用，reply 不得再声称成功。
+    只在有明确失败记录（ok=False）的条目时触发；ok=True 或无 run_workflow 记录时不报。
+    """
+    failed = [
+        t for t in (tool_log or [])
+        if t.get("name") == "run_workflow" and not t.get("ok", True)
+    ]
+    if not failed:
+        return []
+    if not _WORKFLOW_SUCCESS_RE.search(reply):
+        return []
+    parts = []
+    for t in failed:
+        args = t.get("args") or {}
+        wf = args.get("workflow", "unknown") if isinstance(args, dict) else "unknown"
+        err = t.get("error") or "启动失败"
+        parts.append(f"{wf}: {err}")
+    return [
+        f"⚠️ 以下工作流启动失败但回复声称成功 — 文案与事实不符: {'; '.join(parts)}"
+    ]
+
+
 def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
@@ -144,6 +176,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
+    warnings.extend(_check_failed_workflow_claimed_success(reply, tool_log or []))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)

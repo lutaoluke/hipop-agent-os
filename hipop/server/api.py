@@ -908,6 +908,9 @@ def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1, actor: Option
     actor：触发方信息 {user_id, email, role, source}，每个 event 都带，审计/日志用。
     """
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
+    # 后台线程：必须 set tenant context（middleware 不在这条线程上）
+    # 必须在第一个 write_event 之前 —— 否则 step0 落入默认 tenant 而非触发者 tenant。
+    data.set_current_tenant(tenant_id)
     data.write_event(
         task_id, 0, "初始化",
         "done",
@@ -917,8 +920,6 @@ def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1, actor: Option
                    ensure_ascii=False),
         actor=actor,
     )
-    # 后台线程：必须 set tenant context（middleware 不在这条线程上）
-    data.set_current_tenant(tenant_id)
     failed = False
     for step_no, step_name, path in steps:
         if failed:
