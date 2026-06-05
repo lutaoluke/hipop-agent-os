@@ -102,6 +102,35 @@ def test_regression_run_workflow_still_works():
     _, warns = _safety.sanitize_reply("已触发物流刷新。", [])
     assert any("run_workflow" in w for w in warns), "run_workflow 检测被破坏"
 
+# ── 显式白名单：非查询工具不能作为查询证据 ────────────────────────────────
+
+def test_export_table_not_proof_of_query():
+    """export_table 不能作为'查了商品'的证据。"""
+    tool_log = [{"name": "export_table", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了你的商品，库存都正常。", ["export_table"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "查询" in w for w in warns), \
+        f"export_table 被当成查询证据，漏拦: {warns}"
+
+def test_run_workflow_not_proof_of_query():
+    """run_workflow 不能作为'查了数据'的证据。"""
+    tool_log = [{"name": "run_workflow", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了一下数据，都正常。", ["run_workflow"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "查询" in w for w in warns), \
+        f"run_workflow 被当成查询证据，漏拦: {warns}"
+
+def test_notify_feishu_not_proof_of_query():
+    """notify_via_feishu 不能作为'查了SKU'的证据。"""
+    tool_log = [{"name": "notify_via_feishu", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了这个SKU，库存有30件。", ["notify_via_feishu"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "query_sku" in w or "查询" in w for w in warns), \
+        f"notify_via_feishu 被当成查询证据，漏拦: {warns}"
+
 
 if __name__ == "__main__":
     tests = [
@@ -117,6 +146,9 @@ if __name__ == "__main__":
         test_data_health_check_passes,
         test_regression_export_table_still_works,
         test_regression_run_workflow_still_works,
+        test_export_table_not_proof_of_query,
+        test_run_workflow_not_proof_of_query,
+        test_notify_feishu_not_proof_of_query,
     ]
     failed = 0
     for t in tests:

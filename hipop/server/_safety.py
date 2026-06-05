@@ -106,39 +106,48 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-def _has_real_data_query(tools_used: List[str], tool_log) -> bool:
-    """判断本轮是否有真实数据查询：任何非 list_products 工具 = 真查；
-    list_products 需 limit>0；无 tool_log 时保守信任（无参数信息）。"""
-    # 任何非 list_products 工具 = 真实数据查询（scope_overview/query_sku/data_health_check 等）
-    if any(t != "list_products" for t in tools_used):
-        return True
-    # 只有 list_products：检查 limit 参数
-    if "list_products" in tools_used:
-        if tool_log is None:
-            return True  # 无参数信息，保守信任
-        for t in tool_log:
-            if t.get("name") == "list_products":
-                args = t.get("args") or {}
-                if isinstance(args, dict) and args.get("limit", 1) > 0:
-                    return True
+# 能证明"查了商品/数据"的工具集合（显式白名单，不是"非list_products的任意工具"）
+_DATA_QUERY_TOOLS = frozenset({
+    "list_products",        # 需要 limit>0
+    "query_sku",
+    "query_order",
+    "scope_overview",
+    "compute_replenishment",
+    "data_health_check",
+})
+
+
+def _has_real_data_query(tools_used: list, tool_log=None) -> bool:
+    """检查本轮是否有真实数据查询工具调用。"""
+    for tool_name in tools_used:
+        if tool_name not in _DATA_QUERY_TOOLS:
+            continue  # 非查询工具，跳过
+        if tool_name == "list_products":
+            if tool_log:
+                for t in tool_log:
+                    if t.get("name") == "list_products":
+                        args = t.get("args") or {}
+                        if isinstance(args, dict) and args.get("limit", 1) > 0:
+                            return True
+            # 有 list_products 但没 tool_log（降级保守处理）→ 也不信，要求 limit>0
+            continue
+        return True  # 白名单里其他工具 = 合法查询证据
     return False
 
 
 def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -> List[str]:
-    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。
-    只拦截唯一工具证据是 list_products(limit=0) 的情况；其他任何真实工具调用均放行。"""
+    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。"""
     warns = []
     claimed_query = re.search(
         r"(我|已)?(再次|重新)?(查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
         r".{0,15}(商品|产品|SKU|sku|数据|库存|ERP|erp|全部货|所有货)",
         reply, re.IGNORECASE
     )
-    if claimed_query:
-        if not _has_real_data_query(tools_used, tool_log):
-            warns.append(
-                "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
-                "（本轮无真实数据查询工具调用，或仅调 list_products(limit=0) 拿计数）— 这是 hallucinate"
-            )
+    if claimed_query and not _has_real_data_query(tools_used, tool_log):
+        warns.append(
+            "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
+            "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"
+        )
 
     claimed_order_query = re.search(
         r"(我|已)?(查了|已查|查好了|看了).{0,10}(货单|订单|order)",
