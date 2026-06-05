@@ -4,8 +4,9 @@
 让用户看见 Agent 在编造，并在前端展开真相。
 """
 from __future__ import annotations
+import json
 import re
-from typing import Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 # 已知合法域名（可以出现在 reply 里的）
 ALLOWED_DOMAINS = {
@@ -66,6 +67,9 @@ TIMEZONE_HINT_RE = re.compile(r"(?:UTC[+-]\d|沙特时间|时区换算|（UTC\+)
 
 URL_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)(?::\d+)?(/[^\s)\"'>]*)?")
 
+# T36: 任务号提及模式 — 只匹配出现在"任务"上下文中的 8 位十六进制串
+_TASK_ID_MENTION_RE = re.compile(r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：]*([0-9a-f]{8})\b')
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -106,7 +110,34 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
+def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
+    """T36: reply 中出现未由 run_workflow 工具返回的 task_id → banner。"""
+    warns: List[str] = []
+    mentioned = set(_TASK_ID_MENTION_RE.findall(reply))
+    if not mentioned:
+        return warns
+    real_ids = {t["task_id"] for t in (tool_log or []) if t.get("task_id")}
+    fake = mentioned - real_ids
+    if fake:
+        warns.append(
+            f"⚠️ Agent 回复中出现了未由 run_workflow 工具返回的任务号 "
+            f"({', '.join(sorted(fake))}) — 这些 task_id 可能是编造的"
+        )
+    return warns
+
+
+def _get_tool_arg(t, key):
+    """从 tool_log 条目安全取 args 里的字段（Anthropic=dict, OpenAI=str）。"""
+    args = t.get("args") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    return (args.get(key) or "") if isinstance(args, dict) else ""
+
+
+def sanitize_reply(reply, tools_used, tool_log=None):
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
     if not reply:
@@ -115,6 +146,7 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
+    warnings.extend(_check_fake_task_ids(reply, tool_log or []))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)
@@ -171,6 +203,60 @@ def sanitize_reply(reply: str, tools_used: List[str]) -> Tuple[str, List[str]]:
             "[⚠️ 句子被 _safety 拦掉：未真调 run_workflow，请用 query_sku_live 实时查] ",
             reply,
         )
+
+    # ── T26 货单负控 ──────────────────────────────────────────────────────────────
+    # Rule A: 没调 query_order_live 却说"我来查货单实时状态/正在查" — 假称在查，直接删句
+    pretend_order_query = re.search(
+        r"(我来查这个货单号的实时状态"
+        r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+        r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+        r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+        r"|查.{0,5}货单.{0,8}实时状态"
+        r"|让我.{0,5}查.{0,10}货单)",
+        reply,
+    )
+    if pretend_order_query and "query_order_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查货单实时状态/正在查货单'但本轮没真调 query_order_live — "
+            "禁止假称在查（T26 货单负控）"
+        )
+        sentence_pat_order = re.compile(
+            r"[^。\n!?]*("
+            r"我来查这个货单号的实时状态"
+            r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+            r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+            r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+            r"|查.{0,5}货单.{0,8}实时状态"
+            r"|让我.{0,5}查.{0,10}货单"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat_order.sub(
+            "[⚠️ 被 _safety 拦掉：未调 query_order_live，不许假称正在查货单] ",
+            reply,
+        )
+
+    # Rule B: query_order_live 返回 order_not_found_in_erp 时，reply 必须明确说未找到
+    order_not_found_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "order_not_found_in_erp"
+    ]
+    if order_not_found_entries and not re.search(
+        r"(未找到|不存在|无物流|找不到|无记录|没有.{0,5}找到|该货单.{0,10}(不|无)|ERP.*无记录|核实货单号)",
+        reply,
+    ):
+        order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
+        order_str = "、".join(filter(None, order_nos)) or "该货单"
+        not_found_prefix = (
+            f"**货单 {order_str} 在 ERP 中无记录**，请核实货单号是否正确。"
+            "当前无物流数据.\n\n"
+        )
+        reply = not_found_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live 返回 order_not_found_in_erp（{order_str}）"
+            "但回复未明确说明未找到，已自动补充负控提示（T26）"
+        )
+
 
     if warnings:
         banner = (

@@ -168,11 +168,15 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                     "affected_modules": result["affected_modules"],
                     "followup_prompt": result.get("followup_prompt"),
                 }
-            tool_log.append({
+            log_entry = {
                 "name": tool_name,
                 "args": tool_args_raw,
                 "result_keys": list(result.keys()) if isinstance(result, dict) else None,
-            })
+                "result_error": result.get("error") if isinstance(result, dict) else None,
+            }
+            if tool_name == "run_workflow" and isinstance(result, dict):
+                log_entry["task_id"] = result.get("task_id")
+            tool_log.append(log_entry)
             msgs.append({
                 "role": "tool",
                 "tool_call_id": tc.id,

@@ -924,17 +924,21 @@ def _run_workflow(task_id: str, workflow: str, tenant_id: int = 1, actor: Option
     actor：触发方信息 {user_id, email, role, source}，每个 event 都带，审计/日志用。
     """
     label, steps, affected = WORKFLOW_REGISTRY[workflow]
-    data.write_event(
-        task_id, 0, "初始化",
-        "done",
-        json.dumps({"workflow": workflow, "label": label,
-                    "affected_modules": affected, "total_steps": len(steps),
-                    "tenant_id": tenant_id},
-                   ensure_ascii=False),
-        actor=actor,
-    )
-    # 后台线程：必须 set tenant context（middleware 不在这条线程上）
+    # T36-S2(b): 后台线程先 set tenant context，再写 step0 event（修：之前顺序反了，
+    # PG RLS 可能把 step0 event 写入错 tenant；且 step0 裸写崩溃会静默挂掉整个 daemon）
     data.set_current_tenant(tenant_id)
+    try:
+        data.write_event(
+            task_id, 0, "初始化",
+            "done",
+            json.dumps({"workflow": workflow, "label": label,
+                        "affected_modules": affected, "total_steps": len(steps),
+                        "tenant_id": tenant_id},
+                       ensure_ascii=False),
+            actor=actor,
+        )
+    except Exception:
+        pass  # step0 event 写失败不中止后续 steps
     failed = False
     for step_no, step_name, path in steps:
         if failed:
