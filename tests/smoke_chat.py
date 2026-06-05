@@ -259,6 +259,33 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T15 库存 TopN 确定性查询（WS-102）────────────────────────────────────────
+    # fail-then-pass: 改前 query_stock_top 不存在 → Agent 用历史/记忆编排名 → must_use_tools 断言失败
+    # 改后 query_stock_top 注册 → Agent 真调工具 → 返回真实 Top3 + 库存数量 → 全绿
+    Case(
+        name="T15 库存 TopN KSA（必走 query_stock_top，禁猜/禁宣称已生成/已排名）",
+        question="请列出 KSA 当前总库存最高的 3 个 SKU 和库存数量",
+        store="KSA",
+        must_use_tools=["query_stock_top"],
+        must_contain=[r"\d+"],
+        must_not_contain=[
+            "已生成",
+            "已排名",
+            "根据之前",
+            "根据记忆",
+            r"候选.{0,10}SKU",
+        ],
+        timeout=90,
+    ),
+    # ─── T26 货单负控（WS-106）────────────────────────────────────────────────────
+    Case(
+        name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
+        question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
+        must_use_tools=["query_order_live"],
+        must_contain=[r"未找到|不存在|无物流|无记录|找不到|核实货单号"],
+        must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
+        timeout=120,
+    ),
 ]
 
 
