@@ -935,15 +935,13 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     conn = _data.conn()
     all_results = {}
     skipped_entities = []
-    degraded_entities = []
     for ent in entities:
         alias = ent["alias"]
         print(f"\n[v2 tenant={tenant_id} entity {alias}]", file=sys.stderr)
         # ── 上游空/不完整保护（5/12 root cause: tenant=5 wf1_stock 空导致 need_replenish 全 0）──
         # wf5 = SKU 销量 + 库存 + 在途 → 补货建议；任何上游空/不全都会静默返 0。
         # 就绪度判定用 server.data.stock_readiness（单一事实源），与运营入口同口径：
-        #   empty/no_skus → fail-fast SKIP 告诉用户先跑 ingest；
-        #   incomplete    → 仍计算,但把降级状态带进返回,不静默假确定。
+        #   not ready → fail-fast SKIP 告诉用户先跑 ingest；不拿空/旧/不全库存继续算假建议。
         sku_cnt = conn.execute(
             "SELECT COUNT(*) AS n FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
             (tenant_id, alias),
@@ -951,12 +949,12 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
         sku_cnt = sku_cnt["n"] if isinstance(sku_cnt, dict) else sku_cnt[0]
         readiness = _data.stock_readiness(tenant_id, alias)
         stock_cnt = readiness["stock_rows"]
-        if sku_cnt < 10 or readiness["status"] in ("empty", "no_skus"):
-            print(f"  [{alias}] SKIP: wf2_sku={sku_cnt} wf1_stock={stock_cnt}（上游空），先跑 wf2/wf1 ingest",
+        if sku_cnt < 10 or not readiness["ready"]:
+            print(f"  [{alias}] SKIP: wf2_sku={sku_cnt} wf1_stock={stock_cnt}（上游未就绪），先跑 wf2/wf1 ingest",
                   file=sys.stderr)
             skipped_entities.append({
                 "alias": alias,
-                "reason": "upstream_empty",
+                "reason": "upstream_not_ready",
                 "wf2_sku_count": sku_cnt,
                 "wf1_stock_count": stock_cnt,
                 "stock_status": readiness,
@@ -966,9 +964,6 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
                 ),
             })
             continue
-        if not readiness["ready"]:
-            print(f"  [{alias}] ⚠️ 库存不完整: {readiness['message']}", file=sys.stderr)
-            degraded_entities.append({"alias": alias, "stock_status": readiness})
         # 取该 entity 全部 partner_sku（兼容 sqlite tuple 和 PG dict cursor）
         rows = conn.execute(
             "SELECT partner_sku FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
@@ -997,23 +992,20 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     conn.close()
     print(f"\n[done] tenant={tenant_id} {all_results}", file=sys.stderr)
     if skipped_entities:
-        print(f"[skipped] {len(skipped_entities)} entities upstream_empty: "
+        print(f"[skipped] {len(skipped_entities)} entities upstream_not_ready: "
               f"{[s['alias'] for s in skipped_entities]}", file=sys.stderr)
     # 全部 entity 都被跳 → 整体 fail-fast，告诉调用方 wf5 没产出数据
     if not all_results and skipped_entities:
         return {
             "ok": False,
-            "error": "upstream_empty",
+            "error": "upstream_not_ready",
             "message": f"tenant={tenant_id} 全部 {len(skipped_entities)} 个 entity 上游空"
-                       f"（wf2_sku 或 wf1_stock 不足 10 行），请先跑 wf2/wf1 ingest",
+                       f"（wf2_sku 或 wf1_stock 未就绪），请先跑 wf2/wf1 ingest",
             "skipped": skipped_entities,
         }
     # 部分成功 → 正常返回 + warning
     if skipped_entities:
         all_results["_skipped"] = skipped_entities
-    # 不完整（非全空但覆盖不足）→ 带降级状态，运营入口据此告警，不静默假确定
-    if degraded_entities:
-        all_results["_stock_warnings"] = degraded_entities
     return all_results
 
 

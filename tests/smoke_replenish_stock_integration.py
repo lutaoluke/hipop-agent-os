@@ -23,7 +23,9 @@
 
 验收 2 · 库存未就绪/不完整 降级（防「死代码短路」）
   - 空库存（0 行）→ 三条入口都 ready=False、status=empty、message 含「未就绪」；
-  - 不完整库存（非空但覆盖率不足）→ 三条入口都 ready=False、status=incomplete、含「不完整」；
+  - 未就绪库存（19 行）→ 三条入口都 ready=False、status=empty、含「未就绪」；
+  - 不完整库存（94% 覆盖率或库存超过 3 天未更新）→ 三条入口都 ready=False、
+    status=incomplete、含「不完整」；
   - 完整库存但本周无需补货 → 三条入口 ready=True（rows 空 ≠ 未就绪，不误报）；
   绝不静默给 0 / 假确定建议：未就绪时入口响应本身带 ready=False，不是只在 run_v2 log。
 
@@ -39,6 +41,7 @@ import os
 import re
 import sys
 import json
+import time
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +103,7 @@ def _reset_ksa():
     conn.close()
 
 
-def _add_sku(sku, *, listed=1, sales=False, stock=None):
+def _add_sku(sku, *, listed=1, sales=False, stock=None, updated_at=None):
     """插一个 wf2_sku（hipop_ksa）；可选灌销量与 wf1_stock 行。stock=None → 不建库存行。"""
     from hipop.server import data
     conn = data.conn()
@@ -116,11 +119,12 @@ def _add_sku(sku, *, listed=1, sales=False, stock=None):
         (TENANT, KSA_ALIAS, sku, f"商品 {sku}", listed, 99.0, profit, s10, s30, s60, s180),
     )
     if stock is not None:
+        updated_at = updated_at or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         conn.execute(
             "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, noon_saleable_qty, "
-            "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock),
+            "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock, updated_at),
         )
     conn.commit()
     conn.close()
@@ -208,6 +212,8 @@ def _assert_not_ready_all_entries(check, expect_status, expect_word):
         check(f"[{label}] ready=False（不静默当 0 建议）", st.get("ready") is False, st)
         check(f"[{label}] status={expect_status}", st.get("status") == expect_status, st)
         check(f"[{label}] message 含『{expect_word}』", expect_word in (st.get("message") or ""), st)
+        rows = resp.get("rows", resp.get("items", []))
+        check(f"[{label}] not ready 时不返回补货建议", rows == [], rows)
     # data 入口与 HTTP 路由必须同形（页面/chat 据此渲染）
     check("HTTP 路由与 data 入口同形(stock_status+rows)",
           set(h.keys()) >= {"stock_status", "rows"} and isinstance(h["rows"], list), list(h.keys()))
@@ -218,8 +224,8 @@ def test_stock_change_changes_replenishment():
     print("== test_stock_change_changes_replenishment (验收 1: 数值真随真实库存变) ==")
     check = _Checker()
     _reset_ksa()
-    # >=10 个上架 SKU 且各有库存行（满足 run_v2 上游非空 + readiness ready）。
-    for i in range(12):
+    # >=20 个上架 SKU 且各有库存行（满足 run_v2 上游非空 + readiness ready）。
+    for i in range(20):
         _add_sku(f"FILL{i:03d}", sales=False, stock=500)
     _add_sku(SENS_SKU, sales=True, stock=400)
     _add_hub(SENS_SKU, avg_days=30)
@@ -269,19 +275,61 @@ def test_empty_stock_surfaces_not_ready_at_all_entry_points():
     return check.failures
 
 
+# ── 验收 2 · 19 行库存：新门槛下仍属于「库存未就绪」──────────────────
+def test_min_rows_20_threshold_surfaces_not_ready_at_all_entry_points():
+    print("== test_min_rows_20_threshold_surfaces_not_ready_at_all_entry_points (验收 2: <20 行降级) ==")
+    check = _Checker()
+    _reset_ksa()
+    # 20 个上架 SKU,19 个有库存行。旧口径（>=10 且覆盖率 95%）会误判 ready；
+    # Luke 新口径要求 wf1_stock <20 行必须先刷新库存。
+    for i in range(20):
+        _add_sku(f"MIN{i:03d}", sales=True, stock=300 if i < 19 else None)
+
+    _assert_not_ready_all_entries(check, expect_status="empty", expect_word="未就绪")
+    st = _view()["stock_status"]
+    check("readiness 使用 Luke 新门槛 MIN_ROWS=20",
+          st["stock_rows"] == 19 and st["status"] == "empty", st)
+    return check.failures
+
+
 # ── 验收 2 · 不完整库存：三条运营入口都明确「库存不完整」─────────────────
 def test_incomplete_stock_surfaces_not_ready_at_all_entry_points():
     print("== test_incomplete_stock_surfaces_not_ready_at_all_entry_points (验收 2: 不完整库存降级) ==")
     check = _Checker()
     _reset_ksa()
-    # 20 个上架 SKU,只有 14 个有库存行 → 覆盖率 0.70 < 0.8,但行数 14 ≥ 10（非全空）
-    for i in range(20):
-        _add_sku(f"PRT{i:03d}", sales=True, stock=300 if i < 14 else None)
+    # 100 个上架 SKU,94 个有库存行 → 覆盖率 0.94。
+    # 旧口径 80% 会误判 ready；Luke 新口径要求低于 95% 均为不完整。
+    for i in range(100):
+        _add_sku(f"PRT{i:03d}", sales=True, stock=300 if i < 94 else None)
 
     _assert_not_ready_all_entries(check, expect_status="incomplete", expect_word="不完整")
     st = _view()["stock_status"]
-    check("非全空(stock_rows≥10)也被识别为不完整",
-          st["stock_rows"] >= 10 and st["coverage"] < 0.8, st)
+    check("覆盖率 94% 被 Luke 新门槛 95% 拦为不完整",
+          st["stock_rows"] == 94 and st["coverage"] < 0.95, st)
+    wf5 = _run_wf5()
+    check("run_v2 进入计算前硬拦不完整库存",
+          wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["status"] == "incomplete", wf5)
+    return check.failures
+
+
+# ── 验收 2 · 陈旧库存：更新时间超过 3 天必须先刷新库存 ─────────────────
+def test_stale_stock_surfaces_not_ready_at_all_entry_points():
+    print("== test_stale_stock_surfaces_not_ready_at_all_entry_points (验收 2: 库存超过 3 天降级) ==")
+    check = _Checker()
+    _reset_ksa()
+    stale_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 73 * 3600))
+    for i in range(20):
+        _add_sku(f"OLD{i:03d}", sales=True, stock=300, updated_at=stale_ts)
+
+    _assert_not_ready_all_entries(check, expect_status="incomplete", expect_word="不完整")
+    st = _view()["stock_status"]
+    check("readiness 暴露 72h 时效门槛",
+          st["freshness_max_hours"] == 72 and (st["stock_age_hours"] or 0) > 72, st)
+    check("陈旧库存 message 要求先刷新库存",
+          "刷新库存" in st["message"] or "wf1 ingest" in st["message"], st)
+    wf5 = _run_wf5()
+    check("run_v2 进入计算前硬拦陈旧库存",
+          wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["status"] == "incomplete", wf5)
     return check.failures
 
 
@@ -290,7 +338,7 @@ def test_ready_stock_no_false_positive():
     print("== test_ready_stock_no_false_positive (就绪态对照,空 rows ≠ 未就绪) ==")
     check = _Checker()
     _reset_ksa()
-    for i in range(15):  # 完整覆盖 + 无销量 → 不会产生补货建议(rows 空),但库存就绪
+    for i in range(20):  # 完整覆盖 + 无销量 → 不会产生补货建议(rows 空),但库存就绪
         _add_sku(f"RDY{i:03d}", sales=False, stock=500)
     _run_wf5()
 
@@ -325,7 +373,9 @@ if __name__ == "__main__":
     tests = [
         test_stock_change_changes_replenishment,
         test_empty_stock_surfaces_not_ready_at_all_entry_points,
+        test_min_rows_20_threshold_surfaces_not_ready_at_all_entry_points,
         test_incomplete_stock_surfaces_not_ready_at_all_entry_points,
+        test_stale_stock_surfaces_not_ready_at_all_entry_points,
         test_ready_stock_no_false_positive,
         test_template_surfaces_readiness,
     ]

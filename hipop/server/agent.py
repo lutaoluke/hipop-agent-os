@@ -20,6 +20,9 @@ from typing import List, Dict, Any, Optional
 # 由 chat() 入口 set，所有 tool 函数同线程读
 _chat_tenant: contextvars.ContextVar[int] = contextvars.ContextVar("chat_tenant", default=1)
 _chat_scope: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_scope", default={})
+_last_replenishment_stock_status: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "last_replenishment_stock_status", default=None
+)
 
 
 def _get_tenant() -> int:
@@ -525,6 +528,7 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     # 空建议当成「不用补货」，必须如实说「库存未就绪/不完整」（防死代码短路）。
     view = _data.get_replenishment_view(store, limit=limit)
     stock_status = view["stock_status"]
+    _last_replenishment_stock_status.set(stock_status)
     rows = view["rows"]
     items = [{
         "sku": r["partner_sku"], "title": r["title"], "qty": r["qty"],
@@ -534,6 +538,8 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     return {
         "store": store, "count": len(items), "items": items,
         "stock_status": stock_status,
+        "warning": None if stock_status.get("ready") else stock_status.get("message"),
+        "stale_warning": None if stock_status.get("ready") else "库存数据未更新或不完整，当前补货结论偏保守",
         "references": [
             {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0"},
             {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
@@ -1752,6 +1758,30 @@ def _maybe_append_feedback_offer(reply: str, tools_used: List[str]) -> str:
     return reply
 
 
+def _maybe_append_stock_readiness_warning(reply: str) -> str:
+    status = _last_replenishment_stock_status.get()
+    if not status or status.get("ready"):
+        return reply
+    text = reply or ""
+    if any(k in text for k in ("未更新", "不新鲜", "滞后", "偏保守", "旧数据", "数据旧", "库存旧")):
+        return reply
+    warning = "提示：库存数据未更新或不完整，当前补货结论偏保守；请先完成库存更新后再计算。"
+    return text.rstrip() + "\n\n" + warning
+
+
+def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
+    q = (question or "").lower()
+    if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
+        return None
+    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下")):
+        return None
+    if "物流" in q:
+        return {"workflow": "wf3_logistics_v2", "label": "物流刷新"}
+    if "库存" in q:
+        return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
+    return None
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -1765,8 +1795,46 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     # 把 scope.tenant_id 注入 contextvars，让所有 tool 函数（同线程）能拿到
     _chat_tenant.set(scope.get("tenant_id") or 1)
     _chat_scope.set(scope)
+    _last_replenishment_stock_status.set(None)
     # 同时设给 data 层（PG RLS 用）
     _data.set_current_tenant(scope.get("tenant_id") or 1)
+
+    question = messages[-1].get("content") if messages else ""
+    if isinstance(question, list):  # content 可能是 blocks
+        question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+    direct_workflow = _deterministic_workflow_request(question)
+    if direct_workflow:
+        tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
+        tool_result = _exec_tool("run_workflow", tool_args, user=scope)
+        workflow_task = None
+        if isinstance(tool_result, dict) and tool_result.get("ok"):
+            workflow_task = {
+                "task_id": tool_result["task_id"],
+                "workflow": tool_result["workflow"],
+                "label": tool_result["label"],
+                "total_steps": tool_result["total_steps"],
+                "affected_modules": tool_result["affected_modules"],
+                "followup_prompt": tool_result.get("followup_prompt"),
+            }
+            reply = (
+                f"已触发{direct_workflow['label']}（{direct_workflow['workflow']}）。"
+                "跑完后我会按你的原问题继续回答。"
+            )
+        else:
+            reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["run_workflow"],
+            "tag": "执行",
+            "workflow_task": workflow_task,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_workflow_router",
+            "hallucination_warnings": None,
+        }
 
     sys_text = SYSTEM_PROMPT.format(scope=json.dumps(scope, ensure_ascii=False))
     result = _provider.chat_with_tools(
@@ -1786,11 +1854,10 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
     from . import _safety
     final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used)
+    final_text = _maybe_append_stock_readiness_warning(final_text)
+    clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
 
     # judge + confidence 真逻辑（混合：启发式 + 低置信/destructive 触发 LLM judge）
-    question = messages[-1].get("content") if messages else ""
-    if isinstance(question, list):  # content 可能是 blocks
-        question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
     judge, confidence, judge_method = _compute_judge_confidence(
         question, final_text, tool_log, refs_collected, hallu_warnings)
 
