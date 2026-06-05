@@ -314,15 +314,93 @@ def api_traffic(store: str):
     }
 
 
+def _require_authenticated_selection_user(user: dict = Depends(_auth_mod.get_current_user)):
+    if not user or user.get("is_default"):
+        raise HTTPException(401, "未登录，请先登录后再提交选品反馈")
+    if not user.get("tenant_id"):
+        raise HTTPException(401, "当前用户缺 tenant_id，不能提交选品反馈")
+    return user
+
+
 @router.get("/selection/{store}")
-def api_selection(store: str):
-    """选品候选评估功能未上线（计算逻辑还在工程化）。"""
-    return {
-        "_status": "not_implemented",
-        "candidates": [],
-        "strategies": data.get_selection_strategies(),
-        "message": "选品 Agent 在工程化中（见 plans/productization.md 阶段 2）",
-    }
+def api_selection(store: str, user: dict = Depends(_auth_mod.get_current_user)):
+    """Agent OS candidate-pool surface backed by the L4 delivery artifact."""
+    from selection.l4_delivery.candidate_pool import (
+        load_candidate_pool,
+        render_agent_os_payload,
+    )
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_scoped_preferences,
+    )
+
+    pool = load_candidate_pool()
+    if pool is None:
+        return {
+            "_status": "no_candidate_pool",
+            "candidates": [],
+            "strategies": data.get_selection_strategies(),
+            "message": "暂无生产候选池输出",
+        }
+    pool = apply_preferences_to_candidate_pool(
+        pool,
+        load_scoped_preferences(user.get("tenant_id") or 1, store),
+    )
+    payload = render_agent_os_payload(pool)
+    payload["strategies"] = data.get_selection_strategies()
+    return payload
+
+
+@router.get("/selection/{store}/report")
+def api_selection_report(store: str, user: dict = Depends(_auth_mod.get_current_user)):
+    """Structured report using the same L4 candidate pool as Agent OS."""
+    from selection.l4_delivery.candidate_pool import (
+        load_candidate_pool,
+        render_structured_report,
+    )
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_scoped_preferences,
+    )
+
+    pool = load_candidate_pool()
+    if pool is None:
+        return {
+            "_status": "no_candidate_pool",
+            "report_type": "selection_candidate_pool",
+            "candidate_pool": [],
+            "inquiry_todos": [],
+        }
+    pool = apply_preferences_to_candidate_pool(
+        pool,
+        load_scoped_preferences(user.get("tenant_id") or 1, store),
+    )
+    return render_structured_report(pool)
+
+
+@router.post("/selection/{store}/feedback")
+def api_selection_feedback(
+    store: str,
+    body: dict,
+    user: dict = Depends(_require_authenticated_selection_user),
+):
+    """Write structured selection feedback to preferences.jsonl."""
+    from selection.l4_delivery.feedback import write_scoped_candidate_feedback
+
+    try:
+        event = write_scoped_candidate_feedback(
+            tenant_id=int(user["tenant_id"]),
+            store=store,
+            product_id=(body or {}).get("product_id"),
+            action=(body or {}).get("action"),
+            reason_tags=(body or {}).get("reason_tags") or [],
+            reason_text=(body or {}).get("reason_text") or "",
+            attributes=(body or {}).get("attributes") or {},
+            run_id=(body or {}).get("run_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "event": event}
 
 
 # ── N7: 1688 图搜找同款 ──────────────────────────────────

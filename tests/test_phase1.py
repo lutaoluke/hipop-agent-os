@@ -952,6 +952,243 @@ def test_selection_phase1_1688_low_similarity_not_high_confidence_same_match():
     assert supply["offers"][0]["verdict"] != "inquiry"
 
 
+def test_selection_delivery_agent_os_and_report_share_candidate_pool():
+    import tempfile
+    from pathlib import Path
+
+    records = [
+        _selection_noon_record(
+            "DELIV1",
+            "24 inch expandable ABS luggage suitcase spinner wheels with cup holder",
+            price=259,
+            sold=88,
+            rating=4.7,
+            reviews=130,
+        )
+    ]
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: [
+            {
+                "partner_sku": "HIPOP20BACKLOG",
+                "title": "20 inch ABS hardside luggage suitcase spinner",
+                "family": "bags_luggage",
+                "product_category_detail": "20 inch luggage",
+                "total_stock": 420,
+                "sales_30d": 3,
+                "sales_grade": "low",
+            }
+        ],
+    )
+
+    from selection.l4_delivery.candidate_pool import (
+        build_candidate_pool,
+        build_inquiry_todos,
+        load_candidate_pool,
+        render_agent_os_payload,
+        render_structured_report,
+        save_candidate_pool,
+    )
+
+    pool = build_candidate_pool(result, source_run_id="fixture-run")
+    with tempfile.TemporaryDirectory() as td:
+        artifact_path = Path(td) / "candidate_pool.json"
+        save_candidate_pool(pool, artifact_path)
+        loaded_pool = load_candidate_pool(artifact_path)
+
+    agent_os = render_agent_os_payload(loaded_pool)
+    report = render_structured_report(loaded_pool)
+    inquiry_todos = build_inquiry_todos(loaded_pool)
+
+    os_candidate = agent_os["candidates"][0]
+    report_candidate = report["candidate_pool"][0]
+    source_candidate = result["candidates"][0]
+
+    assert os_candidate == report_candidate
+    assert os_candidate["sku_id"] == "DELIV1"
+    assert os_candidate["tier"] == source_candidate["overall_v3"]["tier_overall"]
+    assert os_candidate["platform_evidence_tags"]
+    assert os_candidate["relevance"] == source_candidate["relevance"]
+    assert os_candidate["price_normalized"]["unit_price_sar"] == source_candidate["price"]["unit_price_sar"]
+    assert os_candidate["sales"]["tier_in_query"] == source_candidate["sales"]["tier_in_query"]
+    assert os_candidate["momentum"]["is_rising"] == source_candidate["sales"]["is_rising"]
+    assert "ABS" in os_candidate["selling_points"]["material"]
+    assert os_candidate["supply_1688"]["status"] == "sufficient"
+    assert os_candidate["profit"]["verdict"]
+    assert os_candidate["differentiation"]["signals"]
+    assert os_candidate["inventory"]["state"] == "sufficient"
+    assert os_candidate["evidence_insufficient"] is False
+
+    assert inquiry_todos
+    assert inquiry_todos[0]["status"] == "todo"
+    assert inquiry_todos[0]["external_side_effect"] is False
+    assert "send" not in inquiry_todos[0]
+
+
+def test_selection_delivery_evidence_insufficient_visible_in_agent_os_and_report():
+    records = [
+        _selection_noon_record(
+            "DELIVNOEVID1",
+            "20 inch hardside luggage suitcase spinner",
+            price=189,
+            sold=18,
+            image=False,
+            reviews=20,
+        )
+    ]
+    result = _selection_fixture_result(
+        records,
+        detail_provider=None,
+        feature_extractor=None,
+        supply_provider=None,
+        ali_records=[],
+    )
+
+    from selection.l3_orchestration.production_pipeline import EVIDENCE_INSUFFICIENT
+    from selection.l4_delivery.candidate_pool import (
+        build_candidate_pool,
+        render_agent_os_payload,
+        render_structured_report,
+    )
+
+    pool = build_candidate_pool(result, source_run_id="fixture-run")
+    os_candidate = render_agent_os_payload(pool)["candidates"][0]
+    report_candidate = render_structured_report(pool)["candidate_pool"][0]
+
+    assert os_candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert os_candidate["evidence_insufficient"] is True
+    assert "detail" in os_candidate["evidence_insufficient_reasons"]
+    assert "supply_1688" in os_candidate["evidence_insufficient_reasons"]
+    assert report_candidate["evidence_state"] == EVIDENCE_INSUFFICIENT
+    assert report_candidate["evidence_insufficient_reasons"] == os_candidate["evidence_insufficient_reasons"]
+
+
+def test_selection_delivery_structured_feedback_writes_preferences_and_changes_offline_state():
+    import tempfile
+    from pathlib import Path
+
+    records = [
+        _selection_noon_record(
+            "FEEDBACK1",
+            "American Tourister 20 inch ABS hardside luggage suitcase spinner",
+            brand="American Tourister",
+            price=310,
+            sold=44,
+        )
+    ]
+    result = _selection_fixture_result(records)
+
+    from selection.l4_delivery.candidate_pool import build_candidate_pool
+    from selection.l4_delivery.feedback import (
+        REASON_TAGS,
+        apply_preferences_to_candidate_pool,
+        load_preferences,
+        write_candidate_feedback,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        preferences_path = Path(td) / "preferences.jsonl"
+        pool = build_candidate_pool(result, source_run_id="fixture-run")
+
+        include_event = write_candidate_feedback(
+            product_id="noon_sa:MISSED1",
+            action="include",
+            reason_tags=["missing_candidate"],
+            reason_text="missed a relevant SKU, add it to review",
+            preferences_path=preferences_path,
+        )
+        reject_event = write_candidate_feedback(
+            product_id="noon_sa:FEEDBACK1",
+            action="reject",
+            reason_tags=["brand", "material", "return_risk"],
+            reason_text="do not want branded ABS products with return risk",
+            attributes={"brand": "American Tourister", "material": "ABS"},
+            preferences_path=preferences_path,
+        )
+
+        assert {"brand", "material", "color", "price", "return_risk"} <= REASON_TAGS
+        assert include_event["action"] == "include"
+        assert reject_event["reason_tags"] == ["brand", "material", "return_risk"]
+
+        preferences = load_preferences(preferences_path)
+        assert len(preferences) == 2
+        rescored = apply_preferences_to_candidate_pool(pool, preferences)
+        candidate = rescored["candidates"][0]
+
+        assert candidate["feedback_status"] == "rejected_by_preference"
+        assert {"brand", "material"} <= set(candidate["feedback_reason_tags"])
+        assert candidate["preference_effects"][0]["source_product_id"] == "noon_sa:FEEDBACK1"
+
+
+def test_selection_feedback_api_requires_login_and_scopes_preferences_by_tenant_store():
+    import os
+    import tempfile
+
+    os.environ["AUTH_LOCKDOWN"] = "0"
+    os.environ["DISABLE_DAILY_REFRESH"] = "1"
+
+    records = [
+        _selection_noon_record(
+            "TENANTFB1",
+            "American Tourister 20 inch ABS hardside luggage suitcase spinner",
+            brand="American Tourister",
+            price=310,
+            sold=44,
+        )
+    ]
+    result = _selection_fixture_result(records)
+
+    from fastapi.testclient import TestClient
+    from hipop.server.main import app
+    from server import auth as _auth_mod
+    from selection.l4_delivery.candidate_pool import build_candidate_pool
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_scoped_preferences,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["SELECTION_PREFERENCES_ROOT"] = td
+        client = TestClient(app)
+        body = {
+            "product_id": "noon_sa:TENANTFB1",
+            "action": "reject",
+            "reason_tags": ["brand", "material"],
+            "reason_text": "tenant A rejects this branded ABS product",
+            "attributes": {"brand": "American Tourister", "material": "ABS"},
+        }
+
+        unauth = client.post("/api/selection/ksa/feedback", json=body)
+        assert unauth.status_code == 401
+
+        app.dependency_overrides[_auth_mod.get_current_user] = lambda: {
+            "id": 1001,
+            "tenant_id": 101,
+            "email": "tenant-a@example.com",
+            "role": "owner",
+            "active": True,
+            "is_default": False,
+        }
+        try:
+            auth = client.post("/api/selection/ksa/feedback", json=body)
+        finally:
+            app.dependency_overrides.clear()
+        assert auth.status_code == 200, auth.text
+
+        tenant_a_preferences = load_scoped_preferences(101, "ksa", preferences_root=td)
+        tenant_b_preferences = load_scoped_preferences(202, "ksa", preferences_root=td)
+        assert len(tenant_a_preferences) == 1
+        assert tenant_a_preferences[0]["tenant_id"] == 101
+        assert tenant_a_preferences[0]["store"] == "ksa"
+        assert tenant_b_preferences == []
+
+        pool = build_candidate_pool(result, source_run_id="fixture-run")
+        tenant_a_candidate = apply_preferences_to_candidate_pool(pool, tenant_a_preferences)["candidates"][0]
+        tenant_b_candidate = apply_preferences_to_candidate_pool(pool, tenant_b_preferences)["candidates"][0]
+        assert tenant_a_candidate["feedback_status"] == "rejected_by_preference"
+        assert tenant_b_candidate["feedback_status"] == "unreviewed"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []

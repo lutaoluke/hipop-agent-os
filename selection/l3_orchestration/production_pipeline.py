@@ -10,6 +10,7 @@ caller has no detail/image/N6/1688 evidence, the candidate stays visible with
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from typing import Any, Optional
 
 from selection.l1_normalize.product_record import ProductRecord
@@ -273,9 +274,11 @@ def _candidate_dict(rec: ProductRecord) -> dict[str, Any]:
         "platform": rec.platform,
         "sku_id": rec.id.split(":", 1)[1],
         "title": rec.title,
+        "brand": rec.brand,
         "url": rec.url,
         "evidence_state": evidence_state,
         "missing_evidence": missing,
+        "evidence_insufficient_reasons": rec.policy_flags.get("evidence_insufficient_reasons") or {},
         "relevance": rec.policy_flags.get("relevance_check") or {},
         "brand_marker": rec.policy_flags.get("brand_marker") or {},
         "price": {
@@ -306,6 +309,7 @@ def _candidate_dict(rec: ProductRecord) -> dict[str, Any]:
         "supply": rec.policy_flags.get("supply")
         or {"status": EVIDENCE_INSUFFICIENT if "supply_1688" in missing else "unknown"},
         "profit": profit,
+        "return_risk": asdict(rec.return_risk) if rec.return_risk else {},
         "overall_v3": rec.policy_flags.get("overall_v3") or {},
     }
 

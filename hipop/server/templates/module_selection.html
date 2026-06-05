@@ -103,25 +103,92 @@
     </table>
   </div>
 
-  <!-- ── 旧的候选品评估区 (stub, 保留, 等 N7 接 N8 之后并入) ─────── -->
-  <div class="pc-section-title">候选品评估 (3) <span class="ref">基于成功/失败模式 + 类目相似度</span></div>
-  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px;">
-    <template x-for="c in candidates" :key="c.candidate">
-      <div class="pc-module-card" :class="c.verdict==='推荐'?'ok':(c.verdict==='不推荐'?'danger':'warn')">
-        <div class="pc-module-head">
-          <span x-text="c.candidate"></span>
-          <span class="pc-module-state"
-                :class="c.verdict==='推荐'?'ok':(c.verdict==='不推荐'?'danger':'warn')"
-                x-text="c.verdict"></span>
-        </div>
-        <div class="pc-module-line1" x-text="c.reason"></div>
-        <div class="pc-module-line2" x-text="c.details"></div>
-        <div class="pc-module-foot">
-          <span x-text="'匹配度: ' + Math.round((c.score||0)*100) + '%'"></span>
-          <span class="pc-module-drill" @click="show(c)">详情 →</span>
-        </div>
-      </div>
-    </template>
+  <div class="pc-section-title">
+    生产候选池 <span class="ref" x-text="candidatePoolId ? candidatePoolId : statusText"></span>
+  </div>
+  <div class="pc-table" style="padding:0;margin-bottom:20px;overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:1180px;">
+      <thead>
+        <tr style="border-bottom:1px solid var(--border-default);">
+          <th style="text-align:left;padding:8px;width:78px;">tier</th>
+          <th style="text-align:left;padding:8px;">SKU / 证据</th>
+          <th style="text-align:left;padding:8px;width:150px;">价格 / 销量</th>
+          <th style="text-align:left;padding:8px;width:170px;">卖点</th>
+          <th style="text-align:left;padding:8px;width:210px;">1688 / 利润</th>
+          <th style="text-align:left;padding:8px;width:220px;">差异化 / 库存</th>
+          <th style="text-align:left;padding:8px;width:180px;">反馈</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="c in candidates" :key="c.id">
+          <tr style="border-bottom:1px solid var(--border-subtle);vertical-align:top;">
+            <td style="padding:8px;">
+              <span class="pc-module-state" :class="c.evidence_insufficient ? 'warn' : 'ok'" x-text="c.tier"></span>
+              <div style="margin-top:5px;color:var(--text-tertiary);font-size:11px;" x-text="c.tier_track"></div>
+            </td>
+            <td style="padding:8px;">
+              <a :href="c.url" target="_blank" style="color:var(--text-primary);font-weight:600;text-decoration:none;" x-text="c.sku_id + ' · ' + c.title"></a>
+              <div style="margin-top:5px;color:var(--text-secondary);">
+                <span x-text="c.platform"></span>
+                <template x-if="c.brand"><span> · <b x-text="c.brand"></b></span></template>
+                <template x-if="c.evidence_insufficient"><span style="color:#a56500;"> · evidence_insufficient</span></template>
+              </div>
+              <div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap;">
+                <template x-for="tag in c.platform_evidence_tags" :key="tag">
+                  <span style="background:var(--bg-tertiary);border:1px solid var(--border-subtle);border-radius:4px;padding:1px 5px;font-size:11px;color:var(--text-secondary);" x-text="tag"></span>
+                </template>
+              </div>
+              <template x-if="c.evidence_insufficient">
+                <div style="margin-top:5px;color:#a56500;font-size:11px;" x-text="Object.keys(c.evidence_insufficient_reasons || {}).join(', ')"></div>
+              </template>
+            </td>
+            <td style="padding:8px;">
+              <div x-text="'SAR ' + (c.price_normalized?.value || '-') + ' / unit ' + (c.price_normalized?.unit_price_sar || '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="'pack ' + (c.price_normalized?.pack_size || '-')"></div>
+              <div style="margin-top:5px;" x-text="'sales ' + (c.sales?.raw_value || '-') + ' · ' + (c.sales?.tier_in_query || '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="c.momentum?.is_rising ? 'rising' : 'mature'"></div>
+            </td>
+            <td style="padding:8px;">
+              <div x-text="'material: ' + (c.selling_points?.material || '-')"></div>
+              <div x-text="'color: ' + (c.selling_points?.color || '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="(c.selling_points?.features || []).join(', ')"></div>
+            </td>
+            <td style="padding:8px;">
+              <div x-text="'1688: ' + (c.supply_1688?.status || '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="'offers ' + ((c.supply_1688?.offers || []).length)"></div>
+              <div style="margin-top:5px;" x-text="'profit: ' + (c.profit?.verdict || '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="c.profit?.reason || ''"></div>
+            </td>
+            <td style="padding:8px;">
+              <div x-text="'diff: ' + (c.differentiation?.score ?? '-')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="(c.differentiation?.signals || []).map(s => s.label || s.id).join(', ')"></div>
+              <div style="margin-top:5px;" x-text="'inventory: ' + (c.inventory?.state || '-') + ' ' + (c.inventory?.score_adjustment ?? '')"></div>
+              <div style="color:var(--text-tertiary);font-size:11px;" x-text="(c.inventory?.warnings || c.inventory?.reasons || []).join(', ')"></div>
+            </td>
+            <td style="padding:8px;">
+              <select x-model="feedback[c.id].tag" style="width:100%;padding:5px;border:1px solid var(--border-default);border-radius:4px;font-size:12px;">
+                <option value="brand">品牌</option>
+                <option value="material">材质</option>
+                <option value="color">颜色</option>
+                <option value="price">价格</option>
+                <option value="return_risk">退货风险</option>
+                <option value="missing_candidate">漏掉补进来</option>
+              </select>
+              <input x-model="feedback[c.id].reason" placeholder="理由"
+                     style="width:100%;margin-top:6px;padding:5px;border:1px solid var(--border-default);border-radius:4px;font-size:12px;">
+              <div style="display:flex;gap:6px;margin-top:6px;">
+                <button @click="submitFeedback(c, 'reject')" style="padding:5px 8px;border:1px solid var(--border-default);border-radius:4px;background:#fff;font-size:12px;">不要</button>
+                <button @click="submitFeedback(c, 'include')" style="padding:5px 8px;border:1px solid var(--border-default);border-radius:4px;background:#fff;font-size:12px;">补进来</button>
+              </div>
+              <div style="margin-top:5px;color:var(--text-tertiary);font-size:11px;" x-text="c.feedback_status"></div>
+            </td>
+          </tr>
+        </template>
+        <tr x-show="!candidates.length">
+          <td colspan="7" style="padding:14px;color:var(--text-tertiary);" x-text="statusText"></td>
+        </tr>
+      </tbody>
+    </table>
   </div>
 
   <div class="pc-section-title">沉淀策略 (LLM 内省) <span class="ref">/agent_memory/strategies/</span></div>
@@ -143,12 +210,22 @@ function selectionModule() {
   return {
     candidates: [],
     strategies: {},
+    candidatePoolId: '',
+    statusText: '加载中...',
+    feedback: {},
     n7: { imageUrl: '', pack: 1, material: '', loading: false, result: null, error: '', cookiesStatus: '' },
     async init() {
       const r = await fetch('/api/selection/{{ store_lower }}');
       const d = await r.json();
-      this.candidates = d.candidates;
+      const loadedCandidates = d.candidates || [];
       this.strategies = d.strategies;
+      this.candidatePoolId = d.candidate_pool_id || '';
+      this.statusText = d.message || d._status || '';
+      this.feedback = {};
+      loadedCandidates.forEach(c => {
+        this.feedback[c.id] = { tag: 'material', reason: '' };
+      });
+      this.candidates = loadedCandidates;
       // N7 cookies 状态展示
       try {
         const cs = await fetch('/api/n7/cookies-status').then(r => r.json());
@@ -181,6 +258,30 @@ function selectionModule() {
         this.n7.loading = false;
       }
     },
+    async submitFeedback(c, action) {
+      const form = this.feedback[c.id] || {tag: 'material', reason: ''};
+      const attrs = {};
+      if (form.tag === 'brand') attrs.brand = c.brand;
+      if (form.tag === 'material') attrs.material = c.selling_points?.material;
+      if (form.tag === 'color') attrs.color = c.selling_points?.color;
+      if (form.tag === 'price') attrs.max_price_sar = c.price_normalized?.unit_price_sar;
+      if (form.tag === 'return_risk') attrs.return_risk = c.return_risk?.level || 'high';
+      const r = await fetch('/api/selection/{{ store_lower }}/feedback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          product_id: c.id,
+          action,
+          reason_tags: [form.tag],
+          reason_text: form.reason || action,
+          attributes: attrs,
+          run_id: this.candidatePoolId,
+        }),
+      });
+      if (r.ok) {
+        c.feedback_status = action === 'reject' ? 'rejected_by_preference' : 'included_by_preference';
+      }
+    },
     verdictStyle(v) {
       const map = {
         inquiry:        'background:#d9f2d9;color:#2a7a2a;padding:2px 8px;border-radius:10px;font-size:11px;',
@@ -193,13 +294,12 @@ function selectionModule() {
     show(c) {
       window.dispatchEvent(new CustomEvent('open-ref', {
         detail: {
-          title: c.candidate + ' · 评估详情',
-          body: '<div><b>判定:</b> ' + c.verdict + ' (' + Math.round(c.score*100) + '%)</div>'
-              + '<div><b>原因:</b> ' + c.reason + '</div>'
-              + '<div><b>类目分析:</b> ' + c.details + '</div>',
+          title: c.sku_id + ' · 评估详情',
+          body: '<div><b>tier:</b> ' + c.tier + '</div>'
+              + '<div><b>evidence:</b> ' + c.platform_evidence_tags.join(', ') + '</div>',
           refs: [
-            {table: 'wf2_hipop_*_sku', where: 'family LIKE category', as_of_date: '历史 30 天'},
-            {table: '选品_成功模式_v1.md', where: 'agent_memory/strategies/', as_of_date: '今日'},
+            {table: 'selection.l4_delivery.latest_candidate_pool', where: c.id, as_of_date: c.generated_at || 'latest'},
+            {table: 'selection.preferences.jsonl', where: 'structured feedback', as_of_date: 'latest'},
           ],
         }
       }));
