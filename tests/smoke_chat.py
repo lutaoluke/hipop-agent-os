@@ -286,6 +286,23 @@ CASES: List[Case] = [
         must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
         timeout=120,
     ),
+    # ─── T11 单 SKU 库存拆分（WS-104）────────────────────────────────────────────
+    Case(
+        name="T11 单 SKU 库存拆分 TBP0169A（必含 total=10702/noon=22/overseas=10680）",
+        question="TBP0169A 的总库存 noon可售 海外仓分别多少",
+        store="KSA",
+        must_use_tools=["query_stock_breakdown"],
+        must_contain=["10702", "22", "10680"],
+        must_not_contain=[r"请.{0,20}(跑|上传|wf1_stock)", r"断货"],
+    ),
+    Case(
+        name="T11 缺源边界（不存在 SKU 应报无数据，不报 0 不踢回运营）",
+        question="NONEXISTENT_SKU_T11_BOUNDARY 的库存拆分",
+        store="KSA",
+        must_use_tools=["query_stock_breakdown"],
+        must_contain=[r"无数据|未刷新|未接入|无行|没有记录|找不到|无库存记录"],
+        must_not_contain=[r"断货", r"请.{0,20}(跑|上传|wf1_stock)"],
+    ),
 ]
 
 

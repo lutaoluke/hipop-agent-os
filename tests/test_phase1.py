@@ -1229,6 +1229,30 @@ def test_t26_safety_passes_when_reply_already_says_not_found():
     assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
 
 
+# ── T11 单 SKU 库存拆分（WS-104）────────────────────────────────────────────────
+def test_t11_stock_breakdown_tbp0169a_returns_correct_values():
+    """tool_query_stock_breakdown 查 TBP0169A 应返回真实值：total=10702/noon=22/overseas=10680。"""
+    from hipop.server.agent import tool_query_stock_breakdown
+    result = tool_query_stock_breakdown("TBP0169A", "KSA")
+    assert result["found"] is True, f"TBP0169A 应 found=True: {result}"
+    assert result["total_stock"] == 10702, f"total_stock 应=10702: {result['total_stock']}"
+    assert result["noon_saleable"] == 22, f"noon_saleable 应=22: {result['noon_saleable']}"
+    assert result["overseas"] == 10680, f"overseas 应=10680: {result['overseas']}"
+    assert result["source"] == "wf1_hipop_ksa_stock", f"source: {result['source']}"
+
+
+def test_t11_stock_breakdown_missing_sku_no_zero_no_stock_out():
+    """缺失 SKU 应 found=False + 含 error 信息，不报 0 不报断货。"""
+    from hipop.server.agent import tool_query_stock_breakdown
+    result = tool_query_stock_breakdown("NONEXISTENT_T11_SKU", "KSA")
+    assert result["found"] is False, f"应 found=False: {result}"
+    error_msg = result.get("error", "")
+    assert any(kw in error_msg for kw in ("无", "未刷新", "未接入", "无行")), \
+        f"error 应含无/未刷新/未接入: {error_msg}"
+    assert "断货" not in str(result), f"不应含断货: {result}"
+    assert "0" != str(result.get("total_stock", "")), "不应默认 total_stock=0"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []
