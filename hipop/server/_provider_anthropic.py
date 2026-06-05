@@ -74,6 +74,8 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 tool_log.append({
                     "name": tool_name, "args": tool_args,
                     "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+                    "result_found": result.get("found") if isinstance(result, dict) and "found" in result else None,
+                    "result_error": result.get("error") if isinstance(result, dict) else None,
                 })
                 tool_results.append({
                     "type": "tool_result",

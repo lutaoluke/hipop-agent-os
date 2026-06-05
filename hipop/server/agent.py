@@ -1691,6 +1691,21 @@ _JUDGE_SYSTEM_PROMPT = (
 )
 
 
+def _fix_stock_breakdown_reply(reply: str, tool_log: list) -> str:
+    """T11 deterministic verifier: if query_stock_breakdown returned found=False but reply
+    lacks the required stock-not-found phrasing, prepend the standard notice."""
+    import re as _re_local
+    _NOT_FOUND_RE = _re_local.compile(r"无数据|未刷新|未接入|无行|没有记录|找不到|无库存记录")
+    for t in tool_log:
+        if (t.get("name") == "query_stock_breakdown"
+                and t.get("result_found") is False
+                and not _NOT_FOUND_RE.search(reply)):
+            sku = (t.get("args") or {}).get("sku", "该 SKU")
+            prefix = f"{sku} 在库存系统无库存记录（该 SKU 未接入或未刷新），如需查询请确认 SKU 是否已录入库存系统。\n\n"
+            return prefix + reply
+    return reply
+
+
 def _run_llm_judge(question, reply, tool_log, warnings):
     """独立 LLM 给回复打分。复用 governance 的 LLM 调用 + JSON 抽取 pattern。
     走当前 provider（默认 deepseek，便宜）。失败返 None → 调用方退回启发式分。"""
@@ -1912,6 +1927,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     refs_collected = result["refs_collected"]
     workflow_task  = result.get("workflow_task")
     tools_used     = [t["name"] for t in tool_log]
+
+    # T11: deterministic verifier — stock breakdown not-found phrasing
+    clean_reply = _fix_stock_breakdown_reply(clean_reply, tool_log)
 
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
     # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
