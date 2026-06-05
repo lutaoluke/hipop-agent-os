@@ -408,6 +408,23 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "query_stock_top",
+        "description": (
+            "按 total_stock 降序列出当前库存快照中占压最高的 N 个 SKU（默认 Top 3）。"
+            "**触发场景**：用户问『库存最高 / 库存最多 / Top 库存 / 库存排名 / 当前总库存最高的 N 个 SKU / 哪些 SKU 库存压货最多』。"
+            "必须调此 tool 拿真实排序结果；**禁止**用历史对话、候选 SKU、模型记忆或 export_table row_count 拼排名。"
+            "tool 返回 ok=False 或数据为空时，明确告知用户『当前无法确认库存排名』并给 next_step，不猜、不宣称已生成/已排名。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "store": {"type": "string", "enum": ["KSA", "UAE"]},
+                "n": {"type": "integer", "description": "返回前 N 个 SKU，默认 3，最大 20", "default": 3},
+            },
+            "required": ["store"],
+        },
+    },
 ]
 
 
@@ -1263,6 +1280,60 @@ def tool_explain_status_enum(field: str = "alert_status") -> Dict:
     }
 
 
+
+def tool_query_stock_top(store: str, n: int = 3) -> Dict:
+    """按 total_stock 降序返回当前库存快照中占压最高的 N 个 SKU。
+    数据来自 wf1_stock（最新成功库存快照）。
+    工具失败或数据为空时返回 ok=False，禁止调用方用记忆/候选拼排名。
+    """
+    tid = _get_tenant()
+    alias = _resolve_entity_alias(store) or ""
+    if not alias:
+        return {"ok": False, "store": store, "error": f"未知店铺 store={store}"}
+    n = max(1, min(int(n), 20))
+    rows = _data._fetch("""
+        SELECT s.partner_sku, s.total_stock, s.noon_total_qty,
+               s.pending_inbound_qty, s.overseas_total_qty,
+               s.imported_at, w2.title
+        FROM wf1_stock s
+        LEFT JOIN wf2_sku w2
+          ON s.tenant_id = w2.tenant_id AND s.entity_alias = w2.entity_alias
+             AND s.partner_sku = w2.partner_sku
+        WHERE s.tenant_id = ? AND s.entity_alias = ? AND s.total_stock IS NOT NULL
+        ORDER BY s.total_stock DESC
+        LIMIT ?
+    """, (tid, alias, n))
+    if not rows:
+        return {
+            "ok": False,
+            "store": store,
+            "error": "当前库存快照为空，请先运行 wf1_stock_v2 拉取库存数据",
+            "next_step": "run_workflow(wf1_stock_v2)",
+        }
+    items = [{
+        "rank": i + 1,
+        "sku": r["partner_sku"],
+        "title": r["title"],
+        "total_stock": r["total_stock"],
+        "noon_qty": r["noon_total_qty"],
+        "pending_inbound_qty": r["pending_inbound_qty"],
+        "overseas_qty": r["overseas_total_qty"],
+        "data_as_of": r["imported_at"][:10] if r["imported_at"] else None,
+    } for i, r in enumerate(rows)]
+    timestamps = [r["imported_at"] for r in rows if r["imported_at"]]
+    data_as_of = min(timestamps)[:10] if timestamps else None
+    return {
+        "ok": True,
+        "store": store,
+        "top_n": len(items),
+        "items": items,
+        "data_as_of": data_as_of,
+        "note": "total_stock = noon平台库存 + 在途 + 海外仓 + 义乌仓 + 东莞仓",
+        "references": [
+            {"table": "wf1_stock", "where": f"tenant_id={tid} AND entity_alias=\'{alias}\' ORDER BY total_stock DESC LIMIT {n}"},
+        ],
+    }
+
 # ── Tool 派发 ─────────────────────────────────────────
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
@@ -1285,6 +1356,7 @@ TOOL_FUNCS = {
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
     "capture_feedback": tool_capture_feedback,
+    "query_stock_top": tool_query_stock_top,
 }
 
 
@@ -1586,6 +1658,7 @@ scope: {scope}
 | 跑/刷新/扫/拉/重算/同步 | run_workflow |
 | 导出/下载/Excel/打成表格 | **export_table**（真生成 xlsx，禁说"系统只能返 N 个示例"——filtered_count 才是真总数；返完用 [文件名](download_url) markdown 给用户）|
 | 状态/字段哪来 / 5 个状态出处 / 能加 X 状态吗 / 是 ERP 字段还是 hipop 字段 | **explain_status_enum**（不要凭空说"系统写死"，必须真调拿 source 引用）|
+| 库存最高 / Top 库存 / 库存排名 / 当前总库存最高的 N 个 SKU | **query_stock_top**（禁用历史/记忆/猜，失败则说无法确认）|
 | 打开 X 页面 | navigate_user_to（禁编 URL）|
 | 发飞书 / 通知群 | notify_via_feishu（禁说"已发"）|
 | 撞到你做不了/超范围 → 用户回"记一下/提个需求/帮我记" | **capture_feedback**（真写 feedback 表；禁不调就说"已记下"；写失败如实报"没记成"）|
@@ -1603,6 +1676,7 @@ scope: {scope}
 5. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
 6. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
 7. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
+8. **库存排名必须走 query_stock_top**：用户问 Top 库存 / 库存最高时，**禁止**用历史对话、候选列表、模型记忆拼排名；tool 返回 ok=False → 明告「无法确认库存排名」，绝不猜
 
 ## 长期偏好沉淀
 - 用户明确说"以后都这么办" / "记住" / "默认 X" → 调 tenant_notes_append

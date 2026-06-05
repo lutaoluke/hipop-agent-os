@@ -259,6 +259,24 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T15 库存 TopN 确定性查询（WS-102）────────────────────────────────────────
+    # fail-then-pass: 改前 query_stock_top 不存在 → Agent 用历史/记忆编排名 → must_use_tools 断言失败
+    # 改后 query_stock_top 注册 → Agent 真调工具 → 返回真实 Top3 + 库存数量 → 全绿
+    Case(
+        name="T15 库存 TopN KSA（必走 query_stock_top，禁猜/禁宣称已生成/已排名）",
+        question="请列出 KSA 当前总库存最高的 3 个 SKU 和库存数量",
+        store="KSA",
+        must_use_tools=["query_stock_top"],
+        must_contain=[r"\d+"],
+        must_not_contain=[
+            "已生成",
+            "已排名",
+            "根据之前",
+            "根据记忆",
+            r"候选.{0,10}SKU",
+        ],
+        timeout=90,
+    ),
 ]
 
 
