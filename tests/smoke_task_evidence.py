@@ -24,14 +24,25 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# CI 兼容：DB_PATH 默认 /Users/luke/... 在 GitHub Actions 不存在，必须在 data 模块
+# 首次导入前设置，否则 DB_PATH 会被固化成本地绝对路径，CI 里 conn() 报 "unable to open"
+os.environ.setdefault("HIPOP_DB", "/tmp/hipop_test_task_evidence.db")
+os.environ.setdefault("JWT_SECRET", "test_secret_for_task_evidence_smoke")
+
 from hipop.server import data as _data
 from hipop.server import runtime as _runtime
 
 
 def _setup():
     """Bootstrap SQLite schema + set tenant context for tests."""
+    # 显式覆盖，处理 data 模块在设置 env 前就被其他文件导入的情况
+    _data.DB_PATH = os.environ.get("HIPOP_DB", "/tmp/hipop_test_task_evidence.db")
     _data._ensure_task_tables()
     _data.set_current_tenant(1)
+
+
+# 模块级调用：确保 pytest 直接收集此文件时也完成 DB 初始化（无需 __main__ 入口）
+_setup()
 
 
 def test_spawn_creates_task_row_and_queued_event():
