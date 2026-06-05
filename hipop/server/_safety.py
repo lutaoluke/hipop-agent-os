@@ -135,10 +135,30 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
 
 
 _WORKFLOW_SUCCESS_RE = re.compile(
-    r"(已触发|已启动|已开始|再次触发|✅.*工作流|工作流.*✅|"
+    r"(已触发|已启动|已开始|再次触发|✅|"
+    r"工作流.{0,10}(成功|启动|已)|已成功.{0,5}(触发|启动)|"
     r"任务.{0,10}(提交|启动|成功)|已让.{0,5}系统|"
-    r"后台.{0,5}(任务|正在跑|处理中)|后台跑了|正在刷新|已经在.{0,5}后台)"
+    r"后台.{0,5}(任务|正在跑|处理中)|后台跑了|正在刷新|已经在.{0,5}后台|"
+    r"started successfully|workflow.*success|"
+    # markdown table with success cell: | ... | 成功 | or | ✅ |
+    r"\|\s*(成功|✅|started|done)\s*\|"
+    r")"
 )
+
+
+def _extract_workflow_name(args) -> str:
+    """Extract workflow name from args, which may be a dict or a JSON string."""
+    if isinstance(args, dict):
+        return args.get("workflow", "unknown")
+    if isinstance(args, str):
+        import json as _json
+        try:
+            parsed = _json.loads(args)
+            if isinstance(parsed, dict):
+                return parsed.get("workflow", "unknown")
+        except Exception:
+            pass
+    return "unknown"
 
 
 def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
@@ -146,6 +166,8 @@ def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[s
 
     文案与事实解耦：tool_log 里记录了失败的工作流调用，reply 不得再声称成功。
     只在有明确失败记录（ok=False）的条目时触发；ok=True 或无 run_workflow 记录时不报。
+    args 字段可能是 dict（Anthropic provider）或 JSON string（OpenAI-compat provider），
+    两种形式都正确解析工作流名称。
     """
     failed = [
         t for t in (tool_log or [])
@@ -157,8 +179,7 @@ def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[s
         return []
     parts = []
     for t in failed:
-        args = t.get("args") or {}
-        wf = args.get("workflow", "unknown") if isinstance(args, dict) else "unknown"
+        wf = _extract_workflow_name(t.get("args"))
         err = t.get("error") or "启动失败"
         parts.append(f"{wf}: {err}")
     return [

@@ -138,6 +138,100 @@ def test_sanitize_reply_integrates_failure_check():
     )
 
 
+# ── 红队补充（round-2，验门人指出的覆盖洞）────────────────────────────────────────
+
+def test_redteam_args_as_json_string_openai_provider():
+    """红队: OpenAI-compat provider 把 args 存为 JSON string，必须仍能提取工作流名称。
+
+    验门人红队样例：
+    _check_failed_workflow_claimed_success(
+        '好的，已启动 ERP 商品库刷新任务，请稍候。',
+        [{'name':'run_workflow','args':'{"workflow":"wf2_products_v2"}',
+          'ok':False,'error':'permission_denied'}]
+    )
+    修前返回: 'unknown: permission_denied' (不含工作流名)
+    修后返回: 'wf2_products_v2: permission_denied'
+    """
+    from hipop.server._safety import _check_failed_workflow_claimed_success
+    tool_log = [
+        {
+            "name": "run_workflow",
+            "args": '{"workflow": "wf2_products_v2"}',  # JSON string, not dict
+            "ok": False,
+            "error": "permission_denied",
+        }
+    ]
+    reply = "好的，已启动 ERP 商品库刷新任务，请稍候。"
+    warns = _check_failed_workflow_claimed_success(reply, tool_log)
+    assert warns, "JSON-string args 路径：run_workflow ok=False 应触发 warning"
+    assert "wf2_products_v2" in warns[0], (
+        f"JSON-string args 路径：warning 必须含工作流名称，实际: {warns}"
+    )
+    assert "permission_denied" in warns[0], (
+        f"warning 必须包含错误原因，实际: {warns}"
+    )
+
+
+def test_redteam_success_table_flagged():
+    """红队: markdown 成功表格 | 工作流 | 任务号 | 说明 | → 应被识别为成功声称。
+
+    T36 原始场景：Agent 用 markdown 表格回复，有 ✅ 等成功标记。
+    """
+    from hipop.server._safety import _check_failed_workflow_claimed_success
+    tool_log = [
+        {
+            "name": "run_workflow",
+            "args": {"workflow": "wf2_products_v2"},
+            "ok": False,
+            "error": "ERP 连接超时",
+        }
+    ]
+    # Markdown table with ✅ success indicators (T36 原始回复格式)
+    reply = (
+        "已启动两个后台任务 ✅\n"
+        "| 工作流 | 任务号 | 说明 |\n"
+        "|---|---|---|\n"
+        "| **ERP 商品库** | `97eea0ed` | 拉取最新商品主数据 |\n"
+    )
+    warns = _check_failed_workflow_claimed_success(reply, tool_log)
+    assert warns, "含 ✅ 的成功表格应被识别为成功声称，触发 warning"
+    assert "wf2_products_v2" in warns[0], (
+        f"warning 必须含失败的工作流名称: {warns}"
+    )
+
+
+def test_redteam_success_status_in_table_cell():
+    """红队: markdown 表格中含 | 成功 | 状态 → 应被识别为成功声称。"""
+    from hipop.server._safety import _check_failed_workflow_claimed_success
+    tool_log = [
+        {
+            "name": "run_workflow",
+            "args": '{"workflow": "wf2_sales_v2"}',
+            "ok": False,
+            "error": "auth_failed",
+        }
+    ]
+    reply = (
+        "工作流执行结果：\n"
+        "| 工作流 | 状态 |\n"
+        "|---|---|\n"
+        "| wf2_sales_v2 | 成功 |\n"
+    )
+    warns = _check_failed_workflow_claimed_success(reply, tool_log)
+    assert warns, "表格 | 成功 | 状态单元格应触发 warning"
+    assert "wf2_sales_v2" in warns[0], f"warning 必须含工作流名: {warns}"
+
+
+def test_redteam_extract_workflow_name_helper():
+    """_extract_workflow_name 必须处理 dict 和 JSON string 两种 args 格式。"""
+    from hipop.server._safety import _extract_workflow_name
+    assert _extract_workflow_name({"workflow": "wf2_products_v2"}) == "wf2_products_v2"
+    assert _extract_workflow_name('{"workflow": "wf2_sales_v2"}') == "wf2_sales_v2"
+    assert _extract_workflow_name(None) == "unknown"
+    assert _extract_workflow_name("not-json") == "unknown"
+    assert _extract_workflow_name({}) == "unknown"
+
+
 # ── Part 2: 可见进度断言（set_current_tenant 顺序）──────────────────────────────
 
 def test_run_workflow_set_tenant_before_step0():
@@ -185,6 +279,16 @@ if __name__ == "__main__":
          test_empty_tool_log_no_failure_warning),
         ("test_sanitize_reply_integrates_failure_check",
          test_sanitize_reply_integrates_failure_check),
+        # 红队补充（round-2）
+        ("test_redteam_args_as_json_string_openai_provider",
+         test_redteam_args_as_json_string_openai_provider),
+        ("test_redteam_success_table_flagged",
+         test_redteam_success_table_flagged),
+        ("test_redteam_success_status_in_table_cell",
+         test_redteam_success_status_in_table_cell),
+        ("test_redteam_extract_workflow_name_helper",
+         test_redteam_extract_workflow_name_helper),
+        # 可见进度断言
         ("test_run_workflow_set_tenant_before_step0",
          test_run_workflow_set_tenant_before_step0),
     ]
