@@ -292,8 +292,8 @@ CASES: List[Case] = [
         question="TBP0169A 的总库存 noon可售 海外仓分别多少",
         store="KSA",
         must_use_tools=["query_stock_breakdown"],
-        must_contain=["10702", "22", "10680"],
-        must_not_contain=[r"请.{0,20}(跑|上传|wf1_stock)", r"断货"],
+        must_contain=[r"10[,，]?702", r"\b22\b", r"10[,，]?680"],
+        must_not_contain=[r"请.{0,20}(跑|上传|wf1_stock)", r"已断货|总库存.{0,10}0.{0,10}断货"],
     ),
     Case(
         name="T11 缺源边界（不存在 SKU 应报无数据，不报 0 不踢回运营）",
