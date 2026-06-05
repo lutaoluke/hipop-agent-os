@@ -1142,12 +1142,7 @@ def tool_query_order_live(order_no: str) -> Dict:
     # 找精确匹配
     match = [o for o in items if (o.get("delivery_order_no") or "").upper() == order_no.upper()]
     if not match:
-        return {
-            "ok": False,
-            "error": "order_not_found_in_erp",
-            "order_no": order_no,
-            "message": f"货单号 {order_no} 在 ERP 中无记录，请核实货单号是否正确。",
-        }
+        return {"ok": False, "error": "order_not_found_in_erp", "order_no": order_no}
     o = match[0]
     forwarder = (o.get("logistics") or {}).get("logistics_name", "")
     tracking = o.get("logistics_bill_no", "")
@@ -1313,7 +1308,6 @@ TOOL_FUNCS = {
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
     "capture_feedback": tool_capture_feedback,
-    "query_stock_breakdown": tool_query_stock_breakdown,
 }
 
 
@@ -1603,7 +1597,6 @@ scope: {scope}
 | 用户问 | 调 |
 |---|---|
 | <SKU> 卖得 / 销量 / 趋势 | query_sku |
-| <SKU> 各仓库存 / noon 可售 / 海外仓 / 义乌 / 东莞 / 总库存 / 库存拆分 | query_stock_breakdown |
 | <SKU> 当前在途多少 / 实时物流 / wf3 陈旧时 | **query_sku_live**（实时 ERP，5-15s）|
 | <PDxxx> 状态 / 卡几天（hipop 缓存）| query_order |
 | <PDxxx> 现在到哪了 / 实时状态 / 物流码 | **query_order_live**（实时 ERP）|
