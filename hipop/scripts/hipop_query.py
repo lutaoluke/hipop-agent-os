@@ -108,6 +108,25 @@ def cmd_replenish(args):
     ent = _entity(args.entity)
     conn = _conn()
     print(f"━━ {ent['alias']} 本周必补 ━━")
+    # WS-62：库存未就绪/不完整时先告警,避免空建议被读成"无需补货"（与 v2 入口同口径,
+    # 阈值见 server.data._STOCK_READINESS_*；本 CLI 走 legacy per-alias 表,自包含查行数）。
+    try:
+        n_stock = conn.execute(
+            f"SELECT COUNT(*) FROM {stock_table(ent['alias'])}").fetchone()[0]
+        n_listed = conn.execute(
+            f"SELECT COUNT(*) FROM {sku_table(ent['alias'])} WHERE is_listed=1").fetchone()[0]
+        n_cov = conn.execute(
+            f"SELECT COUNT(*) FROM {sku_table(ent['alias'])} k "
+            f"WHERE k.is_listed=1 AND EXISTS (SELECT 1 FROM {stock_table(ent['alias'])} s "
+            f"WHERE s.partner_sku=k.partner_sku)").fetchone()[0]
+        cov = (n_cov / n_listed) if n_listed else 0.0
+        if n_stock < 10:
+            print(f"  ⚠️ 库存未就绪：库存表仅 {n_stock} 行,请先刷新库存——以下建议不可靠")
+        elif n_listed and cov < 0.8:
+            print(f"  ⚠️ 库存不完整：{n_listed} 个上架 SKU 仅 {n_cov} 个有库存"
+                  f"（覆盖率 {cov:.0%}）,建议可能偏低,请补全库存 ingest")
+    except sqlite3.OperationalError:
+        print("  ⚠️ 库存未就绪：库存表不存在,请先刷新库存")
     for r in conn.execute(f"""
         SELECT partner_sku, weekly_total_replenish, urgency, ops_advice
         FROM {sales_cycle_table(ent['alias'])} WHERE weekly_total_replenish > 0

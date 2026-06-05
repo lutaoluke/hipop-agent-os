@@ -938,27 +938,26 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     for ent in entities:
         alias = ent["alias"]
         print(f"\n[v2 tenant={tenant_id} entity {alias}]", file=sys.stderr)
-        # ── 上游空表保护（5/12 root cause: tenant=5 wf1_stock 空导致 need_replenish 全 0）──
-        # wf5 = SKU 销量 + 库存 + 在途 → 补货建议
-        # 任何上游空都会静默返 0，必须 fail-fast 告诉用户先跑 ingest
+        # ── 上游空/不完整保护（5/12 root cause: tenant=5 wf1_stock 空导致 need_replenish 全 0）──
+        # wf5 = SKU 销量 + 库存 + 在途 → 补货建议；任何上游空/不全都会静默返 0。
+        # 就绪度判定用 server.data.stock_readiness（单一事实源），与运营入口同口径：
+        #   not ready → fail-fast SKIP 告诉用户先跑 ingest；不拿空/旧/不全库存继续算假建议。
         sku_cnt = conn.execute(
             "SELECT COUNT(*) AS n FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
             (tenant_id, alias),
         ).fetchall()[0]
         sku_cnt = sku_cnt["n"] if isinstance(sku_cnt, dict) else sku_cnt[0]
-        stock_cnt = conn.execute(
-            "SELECT COUNT(*) AS n FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
-            (tenant_id, alias),
-        ).fetchall()[0]
-        stock_cnt = stock_cnt["n"] if isinstance(stock_cnt, dict) else stock_cnt[0]
-        if sku_cnt < 10 or stock_cnt < 10:
-            print(f"  [{alias}] SKIP: wf2_sku={sku_cnt} wf1_stock={stock_cnt}（上游空），先跑 wf2/wf1 ingest",
+        readiness = _data.stock_readiness(tenant_id, alias)
+        stock_cnt = readiness["stock_rows"]
+        if sku_cnt < 10 or not readiness["ready"]:
+            print(f"  [{alias}] SKIP: wf2_sku={sku_cnt} wf1_stock={stock_cnt}（上游未就绪），先跑 wf2/wf1 ingest",
                   file=sys.stderr)
             skipped_entities.append({
                 "alias": alias,
-                "reason": "upstream_empty",
+                "reason": "upstream_not_ready",
                 "wf2_sku_count": sku_cnt,
                 "wf1_stock_count": stock_cnt,
+                "stock_status": readiness,
                 "next_action": (
                     f"run_workflow(name='wf2_products_v2', alias='{alias}') 拉 SKU；"
                     f"再 run_workflow(name='wf1_stock_v2', alias='{alias}') 拉库存"
@@ -993,15 +992,15 @@ def run_v2(tenant_id: int, entity_aliases: list = None, skus: list = None,
     conn.close()
     print(f"\n[done] tenant={tenant_id} {all_results}", file=sys.stderr)
     if skipped_entities:
-        print(f"[skipped] {len(skipped_entities)} entities upstream_empty: "
+        print(f"[skipped] {len(skipped_entities)} entities upstream_not_ready: "
               f"{[s['alias'] for s in skipped_entities]}", file=sys.stderr)
     # 全部 entity 都被跳 → 整体 fail-fast，告诉调用方 wf5 没产出数据
     if not all_results and skipped_entities:
         return {
             "ok": False,
-            "error": "upstream_empty",
+            "error": "upstream_not_ready",
             "message": f"tenant={tenant_id} 全部 {len(skipped_entities)} 个 entity 上游空"
-                       f"（wf2_sku 或 wf1_stock 不足 10 行），请先跑 wf2/wf1 ingest",
+                       f"（wf2_sku 或 wf1_stock 未就绪），请先跑 wf2/wf1 ingest",
             "skipped": skipped_entities,
         }
     # 部分成功 → 正常返回 + warning

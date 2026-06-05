@@ -263,7 +263,9 @@ def api_orders(store: str, limit: int = 50):
 
 @router.get("/replenishment/{store}")
 def api_replenishment(store: str, limit: int = 50):
-    return data.get_replenishment(store, limit=limit)
+    # WS-62：返回 {stock_status, rows}。stock_status 把「库存未就绪/不完整」带进
+    # 入口响应本身，运营据此区分「管道充足（真 0 需求）」与「库存没刷新/不全」。
+    return data.get_replenishment_view(store, limit=limit)
 
 
 @router.get("/work-log/{store}")

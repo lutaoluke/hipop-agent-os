@@ -15,9 +15,17 @@
     <div class="pc-health-chip">合计补货件数 <span x-text="totalQty"></span></div>
   </div>
 
-  <div x-show="rows.length === 0" style="padding:30px;text-align:center;color:var(--text-tertiary);background:var(--bg-primary);border:1px solid var(--border-default);border-radius:10px;">
+  <!-- WS-62：库存未就绪/不完整时,明确告警,绝不让空建议被误读成"管道充足" -->
+  <div x-show="stockStatus && stockStatus.ready === false"
+       style="padding:14px 16px;margin-bottom:14px;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;color:#9a3412;">
+    <b>⚠️ <span x-text="stockStatus && stockStatus.status === 'incomplete' ? '库存不完整' : '库存未就绪'"></span></b>
+    <span x-text="stockStatus ? stockStatus.message : ''"></span><br>
+    <span style="font-size:11.5px;">下方补货建议未基于完整库存,可能偏低——请先刷新库存后再决策。</span>
+  </div>
+
+  <div x-show="rows.length === 0 && stockStatus && stockStatus.ready !== false" style="padding:30px;text-align:center;color:var(--text-tertiary);background:var(--bg-primary);border:1px solid var(--border-default);border-radius:10px;">
     本周 wf5 + wf6 暂无建议补货 SKU。<br>
-    <span style="font-size:11.5px;">这通常意味着补货决策已被覆盖到此前的批次中（见在途物流卡），或系统正在等待新的销量数据。</span>
+    <span style="font-size:11.5px;">库存已就绪、管道充足；补货决策可能已覆盖到此前批次（见在途物流卡），或系统正在等待新的销量数据。</span>
   </div>
 
   <div x-show="rows.length > 0" class="pc-table">
@@ -93,6 +101,7 @@
 function replenishModule() {
   return {
     rows: [],
+    stockStatus: null,
     counts: {},
     totalQty: 0,
     alerts: [],
@@ -103,10 +112,13 @@ function replenishModule() {
       });
     },
     async refresh() {
-      const [rs, alerts] = await Promise.all([
+      const [rv, alerts] = await Promise.all([
         fetch('/api/replenishment/{{ store_lower }}').then(r=>r.json()),
         fetch('/api/orders/{{ store_lower }}').then(r=>r.json()),
       ]);
+      // WS-62：/api/replenishment 现返回 {stock_status, rows}
+      this.stockStatus = rv.stock_status || null;
+      const rs = rv.rows || [];
       this.rows = rs;
       this.alerts = alerts.filter(o=>o.alert_level);
       this.counts = {
