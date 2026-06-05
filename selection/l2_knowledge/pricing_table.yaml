@@ -19,18 +19,38 @@ countries:
   ksa:
     legal_vat_rate: 0.15
     platform_vat_share_seller: 0.039
+    seller_receivable_vat_share: 0.033
     currency: SAR
 
 # 平台佣金率
 platforms:
   noon:
-    default_commission_rate: 0.15   # 定价表实算用 0.835 = 1 - 0.15 - 0.015 (UAE)
-    # 类目级佣金率: 待 Luke 提供 (定价表里没分类目, 只有总系数)
-    by_category: {}
+    default_commission_rate: 0.15
+    by_country:
+      ksa:
+        by_category:
+          luggage:
+            commission_rate: 0.20
+            source: "noon Seller Help Center, FBN Fees in KSA, Referral Fees: Bags & Luggage / Travel Luggage = 20%, effective 2025-09-01"
+            source_type: official
+          suitcase:
+            commission_rate: 0.20
+            source: "Mapped to noon KSA Bags & Luggage / Travel Luggage referral fee"
+            source_type: official
 
   amazon_me:
-    default_commission_rate: 0.15   # 估算, 待 Luke 确认
-    by_category: {}
+    default_commission_rate: 0.15
+    by_country:
+      ksa:
+        by_category:
+          luggage:
+            commission_rate: 0.15
+            source: "Amazon KSA public selling fees page: Category Referral Fees / Luggage = 15%, minimum 1 SAR"
+            source_type: official
+          suitcase:
+            commission_rate: 0.15
+            source: "Mapped to Amazon KSA Luggage referral fee"
+            source_type: official
 
 # 头程运费 (RMB → 国家本币)
 # 定价表内备注: "标准件 < 2kg, UAE 8.5-10.5 / KSA 6-8.5 区间; 大件 < 2kg UAE 11 / KSA 8.5-9"
@@ -53,8 +73,18 @@ warehouse_fees:
 
 # 汇率 (实证 ~0.52, 月度更新)
 exchange_rates:
-  rmb_to_sar: 0.52
-  rmb_to_aed: 0.51
+  rmb_to_sar: 0.555556   # 定价表.xlsx 沙特 sheet 用 RMB / 1.8
+  rmb_to_aed: 0.540541   # 定价表.xlsx 阿联酋 sheet 用 RMB / 1.85
 
 # 推广成本 (售价占比, 估算)
 promo_rate: 0.02
+
+# FBN 配送费默认值; 精算时由结算单/定价表行显式传入覆盖.
+fulfillment_fees:
+  noon:
+    ksa:
+      default_luggage_sar: 15
+      standard_luggage_sar: 12
+      oversize_luggage_sar: 15
+    uae:
+      default_luggage_aed: 16
