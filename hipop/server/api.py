@@ -1065,7 +1065,8 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
             task=out.get("workflow_task"),
         )
     except Exception:
-        pass
+        import traceback as _tb
+        print(f"[chat persist error] {_tb.format_exc()}", flush=True)
     return out
 
 
