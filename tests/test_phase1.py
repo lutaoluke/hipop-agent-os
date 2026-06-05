@@ -1189,36 +1189,9 @@ def test_selection_feedback_api_requires_login_and_scopes_preferences_by_tenant_
         assert tenant_b_candidate["feedback_status"] == "unreviewed"
 
 
-# ── WS-105 T12/T11 库存拆分单元测试 ────────────────────────────────────────────
-def test_ws105_t12_tbb0116a_stock_breakdown():
-    """T12 fail-then-pass: tool_query_stock_breakdown 读 wf1_hipop_ksa_stock 返回 TBB0116A 真实值。
-    改前：tool 不存在，调用 NameError → 断言失败。
-    改后：返回 total_stock=148, noon_saleable=81, overseas=66。
-    """
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from hipop.server.agent import tool_query_stock_breakdown
-    result = tool_query_stock_breakdown("TBB0116A", "KSA")
-    assert result.get("found") is True, f"TBB0116A should be found: {result}"
-    assert str(result.get("total_stock")) == "148", f"total_stock should be 148, got {result.get('total_stock')}"
-    assert str(result.get("noon_saleable")) == "81", f"noon_saleable should be 81, got {result.get('noon_saleable')}"
-    assert str(result.get("overseas")) == "66", f"overseas should be 66, got {result.get('overseas')}"
-
-
-def test_ws105_t11_tbp0169a_stock_breakdown():
-    """T11: tool_query_stock_breakdown 读 wf1_hipop_ksa_stock 返回 TBP0169A 真实值。"""
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from hipop.server.agent import tool_query_stock_breakdown
-    result = tool_query_stock_breakdown("TBP0169A", "KSA")
-    assert result.get("found") is True, f"TBP0169A should be found: {result}"
-    assert str(result.get("noon_saleable")) == "22", f"noon_saleable should be 22, got {result.get('noon_saleable')}"
-    assert str(result.get("overseas")) == "10680", f"overseas should be 10680, got {result.get('overseas')}"
-    assert str(result.get("total_stock")) == "10702", f"total_stock should be 10702, got {result.get('total_stock')}"
-
-
+# ── WS-105 T12 接线检查（无 DB 依赖，smoke_ws105_stock_breakdown.py 覆盖数据验证）──
 def test_ws105_query_stock_breakdown_in_tool_funcs():
-    """三死法 check: query_stock_breakdown 必须在 TOOL_FUNCS 中（接线检查）。"""
+    """三死法 check: query_stock_breakdown 必须在 TOOL_FUNCS 中（接线缺失检查，不读 DB）。"""
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from hipop.server.agent import TOOL_FUNCS
