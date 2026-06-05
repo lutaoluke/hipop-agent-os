@@ -119,6 +119,7 @@ _SPECIFIC_PRODUCT_INVENTORY_RE = re.compile(
     r"(?:这个|该|这款|这件|某个)?\s*(?:SKU|sku|商品|产品).{0,6}库存"
     r"|库存.{0,6}(?:有|还有|剩余|为|是)\s*\d+\s*件"
     r"|(?:商品|产品)库存.{0,4}(?:都)?正常"
+    r"|(?:SKU|sku|商品|产品).{0,20}(?:有|还有|剩余)\s*\d+\s*件.{0,5}库存"
     r")"
 )
 
@@ -211,9 +212,15 @@ def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -
             m and m.start("object") <= broad_pos
             for m in (claimed_product_sku, claimed_order_query)
         )
+        # product_sku evidence (query_sku / list_products) also backs a general data claim
+        has_product_evidence = (
+            claimed_product_sku
+            and _has_claim_evidence("product_sku", tools_used, tool_log)
+        )
         if (
             not has_specific_claim_before_broad
             and not _has_claim_evidence("store_overview", tools_used, tool_log)
+            and not has_product_evidence
         ):
             warns.append(
                 "⚠️ Agent 声称已查询/拉取店铺或补货数据，但没有对应工具调用证据"

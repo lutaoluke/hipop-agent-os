@@ -194,6 +194,47 @@ def test_replenishment_not_proof_when_broad_data_claim_wraps_sku_inventory():
         f"compute_replenishment 用宽泛数据声明包装 SKU 库存，漏拦: {warns}"
 
 
+# ── 第5轮：SKU + 量词 + 库存后缀语序 ─────────────────────────────────────
+
+def test_sku_quantity_suffix_inventory_caught():
+    """'SKU ABC 有 30 件库存' — 库存为后缀语序，data_health_check 不能作证据。"""
+    tool_log = [{"name": "data_health_check", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，SKU ABC 有 30 件库存。", ["data_health_check"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"SKU+量词+库存后缀语序漏拦: {warns}"
+
+
+def test_sku_quantity_haiyou_suffix_inventory_caught():
+    """'SKU ABC 还有 30 件库存' — 还有变体，data_health_check 不能作证据。"""
+    tool_log = [{"name": "data_health_check", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，SKU ABC 还有 30 件库存。", ["data_health_check"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"SKU+还有+库存后缀语序漏拦: {warns}"
+
+
+def test_sku_quantity_suffix_inventory_with_scope_overview_caught():
+    """scope_overview 不能用'查了数据'包装 'SKU ABC 有 30 件库存' 结论。"""
+    tool_log = [{"name": "scope_overview", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了一下数据，SKU ABC 有 30 件库存。", ["scope_overview"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"scope_overview 用宽泛数据包装 SKU 量词后缀库存，漏拦: {warns}"
+
+
+def test_real_query_sku_with_suffix_inventory_passes():
+    """真调了 query_sku，'SKU ABC 还有 30 件库存' → 放行。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，SKU ABC 还有 30 件库存。", ["query_sku"]
+    )
+    assert not any("hallucinate" in w or "list_products" in w for w in warns), \
+        f"query_sku 合法证据被误报: {warns}"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -217,6 +258,10 @@ if __name__ == "__main__":
         test_data_health_not_proof_when_broad_data_claim_wraps_sku_inventory,
         test_scope_overview_not_proof_when_broad_data_claim_wraps_product_inventory,
         test_replenishment_not_proof_when_broad_data_claim_wraps_sku_inventory,
+        test_sku_quantity_suffix_inventory_caught,
+        test_sku_quantity_haiyou_suffix_inventory_caught,
+        test_sku_quantity_suffix_inventory_with_scope_overview_caught,
+        test_real_query_sku_with_suffix_inventory_passes,
     ]
     failed = 0
     for t in tests:
