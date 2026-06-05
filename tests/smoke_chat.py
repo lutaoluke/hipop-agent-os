@@ -259,6 +259,24 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T12 TBB0116A KSA 库存拆分（WS-105）─────────────────────────────────────
+    # fail-then-pass: 改前 Agent 走 query_sku 返回 575（wf2 hallucinate）→ must_use_tools 断言失败
+    # 改后 query_stock_breakdown 注册 + 路由修复 → 返回真实值 total=148 / noon_saleable=81 / overseas=66 → 全绿
+    Case(
+        name="T12 TBB0116A KSA 库存拆分（total=148 / noon_saleable=81 / overseas=66）",
+        question="TBB0116A 当前可售库存和各仓库存拆分",
+        must_use_tools=["query_stock_breakdown"],
+        must_contain=["148", "81", "66"],
+        must_not_contain=["575", "wf1_stock_v2", r"需要.*工作流", r"等.*刷新"],
+    ),
+    # ─── T11 TBP0169A KSA 库存拆分（WS-105）─────────────────────────────────────
+    Case(
+        name="T11 TBP0169A KSA 库存拆分（noon_saleable=22 / overseas=10680 / total=10702）",
+        question="TBP0169A 各仓库存拆分",
+        must_use_tools=["query_stock_breakdown"],
+        must_contain=["22", "10680", "10702"],
+        must_not_contain=[r"wf1_stock_v2", r"需要.*工作流"],
+    ),
 ]
 
 

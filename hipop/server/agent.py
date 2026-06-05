@@ -408,6 +408,24 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "query_stock_breakdown",
+        "description": (
+            "查单 SKU 的库存拆分：noon 可售 / noon 不可售 / 海外仓 / 义乌仓 / 东莞仓 / 总库存。"
+            "数据来源：wf1_hipop_ksa_stock（KSA）/ wf1_hipop_uae_stock（UAE）。"
+            "**触发场景**：用户问'XXX 各仓库存 / noon 可售 / 海外仓 / 义乌 / 东莞 / 总库存 / 库存拆分'。"
+            "字段缺失（NULL）返回 '无数据/未刷新' 字符串，无行返回 found=False + error。"
+            "**不默认为 0，不推断断货**。禁止用 query_sku / wf5 字段反推仓库拆分。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string", "description": "SKU 码，如 TBP0169A"},
+                "store": {"type": "string", "enum": ["KSA", "UAE"], "default": "KSA"},
+            },
+            "required": ["sku"],
+        },
+    },
 ]
 
 
@@ -1264,6 +1282,51 @@ def tool_explain_status_enum(field: str = "alert_status") -> Dict:
 
 
 # ── Tool 派发 ─────────────────────────────────────────
+
+def tool_query_stock_breakdown(sku: str, store: str = "KSA") -> Dict:
+    """查单 SKU 库存拆分，读 wf1_hipop_ksa_stock / wf1_hipop_uae_stock。"""
+    import json as _json
+    store_up = store.upper()
+    table = "wf1_hipop_ksa_stock" if store_up in ("KSA", "SA") else "wf1_hipop_uae_stock"
+    rows = _data._fetch(
+        f"SELECT partner_sku, noon_total_qty, noon_saleable_qty, noon_unsaleable_qty,"
+        f" overseas_total_qty, overseas_breakdown_json, yiwu_qty, dongguan_qty, total_stock"
+        f" FROM {table} WHERE partner_sku=?",
+        (sku,),
+    )
+    if not rows:
+        return {
+            "sku": sku, "found": False, "source": table,
+            "error": f"库存源 {table} 无 {sku} 行（库存未刷新/未接入）",
+            "references": [{"table": table, "where": f"partner_sku='{sku}' — 无行"}],
+        }
+    r = rows[0]
+
+    def _val(v):
+        return v if v is not None else "无数据/未刷新"
+
+    breakdown = None
+    raw_bk = r.get("overseas_breakdown_json")
+    if raw_bk:
+        try:
+            breakdown = _json.loads(raw_bk) if isinstance(raw_bk, str) else raw_bk
+        except Exception:
+            breakdown = raw_bk
+
+    return {
+        "sku": sku, "found": True, "source": table,
+        "total_stock": _val(r["total_stock"]),
+        "noon_saleable": _val(r["noon_saleable_qty"]),
+        "noon_total": _val(r["noon_total_qty"]),
+        "noon_unsaleable": _val(r["noon_unsaleable_qty"]),
+        "overseas": _val(r["overseas_total_qty"]),
+        "overseas_breakdown": breakdown,
+        "yiwu": _val(r["yiwu_qty"]),
+        "dongguan": _val(r["dongguan_qty"]),
+        "references": [{"table": table, "where": f"partner_sku='{sku}'"}],
+    }
+
+
 TOOL_FUNCS = {
     "query_sku": tool_query_sku,
     "query_order": tool_query_order,
@@ -1285,6 +1348,7 @@ TOOL_FUNCS = {
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
     "capture_feedback": tool_capture_feedback,
+    "query_stock_breakdown": tool_query_stock_breakdown,
 }
 
 
@@ -1573,7 +1637,8 @@ scope: {scope}
 ## tool 速查
 | 用户问 | 调 |
 |---|---|
-| <SKU> 卖得 / 库存 / 趋势 | query_sku |
+| <SKU> 卖得 / 销量 / 趋势 | query_sku |
+| <SKU> 各仓库存 / noon 可售 / 海外仓 / 义乌 / 东莞 / 总库存 / 库存拆分 | query_stock_breakdown |
 | <SKU> 当前在途多少 / 实时物流 / wf3 陈旧时 | **query_sku_live**（实时 ERP，5-15s）|
 | <PDxxx> 状态 / 卡几天（hipop 缓存）| query_order |
 | <PDxxx> 现在到哪了 / 实时状态 / 物流码 | **query_order_live**（实时 ERP）|
