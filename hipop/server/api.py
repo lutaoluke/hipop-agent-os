@@ -715,6 +715,22 @@ async def api_events_stream(task_id: str):
     })
 
 
+# ── 任务状态统一回读接口（WS-99 T21-SUB-1）─────────────────
+@router.get("/tasks/{task_id}")
+async def api_task_status(task_id: str, user: dict = Depends(_auth_mod.get_current_user)):
+    """按 task_id 同时返回 tasks 行 + agent_events 列表（统一回读接口）。
+
+    chat 回复与右侧任务卡读同一证据源：任何对任务状态的查询都走本接口。
+    返回 {task_id, task: {...}, events: [...]} 或 404。
+    """
+    data.set_current_tenant(user.get("tenant_id"))
+    result = data.get_task_with_events(task_id)
+    if result is None:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(404, f"task not found: {task_id}")
+    return result
+
+
 # ── Run Workflow（chat / 手动 都可触发的统一入口）──────────
 WORKFLOW_REGISTRY = {
     # name → (label, [(step_no, step_name, callable_path), ...], affected_modules)

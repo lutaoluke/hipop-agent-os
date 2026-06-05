@@ -994,6 +994,24 @@ def get_events_after(task_id: str, last_id: int = 0) -> List[Dict]:
     """, (task_id, last_id))
 
 
+def get_task_with_events(task_id: str) -> Optional[Dict]:
+    """统一回读接口：按 task_id 同时返回 tasks 行 + agent_events 列表。
+
+    返回 {task_id, task: {...}, events: [...]} 或 None（task 不存在）。
+    chat 回复与右侧任务卡共用此接口，保证证据同源（WS-99 T21-SUB-1）。
+    """
+    rows = _fetch(
+        "SELECT task_id, tenant_id, workflow, state, worker_pid, "
+        "       started_at, last_heartbeat, finished_at, wake_count, result_summary "
+        "FROM tasks WHERE task_id=?",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    events = get_events_after(task_id, 0)
+    return {"task_id": task_id, "task": rows[0], "events": events}
+
+
 def get_progress_current() -> Dict:
     """最近一个任务的进度概览。如果没有任务，返回 mock。"""
     rows = _fetch("""
@@ -1486,3 +1504,91 @@ def get_cross_store_logistics() -> Dict:
             "stuck_count": len(hub_rows),
         },
     }
+
+
+# ── SQLite runtime self-bootstrap（WS-99 T21-SUB-1）────────────────────────
+# PG schema 由 db/schema.sql 建；本地 SQLite 用 CREATE TABLE IF NOT EXISTS 自举。
+# 对已有旧 SQLite agent_events（无 tenant_id/actor_* 列）做 ALTER TABLE ADD COLUMN。
+# 保持幂等，失败静默降级不影响主流程。
+
+_task_tables_checked: bool = False
+
+
+def _ensure_task_tables() -> None:
+    """SQLite 自举：创建 tasks 表 + 补全 agent_events 列。PG 模式下 no-op。"""
+    global _task_tables_checked
+    if _task_tables_checked:
+        return
+    _task_tables_checked = True
+    if is_postgres():
+        return
+    try:
+        c = sqlite3.connect(DB_PATH)
+        c.row_factory = sqlite3.Row
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS tasks (
+                task_id        TEXT PRIMARY KEY,
+                tenant_id      INTEGER NOT NULL DEFAULT 1,
+                workflow       TEXT NOT NULL,
+                state          TEXT NOT NULL DEFAULT 'queued',
+                worker_pid     INTEGER,
+                spec_path      TEXT,
+                progress_path  TEXT,
+                scratch_dir    TEXT,
+                actor_user_id  INTEGER,
+                actor_email    TEXT,
+                actor_source   TEXT,
+                started_at     TEXT DEFAULT (datetime('now','localtime')),
+                last_heartbeat TEXT,
+                finished_at    TEXT,
+                wake_count     INTEGER NOT NULL DEFAULT 0,
+                result_summary TEXT
+            )""")
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_tenant_state "
+                "ON tasks(tenant_id, state)"
+            )
+            # agent_events: create full schema if absent, or add missing columns for old DBs
+            c.execute("""CREATE TABLE IF NOT EXISTS agent_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id        TEXT NOT NULL,
+                step_no        INTEGER,
+                step_name      TEXT,
+                status         TEXT NOT NULL,
+                message        TEXT,
+                created_at     TEXT DEFAULT (datetime('now', 'localtime')),
+                tenant_id      INTEGER DEFAULT 1,
+                actor_user_id  INTEGER,
+                actor_email    TEXT,
+                actor_role     TEXT,
+                actor_source   TEXT
+            )""")
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_events_task "
+                "ON agent_events(task_id)"
+            )
+            existing = {
+                row["name"]
+                for row in c.execute("PRAGMA table_info(agent_events)").fetchall()
+            }
+            for col, defn in [
+                ("tenant_id",    "INTEGER DEFAULT 1"),
+                ("actor_user_id","INTEGER"),
+                ("actor_email",  "TEXT"),
+                ("actor_role",   "TEXT"),
+                ("actor_source", "TEXT"),
+            ]:
+                if col not in existing:
+                    c.execute(f"ALTER TABLE agent_events ADD COLUMN {col} {defn}")
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        pass  # non-fatal: degrade gracefully
+
+
+# Run once on import so write_event/get_task_with_events work immediately.
+try:
+    _ensure_task_tables()
+except Exception:
+    pass
