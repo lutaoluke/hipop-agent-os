@@ -413,6 +413,8 @@ TOOLS = [
         "description": (
             "按 total_stock 降序列出当前库存快照中占压最高的 N 个 SKU（默认 Top 3）。"
             "**触发场景**：用户问『库存最高 / 库存最多 / Top 库存 / 库存排名 / 当前总库存最高的 N 个 SKU / 哪些 SKU 库存压货最多』。"
+            "**[路由规则] 收到上述问题时，本轮第一个工具调用必须是 query_stock_top，不得先调 data_health_check。**"
+            "本工具返回值已含 data_as_of（快照时间），无需 data_health_check 作前置。"
             "必须调此 tool 拿真实排序结果；**禁止**用历史对话、候选 SKU、模型记忆或 export_table row_count 拼排名。"
             "tool 返回 ok=False 或数据为空时，明确告知用户『当前无法确认库存排名』并给 next_step，不猜、不宣称已生成/已排名。"
         ),
@@ -1631,7 +1633,7 @@ SYSTEM_PROMPT = """你是点购 Agent OS 的店铺协作 Agent。
 scope: {scope}
 
 ## 工作流
-1. 业务问题先调 data_health_check 看新鲜度 → 再调对应查询 tool 答
+1. 业务问题先调 data_health_check 看新鲜度 → 再调对应查询 tool 答（**例外：用户问"库存最高/TopN/库存排名/哪些 SKU 压货最多"→ 跳过本步，直调 query_stock_top**）
 2. 数据陈旧 → run_workflow（auto 类）/ 给上传指引（noon CSV 类）
 3. destructive tool 返回 action_type='plan' → 原文转告 plan_text 让用户回 OK → 调 confirm_proposal(pid,'ok')
 
@@ -1675,7 +1677,7 @@ scope: {scope}
 - capture_feedback 返 ok=False → 如实说"没记成，等会儿再说一次"，**绝不**假装记了。
 
 ## 死规矩（违反 = 事故）
-1. **业务数据先调 data_health_check**，不要凭空猜"X 天前更新"
+1. **业务数据先调 data_health_check**，不要凭空猜"X 天前更新"——**库存 TopN 排名（query_stock_top）除外：直调，不先 data_health_check**
 2. **禁说"已触发/启动/导出/发飞书"除非本轮真调了对应 tool**（_safety 后处理会拦你撒谎）
 3. **禁说"之前触发的任务还没跑完 / 等 X 分钟 ingest 完 / 任务还在跑"** — 这是新型撒谎模式：用过去时绕开 hook 检测。**真要知道有没有任务在跑，调 data_health_check 看 stale_days，没有"还在跑"这种中间态。wf3 陈旧 → 用 query_sku_live / query_order_live 实时查 ERP（不要等 wf3 跑完）**
 4. **禁编 URL / 字段名 / SKU id / 时间戳** — 数字必须来自 tool 返回
