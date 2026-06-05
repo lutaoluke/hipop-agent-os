@@ -1864,6 +1864,71 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+_CN_NUM = {
+    "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _parse_topn_limit(question: str, default: int = 3) -> int:
+    q = question or ""
+    patterns = [
+        r"(?:top|Top|TOP)\s*(\d{1,2})",
+        r"(?:最高|最多|排名|排行|前)\s*(\d{1,2})\s*(?:个|名|条|款|SKU|sku)?",
+        r"(\d{1,2})\s*(?:个|名|条|款)?\s*(?:SKU|sku)",
+    ]
+    for pat in patterns:
+        m = _re.search(pat, q)
+        if m:
+            return max(1, min(int(m.group(1)), 20))
+    m = _re.search(r"(?:最高|最多|排名|排行|前)\s*([一二两三四五六七八九十])\s*(?:个|名|条|款|SKU|sku)?", q)
+    if m:
+        return _CN_NUM.get(m.group(1), default)
+    return default
+
+
+def _deterministic_stock_top_request(question: str, scope: Dict) -> Optional[Dict[str, Any]]:
+    """库存 TopN 是确定性查询，不能交给 LLM 在多个工具间猜路由。"""
+    q = question or ""
+    q_lower = q.lower()
+    has_stock_subject = any(x in q_lower for x in ("库存", "总库存", "stock", "inventory", "压货"))
+    has_rank_intent = any(x in q_lower for x in ("最高", "最多", "top", "排名", "排行", "占压", "压货最多"))
+    if not (has_stock_subject and has_rank_intent):
+        return None
+
+    if _re.search(r"\buae\b|阿联酋|迪拜|ae\b", q, _re.I):
+        store = "UAE"
+    elif _re.search(r"\bksa\b|沙特|sa\b", q, _re.I):
+        store = "KSA"
+    else:
+        store = (scope or {}).get("store") or "KSA"
+    store = str(store).upper()
+    if store not in ("KSA", "UAE"):
+        store = "KSA"
+    return {"store": store, "n": _parse_topn_limit(q)}
+
+
+def _format_stock_top_reply(tool_result: Dict[str, Any]) -> str:
+    store = tool_result.get("store") or "当前店铺"
+    if not tool_result.get("ok"):
+        reason = tool_result.get("error") or "库存快照为空或不可排序"
+        next_step = tool_result.get("next_step") or "刷新库存数据后再查"
+        return f"当前无法确认库存排名：{reason}。下一步可以先{next_step}。"
+
+    items = tool_result.get("items") or []
+    data_as_of = tool_result.get("data_as_of")
+    header = f"{store} 当前总库存最高的 {len(items)} 个 SKU"
+    if data_as_of:
+        header += f"（数据截至 {data_as_of}）"
+    lines = [header + "："]
+    for item in items:
+        lines.append(f"{item.get('rank')}. {item.get('sku')}：{item.get('total_stock')} 件")
+    note = tool_result.get("note")
+    if note:
+        lines.append(f"口径：{note}。")
+    return "\n".join(lines)
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -1884,6 +1949,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+    direct_stock_top = _deterministic_stock_top_request(question, scope)
+    if direct_stock_top:
+        tool_result = _exec_tool("query_stock_top", direct_stock_top, user=scope)
+        reply = _format_stock_top_reply(tool_result if isinstance(tool_result, dict) else {})
+        refs = _dedup_refs((tool_result or {}).get("references", [])) if isinstance(tool_result, dict) else []
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": refs,
+            "action_id": None,
+            "tools_used": ["query_stock_top"],
+            "tag": "执行",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_stock_top_router",
+            "hallucination_warnings": None,
+        }
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
