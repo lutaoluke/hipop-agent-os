@@ -63,6 +63,35 @@ def test_order_query_real_passes():
     _, warns = _safety.sanitize_reply("我查了这个货单，状态正常。", ["query_order"])
     assert not any("query_order" in w for w in warns), f"合法 query_order 被误报: {warns}"
 
+# ── 其他真实查询工具：scope_overview/compute_replenishment/data_health_check 均放行 ──
+
+def test_scope_overview_passes():
+    """调了 scope_overview（真实数据查询），说了查了数据 → 放行（非假活）。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了一下你的店铺数据，当前共有 1,048 个在售 SKU，20 个急速下降。",
+        ["scope_overview"]
+    )
+    assert not any("hallucinate" in w or ("查询" in w and "list_products" in w) for w in warns), \
+        f"scope_overview 合法查询被误报为假活: {warns}"
+
+def test_compute_replenishment_passes():
+    """调了 compute_replenishment（真实计算），说了查了数据 → 放行。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了一下补货数据，建议补货的 SKU 共 15 个。",
+        ["compute_replenishment"]
+    )
+    assert not any("hallucinate" in w or ("查询" in w and "list_products" in w) for w in warns), \
+        f"compute_replenishment 合法查询被误报为假活: {warns}"
+
+def test_data_health_check_passes():
+    """调了 data_health_check（真实查询），说了查了数据 → 放行。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了一下你的数据，最新 imported_at 是 2026-06-03。",
+        ["data_health_check"]
+    )
+    assert not any("hallucinate" in w or ("查询" in w and "list_products" in w) for w in warns), \
+        f"data_health_check 合法查询被误报为假活: {warns}"
+
 # ── 回归：已有规则不受影响 ────────────────────────────────────────────────
 
 def test_regression_export_table_still_works():
@@ -83,6 +112,9 @@ if __name__ == "__main__":
         test_count_statement_no_claim_passes,
         test_order_query_fake_caught,
         test_order_query_real_passes,
+        test_scope_overview_passes,
+        test_compute_replenishment_passes,
+        test_data_health_check_passes,
         test_regression_export_table_still_works,
         test_regression_run_workflow_still_works,
     ]

@@ -142,8 +142,27 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
     return warns
 
 
+def _has_real_data_query(tools_used: List[str], tool_log) -> bool:
+    """判断本轮是否有真实数据查询：任何非 list_products 工具 = 真查；
+    list_products 需 limit>0；无 tool_log 时保守信任（无参数信息）。"""
+    # 任何非 list_products 工具 = 真实数据查询（scope_overview/query_sku/data_health_check 等）
+    if any(t != "list_products" for t in tools_used):
+        return True
+    # 只有 list_products：检查 limit 参数
+    if "list_products" in tools_used:
+        if tool_log is None:
+            return True  # 无参数信息，保守信任
+        for t in tool_log:
+            if t.get("name") == "list_products":
+                args = t.get("args") or {}
+                if isinstance(args, dict) and args.get("limit", 1) > 0:
+                    return True
+    return False
+
+
 def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -> List[str]:
-    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。"""
+    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。
+    只拦截唯一工具证据是 list_products(limit=0) 的情况；其他任何真实工具调用均放行。"""
     warns = []
     claimed_query = re.search(
         r"(我|已)?(再次|重新)?(查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
@@ -151,21 +170,10 @@ def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -
         reply, re.IGNORECASE
     )
     if claimed_query:
-        has_real_list = False
-        if "list_products" in tools_used:
-            if tool_log:
-                for t in tool_log:
-                    if t.get("name") == "list_products":
-                        args = t.get("args") or {}
-                        if isinstance(args, dict) and args.get("limit", 1) > 0:
-                            has_real_list = True
-            else:
-                has_real_list = True
-        has_sku_query = "query_sku" in tools_used
-        if not has_real_list and not has_sku_query:
+        if not _has_real_data_query(tools_used, tool_log):
             warns.append(
                 "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
-                "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"
+                "（本轮无真实数据查询工具调用，或仅调 list_products(limit=0) 拿计数）— 这是 hallucinate"
             )
 
     claimed_order_query = re.search(
