@@ -114,6 +114,13 @@ _CLAIM_TOOL_MAP = {
 }
 
 _QUERY_ACTION_RE = r"(?:我|已)?(?:再次|重新)?(?:查了一下|查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
+_SPECIFIC_PRODUCT_INVENTORY_RE = re.compile(
+    r"(?:"
+    r"(?:这个|该|这款|这件|某个)?\s*(?:SKU|sku|商品|产品).{0,6}库存"
+    r"|库存.{0,6}(?:有|还有|剩余|为|是)\s*\d+\s*件"
+    r"|(?:商品|产品)库存.{0,4}(?:都)?正常"
+    r")"
+)
 
 
 def _claim_match(reply: str, keywords: str, gap: int = 15):
@@ -140,6 +147,10 @@ def _list_products_has_rows(tool_log) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+def _has_specific_product_inventory_claim(reply: str) -> bool:
+    return bool(_SPECIFIC_PRODUCT_INVENTORY_RE.search(reply))
 
 
 def _has_claim_evidence(claim_type: str, tools_used: List[str], tool_log=None) -> bool:
@@ -171,6 +182,7 @@ def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -
         reply,
         r"店铺数据|补货数据|数据新鲜度|数据健康|你的数据|数据",
     )
+    claimed_specific_inventory = _has_specific_product_inventory_claim(reply)
 
     product_is_primary_claim = (
         claimed_product_sku
@@ -179,7 +191,10 @@ def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -
             or claimed_product_sku.start("object") <= claimed_store_overview.start("object")
         )
     )
-    if product_is_primary_claim and not _has_claim_evidence("product_sku", tools_used, tool_log):
+    product_needs_evidence = product_is_primary_claim or (
+        claimed_store_overview and claimed_specific_inventory
+    )
+    if product_needs_evidence and not _has_claim_evidence("product_sku", tools_used, tool_log):
         warns.append(
             "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
             "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"

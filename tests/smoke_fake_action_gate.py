@@ -164,6 +164,36 @@ def test_scope_overview_not_proof_of_sku_inventory():
         f"scope_overview 被当成 SKU/库存查询证据，漏拦: {warns}"
 
 
+def test_data_health_not_proof_when_broad_data_claim_wraps_sku_inventory():
+    """data_health_check 不能用'查了数据'包装具体 SKU 库存结论。"""
+    tool_log = [{"name": "data_health_check", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，这个SKU库存有30件。", ["data_health_check"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"data_health_check 用宽泛数据声明包装 SKU 库存，漏拦: {warns}"
+
+
+def test_scope_overview_not_proof_when_broad_data_claim_wraps_product_inventory():
+    """scope_overview 不能用'查了数据'包装商品库存正常结论。"""
+    tool_log = [{"name": "scope_overview", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了一下数据，商品库存都正常。", ["scope_overview"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"scope_overview 用宽泛数据声明包装商品库存，漏拦: {warns}"
+
+
+def test_replenishment_not_proof_when_broad_data_claim_wraps_sku_inventory():
+    """compute_replenishment 不能用'查了数据'包装具体 SKU 库存结论。"""
+    tool_log = [{"name": "compute_replenishment", "args": {}}]
+    _, warns = _safety.sanitize_reply(
+        "我查了一下补货数据，这个SKU库存有30件。", ["compute_replenishment"], tool_log=tool_log
+    )
+    assert any("hallucinate" in w or "list_products" in w or "query_sku" in w for w in warns), \
+        f"compute_replenishment 用宽泛数据声明包装 SKU 库存，漏拦: {warns}"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -184,6 +214,9 @@ if __name__ == "__main__":
         test_query_order_not_proof_of_product_inventory,
         test_data_health_not_proof_of_sku_inventory,
         test_scope_overview_not_proof_of_sku_inventory,
+        test_data_health_not_proof_when_broad_data_claim_wraps_sku_inventory,
+        test_scope_overview_not_proof_when_broad_data_claim_wraps_product_inventory,
+        test_replenishment_not_proof_when_broad_data_claim_wraps_sku_inventory,
     ]
     failed = 0
     for t in tests:
