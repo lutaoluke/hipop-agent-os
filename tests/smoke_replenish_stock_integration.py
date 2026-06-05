@@ -24,8 +24,9 @@
 验收 2 · 库存未就绪/不完整 降级（防「死代码短路」）
   - 空库存（0 行）→ 三条入口都 ready=False、status=empty、message 含「未就绪」；
   - 未就绪库存（19 行）→ 三条入口都 ready=False、status=empty、含「未就绪」；
-  - 不完整库存（94% 覆盖率或库存超过 3 天未更新）→ 三条入口都 ready=False、
-    status=incomplete、含「不完整」；
+  - 不完整库存（94% 覆盖率或源库存 ingest 超过 3 天未更新）→ 三条入口都
+    ready=False、status=incomplete、含「不完整」；
+  - 红队：源库存 ingest 已 stale,但 rollup 脚本刷新了 wf1_stock.updated_at → 仍 not-ready；
   - 完整库存但本周无需补货 → 三条入口 ready=True（rows 空 ≠ 未就绪，不误报）；
   绝不静默给 0 / 假确定建议：未就绪时入口响应本身带 ready=False，不是只在 run_v2 log。
 
@@ -103,7 +104,7 @@ def _reset_ksa():
     conn.close()
 
 
-def _add_sku(sku, *, listed=1, sales=False, stock=None, updated_at=None):
+def _add_sku(sku, *, listed=1, sales=False, stock=None, imported_at=None, updated_at=None):
     """插一个 wf2_sku（hipop_ksa）；可选灌销量与 wf1_stock 行。stock=None → 不建库存行。"""
     from hipop.server import data
     conn = data.conn()
@@ -119,12 +120,14 @@ def _add_sku(sku, *, listed=1, sales=False, stock=None, updated_at=None):
         (TENANT, KSA_ALIAS, sku, f"商品 {sku}", listed, 99.0, profit, s10, s30, s60, s180),
     )
     if stock is not None:
-        updated_at = updated_at or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        now_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        imported_at = imported_at or updated_at or now_ts
+        updated_at = updated_at or imported_at
         conn.execute(
             "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, noon_saleable_qty, "
-            "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock, updated_at),
+            "pending_inbound_qty, overseas_total_qty, yiwu_qty, dongguan_qty, total_stock, imported_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (TENANT, KSA_ALIAS, sku, stock, 0, 0, 0, 0, stock, imported_at, updated_at),
         )
     conn.commit()
     conn.close()
@@ -312,14 +315,14 @@ def test_incomplete_stock_surfaces_not_ready_at_all_entry_points():
     return check.failures
 
 
-# ── 验收 2 · 陈旧库存：更新时间超过 3 天必须先刷新库存 ─────────────────
+# ── 验收 2 · 陈旧库存：源库存 ingest 超过 3 天必须先刷新库存 ─────────────
 def test_stale_stock_surfaces_not_ready_at_all_entry_points():
-    print("== test_stale_stock_surfaces_not_ready_at_all_entry_points (验收 2: 库存超过 3 天降级) ==")
+    print("== test_stale_stock_surfaces_not_ready_at_all_entry_points (验收 2: 源库存超过 3 天降级) ==")
     check = _Checker()
     _reset_ksa()
     stale_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 73 * 3600))
     for i in range(20):
-        _add_sku(f"OLD{i:03d}", sales=True, stock=300, updated_at=stale_ts)
+        _add_sku(f"OLD{i:03d}", sales=True, stock=300, imported_at=stale_ts, updated_at=stale_ts)
 
     _assert_not_ready_all_entries(check, expect_status="incomplete", expect_word="不完整")
     st = _view()["stock_status"]
@@ -330,6 +333,29 @@ def test_stale_stock_surfaces_not_ready_at_all_entry_points():
     wf5 = _run_wf5()
     check("run_v2 进入计算前硬拦陈旧库存",
           wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["status"] == "incomplete", wf5)
+    return check.failures
+
+
+# ── 红队 · rollup 刷新 updated_at 不得伪造源库存 freshness ─────────────
+def test_rollup_updated_at_does_not_fake_source_freshness():
+    print("== test_rollup_updated_at_does_not_fake_source_freshness (红队: rollup updated_at 假新鲜) ==")
+    check = _Checker()
+    _reset_ksa()
+    stale_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 73 * 3600))
+    fresh_rollup_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    for i in range(20):
+        # 模拟源库存 ingest 已超过 3 天，但 compute_pending/merge 之后刷新了 updated_at。
+        # 旧实现看 MAX(updated_at) 会误判 ready；新实现看 imported_at 仍必须 not-ready。
+        _add_sku(f"RUP{i:03d}", sales=True, stock=300,
+                 imported_at=stale_ts, updated_at=fresh_rollup_ts)
+
+    _assert_not_ready_all_entries(check, expect_status="incomplete", expect_word="不完整")
+    st = _view()["stock_status"]
+    check("readiness 看源库存 imported_at,不被 rollup updated_at 假新鲜骗过",
+          (st["stock_age_hours"] or 0) > 72 and st.get("stock_source_imported_at") is not None, st)
+    wf5 = _run_wf5()
+    check("run_v2 也按源库存 freshness 硬拦",
+          wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["ready"] is False, wf5)
     return check.failures
 
 
@@ -376,6 +402,7 @@ if __name__ == "__main__":
         test_min_rows_20_threshold_surfaces_not_ready_at_all_entry_points,
         test_incomplete_stock_surfaces_not_ready_at_all_entry_points,
         test_stale_stock_surfaces_not_ready_at_all_entry_points,
+        test_rollup_updated_at_does_not_fake_source_freshness,
         test_ready_stock_no_false_positive,
         test_template_surfaces_readiness,
     ]

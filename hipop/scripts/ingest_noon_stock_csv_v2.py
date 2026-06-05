@@ -17,8 +17,9 @@ WS-10。背景：v2 `wf1_stock.noon_*` 当前是一次性 backfill（updated_at 
     noon_saleable_qty    = SUM(qty WHERE inventory_type='saleable')
     noon_unsaleable_qty  = noon_total - noon_saleable
     noon_warehouses_json = [{warehouse_code, qty, inventory_type}, ...]
-- **部分 upsert**：只写 noon_* 四列 + updated_at，绝不碰 ERP 写的
+- **部分 upsert**：只写 noon_* 四列 + imported_at/updated_at，绝不碰 ERP 写的
   yiwu/dongguan/overseas/total_stock，也不碰 pending_inbound_qty（归 WS-11）。
+  imported_at 是源库存 ingest freshness 事实源，非 ingest rollup 脚本不得改。
 - 绝不写 v1 `wf1_<alias>_stock`（active runtime = v2，PK 见 WS-9 核实）。
 
 CLI:
@@ -193,7 +194,7 @@ def _upsert(conn, tenant_id, bucket) -> dict:
     ts = "datetime('now','localtime')"
     cols = ["tenant_id", "entity_alias", "partner_sku", *_NOON_COLS]
     placeholders = ",".join(["?"] * len(cols))
-    update_set = ",".join(f"{c}=excluded.{c}" for c in _NOON_COLS) + f", updated_at={ts}"
+    update_set = ",".join(f"{c}=excluded.{c}" for c in _NOON_COLS) + f", imported_at={ts}, updated_at={ts}"
     sql = (
         f"INSERT INTO wf1_stock ({','.join(cols)}, imported_at, updated_at) "
         f"VALUES ({placeholders}, {ts}, {ts}) "
