@@ -127,6 +127,46 @@ def test_tool_run_workflow_uses_spawn_task():
     print(f"    task_id={task_id} state={task['state']} events={len(events)}")
 
 
+def test_cross_tenant_isolation():
+    """跨 tenant 请求应返回空/None：租户A的 task 对租户B不可见。
+
+    FAIL (before fix): get_events_after/get_task_with_events 不过滤 tenant_id →
+      tenant=2 用同一 task_id 能读到 tenant=1 的数据（越权串租户）。
+    PASS (after fix):  WHERE task_id=? AND tenant_id=? 隔离 →
+      tenant=2 读同一 task_id 返回 None/空（数据不泄露）。
+    """
+    actor = {"user_id": 1, "email": "test@hipop.local", "role": "ops", "source": "test"}
+
+    # tenant=1 创建 task + queued event
+    _data.set_current_tenant(1)
+    task_id = _runtime.spawn_task(
+        "__test_sleep_v2", tenant_id=1, actor=actor,
+        spec={"total_chunks": 0, "sleep_sec": 0},
+    )
+
+    # sanity: tenant=1 自己能读到
+    _data.set_current_tenant(1)
+    own = _data.get_task_with_events(task_id)
+    assert own is not None, f"tenant=1 应能读到自己的 task {task_id}"
+    own_events = _data.get_events_after(task_id, 0)
+    assert len(own_events) >= 1, f"tenant=1 应读到 ≥1 event task_id={task_id}"
+
+    # 跨租户：切到 tenant=2，同一 task_id 不可见
+    _data.set_current_tenant(2)
+    cross_task = _data.get_task_with_events(task_id)
+    assert cross_task is None, (
+        f"越权：tenant=2 读到了 tenant=1 的 task {task_id} → {cross_task}"
+    )
+    cross_events = _data.get_events_after(task_id, 0)
+    assert len(cross_events) == 0, (
+        f"越权：tenant=2 读到了 tenant=1 的 {len(cross_events)} events "
+        f"task_id={task_id}"
+    )
+
+    print(f"    task_id={task_id} tenant=1 可读({len(own_events)}events), "
+          f"tenant=2 隔离(task=None, events=[])")
+
+
 if __name__ == "__main__":
     print("▶ smoke_task_evidence — T21-SUB-1 任务证据契约")
     _setup()
@@ -138,6 +178,8 @@ if __name__ == "__main__":
          test_get_task_with_events_unified_interface),
         ("test_tool_run_workflow_uses_spawn_task",
          test_tool_run_workflow_uses_spawn_task),
+        ("test_cross_tenant_isolation",
+         test_cross_tenant_isolation),
     ]
 
     failed = 0

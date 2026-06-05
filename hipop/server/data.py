@@ -986,25 +986,30 @@ def write_event(task_id: str, step_no: int, step_name: str, status: str, message
 
 
 def get_events_after(task_id: str, last_id: int = 0) -> List[Dict]:
+    # tenant_id filter: SQLite 无 RLS，必须显式 WHERE 隔离（PG 已有 RLS，此为 belt-and-suspenders）
+    tid = get_current_tenant() or 1
     return _fetch("""
         SELECT id, task_id, step_no, step_name, status, message, created_at
         FROM agent_events
-        WHERE task_id=? AND id > ?
+        WHERE task_id=? AND tenant_id=? AND id > ?
         ORDER BY id
-    """, (task_id, last_id))
+    """, (task_id, tid, last_id))
 
 
 def get_task_with_events(task_id: str) -> Optional[Dict]:
     """统一回读接口：按 task_id 同时返回 tasks 行 + agent_events 列表。
 
-    返回 {task_id, task: {...}, events: [...]} 或 None（task 不存在）。
+    返回 {task_id, task: {...}, events: [...]} 或 None（task 不存在或租户不匹配）。
     chat 回复与右侧任务卡共用此接口，保证证据同源（WS-99 T21-SUB-1）。
+    tenant_id 隔离：同时过滤 tasks 和 agent_events，防止跨租户越权读取。
     """
+    # tenant_id filter: SQLite 无 RLS，必须显式 WHERE 隔离（PG 已有 RLS，此为 belt-and-suspenders）
+    tid = get_current_tenant() or 1
     rows = _fetch(
         "SELECT task_id, tenant_id, workflow, state, worker_pid, "
         "       started_at, last_heartbeat, finished_at, wake_count, result_summary "
-        "FROM tasks WHERE task_id=?",
-        (task_id,),
+        "FROM tasks WHERE task_id=? AND tenant_id=?",
+        (task_id, tid),
     )
     if not rows:
         return None
