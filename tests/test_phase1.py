@@ -558,6 +558,64 @@ def test_selection_no_inventory_data_is_explicitly_insufficient():
     assert "inventory" in candidate["missing_evidence"]
 
 
+def test_selection_profit_matches_ksa_pricing_table_formula_sample():
+    """WS-67: 定价表.xlsx 沙特 sheet 第 2 行公式口径不能回退成简化 15% 默认估算."""
+    from selection.l2_knowledge import loader as kb_loader
+    from selection.l3_orchestration.nodes import n10_profit
+
+    pricing_table = kb_loader.load_pricing_table()
+    result = n10_profit.calculate_profit(
+        289,
+        110,
+        country="ksa",
+        platform="noon",
+        category="luggage",
+        shipping_rmb=53,
+        fulfillment_fee_sar=15,
+        warehouse_sar=2,
+        pricing_table=pricing_table,
+    )
+
+    assert result.commission_rate == 0.20
+    assert result.commission_source == "category"
+    assert abs(result.seller_receivable_sar - 198.883) < 0.01
+    assert abs(result.seller_settlement_vat_sar - 29.83245) < 0.01
+    assert abs(result.net_profit_sar - 76.760994) < 0.01
+    assert abs(result.profit_rate - 0.266) < 0.001
+
+
+def test_selection_profit_path_uses_luggage_commission_and_surfaces_low_margin():
+    """WS-67: 候选池消费端读取 N10 真实利润；<20% 只能黄牌/风险，不能假装通过."""
+    records = [
+        _selection_noon_record(
+            "LOWMARGIN1",
+            "20 inch ABS hardside luggage suitcase spinner",
+            price=199,
+            sold=80,
+        )
+    ]
+
+    result = _selection_fixture_result(
+        records,
+        ali_records=[
+            _selection_ali_record(
+                "1688-low-margin",
+                "20 inch ABS hardside luggage suitcase spinner",
+                unit_rmb=160,
+            )
+        ],
+    )
+
+    candidate = result["candidates"][0]
+    profit = candidate["profit"]
+    assert profit["commission"] == 0.20
+    assert profit["commission_source"] == "category"
+    assert profit["profit_rate"] < 0.20
+    assert profit["low_margin"] is True
+    assert profit["verdict"] == "PROFIT_LOW_BUT_VALUABLE"
+    assert result["summaries"]["N10"]["n_yellow"] == 1
+
+
 def test_selection_inventory_malformed_rows_returns_evidence_insufficient():
     """N9: inventory rows present but no parseable size/stock/sales → evidence_insufficient, not sufficient."""
     records = [
