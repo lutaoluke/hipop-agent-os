@@ -721,6 +721,76 @@ def test_selection_inventory_type_b_size_no_stock_returns_evidence_insufficient(
     )
 
 
+def test_selection_inventory_type_a_no_size_returns_evidence_insufficient():
+    """N9 WS-73 A型: rows have stock/sales but no parseable size → evidence_insufficient, not sufficient."""
+    records = [
+        _selection_noon_record(
+            "TYPEA1",
+            "24 inch expandable ABS luggage suitcase spinner",
+            price=249,
+            sold=30,
+        )
+    ]
+    type_a_rows = [
+        {
+            "partner_sku": "TYPEA_SKU",
+            "title": "generic luggage product",
+            "family": "bags_luggage",
+            "product_category_detail": "luggage",
+            "total_stock": 10,
+            "sales_30d": 5,
+        }
+    ]
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: type_a_rows,
+    )
+
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == "evidence_insufficient", (
+        f"A型 Expected evidence_insufficient but got {candidate['inventory']['state']!r}"
+    )
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert "inventory" in candidate["missing_evidence"], (
+        f"missing_evidence should contain 'inventory', got: {candidate['missing_evidence']}"
+    )
+
+
+def test_selection_inventory_type_b_no_stock_sales_returns_evidence_insufficient():
+    """N9 WS-73 B型: rows have parseable size but no stock/sales → evidence_insufficient, not sufficient."""
+    records = [
+        _selection_noon_record(
+            "TYPEB1",
+            "24 inch expandable ABS luggage suitcase spinner",
+            price=249,
+            sold=30,
+        )
+    ]
+    type_b_rows = [
+        {
+            "partner_sku": "TYPEB_SKU",
+            "title": "20 inch hardside luggage suitcase",
+            "family": "bags_luggage",
+            "product_category_detail": "luggage",
+            "total_stock": None,
+            "sales_30d": None,
+        }
+    ]
+    result = _selection_fixture_result(
+        records,
+        inventory_provider=lambda _country, _family: type_b_rows,
+    )
+
+    candidate = result["candidates"][0]
+    assert candidate["inventory"]["state"] == "evidence_insufficient", (
+        f"B型 Expected evidence_insufficient but got {candidate['inventory']['state']!r}"
+    )
+    assert candidate["inventory"]["score_adjustment"] == 0.0
+    assert "inventory" in candidate["missing_evidence"], (
+        f"missing_evidence should contain 'inventory', got: {candidate['missing_evidence']}"
+    )
+
+
 def test_selection_phase1_evidence_insufficient_is_explicit_offline():
     from selection.l3_orchestration.production_pipeline import EVIDENCE_INSUFFICIENT
 

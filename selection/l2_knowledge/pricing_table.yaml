@@ -39,7 +39,7 @@ platforms:
             source_type: official
 
   amazon_me:
-    default_commission_rate: 0.15   # 估算, 待 Luke 确认
+    default_commission_rate: 0.15
     by_country:
       ksa:
         by_category:
