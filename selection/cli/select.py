@@ -147,6 +147,11 @@ def cmd_select(args):
 def cmd_production_noon(args):
     """KSA luggage/noon production path: N1 -> noon -> N3 -> N11 v3."""
     from selection.l3_orchestration.production_pipeline import run_ksa_luggage_noon
+    from selection.l4_delivery.candidate_pool import (
+        DEFAULT_CANDIDATE_POOL_PATH,
+        build_candidate_pool,
+        save_candidate_pool,
+    )
     import json
 
     detail_kwargs = {"detail_provider": None} if args.no_detail else {}
@@ -159,6 +164,15 @@ def cmd_production_noon(args):
         ali_records=[],
         **detail_kwargs,
     )
+    if not args.no_delivery:
+        pool = build_candidate_pool(result)
+        delivery_path = args.delivery_path or DEFAULT_CANDIDATE_POOL_PATH
+        save_candidate_pool(pool, delivery_path)
+        result["delivery"] = {
+            "candidate_pool_path": str(delivery_path),
+            "candidate_pool_id": pool["candidate_pool_id"],
+            "candidate_count": len(pool["candidates"]),
+        }
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
@@ -212,6 +226,8 @@ def main():
     p.add_argument("--category", default="luggage", help="categories yaml 名")
     p.add_argument("--country", default="ksa", choices=["ksa"])
     p.add_argument("--no-detail", action="store_true", help="不抓 noon 详情, 显式标 evidence_insufficient")
+    p.add_argument("--delivery-path", default=None, help="写给 Agent OS/结构化报告读取的候选池 JSON")
+    p.add_argument("--no-delivery", action="store_true", help="只打印生产 JSON, 不写 L4 候选池")
     p.set_defaults(func=cmd_production_noon)
 
     p = sub.add_parser("history-seed")

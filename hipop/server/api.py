@@ -316,13 +316,71 @@ def api_traffic(store: str):
 
 @router.get("/selection/{store}")
 def api_selection(store: str):
-    """选品候选评估功能未上线（计算逻辑还在工程化）。"""
-    return {
-        "_status": "not_implemented",
-        "candidates": [],
-        "strategies": data.get_selection_strategies(),
-        "message": "选品 Agent 在工程化中（见 plans/productization.md 阶段 2）",
-    }
+    """Agent OS candidate-pool surface backed by the L4 delivery artifact."""
+    from selection.l4_delivery.candidate_pool import (
+        load_candidate_pool,
+        render_agent_os_payload,
+    )
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_preferences,
+    )
+
+    pool = load_candidate_pool()
+    if pool is None:
+        return {
+            "_status": "no_candidate_pool",
+            "candidates": [],
+            "strategies": data.get_selection_strategies(),
+            "message": "暂无生产候选池输出",
+        }
+    pool = apply_preferences_to_candidate_pool(pool, load_preferences())
+    payload = render_agent_os_payload(pool)
+    payload["strategies"] = data.get_selection_strategies()
+    return payload
+
+
+@router.get("/selection/{store}/report")
+def api_selection_report(store: str):
+    """Structured report using the same L4 candidate pool as Agent OS."""
+    from selection.l4_delivery.candidate_pool import (
+        load_candidate_pool,
+        render_structured_report,
+    )
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_preferences,
+    )
+
+    pool = load_candidate_pool()
+    if pool is None:
+        return {
+            "_status": "no_candidate_pool",
+            "report_type": "selection_candidate_pool",
+            "candidate_pool": [],
+            "inquiry_todos": [],
+        }
+    pool = apply_preferences_to_candidate_pool(pool, load_preferences())
+    return render_structured_report(pool)
+
+
+@router.post("/selection/{store}/feedback")
+def api_selection_feedback(store: str, body: dict):
+    """Write structured selection feedback to preferences.jsonl."""
+    from selection.l4_delivery.feedback import write_candidate_feedback
+
+    try:
+        event = write_candidate_feedback(
+            product_id=(body or {}).get("product_id"),
+            action=(body or {}).get("action"),
+            reason_tags=(body or {}).get("reason_tags") or [],
+            reason_text=(body or {}).get("reason_text") or "",
+            attributes=(body or {}).get("attributes") or {},
+            run_id=(body or {}).get("run_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "event": event}
 
 
 # ── N7: 1688 图搜找同款 ──────────────────────────────────
