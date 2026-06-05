@@ -18,6 +18,7 @@ PASS 条件（修后）：
 import sys
 import os
 import json
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -27,9 +28,24 @@ if str(REPO) not in sys.path:
 from hipop.server import data as _data
 from hipop.server import runtime as _runtime
 
+_TMP_DB = None
+
 
 def _setup():
-    """Bootstrap SQLite schema + set tenant context for tests."""
+    """Bootstrap temp SQLite DB + set tenant context for tests.
+
+    CI-safe: the default DB_PATH (/Users/luke/code/hipop/hipop.db) does not exist
+    on CI runners.  We create a temp SQLite file and override the module-level
+    DB_PATH so every subsequent conn() call in this process uses the temp DB.
+    """
+    global _TMP_DB
+    if _TMP_DB is None:
+        _TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        _TMP_DB.close()
+    _data.DB_PATH = _TMP_DB.name
+    # Reset the bootstrap flag so _ensure_task_tables() re-runs against the temp DB
+    # (the module-level call at import time may have failed silently on a bad path)
+    _data._task_tables_checked = False
     _data._ensure_task_tables()
     _data.set_current_tenant(1)
 
