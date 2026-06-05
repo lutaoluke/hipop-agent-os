@@ -11,7 +11,10 @@ from .feedback import (
     REASON_TAGS,
     apply_preferences_to_candidate_pool,
     load_preferences,
+    load_scoped_preferences,
+    scoped_preferences_path,
     write_candidate_feedback,
+    write_scoped_candidate_feedback,
 )
 
 __all__ = [
@@ -21,8 +24,11 @@ __all__ = [
     "build_inquiry_todos",
     "load_candidate_pool",
     "load_preferences",
+    "load_scoped_preferences",
     "render_agent_os_payload",
     "render_structured_report",
     "save_candidate_pool",
+    "scoped_preferences_path",
     "write_candidate_feedback",
+    "write_scoped_candidate_feedback",
 ]

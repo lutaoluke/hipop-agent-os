@@ -922,6 +922,75 @@ def test_selection_delivery_structured_feedback_writes_preferences_and_changes_o
         assert candidate["preference_effects"][0]["source_product_id"] == "noon_sa:FEEDBACK1"
 
 
+def test_selection_feedback_api_requires_login_and_scopes_preferences_by_tenant_store():
+    import os
+    import tempfile
+
+    os.environ["AUTH_LOCKDOWN"] = "0"
+    os.environ["DISABLE_DAILY_REFRESH"] = "1"
+
+    records = [
+        _selection_noon_record(
+            "TENANTFB1",
+            "American Tourister 20 inch ABS hardside luggage suitcase spinner",
+            brand="American Tourister",
+            price=310,
+            sold=44,
+        )
+    ]
+    result = _selection_fixture_result(records)
+
+    from fastapi.testclient import TestClient
+    from hipop.server.main import app
+    from server import auth as _auth_mod
+    from selection.l4_delivery.candidate_pool import build_candidate_pool
+    from selection.l4_delivery.feedback import (
+        apply_preferences_to_candidate_pool,
+        load_scoped_preferences,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["SELECTION_PREFERENCES_ROOT"] = td
+        client = TestClient(app)
+        body = {
+            "product_id": "noon_sa:TENANTFB1",
+            "action": "reject",
+            "reason_tags": ["brand", "material"],
+            "reason_text": "tenant A rejects this branded ABS product",
+            "attributes": {"brand": "American Tourister", "material": "ABS"},
+        }
+
+        unauth = client.post("/api/selection/ksa/feedback", json=body)
+        assert unauth.status_code == 401
+
+        app.dependency_overrides[_auth_mod.get_current_user] = lambda: {
+            "id": 1001,
+            "tenant_id": 101,
+            "email": "tenant-a@example.com",
+            "role": "owner",
+            "active": True,
+            "is_default": False,
+        }
+        try:
+            auth = client.post("/api/selection/ksa/feedback", json=body)
+        finally:
+            app.dependency_overrides.clear()
+        assert auth.status_code == 200, auth.text
+
+        tenant_a_preferences = load_scoped_preferences(101, "ksa", preferences_root=td)
+        tenant_b_preferences = load_scoped_preferences(202, "ksa", preferences_root=td)
+        assert len(tenant_a_preferences) == 1
+        assert tenant_a_preferences[0]["tenant_id"] == 101
+        assert tenant_a_preferences[0]["store"] == "ksa"
+        assert tenant_b_preferences == []
+
+        pool = build_candidate_pool(result, source_run_id="fixture-run")
+        tenant_a_candidate = apply_preferences_to_candidate_pool(pool, tenant_a_preferences)["candidates"][0]
+        tenant_b_candidate = apply_preferences_to_candidate_pool(pool, tenant_b_preferences)["candidates"][0]
+        assert tenant_a_candidate["feedback_status"] == "rejected_by_preference"
+        assert tenant_b_candidate["feedback_status"] == "unreviewed"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []

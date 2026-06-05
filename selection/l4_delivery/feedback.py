@@ -4,12 +4,15 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any, Optional
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PREFERENCES_PATH = PACKAGE_ROOT / "preferences.jsonl"
+DEFAULT_PREFERENCES_ROOT = PACKAGE_ROOT / "preferences"
 
 REASON_TAGS = frozenset({
     "missing_candidate",
@@ -25,6 +28,30 @@ REASON_TAGS = frozenset({
     "relevance",
 })
 ALLOWED_ACTIONS = frozenset({"include", "reject", "hold"})
+
+
+def _safe_scope_key(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    key = re.sub(r"[^a-z0-9_-]+", "_", key)
+    return key.strip("_") or "unknown"
+
+
+def _preferences_root(preferences_root: Optional[Path | str] = None) -> Path:
+    if preferences_root is not None:
+        return Path(preferences_root)
+    return Path(os.environ.get("SELECTION_PREFERENCES_ROOT") or DEFAULT_PREFERENCES_ROOT)
+
+
+def scoped_preferences_path(
+    tenant_id: int | str,
+    store: str,
+    *,
+    preferences_root: Optional[Path | str] = None,
+) -> Path:
+    """Return the tenant/store-scoped preference asset path."""
+    tenant_key = _safe_scope_key(tenant_id)
+    store_key = _safe_scope_key(store)
+    return _preferences_root(preferences_root) / f"tenant_{tenant_key}" / f"{store_key}.preferences.jsonl"
 
 
 def _normalize_tags(reason_tags: list[str]) -> list[str]:
@@ -45,6 +72,8 @@ def write_candidate_feedback(
     reason_text: str,
     attributes: Optional[dict[str, Any]] = None,
     run_id: Optional[str] = None,
+    tenant_id: Optional[int] = None,
+    store: Optional[str] = None,
     preferences_path: Path | str = DEFAULT_PREFERENCES_PATH,
 ) -> dict[str, Any]:
     """Append one structured preference event to preferences.jsonl."""
@@ -60,6 +89,8 @@ def write_candidate_feedback(
         "schema_version": 1,
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "run_id": run_id,
+        "tenant_id": tenant_id,
+        "store": store,
         "product_id": product_id,
         "action": action,
         "reason_tags": _normalize_tags(reason_tags),
@@ -73,6 +104,33 @@ def write_candidate_feedback(
     return event
 
 
+def write_scoped_candidate_feedback(
+    *,
+    tenant_id: int,
+    store: str,
+    product_id: str,
+    action: str,
+    reason_tags: list[str],
+    reason_text: str,
+    attributes: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    preferences_root: Optional[Path | str] = None,
+) -> dict[str, Any]:
+    """Append one structured feedback event into a tenant/store-scoped asset."""
+    path = scoped_preferences_path(tenant_id, store, preferences_root=preferences_root)
+    return write_candidate_feedback(
+        product_id=product_id,
+        action=action,
+        reason_tags=reason_tags,
+        reason_text=reason_text,
+        attributes=attributes,
+        run_id=run_id,
+        tenant_id=tenant_id,
+        store=_safe_scope_key(store),
+        preferences_path=path,
+    )
+
+
 def load_preferences(path: Path | str = DEFAULT_PREFERENCES_PATH) -> list[dict[str, Any]]:
     source = Path(path)
     if not source.exists():
@@ -83,6 +141,15 @@ def load_preferences(path: Path | str = DEFAULT_PREFERENCES_PATH) -> list[dict[s
             continue
         out.append(json.loads(line))
     return out
+
+
+def load_scoped_preferences(
+    tenant_id: int | str,
+    store: str,
+    *,
+    preferences_root: Optional[Path | str] = None,
+) -> list[dict[str, Any]]:
+    return load_preferences(scoped_preferences_path(tenant_id, store, preferences_root=preferences_root))
 
 
 def _lower(value: Any) -> str:
