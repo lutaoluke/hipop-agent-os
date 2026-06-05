@@ -416,6 +416,34 @@ TOOLS = [
 
 
 # ── 工具实现（v2 列存：按 tenant_id + entity_alias 过滤）──
+def _rates_from_orders(tid: int, alias: str, sku: str):
+    """从 wf2_orders 聚合 cancel_rate / return_rate。
+    当 wf2_sku 无该行或 cancel_rate/return_rate 为 NULL 时 fallback 到此。
+    返回 (cancel_rate, return_rate)；订单量为 0 时两者均为 None。
+    """
+    rows = _data._fetch("""
+        SELECT
+            COUNT(*)                                             AS total,
+            SUM(CASE WHEN is_cancelled = 0 THEN 1 ELSE 0 END)   AS valid,
+            SUM(CASE WHEN is_cancelled = 1 THEN 1 ELSE 0 END)   AS cancelled,
+            SUM(CASE WHEN is_return    = 1 THEN 1 ELSE 0 END)   AS returned
+        FROM wf2_orders
+        WHERE tenant_id=? AND entity_alias=? AND partner_sku=?
+    """, (tid, alias, sku))
+    if not rows:
+        return None, None
+    r = rows[0]
+    total = r.get("total") or 0
+    if not total:
+        return None, None
+    valid = r.get("valid") or 0
+    cancelled = r.get("cancelled") or 0
+    returned = r.get("returned") or 0
+    cancel_rate = cancelled / total
+    return_rate = (returned / valid) if valid > 0 else None
+    return cancel_rate, return_rate
+
+
 def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
@@ -438,11 +466,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.partner_sku=?
         """, (tid, alias, sku))
         if not rows:
-            out.append({"sku": sku, "found": False})
+            # wf2_sku 无该行：从 wf2_orders fallback 算取消率/退货率
+            cr, rr = _rates_from_orders(tid, alias, sku)
+            if cr is None and rr is None:
+                out.append({"sku": sku, "found": False})
+            else:
+                rates_note = (
+                    "cancel_rate/return_rate 当前不可确认（noon 订单未刷新），不得报 0% 或推断质量稳定"
+                    if (cr is None or rr is None) else None
+                )
+                out.append({
+                    "sku": sku, "found": True,
+                    "cancel_rate": cr, "return_rate": rr,
+                    "rates_note": rates_note,
+                    "rates_source": "wf2_orders_fallback",
+                })
+                refs.append({"table": "wf2_orders", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
             continue
         r = rows[0]
         cancel_rate = r["cancel_rate"]
         return_rate = r["return_rate"]
+        # wf2_sku 有行但 cancel_rate/return_rate 为 NULL：从 wf2_orders 补算
+        if cancel_rate is None or return_rate is None:
+            cr, rr = _rates_from_orders(tid, alias, sku)
+            if cr is not None:
+                cancel_rate = cr
+            if rr is not None:
+                return_rate = rr
         rates_note = (
             "cancel_rate/return_rate 当前不可确认（noon 订单未刷新），不得报 0% 或推断质量稳定"
             if (cancel_rate is None or return_rate is None) else None

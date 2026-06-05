@@ -145,8 +145,8 @@ def _row(conn, partner_sku):
     return dict(r) if r else None
 
 
-def _tool_result_for_sku(sku):
-    """调用 tool_query_sku，隔离 tenant/entity 解析。"""
+def _tool_result_for_sku(sku, entity_alias=None):
+    """调用 tool_query_sku，隔离 tenant/entity 解析。entity_alias 默认 ENTITY_ALIAS。"""
     _stub_anthropic()
     from hipop.server import agent, data as _data
     from unittest.mock import patch
@@ -154,8 +154,9 @@ def _tool_result_for_sku(sku):
     _data.set_current_tenant(TENANT_ID)
     _data.DB_PATH = _TMP_DB
 
+    resolved = entity_alias or ENTITY_ALIAS
     with patch.object(agent, "_get_tenant", return_value=TENANT_ID), \
-         patch.object(agent, "_resolve_entity_alias", return_value=ENTITY_ALIAS):
+         patch.object(agent, "_resolve_entity_alias", return_value=resolved):
         return agent.tool_query_sku([sku], store="KSA")
 
 
@@ -189,8 +190,9 @@ def test_rates_contract():
         f"got {row_before.get('return_rate') if row_before else '---'!r}",
     )
 
-    # 断言 2: tool 层确认 NULL → 返 None 非 0.0，且 rates_note 非空
-    print("[改前：tool 层 — cancel_rate 必须为 None，rates_note 必须有警告]")
+    # 断言 2: tool 层 — wf2_sku cancel_rate 为 NULL 时，从 wf2_orders fallback 返真实比率
+    # 注：改前（merge 前）wf2_sku.cancel_rate=NULL，但 wf2_orders 有数据 → fallback 返真值不报 0%
+    print("[改前：tool 层 — wf2_sku NULL 时 fallback wf2_orders，不报 0% 也不报 found=false]")
     r_before = _tool_result_for_sku(SKU)
     items_before = r_before.get("items", [])
     b = items_before[0] if items_before else {}
@@ -200,18 +202,18 @@ def test_rates_contract():
         f"got {b!r}",
     )
     check(
-        "改前 tool：cancel_rate=None（NULL 不报 0.0）",
-        b.get("cancel_rate") is None,
+        f"改前 tool：cancel_rate 非 None（wf2_orders fallback，不报 0%）≈{EXPECT_CANCEL_RATE:.4f}",
+        _approx(b.get("cancel_rate"), EXPECT_CANCEL_RATE),
         f"got {b.get('cancel_rate')!r}",
     )
     check(
-        "改前 tool：return_rate=None（NULL 不报 0.0）",
-        b.get("return_rate") is None,
+        f"改前 tool：return_rate 非 None（wf2_orders fallback）≈{EXPECT_RETURN_RATE:.4f}",
+        _approx(b.get("return_rate"), EXPECT_RETURN_RATE),
         f"got {b.get('return_rate')!r}",
     )
     check(
-        "改前 tool：rates_note 非空（警告不可确认）",
-        bool(b.get("rates_note")),
+        "改前 tool：rates_note=None（wf2_orders 有真实数据，无需警告）",
+        b.get("rates_note") is None,
         f"got {b.get('rates_note')!r}",
     )
 
@@ -315,16 +317,106 @@ def test_null_guard():
     return check.failures
 
 
+def test_orders_fallback():
+    """关键场景：SKU 在 wf2_orders 有订单但不在 wf2_sku → tool 从 wf2_orders fallback 算真实比率。
+
+    这是 TBB0116A/KSA 生产故障的精确复现：wf2_sku 无该行，wf2_orders 有 270 单。
+    验收标准：tool 返回 found=True + cancel_rate≈1.11% + return_rate≈1.12%，不报 0% 也不报 found=false。
+    """
+    print("== test_orders_fallback (wf2_orders fallback, no wf2_sku row) ==")
+    from hipop.server import data as _data
+    check = _Checker()
+
+    # 用不同的 entity_alias，确保 wf2_sku 里不会有这个 entity 的任何行
+    FB_ALIAS = "smoke_ksa_t04_fb"
+    FB_SKU = "TBB0116A_FB"
+
+    # 确保 schema 已建（复用 _TMP_DB 里已有的 schema）
+    _data.DB_PATH = _TMP_DB
+    conn = _data.conn()
+
+    # 注册 entity
+    conn.execute(
+        "INSERT OR IGNORE INTO sales_entities "
+        "(tenant_id, alias, country, platform, store_name, store_id, currency) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (TENANT_ID, FB_ALIAS, "SA", "Noon", "SMOKE-T04-FB", 9999, "SAR"),
+    )
+
+    # 只插 wf2_orders，不插 wf2_sku（复现 TBB0116A/KSA 生产状态）
+    orders = []
+    for i in range(TOTAL):
+        is_cancelled = 1 if i < CANCEL else 0
+        is_return = 1 if (not is_cancelled and i < CANCEL + RETURNS) else 0
+        orders.append(
+            (TENANT_ID, FB_ALIAS, FB_SKU, f"FB-NR-{i:05d}",
+             "2026-05-01", "completed", is_cancelled, is_return,
+             57.0, 57.0, "SAR")
+        )
+    conn.executemany(
+        "INSERT OR IGNORE INTO wf2_orders "
+        "(tenant_id, entity_alias, partner_sku, item_nr, "
+        " order_date, status, is_cancelled, is_return, "
+        " seller_price, customer_paid, currency) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        orders,
+    )
+    conn.commit()
+
+    # 确认 wf2_sku 确实没有该行（前提断言）
+    row_sku = conn.execute(
+        "SELECT * FROM wf2_sku WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (TENANT_ID, FB_ALIAS, FB_SKU),
+    ).fetchone()
+    check("fallback 前提：wf2_sku 无该行", row_sku is None, f"got {row_sku!r}")
+
+    # 调 tool — 应从 wf2_orders fallback
+    r = _tool_result_for_sku(FB_SKU, entity_alias=FB_ALIAS)
+    items = r.get("items", [])
+    item = items[0] if items else {}
+
+    check("fallback：found=True（wf2_orders 有数据）", item.get("found") is True, f"got {item!r}")
+    check(
+        "fallback：cancel_rate 非 None（不报 0% 也不报 found=false）",
+        item.get("cancel_rate") is not None,
+        f"got {item.get('cancel_rate')!r}",
+    )
+    check(
+        "fallback：return_rate 非 None",
+        item.get("return_rate") is not None,
+        f"got {item.get('return_rate')!r}",
+    )
+    check(
+        f"fallback：cancel_rate ≈ {EXPECT_CANCEL_RATE:.4f} ({EXPECT_CANCEL_RATE*100:.2f}%)",
+        _approx(item.get("cancel_rate"), EXPECT_CANCEL_RATE),
+        f"got {item.get('cancel_rate')!r}",
+    )
+    check(
+        f"fallback：return_rate ≈ {EXPECT_RETURN_RATE:.4f} ({EXPECT_RETURN_RATE*100:.2f}%)",
+        _approx(item.get("return_rate"), EXPECT_RETURN_RATE),
+        f"got {item.get('return_rate')!r}",
+    )
+    check(
+        "fallback：rates_note=None（真实数据，无警告）",
+        item.get("rates_note") is None,
+        f"got {item.get('rates_note')!r}",
+    )
+
+    return check.failures
+
+
 def run():
     failures = []
     failures += test_rates_contract()
     print()
     failures += test_null_guard()
     print()
+    failures += test_orders_fallback()
+    print()
     if failures:
         print(f"✗ {len(failures)} 项断言失败: {failures}")
         return 1
-    print("✓ T04 cancel_rate/return_rate smoke 全过（rates_contract + null_guard）")
+    print("✓ T04 cancel_rate/return_rate smoke 全过（rates_contract + null_guard + orders_fallback）")
     return 0
 
 
