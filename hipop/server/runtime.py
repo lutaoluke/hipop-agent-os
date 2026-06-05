@@ -309,7 +309,7 @@ def find_orphan_tasks() -> list:
     # PG: 用 owner bypass RLS，跨所有 tenant 扫
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    raw = psycopg2.connect(_data.DB_URL, cursor_factory=RealDictCursor)
+    raw = psycopg2.connect(os.environ.get("DB_URL"), cursor_factory=RealDictCursor)
     raw.autocommit = True
     try:
         with raw.cursor() as cur:
