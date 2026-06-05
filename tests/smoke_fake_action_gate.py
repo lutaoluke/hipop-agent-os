@@ -235,6 +235,40 @@ def test_real_query_sku_with_suffix_inventory_passes():
         f"query_sku 合法证据被误报: {warns}"
 
 
+# ── 第6轮（码长指定）：货品/货 + N件库存后缀，及通用 N件库存 ─────────────
+
+def test_sku_plus_id_inventory_caught():
+    """SKU+标识符+有N件库存，data_health_check 不能作证据 → 必须拦。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，SKU ABC 有 30 件库存。",
+        ["data_health_check"],
+        tool_log=[{"name": "data_health_check", "args": {}}],
+    )
+    assert any("hallucinate" in w or "查询" in w or "list_products" in w for w in warns), \
+        f"SKU+标识符库存声明未被拦: {warns}"
+
+
+def test_n_jian_kucun_suffix_caught():
+    """N件库存后缀写法（货品+还有+N件库存），compute_replenishment 不能作证据 → 必须拦。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了补货数据，这批货还有 50 件库存。",
+        ["compute_replenishment"],
+        tool_log=[{"name": "compute_replenishment", "args": {}}],
+    )
+    assert any("hallucinate" in w or "查询" in w or "list_products" in w for w in warns), \
+        f"N件库存后缀写法未被拦: {warns}"
+
+
+def test_sku_id_real_query_passes():
+    """SKU+标识符+有N件库存，真调了 query_sku → 放行。"""
+    _, warns = _safety.sanitize_reply(
+        "我查了你的数据，SKU ABC 有 30 件库存。",
+        ["query_sku"],
+    )
+    assert not any("list_products" in w or "query_sku" in w for w in warns), \
+        f"合法 query_sku 被误报: {warns}"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -262,6 +296,9 @@ if __name__ == "__main__":
         test_sku_quantity_haiyou_suffix_inventory_caught,
         test_sku_quantity_suffix_inventory_with_scope_overview_caught,
         test_real_query_sku_with_suffix_inventory_passes,
+        test_sku_plus_id_inventory_caught,
+        test_n_jian_kucun_suffix_caught,
+        test_sku_id_real_query_passes,
     ]
     failed = 0
     for t in tests:
