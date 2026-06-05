@@ -6,7 +6,7 @@
 from __future__ import annotations
 import json
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # 已知合法域名（可以出现在 reply 里的）
 ALLOWED_DOMAINS = {
@@ -299,7 +299,7 @@ def _get_tool_arg(t: dict, key: str):
             args = json.loads(args)
         except Exception:
             args = {}
-    return args.get(key) if isinstance(args, dict) else None
+    return (args.get(key) or "") if isinstance(args, dict) else ""
 
 
 def _check_inventory_selection_evidence(
@@ -417,6 +417,59 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         reply = sentence_pat.sub(
             "[⚠️ 句子被 _safety 拦掉：未真调 run_workflow，请用 query_sku_live 实时查] ",
             reply,
+        )
+
+    # ── T26 货单负控 ──────────────────────────────────────────────────────────────
+    # Rule A: 没调 query_order_live 却说"我来查货单实时状态/正在查" — 假称在查，直接删句
+    pretend_order_query = re.search(
+        r"(我来查这个货单号的实时状态"
+        r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+        r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+        r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+        r"|查.{0,5}货单.{0,8}实时状态"
+        r"|让我.{0,5}查.{0,10}货单)",
+        reply,
+    )
+    if pretend_order_query and "query_order_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查货单实时状态/正在查货单'但本轮没真调 query_order_live — "
+            "禁止假称在查（T26 货单负控）"
+        )
+        sentence_pat_order = re.compile(
+            r"[^。\n!?]*("
+            r"我来查这个货单号的实时状态"
+            r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+            r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+            r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+            r"|查.{0,5}货单.{0,8}实时状态"
+            r"|让我.{0,5}查.{0,10}货单"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat_order.sub(
+            "[⚠️ 被 _safety 拦掉：未调 query_order_live，不许假称正在查货单] ",
+            reply,
+        )
+
+    # Rule B: query_order_live 返回 order_not_found_in_erp 时，reply 必须明确说未找到
+    order_not_found_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "order_not_found_in_erp"
+    ]
+    if order_not_found_entries and not re.search(
+        r"(未找到|不存在|无物流|找不到|无记录|没有.{0,5}找到|该货单.{0,10}(不|无)|ERP.*无记录|核实货单号)",
+        reply,
+    ):
+        order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
+        order_str = "、".join(filter(None, order_nos)) or "该货单"
+        not_found_prefix = (
+            f"**货单 {order_str} 在 ERP 中无记录**，请核实货单号是否正确。"
+            "当前无物流数据。\n\n"
+        )
+        reply = not_found_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live 返回 order_not_found_in_erp（{order_str}）"
+            "但回复未明确说明未找到，已自动补充负控提示（T26）"
         )
 
     if warnings:

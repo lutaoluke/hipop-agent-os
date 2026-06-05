@@ -1180,7 +1180,12 @@ def tool_query_order_live(order_no: str) -> Dict:
     # 找精确匹配
     match = [o for o in items if (o.get("delivery_order_no") or "").upper() == order_no.upper()]
     if not match:
-        return {"ok": False, "error": "order_not_found_in_erp", "order_no": order_no}
+        return {
+            "ok": False,
+            "error": "order_not_found_in_erp",
+            "order_no": order_no,
+            "message": f"货单号 {order_no} 在 ERP 中无记录，请核实货单号是否正确。",
+        }
     o = match[0]
     forwarder = (o.get("logistics") or {}).get("logistics_name", "")
     tracking = o.get("logistics_bill_no", "")

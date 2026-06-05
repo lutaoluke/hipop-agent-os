@@ -1224,6 +1224,46 @@ def test_selection_feedback_api_requires_login_and_scopes_preferences_by_tenant_
         assert tenant_b_candidate["feedback_status"] == "unreviewed"
 
 
+
+# ── T26 货单负控单元测试（WS-106）──────────────────────────────────────────────
+def test_t26_safety_blocks_pretend_querying_without_tool():
+    """Rule A: Agent 说'我来查货单实时状态'但没调 query_order_live → _safety 拦截。"""
+    from hipop.server._safety import sanitize_reply
+    fake_reply = "我来查这个货单号的实时状态，请稍等。"
+    out, warns = sanitize_reply(fake_reply, tools_used=[], tool_log=[])
+    assert warns, "应有警告"
+    assert any("T26" in w for w in warns), f"警告应含 T26: {warns}"
+    assert "被 _safety 拦掉" in out, f"回复应含拦截标记: {out[:200]}"
+
+
+def test_t26_safety_injects_not_found_when_tool_returned_missing():
+    """Rule B: query_order_live 返回 order_not_found_in_erp 但回复没说未找到 → _safety 补充负控。"""
+    import re as _re
+    from hipop.server._safety import sanitize_reply
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "DGORDER-NOT-EXIST-0001"},
+        "result_error": "order_not_found_in_erp",
+    }]
+    vague_reply = "抱歉，目前无法为您提供该货单的物流信息。"
+    out, warns = sanitize_reply(vague_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns and any("T26" in w for w in warns), f"应有 T26 警告: {warns}"
+    assert _re.search(r"ERP.*无记录|核实货单号|未找到|不存在", out), f"回复应含未找到提示: {out[:300]}"
+
+
+def test_t26_safety_passes_when_reply_already_says_not_found():
+    """Rule B: 如果回复已经明确说了未找到，_safety 不应重复插入。"""
+    from hipop.server._safety import sanitize_reply
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "DGORDER-NOT-EXIST-0001"},
+        "result_error": "order_not_found_in_erp",
+    }]
+    good_reply = "货单 DGORDER-NOT-EXIST-0001 在 ERP 中未找到，请核实货单号是否正确。"
+    out, warns = sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    t26_warns = [w for w in warns if "T26" in w]
+    assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []
