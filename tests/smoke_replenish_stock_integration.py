@@ -28,6 +28,7 @@
     ready=False、status=incomplete、含「不完整」；
   - 红队：源库存 ingest 已 stale,但 rollup 脚本刷新了 wf1_stock.updated_at → 仍 not-ready；
   - 红队：库存行覆盖 95%,但 Noon 只拉到 1% → partial_noon,仍 not-ready；
+  - 红队：Noon 覆盖率 51%（旧 50% 阈值会假绿）→ 新 100% 阈值必须 partial_noon；
   - 完整库存但本周无需补货 → 三条入口 ready=True（rows 空 ≠ 未就绪，不误报）；
   绝不静默给 0 / 假确定建议：未就绪时入口响应本身带 ready=False，不是只在 run_v2 log。
 
@@ -388,6 +389,30 @@ def test_partial_noon_coverage_surfaces_not_ready():
     return check.failures
 
 
+# ── 红队 · Noon 51% 覆盖（> 50% 旧阈值）在 100% 新阈值下必须 partial_noon ─
+def test_51pct_noon_coverage_is_partial_noon():
+    print("== test_51pct_noon_coverage_is_partial_noon (红队: 51% Noon 覆盖不得假绿) ==")
+    check = _Checker()
+    _reset_ksa()
+    fresh_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    for i in range(100):
+        # 51 rows have noon_saleable_qty non-NULL, 49 are NULL → 51% coverage
+        noon_qty = 300 if i < 51 else None
+        _add_sku(f"N51PCT{i:03d}", sales=True, stock=300,
+                 noon_saleable_qty=noon_qty, imported_at=fresh_ts, updated_at=fresh_ts)
+
+    _assert_not_ready_all_entries(check, expect_status="partial_noon", expect_word="noon")
+    st = _view()["stock_status"]
+    check("51% Noon 覆盖必须 partial_noon（not-ready）",
+          st["status"] == "partial_noon" and st["ready"] is False, st)
+    check("noon_pulled_rows=51, noon_coverage=0.51",
+          st["noon_pulled_rows"] == 51 and abs(st.get("noon_coverage", 0) - 0.51) < 0.01, st)
+    wf5 = _run_wf5()
+    check("run_v2 进入计算前硬拦 partial_noon",
+          wf5.get("ok") is False and wf5["skipped"][0]["stock_status"]["status"] == "partial_noon", wf5)
+    return check.failures
+
+
 # ── 就绪态对照：完整库存但本周无需补货 → ready=True（防把正常态误报降级）────
 def test_ready_stock_no_false_positive():
     print("== test_ready_stock_no_false_positive (就绪态对照,空 rows ≠ 未就绪) ==")
@@ -433,6 +458,7 @@ if __name__ == "__main__":
         test_stale_stock_surfaces_not_ready_at_all_entry_points,
         test_rollup_updated_at_does_not_fake_source_freshness,
         test_partial_noon_coverage_surfaces_not_ready,
+        test_51pct_noon_coverage_is_partial_noon,
         test_ready_stock_no_false_positive,
         test_template_surfaces_readiness,
     ]

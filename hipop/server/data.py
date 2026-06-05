@@ -471,7 +471,7 @@ def get_replenishment(store: str, limit: int = 50) -> List[Dict]:
 # 保证降级在每个入口一致呈现、无法旁路。纯确定性：只查表行数 / 覆盖率，不读 prompt。
 _STOCK_READINESS_MIN_ROWS = 20         # 未就绪门槛：wf1_stock 少于 20 行先刷库存
 _STOCK_READINESS_COVERAGE_MIN = 0.95   # 覆盖率门槛：上架 SKU 中有库存行的比例
-_STOCK_READINESS_NOON_COVERAGE_MIN = 0.50  # Noon 拉取覆盖率门槛：上架 SKU 中 noon 可售数非 NULL 的比例
+_STOCK_READINESS_NOON_COVERAGE_MIN = 1.0   # Noon 拉取覆盖率门槛：上架 SKU 中 noon 可售数非 NULL 的比例（要求全覆盖）
 _STOCK_READINESS_MAX_AGE_HOURS = 72    # 时效门槛：源库存 ingest 时间超过 3 天即不可计算
 
 
