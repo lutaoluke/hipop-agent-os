@@ -230,6 +230,17 @@ def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -
     return warns
 
 
+def _is_substantive_action(tool_log: list) -> bool:
+    """list_products(limit=0) 只计数，不算真执行；其他工具调用 = 真执行。"""
+    for t in (tool_log or []):
+        if t.get("name") != "list_products":
+            return True
+        args = t.get("args") or {}
+        if isinstance(args, dict) and args.get("limit", 1) > 0:
+            return True
+    return False
+
+
 def sanitize_reply(reply: str, tools_used: List[str], tool_log=None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []

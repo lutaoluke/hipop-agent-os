@@ -269,6 +269,41 @@ def test_sku_id_real_query_passes():
         f"合法 query_sku 被误报: {warns}"
 
 
+# ── 第7轮（码长指定）：_is_substantive_action 直接覆盖 ──────────────────────
+# fail-then-pass 说明：函数已在 _safety.py 定义，故 import 即可通过；
+# 若函数被删或逻辑退化，断言立即 FAIL。
+
+def test_is_substantive_action_count_only_false():
+    """list_products(limit=0) 单独调用 → _is_substantive_action 返回 False。"""
+    tool_log = [{"name": "list_products", "args": {"limit": 0}}]
+    assert not _safety._is_substantive_action(tool_log), \
+        "limit=0 应返回 False（只计数，非真执行）"
+
+
+def test_is_substantive_action_limit_positive_true():
+    """list_products(limit=20) → _is_substantive_action 返回 True。"""
+    tool_log = [{"name": "list_products", "args": {"limit": 20}}]
+    assert _safety._is_substantive_action(tool_log), \
+        "limit>0 应返回 True（有行返回，是真执行）"
+
+
+def test_is_substantive_action_other_tool_true():
+    """export_table（非 list_products）→ _is_substantive_action 返回 True。"""
+    tool_log = [{"name": "export_table", "args": {}}]
+    assert _safety._is_substantive_action(tool_log), \
+        "非 list_products 工具应返回 True"
+
+
+def test_is_substantive_action_mixed_true():
+    """list_products(limit=0) + export_table 混合 → _is_substantive_action 返回 True。"""
+    tool_log = [
+        {"name": "list_products", "args": {"limit": 0}},
+        {"name": "export_table", "args": {}},
+    ]
+    assert _safety._is_substantive_action(tool_log), \
+        "混合工具（含非 list_products）应返回 True"
+
+
 if __name__ == "__main__":
     tests = [
         test_fake_query_no_tool_caught,
@@ -299,6 +334,10 @@ if __name__ == "__main__":
         test_sku_plus_id_inventory_caught,
         test_n_jian_kucun_suffix_caught,
         test_sku_id_real_query_passes,
+        test_is_substantive_action_count_only_false,
+        test_is_substantive_action_limit_positive_true,
+        test_is_substantive_action_other_tool_true,
+        test_is_substantive_action_mixed_true,
     ]
     failed = 0
     for t in tests:
