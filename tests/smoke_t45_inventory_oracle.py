@@ -35,7 +35,6 @@ PASS（修后 oracle）：
   （也被 make test 自动聚合）
 """
 import re
-import json
 import sys
 import traceback
 from pathlib import Path
@@ -43,6 +42,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+
+from hipop.server import _safety  # noqa: E402
 
 
 # ── T45 S2 内容 oracle（确定性规则）────────────────────────────────────────────
@@ -100,45 +101,24 @@ def _t45_content_oracle(reply: str) -> tuple[bool, list[str]]:
 
 # ── T45 S1 证据门（选品库存约束类回答必须有工具证据）──────────────────────────────
 
-# S1 gate 触发上下文：含选品/库存约束关键词时必须有工具调用证据。
-_S1_INVENTORY_CONTEXT_RE = re.compile(
-    r"库存约束|库存反向约束|本期选品|选品.{0,30}库存"
-)
+def _inventory_gate_warned(warns):
+    """是否出现选品/库存约束证据门告警。"""
+    return any(
+        ("库存" in w or "选品" in w or "list_products" in w or "query_sku" in w)
+        and ("证据" in w or "工具" in w or "未查询" in w or "叙述查过" in w)
+        for w in warns
+    )
 
 
 def _s1_inventory_evidence_gate(reply: str, tool_log: list) -> list[str]:
-    """T45-S1 选品库存约束证据门：确定性函数，不靠 LLM。
+    """T45-S1 选品/库存约束证据门：走真实 _safety.sanitize_reply hook。
 
     当 reply 含选品/库存约束上下文且无 list_products(limit>0) 或 query_sku 工具证据时，
     返回告警列表（非空=被拦截；空=通过）。
-
-    与 _safety.sanitize_reply 中的 _check_inventory_selection_evidence（WS-108）
-    实现相同逻辑，作为 S2 smoke 内的独立确定性 verifier，不依赖 main 分支合并状态。
     """
-    # 不含选品/库存约束上下文 → 不触发
-    if not _S1_INVENTORY_CONTEXT_RE.search(reply):
-        return []
-
-    # 检查工具证据
-    for entry in (tool_log or []):
-        name = entry.get("name", "")
-        if name == "query_sku":
-            return []  # 有 query_sku 证据 → 通过
-        if name == "list_products":
-            args = entry.get("args", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            limit = args.get("limit", 0)
-            if limit and int(limit) > 0:
-                return []  # list_products(limit>0) → 通过
-
-    return [
-        "⚠️ S1 gate: 回答含选品/库存约束上下文，但无 list_products(limit>0) 或 query_sku"
-        " 工具调用证据 — 叙述查过 ≠ 查过"
-    ]
+    tools_used = [entry.get("name", "") for entry in (tool_log or []) if entry.get("name")]
+    _, warns = _safety.sanitize_reply(reply, tools_used, tool_log=tool_log or [])
+    return [w for w in warns if _inventory_gate_warned([w])]
 
 
 # ── fail-then-pass 演示：旧 oracle 误判 ─────────────────────────────────────────
@@ -331,6 +311,43 @@ def test_s1_gate_blocks_claim_without_evidence():
     )
 
 
+def test_gate_catches_yichaxun_claim_no_tool_log():
+    """round-3 红队：含「根据已查询的完整库存数据」但无工具证据 → 必须拦截。"""
+    reply = (
+        "根据已查询的完整库存数据，库存只约束同款同 SKU，"
+        "20寸库存多不影响其他款选品。"
+    )
+    warns = _s1_inventory_evidence_gate(reply, tool_log=[])
+    assert warns, (
+        "S1 gate 应拦截「根据已查询的完整库存数据」但无工具证据的声明，"
+        "不得因为未出现连续的'库存约束'四字而放行"
+    )
+
+
+def test_gate_catches_yilaqu_claim_no_tool_log():
+    """round-3 红队：含「已拉取库存数据」但无工具证据 → 必须拦截。"""
+    reply = (
+        "已拉取库存数据，结论：库存只约束同款同 SKU，"
+        "20寸库存多不影响其他款。"
+    )
+    warns = _s1_inventory_evidence_gate(reply, tool_log=[])
+    assert warns, (
+        "S1 gate 应拦截「已拉取库存数据」但无工具证据的声明，"
+        "不得因缺少选品/库存约束连续关键词而放行"
+    )
+
+
+def test_gate_catches_genjv_data_claim_no_tool_log():
+    """round-3 红队：含「根据完整数据」但无工具证据 → 必须拦截。"""
+    reply = (
+        "根据完整数据，国内仓20寸库存多时，库存只约束同款同 SKU。"
+    )
+    warns = _s1_inventory_evidence_gate(reply, tool_log=[])
+    assert warns, (
+        "S1 gate 应拦截「根据完整数据」但无工具证据的库存判断声明"
+    )
+
+
 def test_s1_gate_allows_with_query_sku_evidence():
     """S1 gate 放行：有 query_sku 工具调用证据 → 不拦截。"""
     reply = (
@@ -470,6 +487,12 @@ if __name__ == "__main__":
          test_new_oracle_rejects_tongkuan_without_sku),
         ("test_s1_gate_blocks_claim_without_evidence",
          test_s1_gate_blocks_claim_without_evidence),
+        ("test_gate_catches_yichaxun_claim_no_tool_log",
+         test_gate_catches_yichaxun_claim_no_tool_log),
+        ("test_gate_catches_yilaqu_claim_no_tool_log",
+         test_gate_catches_yilaqu_claim_no_tool_log),
+        ("test_gate_catches_genjv_data_claim_no_tool_log",
+         test_gate_catches_genjv_data_claim_no_tool_log),
         ("test_s1_gate_allows_with_query_sku_evidence",
          test_s1_gate_allows_with_query_sku_evidence),
         ("test_s1_gate_allows_with_list_products_limit_positive",
