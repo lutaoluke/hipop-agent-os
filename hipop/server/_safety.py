@@ -4,6 +4,7 @@
 让用户看见 Agent 在编造，并在前端展开真相。
 """
 from __future__ import annotations
+import json
 import re
 from typing import List, Optional, Tuple
 
@@ -65,6 +66,13 @@ PRECISE_TIMESTAMP_RE = re.compile(
 TIMEZONE_HINT_RE = re.compile(r"(?:UTC[+-]\d|沙特时间|时区换算|（UTC\+)")
 
 URL_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)(?::\d+)?(/[^\s)\"'>]*)?")
+
+# T45: 选品/库存约束判断必须有工具证据。包含“已查询/已拉取/根据完整数据”
+# 这类数据已取到的声明时，也必须有 query_sku 或 list_products(limit>0) 背书。
+_SELECTION_INVENTORY_GATE_RE = re.compile(
+    r"库存约束|库存反向约束|本期选品|选品.{0,30}库存|库存.{0,8}只.{0,10}约束|"
+    r"已查询.{0,20}库存数据|已拉取.{0,20}库存数据|根据.{0,10}完整数据.{0,40}库存"
+)
 
 
 def _check_urls(text: str) -> List[str]:
@@ -134,6 +142,44 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
     return warns
 
 
+def _get_tool_arg(t: dict, key: str):
+    """从 tool_log 条目安全取 args 里的字段（Anthropic=dict, OpenAI=str）。"""
+    args = t.get("args") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    return args.get(key) if isinstance(args, dict) else None
+
+
+def _check_inventory_selection_evidence(
+    reply: str, tools_used: List[str], tool_log: List
+) -> List[str]:
+    """T45: 选品/库存约束类回答必须有 list_products(limit>0) 或 query_sku 证据。"""
+    if not _SELECTION_INVENTORY_GATE_RE.search(reply):
+        return []
+
+    for t in (tool_log or []):
+        name = t.get("name", "")
+        if name == "query_sku":
+            return []
+        if name == "list_products":
+            limit_raw = _get_tool_arg(t, "limit")
+            try:
+                limit = int(limit_raw) if limit_raw not in (None, "") else 0
+            except (ValueError, TypeError):
+                limit = 0
+            if limit > 0:
+                return []
+
+    return [
+        "⚠️ Agent 回答涉及选品/库存约束或声称已查询库存数据，但没有 "
+        "list_products(limit>0) 或 query_sku 的工具调用证据 — 无法确认，"
+        "叙述查过 ≠ 查过"
+    ]
+
+
 def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
@@ -144,6 +190,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
+    warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)
