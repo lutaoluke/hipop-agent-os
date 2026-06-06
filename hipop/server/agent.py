@@ -1346,7 +1346,7 @@ TOOL_FUNCS = {
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
     "capture_feedback": tool_capture_feedback,
-}
+    }
 
 
 def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
