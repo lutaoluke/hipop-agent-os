@@ -92,8 +92,8 @@ def _finish(task_id: str, state: str, summary: str = "",
     _data.set_current_tenant_to_task(task_id)
     with _data.conn() as c:
         c.execute(
-            "UPDATE tasks SET state=?, finished_at=NOW(), worker_pid=NULL, "
-            "result_summary=? WHERE task_id=?",
+            "UPDATE tasks SET state=?, finished_at=datetime('now','localtime'), "
+            "worker_pid=NULL, result_summary=? WHERE task_id=?",
             (state, summary, task_id),
         )
         c.commit()

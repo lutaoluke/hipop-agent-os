@@ -846,17 +846,19 @@ def tool_notify_via_feishu(message_summary: str, channel: str = "") -> Dict:
 
 
 def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
-    """触发后台工作流。直接复用 api._run_workflow + uuid 生成 task_id，不走 HTTP 自调用。"""
-    from uuid import uuid4
-    import threading
+    """触发后台工作流。
+
+    WS-99 T21-SUB-1：对已注册 Managed Agents runner 的 workflow 走 spawn_task（落 tasks
+    表 + 同步写 queued event），保证任务证据链完整；legacy workflow 仍走 daemon thread。
+    ⚠️ agent.py 受 CODEOWNERS 锁定，本次修改经 PR 审批。
+    """
+    import json as _json
     from . import api as _api
 
     if workflow not in _api.WORKFLOW_REGISTRY:
         return {"ok": False, "error": f"unknown workflow: {workflow}",
                 "valid": list(_api.WORKFLOW_REGISTRY)}
     label, steps, affected = _api.WORKFLOW_REGISTRY[workflow]
-    task_id = uuid4().hex[:8]
-    # 拿当前 chat 的 tenant_id（contextvars 注入），传给后台线程
     tid = _get_tenant()
     sc = _chat_scope.get() or {}
     actor = {
@@ -865,9 +867,30 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         "role": sc.get("current_role"),
         "source": "chat",
     }
-    threading.Thread(
-        target=_api._run_workflow, args=(task_id, workflow, tid, actor), daemon=True,
-    ).start()
+
+    from hipop.runtime import workflow_runners as _runners
+    from . import runtime as _runtime
+    if workflow in _runners.list_runners():
+        # Managed Agents path: durable tasks row + events (same contract as /api/run-workflow)
+        task_id = _runtime.spawn_task(
+            workflow=workflow, tenant_id=tid, actor=actor,
+        )
+        _data.set_current_tenant(tid)
+        _data.write_event(
+            task_id, 1, "初始化", "done",
+            _json.dumps({"workflow": workflow, "label": label,
+                         "affected_modules": affected, "total_steps": len(steps),
+                         "tenant_id": tid,
+                         "runtime": "managed_agents"}, ensure_ascii=False),
+            actor=actor,
+        )
+    else:
+        from uuid import uuid4
+        import threading
+        task_id = uuid4().hex[:8]
+        threading.Thread(
+            target=_api._run_workflow, args=(task_id, workflow, tid, actor), daemon=True,
+        ).start()
     return {
         "ok": True,
         "task_id": task_id,

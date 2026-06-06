@@ -63,12 +63,18 @@ def spawn_task(
     spec: Optional[dict] = None,
     task_id: Optional[str] = None,
 ) -> str:
-    """启动 task。写 spec.json + INSERT tasks 行 + 起 subprocess。
+    """启动 task。写 spec.json + INSERT tasks 行 + 写 queued event + 起 subprocess。
 
     actor: {user_id, email, role, source}  跟 agent_events.actor_* 一致
     spec: 给 worker 的输入（workflow 入参 + chunked progress 起点等）
     task_id: 可选；不给则生成 UUID 8 位。
+
+    WS-99 T21-SUB-1：queued event 在子进程启动前同步写入 agent_events，确保
+    调用方能立即通过 get_events_after 读到 ≥1 durable 任务证据（不靠后台线程）。
     """
+    # Bootstrap SQLite tasks/agent_events schema（PG 模式 no-op）
+    _data._ensure_task_tables()
+
     task_id = task_id or uuid.uuid4().hex[:8]
     paths = _task_paths(task_id)
     _ensure_task_dir(task_id)
@@ -98,6 +104,13 @@ def spawn_task(
         )
         c.commit()
 
+    # 2b. 写 queued event（子进程启动前同步落库 — durable 任务证据，WS-99 T21-SUB-1）
+    _data.write_event(
+        task_id, 0, "任务排队", "queued",
+        json.dumps({"workflow": workflow, "tenant_id": tenant_id}, ensure_ascii=False),
+        actor=actor,
+    )
+
     # 3. 起 subprocess worker（nohup detached，重启 uvicorn 不影响）
     # 用 sys.executable 而非裸 "python3" —— 后者在 PATH 上可能解析到错的 venv（如 homebrew
     # python3.14 没装 anthropic/psycopg2），导致 worker 一启动就 ImportError
@@ -116,7 +129,8 @@ def spawn_task(
     # 4. 更新 tasks.worker_pid + state=running
     with _data.conn() as c:
         c.execute(
-            "UPDATE tasks SET worker_pid=?, state='running', last_heartbeat=NOW() "
+            "UPDATE tasks SET worker_pid=?, state='running', "
+            "last_heartbeat=datetime('now','localtime') "
             "WHERE task_id=?",
             (pid, task_id),
         )
@@ -171,7 +185,8 @@ def wake_task(task_id: str) -> dict:
 
     with _data.conn() as c:
         c.execute(
-            "UPDATE tasks SET worker_pid=?, state='running', last_heartbeat=NOW(), "
+            "UPDATE tasks SET worker_pid=?, state='running', "
+            "last_heartbeat=datetime('now','localtime'), "
             "wake_count=wake_count+1 WHERE task_id=?",
             (new_pid, task_id),
         )
@@ -204,7 +219,8 @@ def kill_task(task_id: str) -> dict:
             pass
     with _data.conn() as c:
         c.execute(
-            "UPDATE tasks SET state='cancelled', finished_at=NOW(), worker_pid=NULL WHERE task_id=?",
+            "UPDATE tasks SET state='cancelled', "
+            "finished_at=datetime('now','localtime'), worker_pid=NULL WHERE task_id=?",
             (task_id,),
         )
         c.commit()
@@ -241,7 +257,8 @@ def heartbeat(task_id: str, message: Optional[str] = None) -> None:
     _data.set_current_tenant_to_task(task_id)
     with _data.conn() as c:
         c.execute(
-            "UPDATE tasks SET last_heartbeat=NOW() WHERE task_id=?", (task_id,)
+            "UPDATE tasks SET last_heartbeat=datetime('now','localtime') WHERE task_id=?",
+            (task_id,),
         )
         c.commit()
 
