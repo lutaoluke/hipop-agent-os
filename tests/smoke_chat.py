@@ -24,6 +24,7 @@ import re
 import time
 import argparse
 import http.cookiejar
+import sqlite3
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -378,11 +379,11 @@ CASES: List[Case] = [
         ],
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
-    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-     # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%。WS-122 后，live 成功时可报实时数；
-     # live/ERP 凭据不可用时必须明确不可得，不能用旧快照 48/51/1967 冒充实时。
-     Case(
-        name="T04 TBB0116A 30d 口径（sales / total / cancel / history 同 DB）",
+    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total
+    # 字段，Agent 只能引用全历史 cancel_rate 或答 0%；改后必须报 30d cancel_rate。
+    # 具体数字在 main() 中从本次 server 使用的 SQLite DB 动态绑定，避免 live fixture 前进导致漂移。
+    Case(
+        name="T04 TBB0116A 30d 口径（runtime DB 绑定）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
@@ -566,6 +567,109 @@ CASES: List[Case] = [
         timeout=120,
     ),
 ]
+
+
+# ── runtime fixture expectations ──────────────────────────
+def _is_t04_tbb0116a_case(c: Case) -> bool:
+    return c.question.startswith("TBB0116A 近 30 天销量")
+
+
+def _int_re(n: int) -> str:
+    raw = str(int(n))
+    comma = f"{int(n):,}"
+    if comma == raw:
+        return rf"\b{re.escape(raw)}\b"
+    loose_comma = re.escape(comma).replace(",", r"[,，]?")
+    return rf"\b(?:{re.escape(raw)}|{loose_comma})\b"
+
+
+def _pct_re(rate: Optional[float]) -> str:
+    if rate is None:
+        return r"暂无|未知|N/A|无"
+    pct = rate * 100.0
+    vals = {f"{pct:.2f}", f"{pct:.1f}"}
+    body = "|".join(re.escape(v) for v in sorted(vals, key=len, reverse=True))
+    return rf"(?:{body})\s*%"
+
+
+def _t04_tbb0116a_expected_from_db() -> dict:
+    db_path = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
+    with sqlite3.connect(db_path) as c:
+        c.row_factory = sqlite3.Row
+        sku = c.execute(
+            """
+            SELECT tenant_id, entity_alias, partner_sku, as_of_date, latest_order_date,
+                   sales_30d, total_orders, cancel_count
+            FROM wf2_sku
+            WHERE tenant_id = 1 AND entity_alias = 'hipop_ksa' AND partner_sku = 'TBB0116A'
+            """,
+        ).fetchone()
+        if not sku:
+            raise RuntimeError(f"T04 fixture missing in {db_path}: wf2_sku hipop_ksa/TBB0116A")
+        as_of = sku["as_of_date"] or sku["latest_order_date"]
+        if not as_of:
+            raise RuntimeError(f"T04 fixture missing as_of_date in {db_path}: hipop_ksa/TBB0116A")
+        stats = c.execute(
+            """
+            SELECT COUNT(*) AS total_30d,
+                   SUM(CASE WHEN is_cancelled = 1 THEN 1 ELSE 0 END) AS cancel_30d,
+                   SUM(CASE WHEN is_return = 1 THEN 1 ELSE 0 END) AS return_30d
+            FROM wf2_orders
+            WHERE tenant_id = ? AND entity_alias = ? AND partner_sku = ?
+              AND order_date >= date(?, '-30 days') AND order_date <= ?
+            """,
+            (sku["tenant_id"], sku["entity_alias"], sku["partner_sku"], as_of, as_of),
+        ).fetchone()
+
+    total_30d = int(stats["total_30d"] or 0)
+    cancel_30d = int(stats["cancel_30d"] or 0)
+    return_30d = int(stats["return_30d"] or 0)
+    valid_30d = total_30d - cancel_30d
+    cancel_rate_30d = (cancel_30d / total_30d) if total_30d else None
+    return_rate_30d = (return_30d / valid_30d) if valid_30d else None
+    history_total = int(sku["total_orders"] or 0)
+    history_cancel_rate = (int(sku["cancel_count"] or 0) / history_total) if history_total else None
+    return {
+        "as_of": as_of,
+        "sales_30d": int(sku["sales_30d"] or 0),
+        "total_30d": total_30d,
+        "cancel_rate_30d": cancel_rate_30d,
+        "return_rate_30d": return_rate_30d,
+        "history_total": history_total,
+        "history_cancel_rate": history_cancel_rate,
+    }
+
+
+def _bind_runtime_expectations(cases: List[Case]) -> Optional[dict]:
+    if not any(_is_t04_tbb0116a_case(c) for c in cases):
+        return None
+    exp = _t04_tbb0116a_expected_from_db()
+    for c in cases:
+        if not _is_t04_tbb0116a_case(c):
+            continue
+        c.name = (
+            "T04 TBB0116A 30d 口径"
+            f"（sales={exp['sales_30d']} / total={exp['total_30d']} / "
+            f"cancel≈{exp['cancel_rate_30d'] * 100:.2f}% / history={exp['history_total']}）"
+        )
+        c.must_contain = [
+            _int_re(exp["sales_30d"]),
+            _int_re(exp["total_30d"]),
+            _pct_re(exp["cancel_rate_30d"]),
+            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
+            _int_re(exp["history_total"]),
+        ]
+        c.must_not_contain = [
+            r"10\.0%|10%",
+            r"取消率.*0\.0%",
+        ]
+        if (
+            exp["history_cancel_rate"] is not None
+            and exp["cancel_rate_30d"] is not None
+            and abs(exp["history_cancel_rate"] - exp["cancel_rate_30d"]) > 0.0005
+        ):
+            c.must_not_contain.append(_pct_re(exp["history_cancel_rate"]))
+    return exp
 
 
 # ── runner ────────────────────────────────────────────────
@@ -868,6 +972,19 @@ def main():
     print(f"Cases: {len(CASES)}\n")
 
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
+    try:
+        t04_exp = _bind_runtime_expectations(cases)
+    except Exception as e:
+        print(f"\n✗ T04 runtime fixture 检查失败：{e}")
+        sys.exit(1)
+    if args.verbose and t04_exp:
+        print(
+            "T04 runtime fixture: "
+            f"as_of={t04_exp['as_of']}, sales={t04_exp['sales_30d']}, "
+            f"total={t04_exp['total_30d']}, cancel={t04_exp['cancel_rate_30d'] * 100:.2f}%, "
+            f"history={t04_exp['history_total']}"
+        )
+
     passed, failed = 0, 0
     failures = []
 
