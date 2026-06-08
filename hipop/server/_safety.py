@@ -6,7 +6,7 @@
 from __future__ import annotations
 import json
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # 已知合法域名（可以出现在 reply 里的）
 ALLOWED_DOMAINS = {
@@ -142,6 +142,155 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
     return warns
 
 
+# 声明对象 -> 能证明该对象被查询过的工具。不要用"任意数据工具"互相背书。
+_CLAIM_TOOL_MAP = {
+    "product_sku": frozenset({"list_products", "query_sku"}),
+    "order": frozenset({"query_order"}),
+    "store_overview": frozenset({"scope_overview", "compute_replenishment", "data_health_check"}),
+}
+
+_QUERY_ACTION_RE = r"(?:我|已)?(?:再次|重新)?(?:查了一下|查了|已查|查好了|拉了|已拉|拉好了|看了|看完了)"
+_SPECIFIC_PRODUCT_INVENTORY_RE = re.compile(
+    r"(?:"
+    r"(?:这个|该|这款|这件|某个)?\s*(?:SKU|sku|商品|产品).{0,6}库存"
+    r"|库存.{0,6}(?:有|还有|剩余|为|是)\s*\d+\s*件"
+    r"|(?:商品|产品)库存.{0,4}(?:都)?正常"
+    r"|(?:SKU|sku|商品|产品).{0,20}(?:有|还有|剩余)\s*\d+\s*件.{0,5}库存"
+    r"|\d+\s*件\s*(?:库存|现货)"
+    r")"
+)
+
+
+def _claim_match(reply: str, keywords: str, gap: int = 15):
+    return re.search(
+        rf"{_QUERY_ACTION_RE}.{{0,{gap}}}(?P<object>{keywords})",
+        reply,
+        re.IGNORECASE,
+    )
+
+
+def _normalize_args(args) -> dict:
+    """Normalize tool args to dict — GPT provider stores raw JSON string, Anthropic stores dict."""
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _limit_is_positive(args: dict) -> bool:
+    try:
+        return int(args.get("limit", 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _list_products_has_rows(tool_log) -> bool:
+    if not tool_log:
+        return False
+    for t in tool_log:
+        if t.get("name") != "list_products":
+            continue
+        args = _normalize_args(t.get("args") or {})
+        if _limit_is_positive(args):
+            return True
+    return False
+
+
+def _has_specific_product_inventory_claim(reply: str) -> bool:
+    return bool(_SPECIFIC_PRODUCT_INVENTORY_RE.search(reply))
+
+
+def _has_claim_evidence(claim_type: str, tools_used: List[str], tool_log=None) -> bool:
+    allowed_tools = _CLAIM_TOOL_MAP[claim_type]
+    tool_names = set(tools_used or [])
+    if tool_log:
+        tool_names.update(t.get("name") for t in tool_log if t.get("name"))
+
+    for tool_name in tool_names:
+        if tool_name not in allowed_tools:
+            continue
+        if tool_name == "list_products":
+            if _list_products_has_rows(tool_log):
+                return True
+            continue
+        return True
+    return False
+
+
+def _check_fake_query_claims(reply: str, tools_used: List[str], tool_log=None) -> List[str]:
+    """检测'声称查了/拉了商品/SKU数据'但无真实工具证据的情况。"""
+    warns = []
+    claimed_product_sku = _claim_match(
+        reply,
+        r"商品|产品|SKU|sku|库存|ERP|erp|全部货|所有货",
+    )
+    claimed_order_query = _claim_match(reply, r"货单|订单|order", gap=10)
+    claimed_store_overview = _claim_match(
+        reply,
+        r"店铺数据|补货数据|数据新鲜度|数据健康|你的数据|数据",
+    )
+    claimed_specific_inventory = _has_specific_product_inventory_claim(reply)
+
+    product_is_primary_claim = (
+        claimed_product_sku
+        and (
+            not claimed_store_overview
+            or claimed_product_sku.start("object") <= claimed_store_overview.start("object")
+        )
+    )
+    product_needs_evidence = product_is_primary_claim or (
+        claimed_store_overview and claimed_specific_inventory
+    )
+    if product_needs_evidence and not _has_claim_evidence("product_sku", tools_used, tool_log):
+        warns.append(
+            "⚠️ Agent 声称已查询/拉取商品或数据，但没有对应工具调用证据"
+            "（list_products with limit>0 或 query_sku 均未调用）— 这是 hallucinate"
+        )
+
+    if claimed_order_query and not _has_claim_evidence("order", tools_used, tool_log):
+        warns.append(
+            "⚠️ Agent 声称已查货单/订单，但没有调用 query_order — 这是 hallucinate"
+        )
+
+    if claimed_store_overview:
+        broad_pos = claimed_store_overview.start("object")
+        has_specific_claim_before_broad = any(
+            m and m.start("object") <= broad_pos
+            for m in (claimed_product_sku, claimed_order_query)
+        )
+        # product_sku evidence (query_sku / list_products) also backs a general data claim
+        has_product_evidence = (
+            claimed_product_sku
+            and _has_claim_evidence("product_sku", tools_used, tool_log)
+        )
+        if (
+            not has_specific_claim_before_broad
+            and not _has_claim_evidence("store_overview", tools_used, tool_log)
+            and not has_product_evidence
+        ):
+            warns.append(
+                "⚠️ Agent 声称已查询/拉取店铺或补货数据，但没有对应工具调用证据"
+                "（scope_overview / compute_replenishment / data_health_check 均未调用）— 这是 hallucinate"
+            )
+    return warns
+
+
+def _is_substantive_action(tool_log: list) -> bool:
+    """list_products(limit=0) 只计数，不算真执行；其他工具调用 = 真执行。"""
+    for t in (tool_log or []):
+        if t.get("name") != "list_products":
+            return True
+        args = _normalize_args(t.get("args") or {})
+        if _limit_is_positive(args):
+            return True
+    return False
+
+
 def _get_tool_arg(t: dict, key: str):
     """从 tool_log 条目安全取 args 里的字段（Anthropic=dict, OpenAI=str）。"""
     args = t.get("args") or {}
@@ -150,7 +299,7 @@ def _get_tool_arg(t: dict, key: str):
             args = json.loads(args)
         except Exception:
             args = {}
-    return args.get(key) if isinstance(args, dict) else None
+    return (args.get(key) or "") if isinstance(args, dict) else ""
 
 
 def _check_inventory_selection_evidence(
@@ -180,17 +329,39 @@ def _check_inventory_selection_evidence(
     ]
 
 
-def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None) -> Tuple[str, List[str]]:
+# 纯数字问题检测：用户只问 X 是多少/分别是多少
+_PURE_NUM_RE = re.compile(r'分别是多少|各.*是多少|是多少\s*$|是多少[？?。，,]')
+# 质量/表现评价词（行级匹配，不用 DOTALL 以免吃掉整表）
+_QUALITY_JUDGMENT_RE = re.compile(
+    r'表现.{0,10}不错|毛利.{0,10}不错|健康.{0,10}不错|正常范围|质量.{0,10}稳定'
+    r'|利润.{0,10}不错|表现良好|不错.{0,10}表现|整体.{0,20}表现|非常健康|很健康'
+    r'|整体.*表现|表现良好'
+)
+
+
+def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None, question: Optional[str] = None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
     if not reply:
         return reply, warnings
+
+    # 纯数字问题质量评价过滤（行级，不用 re.DOTALL 以免吃掉整表）
+    if question and _PURE_NUM_RE.search(question):
+        cutoff_pat = re.compile(r'\n+(?:补充信息|其他信息|额外信息)[：:]')
+        m = cutoff_pat.search(reply)
+        if m:
+            reply = reply[:m.start()]
+        if _QUALITY_JUDGMENT_RE.search(reply):
+            lines = reply.split('\n')
+            lines = [ln for ln in lines if not _QUALITY_JUDGMENT_RE.search(ln)]
+            reply = '\n'.join(lines).strip()
 
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
+    warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)
@@ -245,6 +416,144 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         )
         reply = sentence_pat.sub(
             "[⚠️ 句子被 _safety 拦掉：未真调 run_workflow，请用 query_sku_live 实时查] ",
+            reply,
+        )
+
+    # ── T26 货单负控 ──────────────────────────────────────────────────────────────
+    # Rule A: 没调 query_order_live 却说"我来查货单实时状态/正在查" — 假称在查，直接删句
+    pretend_order_query = re.search(
+        r"(我来查这个货单号的实时状态"
+        r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+        r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+        r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+        r"|查.{0,5}货单.{0,8}实时状态"
+        r"|让我.{0,5}查.{0,10}货单)",
+        reply,
+    )
+    if pretend_order_query and "query_order_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查货单实时状态/正在查货单'但本轮没真调 query_order_live — "
+            "禁止假称在查（T26 货单负控）"
+        )
+        sentence_pat_order = re.compile(
+            r"[^。\n!?]*("
+            r"我来查这个货单号的实时状态"
+            r"|我.{0,6}来.{0,6}查.{0,10}货单.{0,10}实时"
+            r"|正在查.{0,10}货单.{0,10}(状态|物流|实时)"
+            r"|帮.{0,5}查.{0,15}货单.{0,10}实时"
+            r"|查.{0,5}货单.{0,8}实时状态"
+            r"|让我.{0,5}查.{0,10}货单"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat_order.sub(
+            "[⚠️ 被 _safety 拦掉：未调 query_order_live，不许假称正在查货单] ",
+            reply,
+        )
+
+    # Rule B: query_order_live 返回 order_not_found_in_erp 时，reply 必须明确说未找到
+    order_not_found_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "order_not_found_in_erp"
+    ]
+    if order_not_found_entries and not re.search(
+        r"(未找到|不存在|无物流|找不到|无记录|没有.{0,5}找到|该货单.{0,10}(不|无)|ERP.*无记录|核实货单号)",
+        reply,
+    ):
+        order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
+        order_str = "、".join(filter(None, order_nos)) or "该货单"
+        not_found_prefix = (
+            f"**货单 {order_str} 在 ERP 中无记录**，请核实货单号是否正确。"
+            "当前无物流数据。\n\n"
+        )
+        reply = not_found_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live 返回 order_not_found_in_erp（{order_str}）"
+            "但回复未明确说明未找到，已自动补充负控提示（T26）"
+        )
+
+    # ── T26-ext 物流负控扩展：SKU / 跟踪号 ────────────────────────────────────────
+    # Rule C: 没调 query_sku_live 却说"我来查 SKU 物流/在途" — 假称在查，直接删句
+    # re.IGNORECASE 覆盖 sku/SKU/Sku 等大小写变体
+    pretend_sku_query = re.search(
+        r"(我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+        r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
+        r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
+        r"|让我.{0,5}查.{0,10}SKU)",
+        reply,
+        re.IGNORECASE,
+    )
+    if pretend_sku_query and "query_sku_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查 SKU 物流/在途'但本轮没真调 query_sku_live — "
+            "禁止假称在查（T26-ext SKU 负控）"
+        )
+        sentence_pat_sku = re.compile(
+            r"[^。\n!?]*("
+            r"我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+            r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
+            r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
+            r"|让我.{0,5}查.{0,10}SKU"
+            r")[^。\n!?]*[。!?]?",
+            re.IGNORECASE,
+        )
+        reply = sentence_pat_sku.sub(
+            "[⚠️ 被 _safety 拦掉：未调 query_sku_live，不许假称正在查 SKU 物流] ",
+            reply,
+        )
+
+    # Rule D: query_sku_live 返回 sku_no_orders_in_erp 时，reply 必须明确说未找到
+    sku_not_found_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_sku_live"
+        and t.get("result_error") == "sku_no_orders_in_erp"
+    ]
+    if sku_not_found_entries and not re.search(
+        r"(未找到|不存在|无货单|找不到|无记录|没有.{0,5}找到|该SKU.{0,10}(不|无)|ERP.*无记录|无在途|核实.*SKU)",
+        reply,
+    ):
+        sku_nos = [_get_tool_arg(t, "sku") for t in sku_not_found_entries]
+        sku_str = "、".join(filter(None, sku_nos)) or "该 SKU"
+        sku_not_found_prefix = (
+            f"**SKU {sku_str} 在 ERP 中无在途或近期完成货单记录**，请核实 SKU 是否正确。"
+            "当前无物流数据。\n\n"
+        )
+        reply = sku_not_found_prefix + reply
+        warnings.append(
+            f"⚠️ query_sku_live 返回 sku_no_orders_in_erp（{sku_str}）"
+            "但回复未明确说明未找到，已自动补充负控提示（T26-ext SKU）"
+        )
+
+    # Rule E: 没调任何物流查询工具却说"我来查跟踪号" — 假称在查，直接删句
+    # re.IGNORECASE 覆盖 tracking/TRACKING/Tracking 等大小写变体（同 Rule C 做法）
+    pretend_tracking_query = re.search(
+        r"(我.{0,6}来.{0,6}查.{0,15}跟踪.{0,5}(号|状态|物流)"
+        r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
+        r"|帮.{0,5}查.{0,15}跟踪号"
+        r"|让我.{0,5}查.{0,10}跟踪号"
+        r"|我来查.{0,10}tracking"
+        r"|正在查.{0,10}tracking)",
+        reply,
+        re.IGNORECASE,
+    )
+    if pretend_tracking_query and "query_order_live" not in tools_used and "query_sku_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查跟踪号物流'但本轮没真调 query_order_live 或 query_sku_live — "
+            "禁止假称在查跟踪号（T26-ext 跟踪号负控）"
+        )
+        sentence_pat_tracking = re.compile(
+            r"[^。\n!?]*("
+            r"我.{0,6}来.{0,6}查.{0,15}跟踪.{0,5}(号|状态|物流)"
+            r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
+            r"|帮.{0,5}查.{0,15}跟踪号"
+            r"|让我.{0,5}查.{0,10}跟踪号"
+            r"|我来查.{0,10}tracking"
+            r"|正在查.{0,10}tracking"
+            r")[^。\n!?]*[。!?]?",
+            re.IGNORECASE,
+        )
+        reply = sentence_pat_tracking.sub(
+            "[⚠️ 被 _safety 拦掉：未调物流查询工具，不许假称正在查跟踪号] ",
             reply,
         )
 

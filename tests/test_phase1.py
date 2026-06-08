@@ -159,6 +159,41 @@ def test_chat_unknown_sku():
     assert s == 200 and d["reply"]
 
 
+def test_chat_t21_workflow_receipt():
+    """T21-SUB-2 验收：触发物流刷新回复必须三态化，直接回答「是否已创建」并含 task_id/workflow/状态。"""
+    s, b = _post("/api/chat", {
+        "messages": [{"role": "user", "content": "请帮我扫一下 ERP 物流信息，并告诉我是否真的创建了后台任务。"}],
+        "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营", "tenant_id": 1},
+    }, timeout=90)
+    d = json.loads(b)
+    assert s == 200 and d["reply"], f"chat 请求失败或无回复: status={s} body={b[:200]}"
+
+    reply = d["reply"]
+    # ① 直接回答「是否创建」
+    created_phrases = ("已创建", "已受理", "后台任务已", "任务已创建", "未确认")
+    assert any(p in reply for p in created_phrases), (
+        f"回复未直接回答「任务是否创建」（须含其一: {created_phrases}）\n回复: {reply[:300]}"
+    )
+    # ② 含 task_id（6-8 位十六进制）
+    import re
+    assert re.search(r"[0-9a-f]{6,8}", reply), (
+        f"回复未包含 task_id（6-8位十六进制）\n回复: {reply[:300]}"
+    )
+    # ③ 含 workflow 名称
+    assert "wf3_logistics_v2" in reply, (
+        f"回复未包含 workflow 名称 wf3_logistics_v2\n回复: {reply[:300]}"
+    )
+    # ④ 含三态状态词
+    state_words = ("已排队", "待执行", "已开始", "已完成", "执行失败", "已受理", "未确认")
+    assert any(w in reply for w in state_words), (
+        f"回复不含三态状态词（须含其一: {state_words}）\n回复: {reply[:300]}"
+    )
+    # ⑤ 无完成事件时不暗示已完成
+    assert "已跑完" not in reply and "跑完了" not in reply, (
+        f"回复不应暗示已完成（「已跑完」/「跑完了」）\n回复: {reply[:300]}"
+    )
+
+
 def test_chat_feedback_offer_on_out_of_scope():
     """WS-26 验收①：撞到做不了/超范围的事，回复必含一句『记成需求』offer。"""
     s, b = _post("/api/chat", {
@@ -1187,6 +1222,47 @@ def test_selection_feedback_api_requires_login_and_scopes_preferences_by_tenant_
         tenant_b_candidate = apply_preferences_to_candidate_pool(pool, tenant_b_preferences)["candidates"][0]
         assert tenant_a_candidate["feedback_status"] == "rejected_by_preference"
         assert tenant_b_candidate["feedback_status"] == "unreviewed"
+
+
+
+# ── T26 货单负控单元测试（WS-106）──────────────────────────────────────────────
+def test_t26_safety_blocks_pretend_querying_without_tool():
+    """Rule A: Agent 说'我来查货单实时状态'但没调 query_order_live → _safety 拦截。"""
+    from hipop.server._safety import sanitize_reply
+    fake_reply = "我来查这个货单号的实时状态，请稍等。"
+    out, warns = sanitize_reply(fake_reply, tools_used=[], tool_log=[])
+    assert warns, "应有警告"
+    assert any("T26" in w for w in warns), f"警告应含 T26: {warns}"
+    assert "被 _safety 拦掉" in out, f"回复应含拦截标记: {out[:200]}"
+
+
+def test_t26_safety_injects_not_found_when_tool_returned_missing():
+    """Rule B: query_order_live 返回 order_not_found_in_erp 但回复没说未找到 → _safety 补充负控。"""
+    import re as _re
+    from hipop.server._safety import sanitize_reply
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "DGORDER-NOT-EXIST-0001"},
+        "result_error": "order_not_found_in_erp",
+    }]
+    vague_reply = "抱歉，目前无法为您提供该货单的物流信息。"
+    out, warns = sanitize_reply(vague_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns and any("T26" in w for w in warns), f"应有 T26 警告: {warns}"
+    assert _re.search(r"ERP.*无记录|核实货单号|未找到|不存在", out), f"回复应含未找到提示: {out[:300]}"
+
+
+def test_t26_safety_passes_when_reply_already_says_not_found():
+    """Rule B: 如果回复已经明确说了未找到，_safety 不应重复插入。"""
+    from hipop.server._safety import sanitize_reply
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "DGORDER-NOT-EXIST-0001"},
+        "result_error": "order_not_found_in_erp",
+    }]
+    good_reply = "货单 DGORDER-NOT-EXIST-0001 在 ERP 中未找到，请核实货单号是否正确。"
+    out, warns = sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    t26_warns = [w for w in warns if "T26" in w]
+    assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
 
 
 if __name__ == "__main__":
