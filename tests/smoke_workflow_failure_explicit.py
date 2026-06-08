@@ -279,6 +279,30 @@ def test_chat_panel_uses_workflow_tasks():
         "chat_panel.html 缺少 attachTask 调用"
 
 
+# ── round-5: smoke_chat 契约同步 + 任务卡点击详情接线 ─────────────────────────
+
+def test_smoke_chat_uses_workflow_tasks_not_single():
+    """smoke_chat.py expected_workflow 检查已改为读 workflow_tasks list（非旧 workflow_task dict）。"""
+    path = os.path.join(HERE, "smoke_chat.py")
+    with open(path) as f:
+        src = f.read()
+    assert "workflow_tasks" in src, \
+        "smoke_chat.py 未更新为 workflow_tasks（chat smoke 对新契约无保护）"
+    assert 'resp.get("workflow_task") or {}' not in src, \
+        "smoke_chat.py 仍用旧 workflow_task dict，chat smoke 会对 workflow_tasks list 误判为空"
+
+
+def test_chat_panel_task_card_has_click_handler():
+    """chat_panel.html 任务卡有 @click 点击详情处理（验收：XX 可点击查看详情）。"""
+    path = os.path.join(os.path.dirname(HERE), "hipop", "server", "templates", "partials", "chat_panel.html")
+    with open(path) as f:
+        src = f.read()
+    assert "@click" in src, \
+        "chat_panel.html 任务卡缺少 @click 点击详情入口（验收：XX 可点击查看详情）"
+    assert "/api/tasks/" in src, \
+        "chat_panel.html @click 未路由到 /api/tasks/ 任务详情端点"
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_workflow_name_dict_args,
@@ -308,6 +332,9 @@ if __name__ == "__main__":
         test_agent_returns_workflow_tasks_not_single,
         test_provider_appends_failed_task_to_list,
         test_chat_panel_uses_workflow_tasks,
+        # round-5: chat smoke 契约同步 + 任务卡点击详情
+        test_smoke_chat_uses_workflow_tasks_not_single,
+        test_chat_panel_task_card_has_click_handler,
     ]
     failed = 0
     for t in tests:

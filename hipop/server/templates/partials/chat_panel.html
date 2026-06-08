@@ -32,8 +32,11 @@
             <span x-html="formatContent(m.content)"></span>
             <template x-for="(t, ti) in (m.tasks && m.tasks.length ? m.tasks : (m.task ? [m.task] : []))" :key="ti">
               <div style="margin-top:6px;padding:6px 8px;background:var(--bg-tertiary);border-radius:6px;font-size:11.5px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
-                  <span style="font-weight:600;"><span x-text="t.ok === false ? '✗' : '⚙️'"></span> <span x-text="t.label || t.workflow"></span></span>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;"
+                     :style="t.task_id ? 'cursor:pointer;' : ''"
+                     :title="t.task_id ? '点击查看任务详情' : ''"
+                     @click="t.task_id && window.open('/api/tasks/' + t.task_id, '_blank')">
+                  <span style="font-weight:600;"><span x-text="t.ok === false ? '✗' : '⚙️'"></span> <span x-text="t.label || t.workflow"></span><span x-show="t.task_id" style="font-size:9.5px;color:var(--text-tertiary);margin-left:4px;" x-text="'#' + (t.task_id || '')"></span></span>
                   <span style="color:var(--text-tertiary);" x-text="t.ok === false ? '启动失败' : (t.done_count + '/' + t.total_steps + (t.finished ? (t.ok ? ' ✓' : ' ✗') : ' …'))"></span>
                 </div>
                 <template x-if="t.ok === false && t.error">

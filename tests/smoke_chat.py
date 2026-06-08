@@ -96,23 +96,22 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1799 /
-    #   listed_sku 1046 / unlisted_sku 753 / listed_prod 950 / unlisted_prod 474，
+    #   SUM(is_listed=1)=listed。2026-06-08 验门 PG 复核：product 1424 / SKU 1798 /
+    #   listed_sku 1046，
     #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
     #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
-    #   +1 SKU: STALE_TST001（is_listed=0, product_id=NULL）测试夹具已入库。
     Case(
-        name="商品总数（要 1424 product / 1799 SKU）",
+        name="商品总数（要 1424 product / 1798 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"1[,，]?799"],
+        must_contain=[r"1[,，]?424", r"1[,，]?798"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1046/752 或 product 维度 950/494）",
+        name="商品总数 + 上架未上架细分（SKU 维度 1046 在售）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        # 1424 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
-        must_contain=[r"1[,，]?424", r"1[,，]?046|752|950|494"],
+        # 1424 product 总数 + 在售 SKU 数（1046）
+        must_contain=[r"1[,，]?424", r"1[,，]?046"],
     ),
     # ─── 概览类 ───
     Case(
@@ -361,13 +360,17 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
             reasons.append(f"reply 含禁忌词: {bw!r}")
 
     if c.expected_workflow:
-        wt = resp.get("workflow_task") or {}
-        wf = wt.get("workflow") or ""
-        if not wf:
-            reasons.append("未真触发任何 workflow（workflow_task 为空）")
-        elif wf != c.expected_workflow:
+        # T36-S3 round-4: backend now returns workflow_tasks (list); backward-compat old dict
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        found = next((t for t in wf_tasks if t.get("workflow") == c.expected_workflow), None)
+        if not wf_tasks:
+            reasons.append("未真触发任何 workflow（workflow_tasks 为空）")
+        elif not found:
+            wf_names = [t.get("workflow", "?") for t in wf_tasks]
             reasons.append(
-                f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"
+                f"选错 workflow: {wf_names!r}（应精确含 {c.expected_workflow!r}；"
                 "老 wf3 / 其它 v2 工作流都=选错）")
 
     if c.must_warn and not warns:
