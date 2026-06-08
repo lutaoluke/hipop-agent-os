@@ -105,6 +105,20 @@ def _live_fetch(sql, params=()):
         con.close()
 
 
+def _skip_if_live_db_unavailable():
+    """若 CI 环境无法访问 live DB，skip 该测试。"""
+    db_path = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
+    if not os.path.exists(db_path):
+        return True
+    try:
+        con = sqlite3.connect(db_path)
+        con.execute("SELECT 1")
+        con.close()
+        return False
+    except Exception:
+        return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test 1: compute_replenishment 工具引用的表/字段是 wf5_sales_cycle.weekly_total_replenish
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +166,10 @@ def test_authoritative_field_is_weekly_total_replenish():
 # ═══════════════════════════════════════════════════════════════════════════════
 def test_wf5_source_chain_fields_exist():
     """wf5_sales_cycle 的三类上游表字段都在线上 DB 里存在，且 wf_sales_cycle.py 真读它们。"""
+    if _skip_if_live_db_unavailable():
+        print("⊘ test_wf5_source_chain_fields_exist (live DB unavailable, skipped in CI)")
+        return
+
     wf5_cycle_path = os.path.join(REPO, "hipop", "workflows", "wf_sales_cycle.py")
     assert os.path.exists(wf5_cycle_path), f"缺 wf_sales_cycle.py: {wf5_cycle_path}"
     wf5_src = open(wf5_cycle_path, encoding="utf-8").read()
@@ -196,6 +214,10 @@ def test_tbu0010a_in_wf2_absent_in_wf5_ksa():
     不会出现在 compute_replenishment 的 Top N。
     S1 修复验收：本 test 在修复后应翻红——TBU0010A 必须被加进 wf5_sales_cycle KSA。
     """
+    if _skip_if_live_db_unavailable():
+        print("⊘ test_tbu0010a_in_wf2_absent_in_wf5_ksa (live DB unavailable, skipped in CI)")
+        return
+
     # wf2_sku (hipop_ksa) 有这个 SKU（上架在列）
     wf2_rows = _live_fetch(
         "SELECT partner_sku, is_listed, sales_30d FROM wf2_sku "
@@ -229,6 +251,10 @@ def test_sab0433a_in_wf2_absent_in_wf5_ksa():
     同 test_tbu0010a_in_wf2_absent_in_wf5_ksa 逻辑。
     S1 修复验收：本 test 在修复后应翻红——SAB0433A 必须被加进 wf5_sales_cycle KSA。
     """
+    if _skip_if_live_db_unavailable():
+        print("⊘ test_sab0433a_in_wf2_absent_in_wf5_ksa (live DB unavailable, skipped in CI)")
+        return
+
     wf2_rows = _live_fetch(
         "SELECT partner_sku, is_listed, sales_30d FROM wf2_sku "
         "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
@@ -261,6 +287,10 @@ def test_tbn0201a_not_in_ksa_entity():
     T29 体验里的 2040 件是来自不同数据快照/路径的异常值，不与 TBU0010A/SAB0433A
     处于同一口径。
     """
+    if _skip_if_live_db_unavailable():
+        print("⊘ test_tbn0201a_not_in_ksa_entity (live DB unavailable, skipped in CI)")
+        return
+
     # wf2_sku KSA: TBN0201A 不存在（它不是 KSA 已上架 SKU）
     wf2_rows = _live_fetch(
         "SELECT partner_sku, entity_alias FROM wf2_sku "
@@ -301,6 +331,10 @@ def test_entry_point_respects_stock_readiness_gate():
     wf5 里有 P51* 行，但工作台实际对运营展示 rows=[]，不是 P51* Top 5。
     S1 修复并刷新库存后本 test 走 ready 分支，无需修改断言。
     """
+    if _skip_if_live_db_unavailable():
+        print("⊘ test_entry_point_respects_stock_readiness_gate (live DB unavailable, skipped in CI)")
+        return
+
     import importlib
     import hipop.server.data as data_mod
     importlib.reload(data_mod)
