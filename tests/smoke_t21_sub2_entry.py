@@ -14,12 +14,17 @@ FAIL 条件（修前）：
 PASS 条件（修后）：
   chat() 回复含 task_id + wf3_logistics_v2 + 状态词（三态之一）
   且无「已跑完」/「跑完了」
+
+CI 说明：
+  governance.decide 被 mock 为 Allow，跳过 Haiku LLM 调用（CI 无 API key）。
+  缺 anthropic SDK 时显式 FAIL，不 SKIP。
 """
 
 import sys
 import re
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -44,22 +49,26 @@ def _setup():
 def test_chat_entry_t21_workflow_receipt():
     """chat() 物流消息走确定性路由，回复必须含 task_id + workflow_name + 状态词。
 
-    FAIL (before fix): 回复「已触发物流刷新…跑完后…」— 无 task_id，无状态词。
-    PASS (after fix):  三态回执含 task_id、wf3_logistics_v2、已排队/已受理等状态词。
+    governance.decide → Allow（mock），跳过 CI 环境无 API key 的 Haiku 调用。
+    缺 anthropic 时 ImportError 显式 FAIL（不 SKIP）。
 
-    agent.py 依赖 anthropic SDK；在缺少该依赖的 CI 环境里 skip 而不报错。
+    FAIL (before fix): 回复「已触发物流刷新…跑完后…」— 无 task_id，无状态词。
+    PASS (after fix):  三态回执含 task_id、wf3_logistics_v2、已受理/已排队等状态词。
     """
-    try:
-        from hipop.server.agent import chat
-    except ImportError as e:
-        print(f"    SKIP (missing dep: {e})")
-        return
+    if _TMP_DB is None:
+        _setup()
+
+    from hipop.server.agent import chat
+    from hipop.server.governance import Decision
 
     messages = [{"role": "user", "content": "请帮我扫一下 ERP 物流信息，并告诉我是否真的创建了后台任务。"}]
-    # HTTP API overrides current_role with auth user's English role; use "ops" directly here.
     scope = {"store": "KSA", "current_user": "tester", "current_role": "ops", "tenant_id": 1}
 
-    result = chat(messages, scope)
+    # mock governance.decide → Allow，绕过 CI 无 API key 的 Haiku 裁决调用
+    with patch("hipop.server.governance.decide",
+               return_value=Decision(kind="Allow", reason="test-allow")):
+        result = chat(messages, scope)
+
     assert isinstance(result, dict), f"chat() 应返回 dict，实际: {type(result)}"
     reply = result.get("reply", "")
     assert reply, f"chat() 回复为空: result={result}"
