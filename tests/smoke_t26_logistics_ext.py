@@ -91,6 +91,33 @@ def test_t26ext_tracking_safety_no_false_positive_when_tool_called():
     assert not t26ext_warns, f"已调工具时不应触发跟踪号误报: {t26ext_warns}"
 
 
+# ── T26-ext 大小写变体负控 (WS-114 round-5) ──────────────────────────────────
+
+def test_t26ext_lowercase_sku_fake_query_blocked():
+    """Rule C: 小写 sku 假查话术（'我来查这个sku的在途'/'正在查 sku 物流状态'）必须被拦截。"""
+    from hipop.server._safety import sanitize_reply
+    for phrase in [
+        "我来查这个sku的在途物流状态，请稍等。",
+        "正在查 sku 物流状态。",
+    ]:
+        out, warns = sanitize_reply(phrase, tools_used=[], tool_log=[])
+        assert any("T26-ext SKU" in w for w in warns), \
+            f"小写 sku 假查应触发 T26-ext SKU 警告 ('{phrase}'): {warns}"
+        assert "被 _safety 拦掉" in out, \
+            f"小写 sku 假查应被拦截 ('{phrase}'): {out[:200]}"
+
+
+def test_t26ext_lowercase_tracking_fake_query_blocked():
+    """Rule E: '正在查 tracking 号' 无工具调用时必须被拦截。"""
+    from hipop.server._safety import sanitize_reply
+    fake_reply = "正在查 tracking 号。"
+    out, warns = sanitize_reply(fake_reply, tools_used=[], tool_log=[])
+    assert any("T26-ext 跟踪号" in w for w in warns), \
+        f"'正在查 tracking 号' 应触发 T26-ext 跟踪号警告: {warns}"
+    assert "被 _safety 拦掉" in out, \
+        f"'正在查 tracking 号' 应被拦截: {out[:200]}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -100,6 +127,8 @@ if __name__ == "__main__":
         test_t26ext_sku_safety_no_false_positive_when_sku_has_orders,
         test_t26ext_tracking_safety_blocks_pretend_querying_without_tool,
         test_t26ext_tracking_safety_no_false_positive_when_tool_called,
+        test_t26ext_lowercase_sku_fake_query_blocked,
+        test_t26ext_lowercase_tracking_fake_query_blocked,
     ]
     failed = 0
     for t in tests:
