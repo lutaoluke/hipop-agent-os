@@ -1,4 +1,4 @@
-"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 5)
+"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 6)
 
 验收：chat 查询 / 工作流执行 / 状态回读 三条热点路径在同一分类框架下可区分，
 且无真实证据时旁路宣称被拦截。
@@ -6,18 +6,21 @@
 三条路径定义（_chat_boundary.py）：
   QUERY           — 读工具证据 (query_sku / list_products 等)
   WORKFLOW_TRIGGER — run_workflow → tasks 表落行 → task_id
-  TASK_READBACK   — task_result/task_status_readback status=done 证明任务完成
+  TASK_READBACK   — get_task_with_events / task_result / task_status_readback
+                    返回真实 done/success 状态，证明任务完成
 
 FAIL 条件（修前 round-2）：
   - "已经刷新" / "已更新" / "刷新已完成" 变体未被 _COMPLETION_BYPASS_RE 捕获
   - classify_evidence 对 task_status_readback/task_result(done) 返回 NONE
 
-PASS 条件（修后 round-5）：
+PASS 条件（修后 round-6）：
   - 三种正则变体均被拦截（已经刷新/已更新/刷新已完成）
   - classify_evidence 对有 done 状态的 task_done_tools 返回 TASK_READBACK
   - sanitize_reply 在 run_workflow 单独存在时拦截所有变体
   - round-1~4 验门人 probes 全部作为回归 smoke；run_workflow only 不放行
     任何"完成了/搞定了/处理好了"类声明
+  - round-6 新增"结束了/完毕/处理完"变体，且 TASK_READBACK 用真实
+    get_task_with_events 返回形状证明，不靠 provider 的 result_keys 摘要洗白
 """
 
 from __future__ import annotations
@@ -653,27 +656,134 @@ def test_no_false_positive_query_hao_le_words():
         assert not warns, f"误报：{reply!r} 不应触发任务完成声明拦截，实得 warns={warns}"
 
 
+# ── Round-6 fail-then-pass: 结束了/完毕/处理完 + real readback ────────────────
+
+ROUND6_REVIEWER_PROBES = (
+    "数据刷新结束了。",
+    "库存更新结束了。",
+    "任务执行完毕。",
+    "数据已处理完。",
+    "数据处理完了。",
+    "库存更新完毕。",
+    "任务执行结束了。",
+    "工作流执行完毕。",
+)
+
+
+def test_round6_completion_tails_block_run_workflow_only():
+    """round-6 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-5）：结束了 / 完毕 / 处理完 这些完成态尾词未命中，返回 warns=[]。
+    PASS（round-6）：仍需真实任务完成 readback；run_workflow 只算任务创建。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND6_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-6 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round6_completion_tails_block_no_tool():
+    """同一 round-6 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND6_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-6 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round6_exact_probes():
+    """sanitize_reply 整合：round-6 exact probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for reply in (
+        "数据刷新结束了。",
+        "库存更新结束了。",
+        "任务执行完毕。",
+        "数据已处理完。",
+    ):
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-6 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def _done_readback_tool_log():
+    """Production readback shape: same payload family as data.get_task_with_events/API /tasks."""
+    return [{
+        "name": "get_task_with_events",
+        "args": {"task_id": "aabb1234"},
+        "result": {
+            "task_id": "aabb1234",
+            "task": {"task_id": "aabb1234", "state": "done"},
+            "events": [{"step_no": 1, "status": "done"}],
+        },
+        "result_keys": ["task_id", "task", "events"],
+    }]
+
+
+def test_classify_real_task_readback_done_shape():
+    """真实 get_task_with_events 返回形状 status=done → TASK_READBACK。"""
+    tool_log = _done_readback_tool_log()
+    assert _has_task_done_evidence(tool_log), "get_task_with_events done 形状应算完成证据"
+    cls = classify_evidence(tool_log)
+    assert cls == EvidenceClass.TASK_READBACK, (
+        f"真实任务回读 done 应分类为 TASK_READBACK，实得 {cls}"
+    )
+
+
+def test_result_keys_only_is_not_task_done_evidence():
+    """provider 摘要 result_keys 不能洗白完成态声明；必须有真实 status/state。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        {"name": "get_task_with_events", "args": {"task_id": "aabb1234"},
+         "result_keys": ["task_id", "task", "events"]},
+    ]
+    assert not _has_task_done_evidence(tool_log), (
+        "只有 result_keys 摘要、没有 task.state/events.status 时不应算完成证据"
+    )
+    assert classify_evidence(tool_log) == EvidenceClass.WORKFLOW_TRIGGER
+    warns = check_task_completion_bypass("任务执行完毕。", tool_log)
+    assert warns, "result_keys-only readback 不应放行'任务执行完毕'"
+
+
+def test_round6_completion_allowed_with_real_task_readback():
+    """正路：真实 task readback done 时，round-6 完成声明允许通过。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ("任务执行完毕。", "数据刷新结束了。", "数据已处理完。"):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
     """关键：三条路径通过 tool_log 可区分，不靠 LLM 自述。"""
     q_cls = classify_evidence([{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}])
     wf_cls = classify_evidence([{"name": "run_workflow", "task_id": "aabb1234"}])
+    rb_cls = classify_evidence(_done_readback_tool_log())
     none_cls = classify_evidence([])
 
     assert q_cls != wf_cls
-    assert q_cls != none_cls
-    assert wf_cls != none_cls
+    assert q_cls != rb_cls
+    assert wf_cls != rb_cls
     assert q_cls == EvidenceClass.QUERY
     assert wf_cls == EvidenceClass.WORKFLOW_TRIGGER
+    assert rb_cls == EvidenceClass.TASK_READBACK
     assert none_cls == EvidenceClass.NONE
-    print(f"    三路径: QUERY={q_cls.value}, WF={wf_cls.value}, NONE={none_cls.value} — 可区分 ✓")
+    print(
+        f"    三路径: QUERY={q_cls.value}, WF={wf_cls.value}, "
+        f"READBACK={rb_cls.value}, NONE={none_cls.value} — 可区分 ✓"
+    )
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 5)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 6)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -779,6 +889,19 @@ if __name__ == "__main__":
          test_round5_completion_claims_allowed_with_task_done_evidence),
         ("test_no_false_positive_query_hao_le_words",
          test_no_false_positive_query_hao_le_words),
+        # Round-6 fail-then-pass: 结束了/完毕/处理完 + real readback
+        ("test_round6_completion_tails_block_run_workflow_only",
+         test_round6_completion_tails_block_run_workflow_only),
+        ("test_round6_completion_tails_block_no_tool",
+         test_round6_completion_tails_block_no_tool),
+        ("test_sanitize_reply_round6_exact_probes",
+         test_sanitize_reply_round6_exact_probes),
+        ("test_classify_real_task_readback_done_shape",
+         test_classify_real_task_readback_done_shape),
+        ("test_result_keys_only_is_not_task_done_evidence",
+         test_result_keys_only_is_not_task_done_evidence),
+        ("test_round6_completion_allowed_with_real_task_readback",
+         test_round6_completion_allowed_with_real_task_readback),
     ]
 
     failed = 0
