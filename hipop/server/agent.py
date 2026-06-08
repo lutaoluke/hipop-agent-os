@@ -1114,6 +1114,13 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     finally:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
+    if not in_transit and not completed:
+        return {
+            "ok": False,
+            "error": "sku_no_orders_in_erp",
+            "sku": sku,
+            "message": f"SKU {sku} 在 ERP 中无在途或近期完成货单记录，请核实 SKU 是否正确。",
+        }
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
     in_transit_out = []
     for o in in_transit[:15]:

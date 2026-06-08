@@ -472,6 +472,83 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "但回复未明确说明未找到，已自动补充负控提示（T26）"
         )
 
+    # ── T26-ext 物流负控扩展：SKU / 跟踪号 ────────────────────────────────────────
+    # Rule C: 没调 query_sku_live 却说"我来查 SKU 物流/在途" — 假称在查，直接删句
+    pretend_sku_query = re.search(
+        r"(我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+        r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
+        r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
+        r"|让我.{0,5}查.{0,10}SKU)",
+        reply,
+    )
+    if pretend_sku_query and "query_sku_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查 SKU 物流/在途'但本轮没真调 query_sku_live — "
+            "禁止假称在查（T26-ext SKU 负控）"
+        )
+        sentence_pat_sku = re.compile(
+            r"[^。\n!?]*("
+            r"我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+            r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
+            r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
+            r"|让我.{0,5}查.{0,10}SKU"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat_sku.sub(
+            "[⚠️ 被 _safety 拦掉：未调 query_sku_live，不许假称正在查 SKU 物流] ",
+            reply,
+        )
+
+    # Rule D: query_sku_live 返回 sku_no_orders_in_erp 时，reply 必须明确说未找到
+    sku_not_found_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_sku_live"
+        and t.get("result_error") == "sku_no_orders_in_erp"
+    ]
+    if sku_not_found_entries and not re.search(
+        r"(未找到|不存在|无货单|找不到|无记录|没有.{0,5}找到|该SKU.{0,10}(不|无)|ERP.*无记录|无在途|核实.*SKU)",
+        reply,
+    ):
+        sku_nos = [_get_tool_arg(t, "sku") for t in sku_not_found_entries]
+        sku_str = "、".join(filter(None, sku_nos)) or "该 SKU"
+        sku_not_found_prefix = (
+            f"**SKU {sku_str} 在 ERP 中无在途或近期完成货单记录**，请核实 SKU 是否正确。"
+            "当前无物流数据。\n\n"
+        )
+        reply = sku_not_found_prefix + reply
+        warnings.append(
+            f"⚠️ query_sku_live 返回 sku_no_orders_in_erp（{sku_str}）"
+            "但回复未明确说明未找到，已自动补充负控提示（T26-ext SKU）"
+        )
+
+    # Rule E: 没调任何物流查询工具却说"我来查跟踪号" — 假称在查，直接删句
+    pretend_tracking_query = re.search(
+        r"(我.{0,6}来.{0,6}查.{0,15}跟踪.{0,5}(号|状态|物流)"
+        r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
+        r"|帮.{0,5}查.{0,15}跟踪号"
+        r"|让我.{0,5}查.{0,10}跟踪号"
+        r"|我来查.{0,10}[Tt]racking)",
+        reply,
+    )
+    if pretend_tracking_query and "query_order_live" not in tools_used and "query_sku_live" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 说'我来查跟踪号物流'但本轮没真调 query_order_live 或 query_sku_live — "
+            "禁止假称在查跟踪号（T26-ext 跟踪号负控）"
+        )
+        sentence_pat_tracking = re.compile(
+            r"[^。\n!?]*("
+            r"我.{0,6}来.{0,6}查.{0,15}跟踪.{0,5}(号|状态|物流)"
+            r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
+            r"|帮.{0,5}查.{0,15}跟踪号"
+            r"|让我.{0,5}查.{0,10}跟踪号"
+            r"|我来查.{0,10}[Tt]racking"
+            r")[^。\n!?]*[。!?]?",
+        )
+        reply = sentence_pat_tracking.sub(
+            "[⚠️ 被 _safety 拦掉：未调物流查询工具，不许假称正在查跟踪号] ",
+            reply,
+        )
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"
