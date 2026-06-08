@@ -490,7 +490,7 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
     c = _find_case("T04 快照过期边界")
     if c and not stale_item.get("found"):
         c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
-        c.must_contain = [r"未找到|不存在|找不到|没有找到|没有.*记录|无记录"]
+        c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
 
 
 def main():

@@ -1503,6 +1503,65 @@ def test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses()
 
 # ── round-14 fail-then-pass helper ────────────────────────────────────────────
 
+def _round14_procurement_verifier_would_warn(reply: str) -> bool:
+    """round-14 生产 verifier 近似版（c1a4ff2），用于证明 round-15 样例改前会漏检。
+
+    与当前 check_procurement_rate_reply 的差异：
+    - _DESCRIPTIVE_DENOM_RE 缺少 '用X做分母' 和 '分母按X计算' 模式
+    - _PLUS_STILL_IN_KPI_RE 缺少 '作为...KPI核算' 模式
+    """
+    topic_re = re.compile(r'采购(?:议价率|折扣率)|(?:议价率|折扣率).{0,10}采购')
+    if not topic_re.search(reply):
+        return False
+    formula_wrong_denom_re = re.compile(
+        r'议价差额\s*(?:[÷/]|除以)\s*\(?\s*(?:只用|仅用)?\s*1688.{0,15}(?:标准价|标价|参考价)\s*\)?'
+        r'(?!\s*[\+＋加].{0,18}头程)',
+        re.IGNORECASE,
+    )
+    formula_external_denom_re = re.compile(
+        r'议价差额\s*(?:[÷/]|除以)\s*\(?\s*'
+        r'(?:'
+        r'noon\s*(?:平台)?\s*(?:价格|价|售价|销售价)'
+        r'|(?:产品|商品|平台)?\s*(?:销售价|售价)'
+        r'|采购价|采购单价|实际成交采购价|成交采购价|成交价'
+        r')\s*\)?',
+        re.IGNORECASE,
+    )
+    # round-14 _DESCRIPTIVE_DENOM_RE (missing 用X做分母 and 分母按X计算)
+    descriptive_denom_re = re.compile(
+        r'分母\s*(?:用|是|为|采用|设为)\s*(?:noon|产品|商品|平台).{0,20}(?:售价|价格|价)'
+        r'|分母\s*(?:用|是|为|采用|设为)\s*(?:销售价|售价|采购价|成交价)'
+        r'|以\s*(?:noon\s*(?:平台)?\s*)?(?:产品|商品)?\s*(?:售价|销售价)\s*作为\s*分母'
+        r'|以\s*noon\s*(?:平台)?\s*.{0,15}(?:价格|售价|价)\s*作为\s*分母',
+        re.IGNORECASE,
+    )
+    old_15pct_re = re.compile(
+        r'(?:采购(?:议价率|折扣率)|议价率|折扣率).{0,24}'
+        r'(?:≥|>=|>|＞|大于|高于|超过|达到|达|不低于|不能低于|最低|至少)?\s*'
+        r'(?:15\s*[%％]|15\s*(?:个点|个百分点|百分点)|十五\s*(?:个点|个百分点|百分点)?)'
+        r'.{0,24}(?:合格|达标|正常|过线|备注|不合格|绩效|说明原因|要说明)'
+        r'|(?:15\s*[%％]|15\s*(?:个点|个百分点|百分点)|十五\s*(?:个点|个百分点|百分点)?)'
+        r'.{0,16}(?:才|即|就|以上|为|算).{0,8}(?:合格|达标|正常|过线)',
+        re.IGNORECASE,
+    )
+    # round-14 _PLUS_STILL_IN_KPI_RE (missing 作为...KPI核算 pattern)
+    plus_still_in_kpi_re = re.compile(
+        r'plus.{0,80}(?<!不)(?:计入|纳入|算入|算进|进入|归入|列入).{0,20}(?:采购端|采购|议价)?(?:绩效|KPI|考核)'
+        r'|plus.{0,80}(?:会|仍|还)\s*(?:计入|纳入|进入|归入).{0,20}(?:议价)?(?:绩效|KPI|考核)'
+        r'|plus.{0,80}(?:会|仍|还)\s*纳入.{0,20}(?:采购端|议价)?(?:绩效|KPI|考核)'
+        r'|绩效考核时?\s*仍\s*(?:纳入|计入|进入|归入).{0,15}(?:绩效|KPI|考核)'
+        r'|要把.{0,5}plus.{0,30}(?:一起)?.{0,5}(?:算进去|算进来|算入|计入|纳入|进入|归入)',
+        re.IGNORECASE,
+    )
+    return bool(
+        formula_wrong_denom_re.search(reply)
+        or formula_external_denom_re.search(reply)
+        or descriptive_denom_re.search(reply)
+        or old_15pct_re.search(reply)
+        or plus_still_in_kpi_re.search(reply)
+    )
+
+
 def _round13_procurement_verifier_would_warn(reply: str) -> bool:
     """round-13 生产 verifier 近似版，用于证明 round-14 样例改前会漏检。"""
     topic_re = re.compile(r'采购(?:议价率|折扣率)|(?:议价率|折扣率).{0,10}采购')
@@ -1669,6 +1728,113 @@ def test_bypass33_guiru_caigou_kaohe_old_passes_new_rejects():
     assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
         f"warns 应包含采购专项规则源，实际: {warns}"
     )
+
+
+def test_bypass34_yong_chanpin_shoujia_zuo_fenmu_old_passes_new_rejects():
+    """round-15 fail-then-pass：'用产品售价做分母'应被新 verifier 拦截。
+
+    round-14 _DESCRIPTIVE_DENOM_RE 要求'分母'在'用'前，'用X做分母'语序漏检。
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    reply = (
+        "采购议价率用产品售价做分母，分子是议价差额。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+    )
+    assert not _round14_procurement_verifier_would_warn(reply), (
+        "Step A fail-then-pass：round-14 verifier 应漏检'用产品售价做分母'话术；"
+        "reply=" + reply
+    )
+    warns = check_procurement_rate_reply(reply)
+    assert warns, (
+        "Step B：round-15 verifier 应触发采购专项 warns，"
+        "但 warns=[]；reply=" + reply
+    )
+    assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+        "warns 应包含采购专项规则源，实际: " + str(warns)
+    )
+
+
+def test_bypass35_fenmu_an_noon_shoujia_jisuan_old_passes_new_rejects():
+    """round-15 fail-then-pass：'分母按 noon平台售价计算'应被新 verifier 拦截。
+
+    round-14 _DESCRIPTIVE_DENOM_RE 不含'按X计算'模式，该语序漏检。
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    reply = (
+        "采购议价率分母按 noon平台售价计算，分子是议价差额。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+    )
+    assert not _round14_procurement_verifier_would_warn(reply), (
+        "Step A fail-then-pass：round-14 verifier 应漏检'分母按noon平台售价计算'话术；"
+        "reply=" + reply
+    )
+    warns = check_procurement_rate_reply(reply)
+    assert warns, (
+        "Step B：round-15 verifier 应触发采购专项 warns，"
+        "但 warns=[]；reply=" + reply
+    )
+    assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+        "warns 应包含采购专项规则源，实际: " + str(warns)
+    )
+
+
+def test_bypass36_plus_zuowei_caigou_kpi_hesuan_old_passes_new_rejects():
+    """round-15 fail-then-pass：'plus补贴作为采购KPI核算'应被新 verifier 拦截。
+
+    round-14 _PLUS_STILL_IN_KPI_RE 不含'作为...KPI核算'动词模式，该说法漏检。
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    reply = (
+        "plus补贴作为采购KPI核算。"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+    )
+    assert not _round14_procurement_verifier_would_warn(reply), (
+        "Step A fail-then-pass：round-14 verifier 应漏检'plus补贴作为采购KPI核算'话术；"
+        "reply=" + reply
+    )
+    warns = check_procurement_rate_reply(reply)
+    assert warns, (
+        "Step B：round-15 verifier 应触发采购专项 warns，"
+        "但 warns=[]；reply=" + reply
+    )
+    assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+        "warns 应包含采购专项规则源，实际: " + str(warns)
+    )
+
+
+def test_verifier_round15_bypass_variants_warn():
+    """直接 verifier 测试：round-15 新增的 3 类绕过变体必须全部触发 warns。"""
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    bad_replies = [
+        (
+            "采购议价率用产品售价做分母，分子是议价差额。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率分母按 noon平台售价计算，分子是议价差额。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "plus补贴作为采购KPI核算。"
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。"
+        ),
+    ]
+
+    for bad_reply in bad_replies:
+        warns = check_procurement_rate_reply(bad_reply)
+        assert warns, (
+            "round-15 verifier 应触发采购专项 warns，"
+            "但 warns=[]；reply=" + bad_reply
+        )
+        assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+            "warns 应包含采购专项规则源，实际: " + str(warns)
+        )
 
 
 def test_verifier_round14_bypass_variants_warn():
@@ -1908,6 +2074,13 @@ if __name__ == "__main__":
          test_bypass32_jinjin_caigou_kpi_old_passes_new_rejects),
         ("test_bypass33_guiru_caigou_kaohe_old_passes_new_rejects",
          test_bypass33_guiru_caigou_kaohe_old_passes_new_rejects),
+        # ── round-15 oracle bypasses (用X做分母/分母按X计算/作为采购KPI核算) ──
+        ("test_bypass34_yong_chanpin_shoujia_zuo_fenmu_old_passes_new_rejects",
+         test_bypass34_yong_chanpin_shoujia_zuo_fenmu_old_passes_new_rejects),
+        ("test_bypass35_fenmu_an_noon_shoujia_jisuan_old_passes_new_rejects",
+         test_bypass35_fenmu_an_noon_shoujia_jisuan_old_passes_new_rejects),
+        ("test_bypass36_plus_zuowei_caigou_kpi_hesuan_old_passes_new_rejects",
+         test_bypass36_plus_zuowei_caigou_kpi_hesuan_old_passes_new_rejects),
         # ── 直接 verifier 测试（round-11 生产接线，不 mock LLM）──
         ("test_verifier_wrong_denominator_warns",
          test_verifier_wrong_denominator_warns),
@@ -1929,6 +2102,8 @@ if __name__ == "__main__":
          test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses),
         ("test_verifier_round14_bypass_variants_warn",
          test_verifier_round14_bypass_variants_warn),
+        ("test_verifier_round15_bypass_variants_warn",
+         test_verifier_round15_bypass_variants_warn),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
