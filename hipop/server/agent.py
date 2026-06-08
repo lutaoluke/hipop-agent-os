@@ -418,6 +418,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     alias = _resolve_entity_alias(store) or ""
     out = []
     refs = []
+    import datetime as _dt
+
+    def _date10(v):
+        if v is None:
+            return ""
+        if hasattr(v, "isoformat"):
+            return v.isoformat()[:10]
+        return str(v)[:10]
+
+    def _days_old(date_str: str):
+        if not date_str:
+            return None
+        try:
+            return max(0, (_dt.date.today() - _dt.date.fromisoformat(date_str[:10])).days)
+        except Exception:
+            return None
+
+    # SKU sales/order metrics depend on noon orders. A fresh ERP product ingest can move
+    # wf2_sku.as_of_date to today while noon order CSV is still old; in that case sales
+    # numbers must be redacted instead of presented as current.
+    latest_noon_order = _date10(_data._scalar(
+        "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
+        (tid, alias),
+    ))
+    noon_order_stale_days = _days_old(latest_noon_order)
+    noon_orders_stale = (noon_order_stale_days is None) or (noon_order_stale_days > 3)
+
     for sku in skus[:3]:
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
@@ -447,17 +474,28 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                 stats_30d = _data.sku_30d_stats(tid, alias, sku, as_of)
             except Exception:
                 stats_30d = {}
-        # 快照时效门：as_of_date 超 3 天或缺失 → data_stale=True，数值 REDACT 为 null。
+        # 快照时效门：as_of_date 超 3 天/缺失，或 noon 订单源超 3 天/缺失
+        # → data_stale=True，销量/订单数值 REDACT 为 null。
         # 目的：防止过期快照被 LLM 当成新鲜数据呈现；LLM 必须告知数据过期。
-        import datetime as _dt
         stale_days_val: int = 0
+        stale_reasons: List[str] = []
         data_stale_val: bool = not as_of
+        if data_stale_val:
+            stale_reasons.append("wf2_sku_as_of_missing")
         if as_of:
             try:
-                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(as_of)).days)
-                data_stale_val = stale_days_val > 3
+                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(str(as_of)[:10])).days)
+                if stale_days_val > 3:
+                    data_stale_val = True
+                    stale_reasons.append("wf2_sku_as_of_stale")
             except Exception:
                 data_stale_val = True
+                stale_reasons.append("wf2_sku_as_of_invalid")
+        if noon_orders_stale:
+            data_stale_val = True
+            stale_reasons.append("noon_orders_stale")
+            if noon_order_stale_days is not None:
+                stale_days_val = max(stale_days_val, noon_order_stale_days)
 
         def _r(val):
             return None if data_stale_val else val
@@ -486,6 +524,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "as_of_date": as_of,
             "data_stale": data_stale_val,
             "stale_days": stale_days_val,
+            "stale_reason": ",".join(stale_reasons) or None,
+            "noon_order_latest": latest_noon_order,
+            "noon_order_stale_days": noon_order_stale_days,
         }
         out.append(item)
         refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})

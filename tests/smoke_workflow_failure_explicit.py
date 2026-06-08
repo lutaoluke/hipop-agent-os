@@ -181,6 +181,31 @@ def test_sanitize_reply_successful_workflow_no_extra_banner():
     assert not workflow_failure_warns, f"成功工作流不应触发失败 banner: {warns}"
 
 
+def test_sanitize_reply_adds_stale_query_sku_warning():
+    """query_sku 返回 data_stale=True 时，reply 漏说陈旧也要被安全层补上。"""
+    tool_log = [{
+        "name": "query_sku",
+        "args": {"skus": ["TBB0116A"]},
+        "result_stale_skus": ["TBB0116A"],
+    }]
+    reply = "TBB0116A 的近 30 天销量、历史总销量当前无法确认，数值为空。"
+    out, warns = _safety.sanitize_reply(reply, ["query_sku"], tool_log=tool_log)
+    assert warns, "data_stale=True 且 reply 未提陈旧/过期时应有 warning"
+    assert "TBB0116A" in out, f"补充提示应点名 SKU: {out}"
+    assert any(word in out for word in ("过期", "旧数据", "陈旧", "stale")), \
+        f"补充提示应包含陈旧/过期警示词: {out}"
+
+
+def test_provider_logs_query_sku_stale_skus_for_safety_hook():
+    """provider 层必须把 query_sku 的 stale SKU 写进 tool_log，_safety 才能兜底。"""
+    anthropic_src = _read_server_src("_provider_anthropic.py")
+    openai_src = _read_server_src("_provider_openai.py")
+    assert "result_stale_skus" in anthropic_src, \
+        "Anthropic provider 未记录 query_sku data_stale SKU（接线缺失）"
+    assert "result_stale_skus" in openai_src, \
+        "OpenAI provider 未记录 query_sku data_stale SKU（接线缺失）"
+
+
 # ── provider 层 tool_log 接线验证（源码检查，不 import 避免 anthropic 依赖）─────
 
 def _read_server_src(filename):
@@ -375,6 +400,8 @@ if __name__ == "__main__":
         test_non_run_workflow_tool_ignored,
         test_sanitize_reply_with_failed_workflow_adds_banner,
         test_sanitize_reply_successful_workflow_no_extra_banner,
+        test_sanitize_reply_adds_stale_query_sku_warning,
+        test_provider_logs_query_sku_stale_skus_for_safety_hook,
         test_anthropic_provider_enriches_tool_log_on_failure,
         test_openai_provider_enriches_tool_log_on_failure,
         test_agent_passes_tool_log_to_sanitize_reply,

@@ -74,6 +74,14 @@ _SELECTION_INVENTORY_GATE_RE = re.compile(
     r"已查询.{0,20}库存数据|已拉取.{0,20}库存数据|根据.{0,10}完整数据.{0,40}库存"
 )
 
+_STALE_REPLY_RE = re.compile(
+    r"陈旧|过期|不新鲜|滞后|偏旧|较旧|"
+    r"旧(?:的)?\s*(?:数据|口径|快照|销量|库存)|"
+    r"(?:数据|销量|库存|口径|快照|同步|noon).{0,15}旧|"
+    r"\bstale\b",
+    re.IGNORECASE,
+)
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -369,6 +377,37 @@ def _get_tool_arg(t: dict, key: str):
     return (args.get(key) or "") if isinstance(args, dict) else ""
 
 
+def _stale_query_skus(tool_log: list) -> List[str]:
+    skus: List[str] = []
+    for t in (tool_log or []):
+        if t.get("name") != "query_sku":
+            continue
+        stale = t.get("result_stale_skus") or []
+        if isinstance(stale, str):
+            stale = [stale]
+        for sku in stale:
+            sku_s = str(sku or "").strip()
+            if sku_s and sku_s not in skus:
+                skus.append(sku_s)
+    return skus
+
+
+def _ensure_stale_query_sku_warning(reply: str, tool_log: list) -> Tuple[str, List[str]]:
+    """query_sku 返回旧快照时，LLM 漏警示也要让用户看见。"""
+    stale_skus = _stale_query_skus(tool_log)
+    if not stale_skus or _STALE_REPLY_RE.search(reply or ""):
+        return reply, []
+
+    sku_str = "、".join(stale_skus)
+    prefix = (
+        f"**数据过期提醒**：SKU {sku_str} 的销量/订单快照是旧数据，"
+        "本次查询返回的数值已被隐藏；请刷新或上传最新 noon CSV 后再确认。\n\n"
+    )
+    return prefix + reply, [
+        f"⚠️ query_sku 返回 data_stale=True（{sku_str}），但回复未明确说明数据过期/旧快照，已自动补充提示（T04）"
+    ]
+
+
 def _check_inventory_selection_evidence(
     reply: str, tools_used: List[str], tool_log: List
 ) -> List[str]:
@@ -428,6 +467,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
     warnings.extend(_check_failed_workflow_claimed_success(reply, tool_log or []))
+    reply, stale_query_warnings = _ensure_stale_query_sku_warning(reply, tool_log or [])
+    warnings.extend(stale_query_warnings)
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
 

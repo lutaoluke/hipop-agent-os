@@ -191,6 +191,14 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 entry["ok"] = ok_val if ok_val is not None else ("error" not in result)
                 entry["task_id"] = result.get("task_id")
                 entry["error"] = result.get("error")
+            if tool_name == "query_sku" and isinstance(result, dict):
+                stale_skus = [
+                    item.get("sku")
+                    for item in (result.get("items") or [])
+                    if isinstance(item, dict) and item.get("data_stale") and item.get("sku")
+                ]
+                if stale_skus:
+                    entry["result_stale_skus"] = stale_skus
             tool_log.append(entry)
             msgs.append({
                 "role": "tool",

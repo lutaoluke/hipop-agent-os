@@ -145,29 +145,29 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-08 验门 PG 复核：product 1424 / SKU 1798 /
-    #   listed_sku 1046，
+    #   SUM(is_listed=1)=listed。2026-06-09 验门 PG 复核：product 2883 / SKU 3657 /
+    #   listed_sku 2091，
     #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
     #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
     Case(
-        name="商品总数（要 1424 product / 1798 SKU）",
+        name="商品总数（要 2883 product / 3657 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"1[,，]?798"],
+        must_contain=[r"2[,，]?883", r"3[,，]?657"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1046 在售）",
+        name="商品总数 + 上架未上架细分（SKU 维度 2091 在售）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        # 1424 product 总数 + 在售 SKU 数（1046）
-        must_contain=[r"1[,，]?424", r"1[,，]?046"],
+        # 2883 product 总数 + 在售 SKU 数（2091）
+        must_contain=[r"2[,，]?883", r"2[,，]?091"],
     ),
     # ─── 概览类 ───
     Case(
-        name="店铺整体（在售 SKU 1046 + 红色告警）",
+        name="店铺整体（在售 SKU 2091 + 红色告警）",
         question="我的店里有多少货 哪些需要我关注",
         must_use_tools=["scope_overview"],
-        must_contain=[r"1[,，]?046"],
+        must_contain=[r"2[,，]?091"],
     ),
     Case(
         name="红色告警（要真数 2）",
@@ -196,8 +196,8 @@ CASES: List[Case] = [
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
     # data 层精确口径（48/51/5.88%/1967）由 smoke_t04_tbb0116a.py 负责。
-    # 当前 PG chat 路径里该 SKU as_of_date=2026-06-05，已超过 3 天新鲜度门；
-    # tool_query_sku 会将数值字段 REDACT 为 null，chat 必须警示陈旧/暂缺，而不是报旧数。
+    # 当前 PG chat 路径里 noon_orders 只到 2026-06-04，超过 3 天新鲜度门；
+    # tool_query_sku 会将销量/订单数值字段 REDACT 为 null，chat 必须警示陈旧/暂缺，而不是报旧数。
     Case(
         name="T04 TBB0116A 30d 口径（陈旧缓存不报旧数）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
