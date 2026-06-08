@@ -247,6 +247,7 @@ function chatPanel() {
       if (sn === 99) {
         taskObj.finished = true;
         taskObj.ok = (st === 'done');
+        if (!taskObj.ok) taskObj.error = ev.message || '任务失败';
         sse.close();
         if (taskObj.ok) {
           // 通知模块页刷新

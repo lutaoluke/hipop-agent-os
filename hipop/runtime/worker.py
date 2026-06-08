@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 # 让 worker 能 import hipop.*
 HERE = Path(__file__).resolve()
@@ -56,7 +57,7 @@ def _save_progress(task_id: str, progress: dict) -> None:
 
 def _finish(task_id: str, state: str, summary: str = "",
             workflow: Optional[str] = None, tenant_id: Optional[int] = None,
-            started_at: Optional[float] = None) -> None:
+            started_at: Optional[float] = None, actor: Optional[dict] = None) -> None:
     """worker 完成时调 — UPDATE tasks.state + finished_at + result_summary。
 
     Phase 0.4: 跑 verify contract，FAIL 时把 state 标 done_unverified（防 premature marking）。
@@ -97,6 +98,16 @@ def _finish(task_id: str, state: str, summary: str = "",
             (state, summary, task_id),
         )
         c.commit()
+    _data.write_event(
+        task_id, 99, "任务结束", state,
+        json.dumps({
+            "workflow": workflow,
+            "ok": state == "done",
+            "state": state,
+            "summary": summary,
+        }, ensure_ascii=False),
+        actor=actor,
+    )
 
 
 def _heartbeat(task_id: str) -> None:
@@ -137,7 +148,8 @@ def main(task_id: str) -> int:
         from hipop.runtime import workflow_runners
         runner = workflow_runners.get_runner(workflow)
         if not runner:
-            _finish(task_id, "error", f"no runner for workflow={workflow}")
+            _finish(task_id, "error", f"no runner for workflow={workflow}",
+                    workflow=workflow, tenant_id=tenant_id, actor=actor)
             return 2
 
         # 跑 — runner 内部周期性调 _heartbeat + _save_progress
@@ -153,14 +165,16 @@ def main(task_id: str) -> int:
         summary = (result or {}).get("summary") or "done"
         _finish(task_id, "done", summary,
                 workflow=workflow, tenant_id=tenant_id,
-                started_at=spec.get("created_at") or time.time())
+                started_at=spec.get("created_at") or time.time(),
+                actor=actor)
         print(f"[worker] DONE {summary}", flush=True)
         return 0
 
     except Exception:
         err = traceback.format_exc()
         print(f"[worker] CRASHED:\n{err}", flush=True)
-        _finish(task_id, "error", err[-500:])
+        _finish(task_id, "error", err[-500:],
+                workflow=workflow, tenant_id=tenant_id, actor=actor)
         return 3
 
 

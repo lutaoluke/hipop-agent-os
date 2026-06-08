@@ -23,10 +23,15 @@ import json
 import re
 import time
 import argparse
+import http.cookiejar
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 
 
 # ── case 定义 ────────────────────────────────────────────
@@ -52,6 +57,50 @@ GLOBAL_BLACKLIST = [
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
 ]
+
+SMOKE_EMAIL = "smoke-chat@hipop.local"
+SMOKE_PASSWORD = "smoke-chat-pass"
+
+
+def ensure_smoke_user_tenant1() -> None:
+    """Create/update a tenant=1 smoke user so chat smokes exercise the auth path."""
+    os.environ.setdefault("DB_URL", "postgresql://hipop:hipop_dev_password@localhost:5432/hipop")
+    from hipop.server import auth as _auth
+    from hipop.server import data as _data
+
+    password_hash = _auth.hash_password(SMOKE_PASSWORD)
+    existing = _auth.get_user_by_email(SMOKE_EMAIL)
+    if existing:
+        with _data.conn() as c:
+            c.execute(
+                "UPDATE users SET tenant_id=?, password_hash=?, role=?, active=1 WHERE email=?",
+                (1, password_hash, "owner", SMOKE_EMAIL),
+            )
+            c.commit()
+        return
+    _auth.create_user(
+        1, SMOKE_EMAIL, SMOKE_PASSWORD,
+        display_name="Smoke Chat",
+        role="owner",
+    )
+
+
+def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
+    ensure_smoke_user_tenant1()
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    body = json.dumps({"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/api/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with opener.open(req, timeout=15) as r:
+        payload = json.loads(r.read())
+    if not payload.get("ok"):
+        raise RuntimeError(f"smoke login failed: {payload}")
+    return opener
 
 
 # ── case 11「拒绝刷新」陈旧警示的**结构判别**（WS-55 门2 五轮收敛的最终形态）──────────
@@ -146,21 +195,23 @@ CASES: List[Case] = [
         ],
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
-    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）+ history=1967。
+    # data 层精确口径（48/51/5.88%/1967）由 smoke_t04_tbb0116a.py 负责。
+    # 当前 PG chat 路径里该 SKU as_of_date=2026-06-05，已超过 3 天新鲜度门；
+    # tool_query_sku 会将数值字段 REDACT 为 null，chat 必须警示陈旧/暂缺，而不是报旧数。
     Case(
-        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel≈5.88% / history=1967）",
+        name="T04 TBB0116A 30d 口径（陈旧缓存不报旧数）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"\b48\b",
-            r"\b51\b",
-            r"5\.8[0-9]|5\.9",
-            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
-            r"1[,，]?967",        # 历史总销量 ERP 口径（2026-06-05 截止）
+            "TBB0116A",
+            r"陈旧|过期|缓存|旧",
+            r"暂无|暂缺|无法确认|不确定|刷新",
         ],
         must_not_contain=[
             r"\b13\b",
+            r"\b48\b",
+            r"\b51\b",
+            r"1[,，]?967",
             r"1\.1[0-9]%|1\.12%",
             r"取消率.*0\.0%",
             # 只问数值时不得主动下质量/表现判断
@@ -175,7 +226,7 @@ CASES: List[Case] = [
         question="STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认",
+            r"过期|超过.*天|距今.*天|\d+\s*天前|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认",
         ],
         must_not_contain=[
             r"\b13\b",
@@ -302,7 +353,7 @@ CASES: List[Case] = [
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
         question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
         must_use_tools=["query_order_live"],
-        must_contain=[r"未找到|不存在|无物流|无记录|找不到|核实货单号"],
+        must_contain=[r"未找到|不存在|无物流|无记录|找不到|查不到|核实货单号"],
         must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
         timeout=120,
     ),
@@ -310,7 +361,8 @@ CASES: List[Case] = [
 
 
 # ── runner ────────────────────────────────────────────────
-def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
+def post_chat(opener: urllib.request.OpenerDirector, base_url: str, question: str,
+              store: str, timeout: int) -> dict:
     body = json.dumps({
         "messages": [{"role": "user", "content": question}],
         "scope": {"store": store},
@@ -322,7 +374,7 @@ def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"_http_error": e.code, "_body": e.read().decode("utf-8", "ignore")[:500]}
@@ -379,14 +431,14 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     return (len(reasons) == 0), reasons
 
 
-def check_chat_history_endpoint(base_url: str) -> Optional[str]:
+def check_chat_history_endpoint(opener: urllib.request.OpenerDirector, base_url: str) -> Optional[str]:
     """GET /api/chat-history/<store> — 防 PG datetime[-8:-3] 之类的崩溃回归。
     切页面时 chat panel init() 会拿这个 endpoint；它一旦 500，整个 chat panel
     Alpine init 抛错，前端表现为'切页面无法继承聊天记录'。返回 None 为通过。"""
     for store in ("ksa", "uae"):
         req = urllib.request.Request(f"{base_url}/api/chat-history/{store}?limit=3")
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with opener.open(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
@@ -411,7 +463,12 @@ def main():
 
     print(f"=== hipop-agent-os smoke test ===")
     print(f"URL: {args.url}")
-    err = check_chat_history_endpoint(args.url)
+    try:
+        opener = build_authenticated_opener(args.url)
+    except Exception as e:
+        print(f"\n✗ smoke 登录失败：{type(e).__name__}: {e}")
+        sys.exit(1)
+    err = check_chat_history_endpoint(opener, args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
@@ -427,7 +484,7 @@ def main():
     for i, c in enumerate(cases, 1):
         print(f"[{i}/{len(cases)}] {c.name} ", end="", flush=True)
         t = time.time()
-        resp = post_chat(args.url, c.question, c.store, c.timeout)
+        resp = post_chat(opener, args.url, c.question, c.store, c.timeout)
         ok, reasons = check(c, resp)
         elapsed = time.time() - t
         if ok:

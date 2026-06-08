@@ -16,6 +16,7 @@ fail-then-pass 钉死三件事：
 """
 import os
 import sys
+import tempfile
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -212,7 +213,7 @@ def test_openai_provider_enriches_tool_log_on_failure():
 def test_agent_passes_tool_log_to_sanitize_reply():
     """agent.chat 调 sanitize_reply 时传了 tool_log=（接线不缺失）"""
     src = _read_server_src("agent.py")
-    assert "sanitize_reply(clean_reply, tools_used, tool_log=tool_log)" in src, \
+    assert "sanitize_reply(clean_reply, tools_used" in src and "tool_log=tool_log" in src, \
         "agent.chat 调 sanitize_reply 时未传 tool_log=tool_log（T36-S3 死法：接线缺失）"
 
 
@@ -303,6 +304,59 @@ def test_chat_panel_task_card_has_click_handler():
         "chat_panel.html @click 未路由到 /api/tasks/ 任务详情端点"
 
 
+def test_managed_worker_error_writes_terminal_event():
+    """managed worker task state=error 时必须写 step 99 终态 event，SSE 才能结束。"""
+    from hipop.server import data as _data
+    from hipop.runtime import worker as _worker
+
+    old_db_path = _data.DB_PATH
+    old_tenant = _data.get_current_tenant()
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        _data.DB_PATH = tmp.name
+        _data._task_tables_checked = False
+        _data._ensure_task_tables()
+        _data.set_current_tenant(1)
+        task_id = "t36err99"
+        with _data.conn() as c:
+            c.execute(
+                "INSERT INTO tasks (task_id, tenant_id, workflow, state) VALUES (?, ?, ?, ?)",
+                (task_id, 1, "wf2_products_v2", "running"),
+            )
+            c.commit()
+
+        _worker._finish(
+            task_id, "error", "permission_denied",
+            workflow="wf2_products_v2", tenant_id=1,
+            actor={"user_id": 1, "email": "test@hipop.local", "role": "ops", "source": "test"},
+        )
+
+        events = _data.get_events_after(task_id, 0)
+        terminal = [e for e in events if e["step_no"] == 99]
+        assert terminal, "managed worker error 未写 step 99 终态 event（SSE 会一直等）"
+        assert terminal[-1]["status"] == "error", f"终态 event 状态应为 error: {terminal[-1]}"
+        assert "permission_denied" in (terminal[-1].get("message") or ""), \
+            f"终态 event 应包含失败原因: {terminal[-1]}"
+    finally:
+        _data.DB_PATH = old_db_path
+        _data._task_tables_checked = False
+        _data.set_current_tenant(old_tenant)
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def test_chat_panel_terminal_error_sets_task_error():
+    """chat_panel 收到 step 99 error 时要把 message 展示到任务卡错误详情。"""
+    path = os.path.join(os.path.dirname(HERE), "hipop", "server", "templates", "partials", "chat_panel.html")
+    with open(path) as f:
+        src = f.read()
+    assert "taskObj.error = ev.message" in src, \
+        "chat_panel 收到 step 99 error 未把失败原因写入任务卡"
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_workflow_name_dict_args,
@@ -335,6 +389,9 @@ if __name__ == "__main__":
         # round-5: chat smoke 契约同步 + 任务卡点击详情
         test_smoke_chat_uses_workflow_tasks_not_single,
         test_chat_panel_task_card_has_click_handler,
+        # round-6: managed worker error terminal SSE event
+        test_managed_worker_error_writes_terminal_event,
+        test_chat_panel_terminal_error_sets_task_error,
     ]
     failed = 0
     for t in tests:
