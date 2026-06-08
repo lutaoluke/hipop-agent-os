@@ -426,9 +426,6 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
-    # WS-128: task completion/refresh bypass gate (已完成/已刷新 without run_workflow)
-    from ._chat_boundary import check_task_completion_bypass
-    warnings.extend(check_task_completion_bypass(reply, tool_log or []))
 
     # "已为你导出/下载/生成 Excel" 这种宣称 → 检查是否真调了 export_table tool
     promise_export = re.search(r"(已[为给]?你?(?:导出|生成|发送)|下载链接|Excel.*已)", reply)

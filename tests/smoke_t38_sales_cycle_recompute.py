@@ -18,8 +18,9 @@ PASS 条件（修后）：
 
 import os
 import sys
+import re
 import traceback
-import tempfile
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -28,6 +29,8 @@ if REPO not in sys.path:
 
 from hipop.server.agent import _deterministic_workflow_request
 from hipop.server import _safety
+from hipop.server import agent as _agent
+from hipop.server import _provider as _prov
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -202,7 +205,6 @@ def test_t38_failure_reply_has_no_fake_task_id():
     failure_reply = failure_result.get("message") or failure_result.get("error") or "工作流触发失败。"
 
     # 失败回复不得含假 task_id 或 accepted
-    import re
     fake_id_re = re.compile(r'[0-9a-f]{8}\b')
     assert not fake_id_re.search(failure_reply), (
         f"失败回复中出现了疑似 task_id: {failure_reply!r}"
@@ -214,6 +216,76 @@ def test_t38_failure_reply_has_no_fake_task_id():
         f"失败回复中出现假启动宣称: {failure_reply!r}"
     )
     print(f"    两态失败回复无假证据: {failure_reply!r}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# End-to-end: chat() → _exec_tool("run_workflow") → workflow_task 证据链
+# ────────────────────────────────────────────────────────────────────────────
+
+_FAKE_TASK_ID = "ab123456"
+_SCOPE = {"tenant_id": 1, "current_user": "test", "current_role": "admin", "store": "KSA"}
+
+
+def _chat_with_fake_exec(question: str, exec_result: dict) -> dict:
+    """Call chat() with _exec_tool mocked to return exec_result."""
+    with patch.object(_agent, "_exec_tool", return_value=exec_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        return _agent.chat([{"role": "user", "content": question}], _SCOPE)
+
+
+def test_t38_chat_e2e_workflow_task_has_real_task_id():
+    """E2E: chat() with T38 trigger creates workflow_task with the run_workflow task_id.
+
+    FAIL (before fix): workflow_task is None or task_id doesn't match — falls to LLM path.
+    PASS (after fix):  workflow_task.task_id == the task_id returned by _exec_tool.
+    """
+    fake_ok = {
+        "ok": True, "task_id": _FAKE_TASK_ID,
+        "workflow": "wf5_sales_cycle_v2", "label": "销售周期与补货重算",
+        "total_steps": 3, "affected_modules": ["sales_cycle", "replenishment"],
+        "followup_prompt": "请重算销售周期和补货建议",
+    }
+    result = _chat_with_fake_exec("请重算销售周期和补货建议，并返回任务进度证据", fake_ok)
+    wt = result.get("workflow_task")
+    assert wt is not None, (
+        f"workflow_task is None — T38 trigger did not create real task (result keys: {list(result)})"
+    )
+    assert wt["task_id"] == _FAKE_TASK_ID, (
+        f"workflow_task.task_id {wt['task_id']!r} != expected {_FAKE_TASK_ID!r}"
+    )
+    assert wt["workflow"] == "wf5_sales_cycle_v2", (
+        f"workflow_task.workflow {wt['workflow']!r} != wf5_sales_cycle_v2"
+    )
+    assert "run_workflow" in result.get("tools_used", []), (
+        f"run_workflow not in tools_used: {result.get('tools_used')}"
+    )
+    reply = result.get("reply", "")
+    assert "accepted" not in reply.lower(), f"reply contains 'accepted': {reply!r}"
+    print(f"    E2E OK: workflow_task.task_id={wt['task_id']}, workflow={wt['workflow']}")
+
+
+def test_t38_chat_e2e_failure_has_no_fake_task_id():
+    """E2E failure path: when run_workflow fails, chat() reply must NOT contain fake task_id.
+
+    FAIL (before fix): could return a hallucinated task_id or 'accepted'.
+    PASS (after fix):  workflow_task is None; reply contains error message, no fake evidence.
+    """
+    fake_fail = {
+        "ok": False,
+        "error": "wf5 正在运行中，请稍后重试。",
+        "message": "工作流 wf5_sales_cycle_v2 正在运行中，请稍后重试。",
+    }
+    result = _chat_with_fake_exec("重算销售周期", fake_fail)
+    wt = result.get("workflow_task")
+    assert wt is None, f"workflow_task should be None on failure, got: {wt!r}"
+    reply = result.get("reply", "")
+    fake_id_re = re.compile(r'[0-9a-f]{8}\b')
+    assert not fake_id_re.search(reply), f"failure reply contains fake task_id: {reply!r}"
+    assert "accepted" not in reply.lower(), f"failure reply contains 'accepted': {reply!r}"
+    assert "已触发" not in reply and "已启动" not in reply, (
+        f"failure reply contains fake trigger claim: {reply!r}"
+    )
+    print(f"    E2E failure: no fake evidence in reply: {reply!r}")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -238,6 +310,9 @@ if __name__ == "__main__":
         test_t38_real_run_workflow_task_id_passes_safety,
         # 两态失败表达
         test_t38_failure_reply_has_no_fake_task_id,
+        # E2E chat() → run_workflow 证据链
+        test_t38_chat_e2e_workflow_task_has_real_task_id,
+        test_t38_chat_e2e_failure_has_no_fake_task_id,
     ]
     failed = 0
     for t in tests:
