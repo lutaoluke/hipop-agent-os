@@ -2888,7 +2888,7 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
     if domain == "sales_skip":
         freshness = _data.check_freshness_coverage(store, "sales")
         if freshness.get("covered"):
-            return None
+            return None  # 数据新鲜，直接让 LLM 答，无需额外提示
         latest = freshness.get("latest_date") or ""
         suffix = (
             f"\n\n（⚠️ 提示：当前销量数据未更新到今天"
@@ -3327,6 +3327,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     _t07_stale_suffix = ""
     if gate_result is not None:
         if gate_result.get("_stale_skip"):
+            # sales_skip 场景：继续走 LLM，事后追加确定性陈旧提示
             _t07_stale_suffix = gate_result.get("_stale_suffix", "")
         else:
             return gate_result
@@ -3345,6 +3346,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     workflow_tasks = result.get("workflow_tasks", [])
     tools_used     = [t["name"] for t in tool_log]
 
+    # T07-2 sales_skip: 确定性陈旧后缀（代码级注入，不依赖 LLM wording）
     if _t07_stale_suffix:
         clean_reply += _t07_stale_suffix
 
