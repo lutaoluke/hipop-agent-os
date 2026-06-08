@@ -48,4 +48,4 @@ PY
   fi
 fi
 
-"$PYTHON_BIN" tests/smoke_chat.py --url "$URL" "$@"
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" tests/smoke_chat.py --url "$URL" "$@"

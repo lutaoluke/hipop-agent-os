@@ -2645,6 +2645,29 @@ def _workflow_registry_summary(workflow: str, fallback_label: str) -> tuple[str,
         return fallback_label, 0, []
 
 
+def _active_workflow_task(workflow: str) -> Optional[Dict]:
+    rows = _data._fetch(
+        "SELECT task_id, workflow, state FROM tasks "
+        "WHERE tenant_id=? AND workflow=? AND state IN ('running', 'queued') "
+        "ORDER BY COALESCE(last_heartbeat, started_at) DESC NULLS LAST LIMIT 1",
+        (_get_tenant(), workflow),
+    )
+    if not rows:
+        return None
+    from . import api as _api
+    label, steps, affected = _api.WORKFLOW_REGISTRY.get(workflow, (workflow, [], []))
+    task = rows[0]
+    return {
+        "task_id": task["task_id"],
+        "workflow": workflow,
+        "label": label,
+        "total_steps": len(steps),
+        "affected_modules": affected,
+        "followup_prompt": None,
+        "state": task.get("state"),
+    }
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
