@@ -35,6 +35,9 @@ PASS 条件（修后 round-6）：
     仅真实 task readback done/success 能放行。
   - round-11 新增 process/recompute/import completion synonyms："后台流程已结束/
     数据已重新计算/已导入最新数据"。仅真实 task readback done/success 能放行。
+  - round-12 新增同义完成/导入变体："后台流程已经结束/最新数据已导入"。
+    无工具、run_workflow only、query evidence 都不能洗白；仅真实 task readback
+    done/success 能放行。
 """
 
 from __future__ import annotations
@@ -1098,6 +1101,67 @@ def test_round11_process_recompute_import_not_washed_by_query_evidence():
         assert warns, f"query_sku 证据不应放行 round-11 完成态 {reply!r}"
 
 
+# ── Round-12 fail-then-pass: process/import variant synonyms ─────────────────
+
+ROUND12_REVIEWER_PROBES = (
+    "后台流程已经结束。",
+    "最新数据已导入。",
+)
+
+
+def test_round12_process_import_variants_block_run_workflow_only():
+    """round-12 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-11）：后台流程已经结束 / 最新数据已导入 只是 exact phrase
+                  变体，未命中 completion regex，返回 warns=[]。
+    PASS（round-12）：这些短句仍需真实 task readback；run_workflow 只算任务创建。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND12_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-12 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round12_process_import_variants_block_no_tool():
+    """同一 round-12 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND12_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-12 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round12_variant_probes():
+    """sanitize_reply 整合：round-12 variant probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for reply in ROUND12_REVIEWER_PROBES:
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-12 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def test_round12_process_import_variants_allowed_with_real_task_readback():
+    """正路：真实 task readback done 时，round-12 完成/导入声明允许通过。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND12_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round12_process_import_variants_not_washed_by_query_evidence():
+    """query evidence 不能洗白 round-12 流程/导入完成声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in ROUND12_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query_sku 证据不应放行 round-12 完成态 {reply!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1123,7 +1187,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 11)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 12)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1297,6 +1361,17 @@ if __name__ == "__main__":
          test_round11_process_recompute_import_allowed_with_real_task_readback),
         ("test_round11_process_recompute_import_not_washed_by_query_evidence",
          test_round11_process_recompute_import_not_washed_by_query_evidence),
+        # Round-12 fail-then-pass: process/import variant synonyms
+        ("test_round12_process_import_variants_block_run_workflow_only",
+         test_round12_process_import_variants_block_run_workflow_only),
+        ("test_round12_process_import_variants_block_no_tool",
+         test_round12_process_import_variants_block_no_tool),
+        ("test_sanitize_reply_round12_variant_probes",
+         test_sanitize_reply_round12_variant_probes),
+        ("test_round12_process_import_variants_allowed_with_real_task_readback",
+         test_round12_process_import_variants_allowed_with_real_task_readback),
+        ("test_round12_process_import_variants_not_washed_by_query_evidence",
+         test_round12_process_import_variants_not_washed_by_query_evidence),
     ]
 
     failed = 0
