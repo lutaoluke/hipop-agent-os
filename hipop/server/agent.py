@@ -1855,6 +1855,29 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _deterministic_export_request(question: str) -> Optional[Dict[str, str]]:
+    q = question or ""
+    if not any(x in q for x in ("导出", "下载", "excel", "Excel", "表格", "xlsx")):
+        return None
+    view = "sales"
+    if "补货" in q:
+        view = "replenish"
+    elif "物流" in q or "货单" in q:
+        view = "logistics"
+    elif "未上架" in q:
+        view = "unlisted_with_sales"
+    return {"view": view, "filter_desc": q[:80]}
+
+
+def _current_workflow_task(workflow: str) -> Optional[dict]:
+    rows = _data._fetch(
+        "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
+        "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
+        (_get_tenant(), workflow),
+    )
+    return dict(rows[0]) if rows else None
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -1875,6 +1898,38 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+
+    direct_export = _deterministic_export_request(question)
+    if direct_export:
+        store = scope.get("store") or "KSA"
+        tool_args = {
+            "view": direct_export["view"],
+            "store": store,
+            "filter_desc": direct_export["filter_desc"],
+        }
+        tool_result = _exec_tool("export_table", tool_args, user=scope)
+        if isinstance(tool_result, dict) and tool_result.get("ok") and tool_result.get("download_url"):
+            filename = tool_result.get("filename") or "export.xlsx"
+            reply = (
+                f"已生成 {tool_result.get('row_count', 0)} 行表格："
+                f"[{filename}]({tool_result['download_url']})"
+            )
+        else:
+            reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "导出失败。"
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": ["export_table"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_export_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
@@ -1895,6 +1950,29 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             reply = _workflow_receipt_reply(
                 task_id, tool_result["workflow"], direct_workflow["label"]
             )
+        elif (
+            isinstance(tool_result, dict)
+            and tool_result.get("action_type") == "denied"
+            and "已有运行中实例" in (tool_result.get("reason") or "")
+        ):
+            existing = _current_workflow_task(direct_workflow["workflow"])
+            if existing:
+                workflow_task = {
+                    "task_id": existing["task_id"],
+                    "workflow": existing["workflow"],
+                    "label": direct_workflow["label"],
+                    "total_steps": None,
+                    "affected_modules": [],
+                    "followup_prompt": question,
+                    "state": existing.get("state"),
+                    "already_running": True,
+                }
+                reply = (
+                    f"{direct_workflow['label']}已有运行中的后台任务 "
+                    f"`{existing['task_id']}`，我不重复触发。"
+                )
+            else:
+                reply = tool_result.get("reason") or "工作流触发失败。"
         else:
             reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
         return {

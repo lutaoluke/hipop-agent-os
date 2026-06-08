@@ -209,8 +209,10 @@ _PLUS_WRONG_TREATMENT_RE = re.compile(
 # plus 声称不计入议价率但仍计入绩效的矛盾口径（验门人 round-10 实测绕过 #25-#27）
 # 正确口径：plus 折扣「完全不计入」采购议价率和采购议价绩效两者。
 _PLUS_KPI_BACK_DOOR_RE = re.compile(
+    # Case 0: "但计入/纳入采购绩效"（无 会/仍/还 等 modal 词）
+    r"plus.{0,80}(?<!不)(?:计入|纳入|算入|算进).{0,20}(?:采购端|采购|议价)?绩效"
     # Case 1: "但/不过 会/仍/还 计入/纳入 绩效"（plus 说不计入议价率，但绩效还是算）
-    r"plus.{0,80}(?:会|仍|还)\s*(?:计入|纳入).{0,20}(?:议价)?绩效"
+    r"|plus.{0,80}(?:会|仍|还)\s*(?:计入|纳入).{0,20}(?:议价)?绩效"
     r"|plus.{0,80}(?:会|仍|还)\s*纳入.{0,20}(?:采购端|议价)?绩效"
     # Case 2: "绩效考核时 仍 纳入/计入"
     r"|绩效考核时?\s*仍\s*(?:纳入|计入).{0,15}绩效"
@@ -1375,6 +1377,130 @@ def test_agent_round12_wires_procurement_specific_warning_for_real_bypasses():
         )
 
 
+def _round12_procurement_verifier_would_warn(reply: str) -> bool:
+    """round-12 生产 verifier 近似版，用于证明 round-13 样例改前会漏检。"""
+    topic_re = re.compile(r'采购(?:议价率|折扣率)|(?:议价率|折扣率).{0,10}采购')
+    exact_external_denom_re = re.compile(
+        r'议价差额\s*(?:[÷/]|除以)\s*\(?\s*'
+        r'(?:noon\s*价格|noon价|销售价|售价|采购价|采购单价|实际成交采购价|成交采购价|成交价)\s*\)?',
+        re.IGNORECASE,
+    )
+    plus_still_in_kpi_re = re.compile(
+        r'plus.{0,80}(?:会|仍|还)\s*(?:计入|纳入).{0,20}(?:议价)?绩效'
+        r'|plus.{0,80}(?:会|仍|还)\s*纳入.{0,20}(?:采购端|议价)?绩效'
+        r'|绩效考核时?\s*仍\s*(?:纳入|计入).{0,15}绩效'
+        r'|要把.{0,5}plus.{0,30}(?:一起)?.{0,5}(?:算进去|算进来|算入|计入|纳入)',
+        re.IGNORECASE,
+    )
+    if not topic_re.search(reply):
+        return False
+    return bool(exact_external_denom_re.search(reply) or plus_still_in_kpi_re.search(reply))
+
+
+def test_verifier_round13_natural_denominator_and_plus_kpi_variants_warn():
+    """round-13 fail-then-pass：自然话术分母/plus绩效回流必须触发专项 warns。
+
+    改前 round-12 verifier 只匹配 exact `noon价格/销售价/采购价`，以及带
+    `会/仍/还/要把` 的 plus 绩效回流；以下验门人实测样例会漏检。
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    bad_replies = [
+        (
+            "采购议价率 = 议价差额 ÷ noon平台售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ 产品售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ noon销售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购议价率，但计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。plus平台补贴纳入采购绩效。"
+        ),
+    ]
+
+    for bad_reply in bad_replies:
+        assert not _round12_procurement_verifier_would_warn(bad_reply), (
+            "Step A fail-then-pass：round-12 verifier 应漏检此自然绕过样例，"
+            f"否则不能复现验门人打回；reply={bad_reply}"
+        )
+        warns = check_procurement_rate_reply(bad_reply)
+        assert warns, (
+            "Step B：round-13 verifier 应触发采购专项 warns，"
+            f"但 warns=[]；reply={bad_reply}"
+        )
+        assert any("规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+            f"warns 应包含采购专项规则源，实际: {warns}"
+        )
+
+
+def test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses():
+    """round-13 集成测试：自然绕过必须进入 agent hallucination_warnings。"""
+    from hipop.server import _provider, agent
+
+    bad_replies = [
+        (
+            "采购议价率 = 议价差额 ÷ noon平台售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ 产品售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ noon销售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购议价率，但计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。plus平台补贴纳入采购绩效。"
+        ),
+    ]
+
+    for bad_reply in bad_replies:
+        mock_result = _provider.ChatResult({
+            "reply": bad_reply,
+            "tool_log": [],
+            "refs_collected": [],
+            "workflow_task": None,
+        })
+
+        with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
+            result = agent.chat(
+                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                scope={
+                    "store": "KSA",
+                    "current_user": "smoke_t48",
+                    "current_role": "owner",
+                    "tenant_id": 1,
+                    "user_id": 1,
+                },
+            )
+
+        warns = result.get("hallucination_warnings") or []
+        assert warns, (
+            "agent.chat() 应对 round-13 自然绕过触发 hallucination_warnings，"
+            f"但为空；reply={bad_reply}"
+        )
+        assert any("采购议价率" in w and "规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+            "hallucination_warnings 应包含采购专项拦截结果，而不是只有泛化低置信 warning；"
+            f"实际: {warns}"
+        )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -1577,6 +1703,10 @@ if __name__ == "__main__":
          test_agent_wires_verifier_for_wrong_procurement_formula),
         ("test_agent_round12_wires_procurement_specific_warning_for_real_bypasses",
          test_agent_round12_wires_procurement_specific_warning_for_real_bypasses),
+        ("test_verifier_round13_natural_denominator_and_plus_kpi_variants_warn",
+         test_verifier_round13_natural_denominator_and_plus_kpi_variants_warn),
+        ("test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses",
+         test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
