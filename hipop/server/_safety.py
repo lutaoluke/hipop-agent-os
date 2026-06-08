@@ -129,22 +129,9 @@ def _extract_workflow_name(args) -> str:
     return "unknown"
 
 
-# Reply 中提到失败/错误的模式（LLM 如实说了就不加 banner）
-_FAILURE_MENTION_RE = re.compile(
-    r"失败|failed|error|错误|未成功|拒绝|denied|permission_denied|起不来|没有启动",
-    re.IGNORECASE,
-)
-
-
-def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
-    """T36-S3: run_workflow 返回 ok=False 时，若 reply 未说明失败原因则加 banner。
-
-    覆盖两种 provider 形状：
-    - Anthropic: tool_log[i].args 是 dict
-    - OpenAI-compat (deepseek/qwen/doubao): tool_log[i].args 是 JSON string
-    """
-    warns: List[str] = []
-    failed: List[tuple] = []
+def _extract_failed_workflows(tool_log: list) -> List[tuple]:
+    """从 tool_log 中收集所有 run_workflow 失败条目，返回 [(wf_name, error_msg), ...]。"""
+    failed = []
     for t in (tool_log or []):
         if t.get("name") != "run_workflow":
             continue
@@ -154,19 +141,43 @@ def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[s
             wf_name = _extract_workflow_name(t.get("args") or {})
             error_msg = t.get("error") or "未知错误"
             failed.append((wf_name, error_msg))
+    return failed
+
+
+def _reply_names_workflow(reply: str, wf_name: str) -> bool:
+    """reply 是否点名了该 workflow（技术名称必须出现）。
+
+    验收口径："哪条失败+原因" — reply 必须包含 workflow 技术标识符
+    （如 wf2_sales_v2 / wf2_products_v2），仅说"有一个工作流失败了"或
+    "销量价格刷新失败"均不满足要求（无法唯一定位失败来源）。
+    """
+    if not wf_name or wf_name == "unknown":
+        return False
+    return wf_name in reply
+
+
+def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
+    """T36-S3: run_workflow 返回 ok=False 时，若 reply 未点名该 workflow 则加 banner。
+
+    覆盖两种 provider 形状：
+    - Anthropic: tool_log[i].args 是 dict
+    - OpenAI-compat (deepseek/qwen/doubao): tool_log[i].args 是 JSON string
+
+    判定标准：reply 必须包含失败 workflow 的技术名称（如 wf2_sales_v2）。
+    "有一个工作流失败了" / "销量价格刷新失败" 均不满足，因为未唯一点名来源。
+    """
+    warns: List[str] = []
+    failed = _extract_failed_workflows(tool_log)
 
     if not failed:
         return warns
 
-    # 只要 reply 里没有任何失败相关词，就加 banner（LLM 没告诉用户工作流失败了）
-    if _FAILURE_MENTION_RE.search(reply):
-        return warns
-
     for wf_name, error_msg in failed:
-        warns.append(
-            f"⚠️ 工作流 {wf_name} 实际启动失败（{error_msg}），"
-            f"但 Agent 回复未说明失败原因，请重试或检查权限"
-        )
+        if not _reply_names_workflow(reply, wf_name):
+            warns.append(
+                f"⚠️ 工作流 {wf_name} 实际启动失败（{error_msg}），"
+                f"但 Agent 回复未点名该工作流 — 请明确告知用户 {wf_name} 失败及原因"
+            )
     return warns
 
 

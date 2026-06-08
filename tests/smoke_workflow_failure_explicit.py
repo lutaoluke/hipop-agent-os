@@ -2,13 +2,14 @@
 
 fail-then-pass 钉死三件事：
 1. _safety._check_failed_workflow_claimed_success：run_workflow ok=False 时
-   若 reply 未说明失败原因 → banner；若 reply 已说明 → 放行。
+   reply 必须点名具体 workflow 技术名（如 wf2_sales_v2），否则加 banner。
+   "有一个工作流失败了"/"销量价格刷新失败"均不满足（未唯一点名来源）。
 2. _extract_workflow_name：Anthropic dict-args 和 OpenAI JSON-string-args 两路都能提取名字。
 3. provider 层 tool_log 包含 ok / task_id / error 字段（验接线不缺失）。
 
-改前（无 _check_failed_workflow_claimed_success）：
-  test_*_failure_not_mentioned FAIL（check 不存在 → 没有 banner）
-改后（加 check + sanitize_reply 传 tool_log）：全 PASS。
+改前（无 _check_failed_workflow_claimed_success / 过于宽松只检查"失败"词）：
+  test_vague_failure_language_still_triggers_banner FAIL（无 banner）
+改后（精确检查 workflow 技术名出现在 reply 里）：全 PASS。
 
 跑法：python3 tests/smoke_workflow_failure_explicit.py
       make test（自动聚合）
@@ -64,12 +65,26 @@ def test_failure_not_mentioned_adds_banner():
     assert "permission_denied" in warns[0], f"banner 应含错误原因: {warns[0]}"
 
 
-def test_failure_mentioned_in_reply_no_banner():
-    """reply 已说明失败 → 放行（LLM 如实说了不误报）"""
+def test_failure_named_workflow_in_reply_no_banner():
+    """reply 点名了具体 workflow 技术名 → 放行（LLM 如实精确说了）"""
     tool_log = [_make_failed_entry("wf2_products_v2", "permission_denied")]
-    reply = "ERP 商品库刷新失败（permission_denied），请检查权限。"
+    reply = "wf2_products_v2 启动失败（permission_denied），请检查权限。"
     warns = _safety._check_failed_workflow_claimed_success(reply, tool_log)
-    assert not warns, f"reply 已含失败说明时不应加 banner: {warns}"
+    assert not warns, f"reply 含 workflow 技术名时不应加 banner: {warns}"
+
+
+def test_vague_failure_language_still_triggers_banner():
+    """验门人卡点：reply 仅含泛化失败词但未点名 workflow → 仍触发 banner"""
+    tool_log = [_make_failed_entry("wf2_sales_v2", "permission_denied")]
+    for vague_reply in [
+        "有一个工作流失败了，请稍后重试。",
+        "销量价格刷新失败，请检查权限。",
+        "很遗憾，刷新任务启动失败了。",
+        "ERP 操作失败（error: permission_denied）。",
+    ]:
+        warns = _safety._check_failed_workflow_claimed_success(vague_reply, tool_log)
+        assert warns, f"泛化失败语言应触发 banner（未点名 wf2_sales_v2）: {vague_reply!r}"
+        assert "wf2_sales_v2" in warns[0], f"banner 应含失败 workflow 名: {warns[0]}"
 
 
 def test_no_failed_workflow_no_banner():
@@ -108,16 +123,30 @@ def test_partial_success_failure_not_mentioned_adds_banner():
     assert "wf2_sales_v2" in warns[0], f"banner 应含失败工作流: {warns[0]}"
 
 
-def test_partial_success_failure_mentioned_no_banner():
-    """两个工作流：一成一败；reply 正确说了 'XX 成功，XX 失败' → 放行"""
+def test_partial_success_failure_named_no_banner():
+    """两个工作流：一成一败；reply 点名失败 workflow 技术名 → 放行"""
     tool_log = [
         {"name": "run_workflow", "args": {"workflow": "wf2_products_v2"},
          "ok": True, "task_id": "abc12345", "error": None},
         _make_failed_entry("wf2_sales_v2", "unknown_workflow"),
     ]
-    reply = "ERP 商品库刷新成功（任务 abc12345），销量价格刷新失败：unknown_workflow。"
+    # reply 包含 "wf2_sales_v2" 技术名 → 满足"哪条失败"要求
+    reply = "ERP 商品库刷新成功（任务 abc12345），wf2_sales_v2 启动失败：unknown_workflow。"
     warns = _safety._check_failed_workflow_claimed_success(reply, tool_log)
-    assert not warns, f"reply 已说明混合结果不应 banner: {warns}"
+    assert not warns, f"reply 已点名失败 workflow 不应 banner: {warns}"
+
+
+def test_partial_success_vague_failure_triggers_banner():
+    """两个工作流：一成一败；reply 只说'有一个失败'未点名 → 仍触发 banner"""
+    tool_log = [
+        {"name": "run_workflow", "args": {"workflow": "wf2_products_v2"},
+         "ok": True, "task_id": "abc12345", "error": None},
+        _make_failed_entry("wf2_sales_v2", "unknown_workflow"),
+    ]
+    reply = "ERP 商品库刷新成功（任务 abc12345），销量价格刷新失败。"
+    warns = _safety._check_failed_workflow_claimed_success(reply, tool_log)
+    assert warns, "未点名失败 workflow 应有 banner"
+    assert "wf2_sales_v2" in warns[0]
 
 
 def test_non_run_workflow_tool_ignored():
@@ -147,7 +176,7 @@ def test_sanitize_reply_successful_workflow_no_extra_banner():
                  "ok": True, "task_id": "abc12345", "error": None}]
     reply = "ERP 商品库刷新已启动，任务 abc12345。"
     out, warns = _safety.sanitize_reply(reply, ["run_workflow"], tool_log=tool_log)
-    workflow_failure_warns = [w for w in (warns or []) if "实际启动失败" in w]
+    workflow_failure_warns = [w for w in (warns or []) if "未点名该工作流" in w]
     assert not workflow_failure_warns, f"成功工作流不应触发失败 banner: {warns}"
 
 
@@ -194,12 +223,14 @@ if __name__ == "__main__":
         test_extract_workflow_name_empty_falls_back,
         test_extract_workflow_name_broken_json_falls_back,
         test_failure_not_mentioned_adds_banner,
-        test_failure_mentioned_in_reply_no_banner,
+        test_failure_named_workflow_in_reply_no_banner,
+        test_vague_failure_language_still_triggers_banner,
         test_no_failed_workflow_no_banner,
         test_empty_tool_log_no_banner,
         test_openai_str_args_failure_detected,
         test_partial_success_failure_not_mentioned_adds_banner,
-        test_partial_success_failure_mentioned_no_banner,
+        test_partial_success_failure_named_no_banner,
+        test_partial_success_vague_failure_triggers_banner,
         test_non_run_workflow_tool_ignored,
         test_sanitize_reply_with_failed_workflow_adds_banner,
         test_sanitize_reply_successful_workflow_no_extra_banner,
