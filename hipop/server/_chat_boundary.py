@@ -88,6 +88,18 @@ _COMPLETION_BYPASS_RE = re.compile(
     r")"
 )
 
+# Short status/completion claims that are too generic to put in the broad regex
+# above. They still need evidence when no query tool backs them, or when the only
+# action evidence is run_workflow (task creation).
+_SHORT_STATUS_BYPASS_RE = re.compile(
+    r"(?:"
+    r"操作.{0,4}(?:完毕|完(?:了)?|已完成|完成了?|成功了?)"
+    r"|已(?:完成处理|刷新)(?=$|[。！？!?,，、\s])"
+    r"|已经?处理(?=$|[。！？!?,，、\s])"
+    r"|一切正常"
+    r")"
+)
+
 
 def classify_evidence(tool_log: list) -> EvidenceClass:
     """Return the primary evidence class for a chat response.
@@ -164,21 +176,31 @@ def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
     exempted any reply that had run_workflow in tool_log, which meant a reply like
     '数据已刷新完成，任务已完成' would pass with only run_workflow evidence.
     """
-    if not _COMPLETION_BYPASS_RE.search(reply):
+    completion_claim = _COMPLETION_BYPASS_RE.search(reply)
+    short_status_claim = _SHORT_STATUS_BYPASS_RE.search(reply)
+    if not completion_claim and not short_status_claim:
         return []
 
     # Explicit task-done evidence → allowed
     if _has_task_done_evidence(tool_log):
         return []
 
-    has_run_workflow = any(t.get("name") == "run_workflow" for t in (tool_log or []))
+    names = {t.get("name") for t in (tool_log or [])}
+    has_run_workflow = bool(names & WORKFLOW_TOOLS)
+    has_query_evidence = bool(names & QUERY_TOOLS)
+    # "一切正常" can be a normal query-backed status judgment. Do not force task
+    # readback unless the reply also contains a real completion/refresh claim or
+    # the tool evidence is only a workflow trigger.
+    if short_status_claim and not completion_claim and has_query_evidence and not has_run_workflow:
+        return []
+
     if has_run_workflow:
         return [
-            "⚠️ Agent 宣称任务/数据已完成或已刷新，但只有 run_workflow（任务创建）证据，"
+            "⚠️ Agent 宣称任务/数据已完成、已刷新或已处理，但只有 run_workflow（任务创建）证据，"
             "没有任务完成（task_result/status=done）的工具证据 — "
-            "已触发 ≠ 已完成，禁旁路生成已完成/已刷新声明"
+            "已触发 ≠ 已完成，禁旁路生成已完成/已刷新/已处理声明"
         ]
     return [
-        "⚠️ Agent 宣称任务/数据已完成或已刷新，但本轮没真调 run_workflow — "
-        "这是 hallucinate（禁旁路生成已完成/已刷新声明，请重发刷新指令让系统真跑）"
+        "⚠️ Agent 宣称任务/数据已完成、已刷新或已处理，但本轮没真调 run_workflow — "
+        "这是 hallucinate（禁旁路生成已完成/已刷新/已处理声明，请重发刷新指令让系统真跑）"
     ]
