@@ -474,7 +474,13 @@ def _erp_sku_stats_live(sku: str, nation_id: int, token) -> dict:
         return {"ok": False, "error": "sku_not_found_in_erp",
                 "message": f"SKU {sku} 在 ERP 30d 窗口内无记录（API 可能不支持 keyword 过滤或该 SKU 无近期订单）"}
 
-    def _parse_country(val, country="SA"):
+    _NATION_TO_COUNTRY = {1: "SA", 2: "AE"}
+    country_code = _NATION_TO_COUNTRY.get(nation_id)
+    if not country_code:
+        return {"ok": False, "error": f"unknown_nation_id_{nation_id}",
+                "message": f"nation_id={nation_id} 未知，无法确定目标国家前缀，拒绝返回其他国家数字"}
+
+    def _parse_country(val, country):
         pat = _re.compile(rf"{country}\s*[:：]\s*(\d+)")
         for s in (val if isinstance(val, list) else [str(val or "")]):
             m = pat.match(str(s).strip())
@@ -482,7 +488,7 @@ def _erp_sku_stats_live(sku: str, nation_id: int, token) -> dict:
                 return int(m.group(1))
         return None
 
-    sales_30d = _parse_country(match.get("sales_count"))
+    sales_30d = _parse_country(match.get("sales_count"), country_code)
     fetched_at = _dt.datetime.utcnow().isoformat() + "Z"
     return {
         "ok": True,

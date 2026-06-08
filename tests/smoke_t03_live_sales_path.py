@@ -526,6 +526,145 @@ def test_live_ok_but_missing_sales_30d_redacts() -> None:
           f"live_sales_error={item.get('live_sales_error')!r}")
 
 
+def test_country_routing_uae_returns_ae_value() -> None:
+    """round-5: nation_id=2 (UAE/AE) → _erp_sku_stats_live 返回 AE: 值而非 SA: 值"""
+    print("\n── test_country_routing_uae_returns_ae_value ─────────────────")
+    import hipop.server.data as _data
+    import hipop.server.agent as _agent
+
+    if SMOKE_SKIP_FIX:
+        print("  [SKIP] SMOKE_SKIP_FIX=1")
+        return
+
+    _fresh_db(_data)
+    conn = _data.conn()
+    _seed_entity(conn)
+    # UAE store — entity may not exist but we need to test the live fn routing
+    conn.execute(
+        "INSERT OR REPLACE INTO sales_entities "
+        "(tenant_id, alias, country, platform, store_name, store_id, currency) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (TENANT_ID, "hipop_uae", "AE", "Noon", "HIPOP-NOON-UAE", 2, "AED"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO wf2_sku "
+        "(tenant_id, entity_alias, partner_sku, title, as_of_date, "
+        " imported_at, sales_30d, sales_10d, sales_grade, "
+        " latest_price, latest_profit_rate, is_listed, total_orders) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (TENANT_ID, "hipop_uae", SKU, "Test SKU T03 UAE",
+         TODAY, TODAY + "T10:00:00", 99, 9, "A", 60.0, 0.12, 1, 500),
+    )
+    conn.commit()
+
+    AE_SALES_30D = 42
+    SA_SALES_30D = 25
+
+    live_calls: list = []
+
+    def mock_live_multi_country(sku, nation_id, token):
+        live_calls.append({"sku": sku, "nation_id": nation_id})
+        # ERP returns multi-country sales_count list
+        return {
+            "ok": True,
+            "sku": sku,
+            "sales_30d": AE_SALES_30D if nation_id == 2 else SA_SALES_30D,
+            "history_total": None,
+            "fetched_at": LIVE_FETCHED_AT,
+            "source": "test_mock_uae",
+        }
+
+    orig = _agent._sku_sales_live_fn
+    _agent._sku_sales_live_fn = mock_live_multi_country
+    _agent._chat_tenant.set(TENANT_ID)
+    _agent._chat_scope.set({"tenant_id": TENANT_ID, "store": "UAE", "user": "test"})
+
+    try:
+        result = _agent.tool_query_sku([SKU], store="UAE")
+    finally:
+        _agent._sku_sales_live_fn = orig
+
+    item = (result.get("items") or [{}])[0]
+
+    check("UAE store → live fn 被调用 nation_id=2",
+          any(c.get("nation_id") == 2 for c in live_calls),
+          f"live_calls={live_calls!r}")
+    check(f"UAE store → sales_30d = {AE_SALES_30D}（AE 值，非 SA 值 {SA_SALES_30D}）",
+          item.get("sales_30d") == AE_SALES_30D,
+          f"got sales_30d={item.get('sales_30d')!r} (应为 AE 值 {AE_SALES_30D})")
+    check("UAE store → live_evidence 存在",
+          isinstance(item.get("live_evidence"), dict),
+          f"live_evidence={item.get('live_evidence')!r}")
+    check("UAE store → live_sales_failed 不存在",
+          not item.get("live_sales_failed"),
+          f"live_sales_failed={item.get('live_sales_failed')!r}")
+
+
+def test_country_routing_erp_live_parse() -> None:
+    """round-5: _erp_sku_stats_live 直接测 _parse_country 按 nation_id 路由"""
+    print("\n── test_country_routing_erp_live_parse ───────────────────────")
+
+    if SMOKE_SKIP_FIX:
+        print("  [SKIP] SMOKE_SKIP_FIX=1")
+        return
+
+    import hipop.server.agent as _agent
+
+    fn = _agent._erp_sku_stats_live
+
+    # 用 mock ERP 内部：注入假 erp_get，验证 _parse_country 用正确 country_code
+    import sys
+    from unittest.mock import patch, MagicMock
+
+    def _make_erp_resp(sku, sales_count_list):
+        return {
+            "code": 200,
+            "data": [{
+                "sku_id": sku.upper(),
+                "sku": {"platform_sku_ids": [{"platform_sku_id": sku.upper()}]},
+                "sales_count": sales_count_list,
+            }]
+        }
+
+    # Scenario A: nation_id=2 (AE), multi-country list → should return AE value (42)
+    with patch("workflows.wf0_logistics.erp_get",
+               return_value=_make_erp_resp(SKU, ["SA: 25", "AE: 42"])):
+        result_ae = fn(SKU, 2, "dummy_token")
+    check("nation_id=2 + [SA:25, AE:42] → sales_30d=42（AE 值）",
+          result_ae.get("sales_30d") == 42,
+          f"got sales_30d={result_ae.get('sales_30d')!r} result={result_ae!r}")
+    check("nation_id=2 → ok=True",
+          result_ae.get("ok") is True,
+          f"ok={result_ae.get('ok')!r}")
+
+    # Scenario B: nation_id=1 (SA), multi-country list → should return SA value (25)
+    with patch("workflows.wf0_logistics.erp_get",
+               return_value=_make_erp_resp(SKU, ["SA: 25", "AE: 42"])):
+        result_sa = fn(SKU, 1, "dummy_token")
+    check("nation_id=1 + [SA:25, AE:42] → sales_30d=25（SA 值）",
+          result_sa.get("sales_30d") == 25,
+          f"got sales_30d={result_sa.get('sales_30d')!r}")
+
+    # Scenario C: nation_id=2 (AE), but AE field missing → fail-closed (sales_30d=None or ok=False)
+    with patch("workflows.wf0_logistics.erp_get",
+               return_value=_make_erp_resp(SKU, ["SA: 25"])):
+        result_missing = fn(SKU, 2, "dummy_token")
+    check("nation_id=2 + [SA:25 only] → AE 字段缺失 → fail-closed (sales_30d=None or ok=False)",
+          result_missing.get("sales_30d") is None or result_missing.get("ok") is False,
+          f"got result={result_missing!r} (SA 值 25 不应作为 AE 答案!)")
+    check("nation_id=2 + AE 字段缺失 → 不返回 SA 的 25",
+          result_missing.get("sales_30d") != 25,
+          f"got sales_30d={result_missing.get('sales_30d')!r} (SA 值 25 串到 AE 口径!)")
+
+    # Scenario D: unknown nation_id → fail-closed
+    with patch("workflows.wf0_logistics.erp_get",
+               return_value=_make_erp_resp(SKU, ["SA: 25"])):
+        result_unknown = fn(SKU, 99, "dummy_token")
+    check("nation_id=99 (未知) → ok=False（拒绝返回任意国家数字）",
+          result_unknown.get("ok") is False,
+          f"got result={result_unknown!r}")
+
+
 def _cleanup() -> None:
     for p in _TMP_DBS + [_TMP_DB_PATH]:
         try:
@@ -543,6 +682,8 @@ if __name__ == "__main__":
     test_live_unavailable_redacts_sales()
     test_live_exception_redacts_sales()
     test_live_ok_but_missing_sales_30d_redacts()
+    test_country_routing_uae_returns_ae_value()
+    test_country_routing_erp_live_parse()
     test_provider_chain_stale_skus()
     test_safety_t03_with_live_failed()
 
