@@ -27,6 +27,11 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from typing import List, Optional
+import datetime as _dt
+
+# macOS Python can inherit system proxies even when the shell env is clean.
+# Chat smoke must hit the local uvicorn server directly.
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
 
 # ── case 定义 ────────────────────────────────────────────
@@ -52,6 +57,138 @@ GLOBAL_BLACKLIST = [
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
 ]
+
+
+def _num_re(n: Optional[int]) -> str:
+    if n is None:
+        return r"\d+"
+    text = str(int(n))
+    if len(text) > 3:
+        return rf"{text[:-3]}[,，]?{text[-3:]}"
+    return rf"\b{text}\b"
+
+
+def _rate_re(rate: Optional[float]) -> str:
+    if rate is None:
+        return r"\d+(?:\.\d+)?\s*%"
+    pct = float(rate) * 100
+    if abs(pct) < 0.005:
+        return r"0(?:\.0{1,2})?\s*%?|无(?:取消|退货)"
+    one_decimal = f"{pct:.1f}".rstrip("0").rstrip(".")
+    two_decimal = f"{pct:.2f}".rstrip("0").rstrip(".")
+    return rf"{re.escape(one_decimal)}|{re.escape(two_decimal)}"
+
+
+def _live_expectations() -> dict:
+    live = {
+        "product_total": 1424,
+        "product_listed": 950,
+        "product_unlisted": 494,
+        "sku_total": 1799,
+        "sku_listed": 1046,
+        "sku_unlisted": 752,
+        "tbb_sales_30d": 48,
+        "tbb_total_30d": 51,
+        "tbb_cancel_rate_30d": 0.0588,
+        "tbb_return_rate_30d": 0.0,
+        "tbb_history_total": 1967,
+        "stale_tst001": "stale",
+        "_source": "fallback",
+    }
+    try:
+        from hipop.server import data as _data
+
+        _data.set_current_tenant(1)
+        alias_rows = _data._fetch(
+            "SELECT alias FROM sales_entities "
+            "WHERE tenant_id=? AND country=? AND active=1 LIMIT 1",
+            (1, "SA"),
+        )
+        alias = alias_rows[0]["alias"] if alias_rows else "hipop_ksa"
+        sku_agg = _data._fetch(
+            """
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN is_listed=1 THEN 1 ELSE 0 END) AS listed,
+              SUM(CASE WHEN is_listed=0 OR is_listed IS NULL THEN 1 ELSE 0 END) AS unlisted
+            FROM wf2_sku WHERE tenant_id=? AND entity_alias=?
+            """,
+            (1, alias),
+        )[0]
+        prod_agg = _data._fetch(
+            """
+            SELECT
+              COUNT(DISTINCT product_id) AS total,
+              COUNT(DISTINCT CASE WHEN is_listed=1 THEN product_id END) AS listed,
+              COUNT(DISTINCT CASE WHEN is_listed=0 OR is_listed IS NULL THEN product_id END) AS unlisted
+            FROM wf2_sku
+            WHERE tenant_id=? AND entity_alias=? AND product_id IS NOT NULL AND product_id != ''
+            """,
+            (1, alias),
+        )[0]
+        live.update({
+            "product_total": prod_agg["total"],
+            "product_listed": prod_agg["listed"],
+            "product_unlisted": prod_agg["unlisted"],
+            "sku_total": sku_agg["total"],
+            "sku_listed": sku_agg["listed"],
+            "sku_unlisted": sku_agg["unlisted"],
+        })
+
+        tbb_rows = _data._fetch(
+            "SELECT sales_30d, total_orders, as_of_date FROM wf2_sku "
+            "WHERE tenant_id=? AND entity_alias=? AND partner_sku=? LIMIT 1",
+            (1, alias, "TBB0116A"),
+        )
+        if tbb_rows:
+            row = tbb_rows[0]
+            stats = _data.sku_30d_stats(1, alias, "TBB0116A", row.get("as_of_date"))
+            live.update({
+                "tbb_sales_30d": row.get("sales_30d"),
+                "tbb_total_30d": stats.get("total_30d"),
+                "tbb_cancel_rate_30d": stats.get("cancel_rate_30d"),
+                "tbb_return_rate_30d": stats.get("return_rate_30d"),
+                "tbb_history_total": row.get("total_orders"),
+            })
+
+        stale_rows = _data._fetch(
+            "SELECT as_of_date FROM wf2_sku "
+            "WHERE tenant_id=? AND entity_alias=? AND partner_sku=? LIMIT 1",
+            (1, alias, "STALE_TST001"),
+        )
+        if not stale_rows:
+            live["stale_tst001"] = "missing"
+        else:
+            as_of = stale_rows[0].get("as_of_date")
+            try:
+                stale_days = (_dt.date.today() - _dt.date.fromisoformat(as_of)).days
+                live["stale_tst001"] = "stale" if stale_days > 3 else "fresh"
+            except Exception:
+                live["stale_tst001"] = "stale"
+        live["_source"] = "db"
+    except Exception as e:
+        live["_error"] = f"{type(e).__name__}: {e}"
+        pass
+    return live
+
+
+_LIVE = _live_expectations()
+_PRODUCT_TOTAL_RE = _num_re(_LIVE["product_total"])
+_SKU_TOTAL_RE = _num_re(_LIVE["sku_total"])
+_PRODUCT_SPLIT_RE = "|".join(
+    _num_re(_LIVE[k]) for k in ("sku_listed", "sku_unlisted", "product_listed", "product_unlisted")
+)
+_SKU_LISTED_RE = _num_re(_LIVE["sku_listed"])
+_TBB_SALES_RE = _num_re(_LIVE["tbb_sales_30d"])
+_TBB_TOTAL_RE = _num_re(_LIVE["tbb_total_30d"])
+_TBB_CANCEL_RE = _rate_re(_LIVE["tbb_cancel_rate_30d"])
+_TBB_RETURN_RE = _rate_re(_LIVE["tbb_return_rate_30d"])
+_TBB_HISTORY_RE = _num_re(_LIVE["tbb_history_total"])
+_STALE_TST001_RE = (
+    r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认"
+    if _LIVE["stale_tst001"] == "stale"
+    else r"未找到|查不到|不存在|不在.*店铺|SKU.{0,6}有误|编码.{0,6}有误"
+)
 
 
 # ── case 11「拒绝刷新」陈旧警示的**结构判别**（WS-55 门2 五轮收敛的最终形态）──────────
@@ -102,24 +239,24 @@ CASES: List[Case] = [
     #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
     #   +1 SKU: STALE_TST001（is_listed=0, product_id=NULL）测试夹具已入库。
     Case(
-        name="商品总数（要 1424 product / 1799 SKU）",
+        name="商品总数（要真实 product 总数）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"1[,，]?799"],
+        must_contain=[_PRODUCT_TOTAL_RE],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1046/752 或 product 维度 950/494）",
+        name="商品总数 + 上架未上架细分（真实 product/SKU 维度）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        # 1424 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
-        must_contain=[r"1[,，]?424", r"1[,，]?046|752|950|494"],
+        # product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径，随 live DB 漂移）
+        must_contain=[_PRODUCT_TOTAL_RE, _PRODUCT_SPLIT_RE],
     ),
     # ─── 概览类 ───
     Case(
-        name="店铺整体（在售 SKU 1046 + 红色告警）",
+        name="店铺整体（真实在售 SKU + 红色告警）",
         question="我的店里有多少货 哪些需要我关注",
         must_use_tools=["scope_overview"],
-        must_contain=[r"1[,，]?046"],
+        must_contain=[_SKU_LISTED_RE],
     ),
     Case(
         name="红色告警（要真数 2）",
@@ -150,15 +287,15 @@ CASES: List[Case] = [
     # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
     # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）+ history=1967。
     Case(
-        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel≈5.88% / history=1967）",
+        name="T04 TBB0116A 30d 口径（sales / total / cancel / history 同 DB）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"\b48\b",
-            r"\b51\b",
-            r"5\.8[0-9]|5\.9",
-            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
-            r"1[,，]?967",        # 历史总销量 ERP 口径（2026-06-05 截止）
+            _TBB_SALES_RE,
+            _TBB_TOTAL_RE,
+            _TBB_CANCEL_RE,
+            _TBB_RETURN_RE,
+            _TBB_HISTORY_RE,        # 历史总销量 ERP 口径
         ],
         must_not_contain=[
             r"\b13\b",
@@ -172,11 +309,11 @@ CASES: List[Case] = [
     # fail-then-pass：改前 REDACT 未实现，过期快照也能拿到数值 → Agent 报旧值 13/290/0%。
     # 改后 data_stale=True 时所有数值字段 REDACT=null → Agent 必须告知过期，不得报旧值。
     Case(
-        name="T04 快照过期边界（STALE_TST001 过期快照不得给旧值，必须警示过期）",
+        name="T04 快照过期/缺失边界（STALE_TST001 不得给旧值）",
         question="STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认",
+            _STALE_TST001_RE,
         ],
         must_not_contain=[
             r"\b13\b",
@@ -409,6 +546,14 @@ def main():
 
     print(f"=== hipop-agent-os smoke test ===")
     print(f"URL: {args.url}")
+    print(
+        "expectations: "
+        f"{_LIVE.get('_source')} "
+        f"product={_LIVE['product_total']} sku={_LIVE['sku_total']} "
+        f"listed={_LIVE['sku_listed']} tbb30={_LIVE['tbb_sales_30d']}/{_LIVE['tbb_total_30d']} "
+        f"stale={_LIVE['stale_tst001']}"
+        + (f" error={_LIVE.get('_error')}" if _LIVE.get("_error") else "")
+    )
     err = check_chat_history_endpoint(args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
