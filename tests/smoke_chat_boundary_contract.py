@@ -1,4 +1,4 @@
-"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 2)
+"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 3)
 
 验收：chat 查询 / 工作流执行 / 状态回读 三条热点路径在同一分类框架下可区分，
 且无真实证据时旁路宣称被拦截。
@@ -6,19 +6,16 @@
 三条路径定义（_chat_boundary.py）：
   QUERY           — 读工具证据 (query_sku / list_products 等)
   WORKFLOW_TRIGGER — run_workflow → tasks 表落行 → task_id
-  TASK_READBACK   — get_task_with_events 从 tasks 表读真实状态
+  TASK_READBACK   — task_result/task_status_readback status=done 证明任务完成
 
-FAIL 条件（修前）：
-  - classify_evidence 不存在 → ImportError
-  - 已完成/已刷新旁路未拦截 → test_bypass_done_without_workflow 失败
-  - run_workflow 单独放行了"已完成"声明 → test_bypass_run_workflow_only_blocks_done_claim 失败
+FAIL 条件（修前 round-2）：
+  - "已经刷新" / "已更新" / "刷新已完成" 变体未被 _COMPLETION_BYPASS_RE 捕获
+  - classify_evidence 对 task_status_readback/task_result(done) 返回 NONE
 
-PASS 条件（修后）：
-  - 所有 classify_evidence 断言正确
-  - 已完成/已刷新旁路被 check_task_completion_bypass 捕获
-  - run_workflow 只证明任务触发，不放行已完成/已刷新声明
-  - task_result/status=done 才是任务完成证据，允许已完成声明
-  - _workflow_receipt_reply 正确读 tasks 表返回三态回执
+PASS 条件（修后 round-3）：
+  - 三种正则变体均被拦截（已经刷新/已更新/刷新已完成）
+  - classify_evidence 对有 done 状态的 task_done_tools 返回 TASK_READBACK
+  - sanitize_reply 在 run_workflow 单独存在时拦截所有变体
 """
 
 from __future__ import annotations
@@ -360,6 +357,145 @@ def test_sanitize_reply_allows_completion_with_task_result():
     print(f"    sanitize allows task_result/done ✓ total_warns={len(warns)}")
 
 
+# ── Round-3 fail-then-pass: 已经刷新/已更新/刷新已完成 变体 ─────────────────────
+
+def test_bypass_jingxi_refresh_no_tool():
+    """红队 round-3：'数据已经刷新完成' + 无工具 → warns（验门人 probe #4）。
+
+    FAIL（修前）：_COMPLETION_BYPASS_RE 不匹配"已经刷新"变体 → warns=[]。
+    PASS（修后）：正则覆盖 已经? 变体 → warns 非空。
+    """
+    warns = check_task_completion_bypass("数据已经刷新完成。", [])
+    assert warns, "round-3 FAIL：'数据已经刷新完成'无工具时应被拦截，但 warns=[]"
+
+
+def test_bypass_jingxi_refresh_run_workflow_only():
+    """红队 round-3：'数据已经刷新完成' + run_workflow only → warns（验门人 probe #1）。
+
+    FAIL（修前）：正则不匹配"已经刷新" → warns=[]（视作无完成声明，直接放行）。
+    PASS（修后）：正则命中 → 进入两阶段门 → run_workflow 无完成证据 → warns 非空。
+    """
+    tool_log = [{"name": "run_workflow"}]
+    warns = check_task_completion_bypass("数据已经刷新完成。", tool_log)
+    assert warns, (
+        "round-3 FAIL：run_workflow 单独时'数据已经刷新完成'应被拦截，但 warns=[]"
+    )
+
+
+def test_bypass_kucu_update_run_workflow_only():
+    """红队 round-3：'库存已更新完成' + run_workflow only → warns（验门人 probe #2）。
+
+    FAIL（修前）：_COMPLETION_BYPASS_RE 无"已更新"分支 → warns=[]。
+    PASS（修后）：库存.{0,8}已经?(?:刷新|更新) 命中"库存已更新" → warns 非空。
+    """
+    tool_log = [{"name": "run_workflow"}]
+    warns = check_task_completion_bypass("库存已更新完成。", tool_log)
+    assert warns, (
+        "round-3 FAIL：run_workflow 单独时'库存已更新完成'应被拦截，但 warns=[]"
+    )
+
+
+def test_bypass_flush_done_run_workflow_only():
+    """红队 round-3：'刷新已完成' + run_workflow only → warns（验门人 probe #3）。
+
+    FAIL（修前）：_COMPLETION_BYPASS_RE 无"刷新已完成"分支 → warns=[]。
+    PASS（修后）：(?:刷新|更新|同步).{0,5}已完成 命中"刷新已完成" → warns 非空。
+    """
+    tool_log = [{"name": "run_workflow"}]
+    warns = check_task_completion_bypass("刷新已完成。", tool_log)
+    assert warns, (
+        "round-3 FAIL：run_workflow 单独时'刷新已完成'应被拦截，但 warns=[]"
+    )
+
+
+def test_sanitize_reply_jingxi_refresh_run_workflow_only():
+    """sanitize_reply 整合：run_workflow 单独时'数据已经刷新完成' → banner（probe #1）。"""
+    from hipop.server._safety import sanitize_reply
+
+    _, warns = sanitize_reply(
+        "数据已经刷新完成。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow"}],
+    )
+    assert warns, "sanitize_reply probe #1 FAIL：'数据已经刷新完成' run_workflow only → warns=[]"
+
+
+def test_sanitize_reply_kucu_update_run_workflow_only():
+    """sanitize_reply 整合：run_workflow 单独时'库存已更新完成' → banner（probe #2）。"""
+    from hipop.server._safety import sanitize_reply
+
+    _, warns = sanitize_reply(
+        "库存已更新完成。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow"}],
+    )
+    assert warns, "sanitize_reply probe #2 FAIL：'库存已更新完成' run_workflow only → warns=[]"
+
+
+def test_sanitize_reply_flush_done_run_workflow_only():
+    """sanitize_reply 整合：run_workflow 单独时'刷新已完成' → banner（probe #3）。"""
+    from hipop.server._safety import sanitize_reply
+
+    _, warns = sanitize_reply(
+        "刷新已完成。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow"}],
+    )
+    assert warns, "sanitize_reply probe #3 FAIL：'刷新已完成' run_workflow only → warns=[]"
+
+
+# ── Round-3: TASK_READBACK classify_evidence contract ────────────────────────
+
+def test_classify_task_readback_task_status_done():
+    """classify_evidence: task_status_readback+status=done → TASK_READBACK（修前返回 NONE）。
+
+    FAIL（修前）：classify_evidence 只检查 WORKFLOW_TOOLS / QUERY_TOOLS → NONE。
+    PASS（修后）：_has_task_done_evidence 优先 → TASK_READBACK。
+    """
+    tool_log = [{"name": "task_status_readback", "status": "done"}]
+    cls = classify_evidence(tool_log)
+    assert cls == EvidenceClass.TASK_READBACK, (
+        f"round-3 FAIL：task_status_readback/done 应分类为 TASK_READBACK，实得 {cls}"
+    )
+
+
+def test_classify_task_readback_task_result_done():
+    """classify_evidence: task_result+result.status=done → TASK_READBACK（修前返回 NONE）。
+
+    FAIL（修前）：classify_evidence 不调用 _has_task_done_evidence → NONE。
+    PASS（修后）：TASK_READBACK 优先级最高 → TASK_READBACK。
+    """
+    tool_log = [{"name": "task_result", "result": {"status": "done"}}]
+    cls = classify_evidence(tool_log)
+    assert cls == EvidenceClass.TASK_READBACK, (
+        f"round-3 FAIL：task_result/done 应分类为 TASK_READBACK，实得 {cls}"
+    )
+
+
+def test_classify_task_readback_beats_workflow_trigger():
+    """classify_evidence: run_workflow + task_result/done → TASK_READBACK（完成优先于触发）。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        {"name": "task_result", "result": {"status": "done"}},
+    ]
+    cls = classify_evidence(tool_log)
+    assert cls == EvidenceClass.TASK_READBACK, (
+        f"任务完成后应为 TASK_READBACK，实得 {cls}"
+    )
+
+
+def test_classify_task_done_running_still_workflow_trigger():
+    """task_status_readback + status=running → 不升为 TASK_READBACK（任务仍在跑）。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        {"name": "task_status_readback", "status": "running"},
+    ]
+    cls = classify_evidence(tool_log)
+    assert cls == EvidenceClass.WORKFLOW_TRIGGER, (
+        f"task 仍在运行时应为 WORKFLOW_TRIGGER，实得 {cls}"
+    )
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -380,7 +516,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 2)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 3)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -403,7 +539,7 @@ if __name__ == "__main__":
          test_bypass_task_done_without_workflow),
         ("test_bypass_already_synced_without_workflow",
          test_bypass_already_synced_without_workflow),
-        # 关键红队 fail-then-pass
+        # 关键红队 fail-then-pass (round 2)
         ("test_bypass_run_workflow_only_blocks_done_claim",
          test_bypass_run_workflow_only_blocks_done_claim),
         ("test_bypass_run_workflow_with_data_refresh_claim",
@@ -436,6 +572,30 @@ if __name__ == "__main__":
         # Three-path
         ("test_three_paths_are_distinguishable",
          test_three_paths_are_distinguishable),
+        # Round-3 fail-then-pass: 已经刷新/已更新/刷新已完成 变体
+        ("test_bypass_jingxi_refresh_no_tool",
+         test_bypass_jingxi_refresh_no_tool),
+        ("test_bypass_jingxi_refresh_run_workflow_only",
+         test_bypass_jingxi_refresh_run_workflow_only),
+        ("test_bypass_kucu_update_run_workflow_only",
+         test_bypass_kucu_update_run_workflow_only),
+        ("test_bypass_flush_done_run_workflow_only",
+         test_bypass_flush_done_run_workflow_only),
+        ("test_sanitize_reply_jingxi_refresh_run_workflow_only",
+         test_sanitize_reply_jingxi_refresh_run_workflow_only),
+        ("test_sanitize_reply_kucu_update_run_workflow_only",
+         test_sanitize_reply_kucu_update_run_workflow_only),
+        ("test_sanitize_reply_flush_done_run_workflow_only",
+         test_sanitize_reply_flush_done_run_workflow_only),
+        # Round-3: TASK_READBACK classify_evidence contract
+        ("test_classify_task_readback_task_status_done",
+         test_classify_task_readback_task_status_done),
+        ("test_classify_task_readback_task_result_done",
+         test_classify_task_readback_task_result_done),
+        ("test_classify_task_readback_beats_workflow_trigger",
+         test_classify_task_readback_beats_workflow_trigger),
+        ("test_classify_task_done_running_still_workflow_trigger",
+         test_classify_task_done_running_still_workflow_trigger),
     ]
 
     failed = 0
