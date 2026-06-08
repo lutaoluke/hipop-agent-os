@@ -444,7 +444,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
-    # WS-128: task completion/refresh bypass gate (已完成/已刷新 without run_workflow)
+    # WS-128: two-phase task completion/refresh bypass gate
     from ._chat_boundary import check_task_completion_bypass
     warnings.extend(check_task_completion_bypass(reply, tool_log or []))
 
