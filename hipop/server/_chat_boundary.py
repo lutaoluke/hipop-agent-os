@@ -58,26 +58,31 @@ _TASK_DONE_STATUSES: frozenset = frozenset({
 })
 
 # Completion/refresh claim patterns that require task-done evidence.
+# Covers 已刷新 and 已经刷新 (optional 经); both 已刷新 and 已更新.
 _COMPLETION_BYPASS_RE = re.compile(
-    r"(数据.{0,5}已刷新"
-    r"|库存.{0,5}已刷新"
-    r"|销量.{0,5}已刷新"
-    r"|已刷新.{0,5}(完成|成功|好了)"
+    r"(数据.{0,8}已经?(?:刷新|更新)"        # 数据已刷新/已更新/已经刷新/已经更新
+    r"|库存.{0,8}已经?(?:刷新|更新)"        # 库存已刷新/已更新/已经刷新/已经更新
+    r"|销量.{0,8}已经?(?:刷新|更新)"        # 销量已刷新/已更新
+    r"|已经?(?:刷新|更新|同步).{0,8}(?:完成|成功|好了)"  # 已(经)刷新/更新/同步…完成
+    r"|(?:刷新|更新|同步).{0,5}已完成"      # 刷新/更新/同步已完成
     r"|工作流.{0,10}已完成"
     r"|后台任务.{0,10}已完成"
-    r"|任务已(跑完|完成|成功)"
-    r"|已重算.{0,5}完(成)?"
+    r"|任务已(?:跑完|完成|成功)"
+    r"|已重算.{0,5}完(?:成)?"
     r"|已跑完"
-    r"|已同步.{0,5}(完成|好了|成功))"
+    r")"
 )
 
 
 def classify_evidence(tool_log: list) -> EvidenceClass:
     """Return the primary evidence class for a chat response.
 
-    Priority: WORKFLOW_TRIGGER > QUERY > NONE.
-    TASK_READBACK is set externally (by _workflow_receipt_reply after reading tasks table).
+    Priority: TASK_READBACK > WORKFLOW_TRIGGER > QUERY > NONE.
+    TASK_READBACK requires explicit done/success status in a task-done tool entry.
     """
+    # Task completion evidence has highest specificity
+    if _has_task_done_evidence(tool_log):
+        return EvidenceClass.TASK_READBACK
     names = {t.get("name") for t in (tool_log or [])}
     if names & WORKFLOW_TOOLS:
         return EvidenceClass.WORKFLOW_TRIGGER
