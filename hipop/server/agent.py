@@ -412,6 +412,22 @@ TOOLS = [
 
 
 # ── 工具实现（v2 列存：按 tenant_id + entity_alias 过滤）──
+_SKU_STALE_DAYS = 3  # wf2_sku 超过 N 天未更新视为陈旧，报告时须告知用户
+
+
+def _sku_stale_warn(imported_at: str) -> bool:
+    """imported_at 超过 _SKU_STALE_DAYS 天（或为空）→ True，标记数据陈旧。"""
+    if not imported_at:
+        return True
+    from datetime import datetime
+    try:
+        ts = str(imported_at).replace("T", " ").split(".")[0][:19]
+        age_days = (datetime.now() - datetime.fromisoformat(ts)).days
+        return age_days > _SKU_STALE_DAYS
+    except Exception:
+        return True
+
+
 def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
@@ -421,6 +437,7 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
                    w2.sales_30d, w2.sales_10d, w2.latest_price,
+                   w2.imported_at,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
                    h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
@@ -436,6 +453,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             out.append({"sku": sku, "found": False})
             continue
         r = rows[0]
+        import_ts = r.get("imported_at")
+        is_stale = _sku_stale_warn(import_ts)
         out.append({
             "sku": sku,
             "found": True,
@@ -450,11 +469,24 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "in_transit": r["in_transit_total_qty"],
             "has_stuck_batch": bool(r["has_stuck_batch"]),
             "weekly_replenish": r["weekly_total_replenish"],
+            # ── 取数证据（T03：报告销量/价格时必须引用这两个字段）──
+            "data_as_of": import_ts,   # ERP/noon import timestamp; 销量/价格的数据口径时间
+            "stale_warn": is_stale,    # True 时须告知用户数据非实时，不可当作当前事实呈现
         })
-        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
+        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'",
+                     "imported_at": str(import_ts) if import_ts else "unknown"})
         refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
         refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'"})
-    return {"items": out, "references": refs}
+    return {
+        "items": out,
+        "references": refs,
+        "data_source_note": (
+            "wf2_sku 为 ERP/noon 定期导入快照（非实时）。"
+            "每个 SKU 的 data_as_of 是本次导入时间；stale_warn=true 表示超过 "
+            f"{_SKU_STALE_DAYS} 天未更新，报告销量/价格/利润率时必须告知用户此快照时间，"
+            "不可作为当前实时数据呈现。本工具不含总库存数字，禁止补充总库存。"
+        ),
+    }
 
 
 def tool_query_order(order_no: str) -> Dict:
@@ -1626,6 +1658,12 @@ scope: {scope}
 5. **用户报告状态变化（"我刷新了"/"我传了"）必须重新调 tool 验证**，不信用户报告
 6. **真实字段**：wf2_sku（partner_sku/sales_*d/latest_profit_rate/is_listed/sales_grade）/ wf5（trend/daily_rate/urgency/sellable_days/weekly_total_replenish）/ wf3_hub_v2（in_transit_total_qty/has_stuck_batch）— 不在此列禁编
 7. **destructive 不一步走完**：update_alert_status / run_workflow 返 plan → 原文转告 plan_text → 等用户回 OK → 调 confirm_proposal(pid, 'ok')。**绝不**自己再调原 destructive tool
+8. **SKU 销量/价格/利润率必须有取数证据（T03 教训）**：
+   - `query_sku` 返回每个 SKU 的 `data_as_of`（ERP/noon 导入时间）和 `stale_warn` 字段
+   - 报告 sales_30d / sales_180d / latest_price / latest_profit_rate 时必须告知用户 `data_as_of` 时间（「数据来自 X 导入的 ERP 快照」）
+   - `stale_warn=true` → 必须明确说「此 SKU 数据来自 N 天前快照，当前**无法实时确认**最新数值」，**禁止**把快照数字作为当前事实呈现
+   - `data_as_of` 为 null → 说「无法确认该 SKU 数据来源时间，不能给出确定数字」
+   - **query_sku 不含总库存**（只有 in_transit 在途量）—— **严禁补充「总库存 X 件」「库存 X 件」类无来源数字**；如用户问总库存，告知需调 compute_replenishment 或 scope_overview
 
 ## 长期偏好沉淀
 - 用户明确说"以后都这么办" / "记住" / "默认 X" → 调 tenant_notes_append
