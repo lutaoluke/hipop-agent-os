@@ -41,12 +41,30 @@ DEPRECATED = {
 # ── 生产接线 verifier（WS-117 round-11）──────────────────────────────────────
 # 当 agent 回复包含采购议价率讨论时，检查分母/plus口径是否正确。
 
-_TOPIC_RE = re.compile(r'采购议价率')
+_TOPIC_RE = re.compile(r'采购(?:议价率|折扣率)|(?:议价率|折扣率).{0,10}采购')
 
 # 错误分母：议价差额 ÷ 仅1688采购标准价（缺头程运费分摊）
 _FORMULA_WRONG_DENOM_RE = re.compile(
     r'议价差额\s*(?:[÷/]|除以)\s*\(?\s*(?:只用|仅用)?\s*1688.{0,15}(?:标准价|标价|参考价)\s*\)?'
     r'(?!\s*[\+＋加].{0,18}头程)',
+    re.IGNORECASE,
+)
+
+# 错误分母：销售价/noon价格/采购价等被拿来当采购议价率或采购折扣率分母。
+_FORMULA_EXTERNAL_DENOM_RE = re.compile(
+    r'议价差额\s*(?:[÷/]|除以)\s*\(?\s*'
+    r'(?:noon\s*价格|noon价|销售价|售价|采购价|采购单价|实际成交采购价|成交采购价|成交价)\s*\)?',
+    re.IGNORECASE,
+)
+
+# 旧 15% 合格/达标线：测试 oracle 已拦截，生产 verifier 也必须标红。
+_OLD_15PCT_THRESHOLD_RE = re.compile(
+    r'(?:采购(?:议价率|折扣率)|议价率|折扣率).{0,24}'
+    r'(?:≥|>=|>|＞|大于|高于|超过|达到|达|不低于|不能低于|最低|至少)?\s*'
+    r'(?:15\s*[%％]|15\s*(?:个点|个百分点|百分点)|十五\s*(?:个点|个百分点|百分点)?)'
+    r'.{0,24}(?:合格|达标|正常|过线|备注|不合格|绩效)'
+    r'|(?:15\s*[%％]|15\s*(?:个点|个百分点|百分点)|十五\s*(?:个点|个百分点|百分点)?)'
+    r'.{0,16}(?:才|即|就|以上|为|算).{0,8}(?:合格|达标|正常|过线)',
     re.IGNORECASE,
 )
 
@@ -78,6 +96,16 @@ def check_procurement_rate_reply(reply: str) -> list:
         warns.append(
             "采购议价率公式分母错误：应为(1688采购标准价 + 头程运费分摊)，"
             "检测到分母缺少头程运费分摊。规则源: hipop/rules/procurement_rate.py"
+        )
+    if _FORMULA_EXTERNAL_DENOM_RE.search(reply):
+        warns.append(
+            "采购议价率公式分母错误：应为(1688采购标准价 + 头程运费分摊)，"
+            "不能使用noon价格、销售价或采购价作为分母。规则源: hipop/rules/procurement_rate.py"
+        )
+    if _OLD_15PCT_THRESHOLD_RE.search(reply):
+        warns.append(
+            "采购议价率旧阈值口径错误：15%合格/达标线已废止，"
+            "应使用3%不合格、6%正常的绩效阈值样例。规则源: hipop/rules/procurement_rate.py"
         )
     if _PLUS_STILL_IN_KPI_RE.search(reply):
         warns.append(

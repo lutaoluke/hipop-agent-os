@@ -1219,6 +1219,64 @@ def test_verifier_no_procurement_topic_no_warn():
     )
 
 
+def test_verifier_round12_wrong_denominator_variants_warn():
+    """round-12 fail-then-pass：销售价/noon价格/采购价/折扣率错误分母必须触发专项 warns。
+
+    修前 round-11 verifier 只覆盖"采购议价率 = 议价差额 ÷ 1688采购标准价"，
+    以下验门人实测绕过均返回 warns=[]。
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    bad_replies = [
+        (
+            "采购议价率 = 议价差额 ÷ noon价格 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ 销售价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率 = 议价差额 ÷ 采购价 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购折扣率 = 议价差额 ÷ noon价格 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+    ]
+
+    for bad_reply in bad_replies:
+        warns = check_procurement_rate_reply(bad_reply)
+        assert warns, (
+            "round-12 错误分母/同义话题应触发采购专项 warns，"
+            f"但 warns=[]；reply={bad_reply}"
+        )
+        assert any("采购议价率" in w and ("分母" in w or "noon" in w or "销售价" in w or "采购价" in w) for w in warns), (
+            f"warns 应包含采购专项分母拦截文本，实际: {warns}"
+        )
+
+
+def test_verifier_round12_old_15pct_threshold_warns():
+    """round-12 fail-then-pass：生产 verifier 也必须拦截旧 15% 合格线。"""
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    wrong_reply = (
+        "采购议价率达15%即合格；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+    )
+
+    warns = check_procurement_rate_reply(wrong_reply)
+    assert warns, (
+        "生产 verifier 应拦截'采购议价率达15%即合格'旧口径，"
+        f"但 warns=[]。reply={wrong_reply}"
+    )
+    assert any("15" in w or "旧" in w for w in warns), (
+        f"warns 应提及 15% 旧阈值口径，实际: {warns}"
+    )
+
+
 def test_agent_wires_verifier_for_wrong_procurement_formula():
     """集成测试：agent.py 已接线 procurement_rate verifier（WS-117 round-11 生产接线）。
 
@@ -1264,6 +1322,57 @@ def test_agent_wires_verifier_for_wrong_procurement_formula():
     assert any("头程" in w or "分母" in w for w in warns), (
         f"warns 应提及分母/头程运费问题，实际: {warns}"
     )
+
+
+def test_agent_round12_wires_procurement_specific_warning_for_real_bypasses():
+    """round-12 集成测试：真实绕过必须进入 hallucination_warnings 的采购专项拦截。
+
+    这里仍 mock LLM 输出以固定红队样本，但断言的是 agent.py 生产后处理管道：
+    `check_procurement_rate_reply()` 必须被调用，且不能只靠泛化低置信 banner。
+    """
+    from hipop.server import _provider, agent
+
+    bad_replies = [
+        (
+            "采购议价率 = 议价差额 ÷ noon价格 × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+        (
+            "采购议价率达15%即合格；"
+            "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+            "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+        ),
+    ]
+
+    for bad_reply in bad_replies:
+        mock_result = _provider.ChatResult({
+            "reply": bad_reply,
+            "tool_log": [],
+            "refs_collected": [],
+            "workflow_task": None,
+        })
+
+        with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
+            result = agent.chat(
+                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                scope={
+                    "store": "KSA",
+                    "current_user": "smoke_t48",
+                    "current_role": "owner",
+                    "tenant_id": 1,
+                    "user_id": 1,
+                },
+            )
+
+        warns = result.get("hallucination_warnings") or []
+        assert warns, (
+            "agent.chat() 应对 round-12 真实绕过触发 hallucination_warnings，"
+            f"但为空；reply={bad_reply}"
+        )
+        assert any("采购议价率" in w and "规则源: hipop/rules/procurement_rate.py" in w for w in warns), (
+            "hallucination_warnings 应包含采购专项拦截结果，而不是只有泛化低置信 warning；"
+            f"实际: {warns}"
+        )
 
 
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
@@ -1460,8 +1569,14 @@ if __name__ == "__main__":
          test_verifier_correct_denominator_ok),
         ("test_verifier_no_procurement_topic_no_warn",
          test_verifier_no_procurement_topic_no_warn),
+        ("test_verifier_round12_wrong_denominator_variants_warn",
+         test_verifier_round12_wrong_denominator_variants_warn),
+        ("test_verifier_round12_old_15pct_threshold_warns",
+         test_verifier_round12_old_15pct_threshold_warns),
         ("test_agent_wires_verifier_for_wrong_procurement_formula",
          test_agent_wires_verifier_for_wrong_procurement_formula),
+        ("test_agent_round12_wires_procurement_specific_warning_for_real_bypasses",
+         test_agent_round12_wires_procurement_specific_warning_for_real_bypasses),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
