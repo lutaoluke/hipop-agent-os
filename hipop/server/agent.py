@@ -523,6 +523,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             live_result = {"ok": False, "error": f"live_fn_exception: {type(_e).__name__}",
                            "message": str(_e)[:200]}
         live_ok = bool(live_result and live_result.get("ok"))
+        # Round-4: ok=True alone is not enough; require sales_30d to be present
+        live_has_sales = live_ok and live_result.get("sales_30d") is not None
 
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
@@ -565,7 +567,7 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             return None if data_stale_val else val
 
         def _live_guarded_snapshot(val):
-            return _r(val) if live_ok else None
+            return _r(val) if live_has_sales else None
 
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
         sales_30d_out = live_result.get("sales_30d") if live_ok else None
@@ -594,23 +596,29 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "stale_days": stale_days_val,
         }
 
-        if live_ok:
+        if live_has_sales:
             item["live_evidence"] = {
                 "fetched_at": live_result.get("fetched_at"),
                 "source": live_result.get("source", "live"),
             }
         else:
             item["live_sales_failed"] = True
-            item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
-            item["live_sales_message"] = (
-                (live_result or {}).get("message")
-                or "当前无法实时确认 SKU 销量，已降级（不输出旧缓存确定数）"
-            )
+            if live_ok:
+                item["live_sales_error"] = "live_ok_but_missing_sales_30d"
+                item["live_sales_message"] = (
+                    "当前无法实时确认 SKU 销量（实时接口返回但关键指标缺失），已降级（不输出旧缓存确定数）"
+                )
+            else:
+                item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
+                item["live_sales_message"] = (
+                    (live_result or {}).get("message")
+                    or "当前无法实时确认 SKU 销量，已降级（不输出旧缓存确定数）"
+                )
 
         imported_at_val = (r.get("imported_at") or "")[:10] or None
         out.append(item)
         refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "imported_at": imported_at_val, "as_of_date": as_of})
-        if live_ok:
+        if live_has_sales:
             refs.append({"table": live_result.get("source", "live (realtime)"),
                          "where": f"partner_sku='{sku}'",
                          "fetched_at": live_result.get("fetched_at")})

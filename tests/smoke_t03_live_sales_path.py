@@ -462,6 +462,70 @@ def test_safety_t03_with_live_failed() -> None:
           f"all_warns={all_warns!r}")
 
 
+def test_live_ok_but_missing_sales_30d_redacts() -> None:
+    """round-4: live ok=True 但 sales_30d=None → fail closed，不泄漏旧缓存"""
+    print("\n── test_live_ok_but_missing_sales_30d_redacts ────────────────")
+    import hipop.server.data as _data
+    import hipop.server.agent as _agent
+
+    if SMOKE_SKIP_FIX:
+        print("  [SKIP] SMOKE_SKIP_FIX=1")
+        return
+
+    _fresh_db(_data)
+    conn = _data.conn()
+    _seed_entity(conn)
+    _seed_wf2_sku(conn, TODAY, SNAPSHOT_SALES_30D, SNAPSHOT_TOTAL_ORDERS)
+    _seed_wf2_orders(conn, TODAY)
+    _seed_wf5_sales_cycle(conn, TODAY)
+
+    def mock_live_ok_no_sales(sku, nation_id, token):
+        # ok=True but sales_30d=None (e.g. parse failure / UAE non-SA)
+        return {"ok": True, "sales_30d": None, "history_total": None,
+                "fetched_at": LIVE_FETCHED_AT, "source": "test_partial"}
+
+    orig = _agent._sku_sales_live_fn
+    _agent._sku_sales_live_fn = mock_live_ok_no_sales
+    _agent._chat_tenant.set(TENANT_ID)
+    _agent._chat_scope.set({"tenant_id": TENANT_ID, "store": "KSA", "user": "test"})
+
+    try:
+        result = _agent.tool_query_sku([SKU], store="KSA")
+    finally:
+        _agent._sku_sales_live_fn = orig
+
+    item = (result.get("items") or [{}])[0]
+
+    check("ok=True + sales_30d=None → sales_30d = null（不泄漏缓存 65）",
+          item.get("sales_30d") is None,
+          f"got sales_30d={item.get('sales_30d')!r} (缓存 {SNAPSHOT_SALES_30D} 泄漏!)")
+    check("ok=True + sales_30d=None → sales_10d = null（不泄漏缓存 11）",
+          item.get("sales_10d") is None,
+          f"got sales_10d={item.get('sales_10d')!r} (缓存 {SNAPSHOT_SALES_10D} 泄漏!)")
+    check("ok=True + sales_30d=None → total_orders_30d = null",
+          item.get("total_orders_30d") is None,
+          f"got total_orders_30d={item.get('total_orders_30d')!r}")
+    check("ok=True + sales_30d=None → profit_rate_pct = null",
+          item.get("profit_rate_pct") is None,
+          f"got profit_rate_pct={item.get('profit_rate_pct')!r}")
+    check("ok=True + sales_30d=None → trend/urgency/advice = null",
+          all(item.get(k) is None for k in ("trend", "urgency", "ops_advice", "weekly_replenish")),
+          f"got trend={item.get('trend')!r} urgency={item.get('urgency')!r} "
+          f"ops_advice={item.get('ops_advice')!r} weekly_replenish={item.get('weekly_replenish')!r}")
+    check("ok=True + sales_30d=None → history_total = null（不泄漏缓存 662）",
+          item.get("history_total") is None,
+          f"got history_total={item.get('history_total')!r}")
+    check("ok=True + sales_30d=None → live_sales_failed=True",
+          item.get("live_sales_failed") is True,
+          f"live_sales_failed={item.get('live_sales_failed')!r}")
+    check("ok=True + sales_30d=None → live_evidence 不存在（无可用证据）",
+          not item.get("live_evidence"),
+          f"live_evidence={item.get('live_evidence')!r}")
+    check("ok=True + sales_30d=None → live_sales_error 为 live_ok_but_missing_sales_30d",
+          item.get("live_sales_error") == "live_ok_but_missing_sales_30d",
+          f"live_sales_error={item.get('live_sales_error')!r}")
+
+
 def _cleanup() -> None:
     for p in _TMP_DBS + [_TMP_DB_PATH]:
         try:
@@ -478,6 +542,7 @@ if __name__ == "__main__":
     test_live_path_called_and_values_used()
     test_live_unavailable_redacts_sales()
     test_live_exception_redacts_sales()
+    test_live_ok_but_missing_sales_30d_redacts()
     test_provider_chain_stale_skus()
     test_safety_t03_with_live_failed()
 
