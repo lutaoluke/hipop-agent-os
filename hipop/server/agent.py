@@ -422,7 +422,7 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
                    w2.sales_30d, w2.sales_10d, w2.latest_price,
-                   w2.total_orders, w2.as_of_date,
+                   w2.total_orders, w2.as_of_date, w2.imported_at,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
                    h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
@@ -487,8 +487,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "data_stale": data_stale_val,
             "stale_days": stale_days_val,
         }
+        imported_at_val = (r.get("imported_at") or "")[:10] or None
         out.append(item)
-        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
+        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "imported_at": imported_at_val, "as_of_date": as_of})
         refs.append({"table": "wf2_orders", "where": f"30d window ending {as_of or 'N/A'}"})
         refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
         refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'"})

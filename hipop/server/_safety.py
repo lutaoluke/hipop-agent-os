@@ -329,6 +329,41 @@ def _check_inventory_selection_evidence(
     ]
 
 
+# T03: 销量数字声明的检测模式
+# 命中：「近30天销量是65」「销量为662件」「卖了25单」「30d销量：25」等
+_STALE_SALES_CLAIM_RE = re.compile(
+    r"(?:"
+    r"近\d+天.{0,15}销量.{0,10}(?:是|为|有|达|共|约)\s*\d+"
+    r"|销量.{0,5}(?:是|为|有|达|约)\s*\d+\s*(?:件|单|个|条)?"
+    r"|(?:30|180|90|60|10|120)\s*天.{0,10}(?:卖|售|销)\s*\d+"
+    r"|(?:卖了|售出|销售了|共卖)\s*\d+\s*(?:件|单|个)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _check_stale_sales_claim(reply: str, tool_log: list) -> List[str]:
+    """T03: query_sku 返回陈旧数据(data_stale=True)但回复中仍含具体销量数字 → 警告。
+
+    防止 LLM 忽略 data_stale=True 信号、把过期快照数值当实时结果呈现。
+    """
+    stale_skus: list = []
+    for t in (tool_log or []):
+        if t.get("name") == "query_sku":
+            stale = t.get("result_stale_skus") or []
+            stale_skus.extend(stale)
+    if not stale_skus:
+        return []
+    if not _STALE_SALES_CLAIM_RE.search(reply):
+        return []
+    sku_str = "、".join(sorted(set(stale_skus)))
+    return [
+        f"⚠️ SKU {sku_str} 的 wf2_sku 快照已过期（data_stale=True），"
+        "Agent 回复中仍含具体销量数字 — 可能来自旧快照或幻觉（T03）。"
+        "请触发 wf2_sales_v2 刷新后再查询，或告知用户当前无法实时确认。"
+    ]
+
+
 # 纯数字问题检测：用户只问 X 是多少/分别是多少
 _PURE_NUM_RE = re.compile(r'分别是多少|各.*是多少|是多少\s*$|是多少[？?。，,]')
 # 质量/表现评价词（行级匹配，不用 DOTALL 以免吃掉整表）
@@ -359,6 +394,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
+    warnings.extend(_check_stale_sales_claim(reply, tool_log or []))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
