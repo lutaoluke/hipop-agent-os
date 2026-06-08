@@ -168,12 +168,19 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                     "affected_modules": result["affected_modules"],
                     "followup_prompt": result.get("followup_prompt"),
                 }
-            tool_log.append({
+            entry: dict = {
                 "name": tool_name,
                 "args": tool_args_raw,
                 "result_keys": list(result.keys()) if isinstance(result, dict) else None,
                 "result_error": result.get("error") if isinstance(result, dict) else None,
-            })
+            }
+            if tool_name == "run_workflow" and isinstance(result, dict):
+                # T36-S3: enrich for _safety._check_failed_workflow_claimed_success
+                ok_val = result.get("ok")
+                entry["ok"] = ok_val if ok_val is not None else ("error" not in result)
+                entry["task_id"] = result.get("task_id")
+                entry["error"] = result.get("error")
+            tool_log.append(entry)
             msgs.append({
                 "role": "tool",
                 "tool_call_id": tc.id,

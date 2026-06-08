@@ -114,6 +114,62 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
+# T36-S3: 检测工作流失败时 reply 是否未说明失败原因
+def _extract_workflow_name(args) -> str:
+    """从 run_workflow args 安全取 workflow 名（dict 或 JSON string 两种形式）。"""
+    if isinstance(args, dict):
+        return args.get("workflow", "unknown")
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                return parsed.get("workflow", "unknown")
+        except Exception:
+            pass
+    return "unknown"
+
+
+# Reply 中提到失败/错误的模式（LLM 如实说了就不加 banner）
+_FAILURE_MENTION_RE = re.compile(
+    r"失败|failed|error|错误|未成功|拒绝|denied|permission_denied|起不来|没有启动",
+    re.IGNORECASE,
+)
+
+
+def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
+    """T36-S3: run_workflow 返回 ok=False 时，若 reply 未说明失败原因则加 banner。
+
+    覆盖两种 provider 形状：
+    - Anthropic: tool_log[i].args 是 dict
+    - OpenAI-compat (deepseek/qwen/doubao): tool_log[i].args 是 JSON string
+    """
+    warns: List[str] = []
+    failed: List[tuple] = []
+    for t in (tool_log or []):
+        if t.get("name") != "run_workflow":
+            continue
+        ok = t.get("ok")
+        has_error = bool(t.get("error"))
+        if ok is False or (ok is None and has_error):
+            wf_name = _extract_workflow_name(t.get("args") or {})
+            error_msg = t.get("error") or "未知错误"
+            failed.append((wf_name, error_msg))
+
+    if not failed:
+        return warns
+
+    # 只要 reply 里没有任何失败相关词，就加 banner（LLM 没告诉用户工作流失败了）
+    if _FAILURE_MENTION_RE.search(reply):
+        return warns
+
+    for wf_name, error_msg in failed:
+        warns.append(
+            f"⚠️ 工作流 {wf_name} 实际启动失败（{error_msg}），"
+            f"但 Agent 回复未说明失败原因，请重试或检查权限"
+        )
+    return warns
+
+
 # T36: 任务号提及模式（8位小写十六进制前缀）
 _TASK_ID_MENTION_RE = re.compile(r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：]*([0-9a-f]{8})\b')
 
@@ -360,6 +416,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
+    warnings.extend(_check_failed_workflow_claimed_success(reply, tool_log or []))
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
 
