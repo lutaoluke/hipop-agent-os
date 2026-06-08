@@ -7,46 +7,117 @@
 4. 未知 domain → fail-open（covered=True，不拦 LLM）
 """
 from __future__ import annotations
-import os, sys
+import os, sys, sqlite3, tempfile
+from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from hipop.server import data as _data
 
 
+@contextmanager
+def _freshness_fixture_db():
+    """Minimal DB fixture for check_freshness_coverage; never rely on a local hipop.db."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        tmp_db = f.name
+    orig_db_path = _data.DB_PATH
+    orig_db_url = os.environ.pop("DB_URL", None)
+    try:
+        with sqlite3.connect(tmp_db) as c:
+            c.execute("""CREATE TABLE sales_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id BIGINT NOT NULL,
+                alias TEXT NOT NULL,
+                country TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                store_name TEXT NOT NULL,
+                active INT NOT NULL DEFAULT 1
+            )""")
+            c.execute("""CREATE TABLE wf2_sku (
+                tenant_id BIGINT NOT NULL,
+                entity_alias TEXT NOT NULL,
+                partner_sku TEXT NOT NULL,
+                as_of_date TEXT,
+                imported_at TEXT,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+            c.execute("""CREATE TABLE wf1_stock (
+                tenant_id BIGINT NOT NULL,
+                entity_alias TEXT NOT NULL,
+                imported_at TEXT
+            )""")
+            c.execute("""CREATE TABLE wf3_logistics_hub_v2 (
+                tenant_id BIGINT NOT NULL,
+                updated_at TEXT
+            )""")
+            c.executemany(
+                "INSERT INTO sales_entities (tenant_id, alias, country, platform, store_name) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (1, "hipop_ksa", "SA", "Noon", "HIPOP-KSA"),
+                    (1, "hipop_uae", "AE", "Noon", "HIPOP-UAE"),
+                ],
+            )
+            c.executemany(
+                "INSERT INTO wf2_sku (tenant_id, entity_alias, partner_sku, as_of_date, imported_at) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (1, "hipop_ksa", "TEST-KSA-001", "2026-06-08", "2026-06-09"),
+                    (1, "hipop_uae", "TEST-UAE-001", "2026-06-08", "2026-06-09"),
+                ],
+            )
+            c.executemany(
+                "INSERT INTO wf1_stock (tenant_id, entity_alias, imported_at) VALUES (?, ?, ?)",
+                [
+                    (1, "hipop_ksa", "2026-06-08"),
+                    (1, "hipop_uae", "2026-06-08"),
+                ],
+            )
+            c.execute("INSERT INTO wf3_logistics_hub_v2 (tenant_id, updated_at) VALUES (1, '2026-06-08')")
+            c.commit()
+        _data.DB_PATH = tmp_db
+        yield
+    finally:
+        _data.DB_PATH = orig_db_path
+        if orig_db_url is not None:
+            os.environ["DB_URL"] = orig_db_url
+        os.unlink(tmp_db)
+
+
 def test_coverage_structure():
     """check_freshness_coverage 对每个 domain 返回合法 schema。"""
     valid_actions = {"use_cache", "run_workflow", "upload_csv"}
-    for domain in ("sales", "stock", "logistics"):
-        r = _data.check_freshness_coverage("KSA", domain)
-        assert isinstance(r.get("covered"), bool), f"covered 非 bool: domain={domain}"
-        assert r.get("domain") == domain, f"domain 字段错: {r}"
-        assert isinstance(r.get("latest_date"), str), f"latest_date 非 str"
-        assert isinstance(r.get("target_date"), str), f"target_date 非 str"
-        assert r.get("action") in valid_actions, f"action 非法: {r.get('action')}"
-        # run_workflow → workflow 必须有值
-        if r["action"] == "run_workflow":
-            assert r.get("workflow"), f"run_workflow 但 workflow 为空: domain={domain}"
-        # upload_csv → csv_hint 必须有值（sales 超出 ERP 新鲜时会走 upload_csv）
-        if r["action"] == "upload_csv":
-            assert r.get("csv_hint"), f"upload_csv 但 csv_hint 为空: domain={domain}"
-        print(f"  [{domain}] covered={r['covered']} action={r['action']} latest={r['latest_date']}")
+    with _freshness_fixture_db():
+        for domain in ("sales", "stock", "logistics"):
+            r = _data.check_freshness_coverage("KSA", domain)
+            assert isinstance(r.get("covered"), bool), f"covered 非 bool: domain={domain}"
+            assert r.get("domain") == domain, f"domain 字段错: {r}"
+            assert isinstance(r.get("latest_date"), str), f"latest_date 非 str"
+            assert isinstance(r.get("target_date"), str), f"target_date 非 str"
+            assert r.get("action") in valid_actions, f"action 非法: {r.get('action')}"
+            # run_workflow → workflow 必须有值
+            if r["action"] == "run_workflow":
+                assert r.get("workflow"), f"run_workflow 但 workflow 为空: domain={domain}"
+            # upload_csv → csv_hint 必须有值（sales 超出 ERP 新鲜时会走 upload_csv）
+            if r["action"] == "upload_csv":
+                assert r.get("csv_hint"), f"upload_csv 但 csv_hint 为空: domain={domain}"
+            print(f"  [{domain}] covered={r['covered']} action={r['action']} latest={r['latest_date']}")
 
 
 def test_future_date_always_stale():
     """target_date = 未来日期 → covered=False（禁止假新鲜放行）。"""
-    for domain in ("sales", "stock", "logistics"):
-        r = _data.check_freshness_coverage("KSA", domain, "2099-12-31")
-        assert r["covered"] is False, f"domain={domain}: 未来日期不应 covered"
-        assert r["action"] in ("run_workflow", "upload_csv"), \
-            f"domain={domain}: 未来日期 action 应为 run_workflow 或 upload_csv，实为 {r['action']}"
+    with _freshness_fixture_db():
+        for domain in ("sales", "stock", "logistics"):
+            r = _data.check_freshness_coverage("KSA", domain, "2099-12-31")
+            assert r["covered"] is False, f"domain={domain}: 未来日期不应 covered"
+            assert r["action"] in ("run_workflow", "upload_csv"), \
+                f"domain={domain}: 未来日期 action 应为 run_workflow 或 upload_csv，实为 {r['action']}"
     print("  future date → covered=False ✓")
 
 
 def test_unknown_domain_fail_open():
     """未知 domain → fail-open（covered=True），不拦 LLM。"""
-    r = _data.check_freshness_coverage("KSA", "unknown_domain_xyz")
-    assert r["covered"] is True, "未知 domain 应 fail-open（covered=True）"
-    assert r["action"] == "use_cache"
+    with _freshness_fixture_db():
+        r = _data.check_freshness_coverage("KSA", "unknown_domain_xyz")
+        assert r["covered"] is True, "未知 domain 应 fail-open（covered=True）"
+        assert r["action"] == "use_cache"
     print("  unknown domain → fail-open ✓")
 
 
@@ -241,9 +312,10 @@ def test_false_freshness_imported_at_new_business_date_old():
 
 def test_uae_store():
     """UAE store 也应正常返回结构（不崩）。"""
-    r = _data.check_freshness_coverage("UAE", "sales")
-    assert "covered" in r
-    print(f"  UAE store: covered={r['covered']} action={r['action']} ✓")
+    with _freshness_fixture_db():
+        r = _data.check_freshness_coverage("UAE", "sales")
+        assert "covered" in r
+        print(f"  UAE store: covered={r['covered']} action={r['action']} ✓")
 
 
 def test_get_data_health_erp_sales_uses_business_date():
