@@ -1346,7 +1346,7 @@ TOOL_FUNCS = {
     "query_1688_similar": tool_query_1688_similar,
     "explain_status_enum": tool_explain_status_enum,
     "capture_feedback": tool_capture_feedback,
-}
+    }
 
 
 def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
@@ -1941,13 +1941,14 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     action_id = None
     if final_text and (refs_collected or tool_log):
         try:
+            first_tool_args = _safety._normalize_args(tool_log[0].get("args") or {}) if tool_log else {}
             action_id = _data.write_agent_action(
                 store=scope.get("store", "KSA"),
                 module="chat",
                 action_type="execute",
-                subject=tool_log[0]["args"].get("sku") or tool_log[0]["args"].get("order_no") if tool_log else None,
+                subject=(first_tool_args.get("sku") or first_tool_args.get("order_no")) if tool_log else None,
                 judge=judge,
-                pill_text="执行" if tool_log else "信息",
+                pill_text="执行" if _safety._is_substantive_action(tool_log) else ("查询" if tool_log else "信息"),
                 pill="info",
                 confidence=confidence,
                 options=[],
@@ -1963,13 +1964,13 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "references": _dedup_refs(refs_collected),
         "action_id": action_id,
         "tools_used": tools_used,
-        "tag": ("hallucinate" if hallu_warnings else ("执行" if tool_log else None)),
+        "tag": ("hallucinate" if hallu_warnings else ("执行" if _safety._is_substantive_action(tool_log) else ("查询" if tool_log else None))),
         "workflow_task": workflow_task,
         "provider": _provider.get_provider(),
         "confidence": round(confidence, 2),
         "judge_method": judge_method,
         "hallucination_warnings": hallu_warnings or None,
-    }
+}
 
 
 def _dedup_refs(refs: List[Dict]) -> List[Dict]:
