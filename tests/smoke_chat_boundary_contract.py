@@ -1,4 +1,4 @@
-"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 3)
+"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 5)
 
 验收：chat 查询 / 工作流执行 / 状态回读 三条热点路径在同一分类框架下可区分，
 且无真实证据时旁路宣称被拦截。
@@ -12,10 +12,12 @@ FAIL 条件（修前 round-2）：
   - "已经刷新" / "已更新" / "刷新已完成" 变体未被 _COMPLETION_BYPASS_RE 捕获
   - classify_evidence 对 task_status_readback/task_result(done) 返回 NONE
 
-PASS 条件（修后 round-3）：
+PASS 条件（修后 round-5）：
   - 三种正则变体均被拦截（已经刷新/已更新/刷新已完成）
   - classify_evidence 对有 done 状态的 task_done_tools 返回 TASK_READBACK
   - sanitize_reply 在 run_workflow 单独存在时拦截所有变体
+  - round-1~4 验门人 probes 全部作为回归 smoke；run_workflow only 不放行
+    任何"完成了/搞定了/处理好了"类声明
 """
 
 from __future__ import annotations
@@ -563,6 +565,94 @@ def test_no_false_positive_hao_le_query_only():
     assert not warns, f"误报：'数据拉好了' 不应触发完成声明拦截，实得 warns={warns}"
 
 
+# ── Round-5 fail-then-pass: 完成了/搞定了/处理好了 变体 ────────────────────────
+
+ROUND_REVIEWER_PROBES = (
+    "数据已刷新完成，任务已完成，库存已更新。",
+    "数据已经刷新完成。",
+    "库存已更新完成。",
+    "刷新已完成。",
+    "数据刷新好了。",
+    "库存更新好了。",
+    "数据同步好了。",
+    "数据刷新完成了。",
+    "库存更新完成了。",
+    "刷新完成了。",
+    "任务搞定了。",
+    "任务处理好了。",
+    "任务跑好了。",
+    "后台任务弄好了。",
+    "工作流完了。",
+    "处理好了。",
+)
+
+
+def test_all_reviewer_completion_probes_block_run_workflow_only():
+    """round-1~4 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-4）：完成了 / 搞定了 / 处理好了 / 跑好了 / 弄好了 / 完了
+                  等口语完成声明仍有多项返回 warns=[]。
+    PASS（round-5）：所有历次 probe 均需任务完成证据；run_workflow 只算触发。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-5 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_all_reviewer_completion_probes_block_no_tool():
+    """同一 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-5 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round5_exact_probes():
+    """sanitize_reply 整合：round-5 exact probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    probes = (
+        "数据刷新完成了。",
+        "库存更新完成了。",
+        "刷新完成了。",
+        "任务搞定了。",
+        "任务处理好了。",
+        "处理好了。",
+    )
+    for reply in probes:
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-5 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def test_round5_completion_claims_allowed_with_task_done_evidence():
+    """正路：round-5 口语完成声明有 task_result/done 时允许。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        {"name": "task_result", "result": {"status": "done"}},
+    ]
+    for reply in (
+        "数据刷新完成了。",
+        "库存更新完成了。",
+        "任务搞定了。",
+        "任务处理好了。",
+    ):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"task_result/done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_no_false_positive_query_hao_le_words():
+    """宽泛口语词尾不能误伤普通查询动作。"""
+    tool_log = [{"name": "query_sku"}]
+    for reply in ("数据查好了，共 50 行。", "库存看好了，没有异常。"):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"误报：{reply!r} 不应触发任务完成声明拦截，实得 warns={warns}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -583,7 +673,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 4)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 5)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -678,6 +768,17 @@ if __name__ == "__main__":
          test_sanitize_reply_kucu_update_hao_le),
         ("test_no_false_positive_hao_le_query_only",
          test_no_false_positive_hao_le_query_only),
+        # Round-5 fail-then-pass: 完成了/搞定了/处理好了 变体
+        ("test_all_reviewer_completion_probes_block_run_workflow_only",
+         test_all_reviewer_completion_probes_block_run_workflow_only),
+        ("test_all_reviewer_completion_probes_block_no_tool",
+         test_all_reviewer_completion_probes_block_no_tool),
+        ("test_sanitize_reply_round5_exact_probes",
+         test_sanitize_reply_round5_exact_probes),
+        ("test_round5_completion_claims_allowed_with_task_done_evidence",
+         test_round5_completion_claims_allowed_with_task_done_evidence),
+        ("test_no_false_positive_query_hao_le_words",
+         test_no_false_positive_query_hao_le_words),
     ]
 
     failed = 0
