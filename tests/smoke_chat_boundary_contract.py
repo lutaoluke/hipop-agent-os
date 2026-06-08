@@ -27,6 +27,9 @@ PASS 条件（修后 round-6）：
   - round-8 新增 bare completion/update/sync 短句："已完成/完成了/已更新/
     已同步/已经同步"。仅真实 task readback done/success 能放行；run_workflow、
     无工具、query evidence 都不能洗白这些完成态声明。
+  - round-9 新增 common done/update/sync variants："已经完成/已经更新/
+    更新了/同步了/刷新了/处理了/完成"。同样仅真实 task readback done/success
+    能放行。
 """
 
 from __future__ import annotations
@@ -895,6 +898,72 @@ def test_round8_bare_claims_not_washed_by_query_evidence():
         assert warns, f"query_sku 证据不应放行 bare 完成态 {reply!r}"
 
 
+# ── Round-9 fail-then-pass: common done/update/sync variants ─────────────────
+
+ROUND9_REVIEWER_PROBES = (
+    "已经完成。",
+    "已经更新。",
+    "更新了。",
+    "同步了。",
+    "刷新了。",
+    "处理了。",
+    "完成。",
+)
+
+
+def test_round9_common_completion_claims_block_run_workflow_only():
+    """round-9 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-8）：已经完成 / 已经更新 / 更新了 / 同步了 / 刷新了 /
+                  处理了 / 完成 等短句未命中，返回 warns=[]。
+    PASS（round-9）：这些短句仍需真实 task readback；run_workflow 只算任务创建。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND9_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-9 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round9_common_completion_claims_block_no_tool():
+    """同一 round-9 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND9_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-9 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round9_exact_probes():
+    """sanitize_reply 整合：round-9 exact probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for reply in ROUND9_REVIEWER_PROBES:
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-9 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def test_round9_common_claims_allowed_with_real_task_readback():
+    """正路：真实 task readback done 时，round-9 短完成声明允许通过。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND9_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round9_common_claims_not_washed_by_query_evidence():
+    """query evidence 不能洗白 round-9 bare 完成/更新/同步/处理声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in ROUND9_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query_sku 证据不应放行 round-9 完成态 {reply!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -920,7 +989,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 8)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 9)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1061,6 +1130,17 @@ if __name__ == "__main__":
          test_round8_bare_claims_allowed_with_real_task_readback),
         ("test_round8_bare_claims_not_washed_by_query_evidence",
          test_round8_bare_claims_not_washed_by_query_evidence),
+        # Round-9 fail-then-pass: common done/update/sync variants
+        ("test_round9_common_completion_claims_block_run_workflow_only",
+         test_round9_common_completion_claims_block_run_workflow_only),
+        ("test_round9_common_completion_claims_block_no_tool",
+         test_round9_common_completion_claims_block_no_tool),
+        ("test_sanitize_reply_round9_exact_probes",
+         test_sanitize_reply_round9_exact_probes),
+        ("test_round9_common_claims_allowed_with_real_task_readback",
+         test_round9_common_claims_allowed_with_real_task_readback),
+        ("test_round9_common_claims_not_washed_by_query_evidence",
+         test_round9_common_claims_not_washed_by_query_evidence),
     ]
 
     failed = 0
