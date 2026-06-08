@@ -145,6 +145,26 @@ CASES: List[Case] = [
             "海运ROI预估",
         ],
     ),
+    # ─── T04 TBB0116A 30d 口径验收（WS-113）───
+    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d 字段，
+    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）。
+    Case(
+        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel_rate≈5.88%）",
+        question="TBB0116A 近 30 天销量多少，退货率和取消率分别是多少",
+        must_use_tools=["query_sku"],
+        must_contain=[
+            r"\b48\b",
+            r"\b51\b",
+            r"5\.8[0-9]|5\.9",
+            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
+        ],
+        must_not_contain=[
+            r"\b13\b",
+            r"10\.0%|10%",
+            r"1\.1[0-9]%|1\.12%",
+            r"取消率.*0\.0%",
+        ],
+    ),
     # ─── 门控 tool（必须真调，不能编结果）───
     Case(
         # 防伪造的真正关口 = must_use_tools=["export_table"]（必须真调到工具）。
