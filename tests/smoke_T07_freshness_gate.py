@@ -246,6 +246,97 @@ def test_uae_store():
     print(f"  UAE store: covered={r['covered']} action={r['action']} ✓")
 
 
+def test_get_data_health_erp_sales_uses_business_date():
+    """fail-then-pass: get_data_health.erp_sales.latest 必须用业务日 as_of_date，不能用 imported_at。
+
+    根因（round-5 验门人红队命中）：
+      旧代码 get_data_health 把 imported_at（可能是今天）暴露为 erp_sales.latest，
+      LLM 读到 erp_sales.latest=2026-06-08（今天）→ 说"数据已经就绪/销量截至 2026-06-08"；
+      但 check_freshness_coverage 用 as_of_date=2026-06-05 判断 covered=False，
+      导致同一答案里先说"新鲜"、末尾追加"最新到 2026-06-05"的矛盾。
+
+    旧行为（FAIL）：erp_sales.latest = imported_at（今天），LLM 会误报"新鲜"。
+    新行为（PASS）：erp_sales.latest = as_of_date（业务截止日），LLM 看到正确陈旧日期。
+    """
+    import tempfile, sqlite3, os as _os
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        tmp_db = f.name
+    try:
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        old_biz_date = "2026-06-05"
+        with sqlite3.connect(tmp_db) as c:
+            c.execute("""CREATE TABLE sales_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id BIGINT NOT NULL,
+                alias TEXT NOT NULL,
+                country TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                store_name TEXT NOT NULL,
+                active INT NOT NULL DEFAULT 1
+            )""")
+            c.execute("""CREATE TABLE wf2_sku (
+                tenant_id BIGINT NOT NULL,
+                entity_alias TEXT NOT NULL,
+                partner_sku TEXT NOT NULL,
+                as_of_date TEXT,
+                imported_at TEXT,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+            c.execute("""CREATE TABLE wf1_stock (tenant_id BIGINT, entity_alias TEXT, imported_at TEXT, noon_total_qty INTEGER)""")
+            c.execute("""CREATE TABLE wf5_sales_cycle (tenant_id BIGINT, entity_alias TEXT, updated_at TEXT)""")
+            c.execute("""CREATE TABLE wf3_logistics_hub_v2 (tenant_id BIGINT, updated_at TEXT)""")
+            c.execute("""CREATE TABLE wf6_logistics_alerts_v2 (tenant_id BIGINT, created_at TEXT)""")
+            c.execute("""CREATE TABLE wf2_orders (tenant_id BIGINT, entity_alias TEXT, order_date TEXT)""")
+            c.execute(
+                "INSERT INTO sales_entities (tenant_id, alias, country, platform, store_name) "
+                "VALUES (1, 'hipop_ksa', 'SA', 'Noon', 'HIPOP-KSA')"
+            )
+            # imported_at = today (import ran today) but as_of_date = old_biz_date (business data only covers up to that date)
+            c.execute(
+                "INSERT INTO wf2_sku (tenant_id, entity_alias, partner_sku, as_of_date, imported_at) "
+                f"VALUES (1, 'hipop_ksa', 'TEST-SKU-001', '{old_biz_date}', '{today}')"
+            )
+            c.commit()
+
+        orig_db_path = _data.DB_PATH
+        orig_db_url = _os.environ.pop("DB_URL", None)
+        try:
+            _data.DB_PATH = tmp_db
+            h = _data.get_data_health("KSA")
+        finally:
+            _data.DB_PATH = orig_db_path
+            if orig_db_url is not None:
+                _os.environ["DB_URL"] = orig_db_url
+    finally:
+        _os.unlink(tmp_db)
+
+    erp_sales = h["sources"]["erp_sales"]
+
+    # FAIL case（旧行为）：如果 latest 是 imported_at（today），LLM 会误报"数据截至今天/新鲜"
+    # 旧代码：erp_sales.latest = latest_w2_imported = MAX(imported_at) = today
+    # 如果 latest == today，说明修复未生效——这就是 round-5 验门人看到的"假新鲜"
+    assert erp_sales["latest"] != today, (
+        f"假新鲜漏洞未修复：erp_sales.latest={erp_sales['latest']!r} 等于今天 {today}，"
+        f"但业务日只到 {old_biz_date}。LLM 会误报'数据截至{today}/新鲜'。"
+        f"必须用 as_of_date 而非 imported_at。"
+    )
+
+    # PASS case（新行为）：latest = business date (as_of_date)，LLM 看到正确的陈旧日期
+    assert erp_sales["latest"] == old_biz_date, (
+        f"erp_sales.latest 应为业务日 {old_biz_date!r}（as_of_date），"
+        f"实为 {erp_sales['latest']!r}"
+    )
+
+    # import_time 字段保留（透明）但不是 latest
+    assert erp_sales.get("import_time") == today, (
+        f"import_time 字段应保留 imported_at={today!r}，实为 {erp_sales.get('import_time')!r}"
+    )
+
+    print(f"  get_data_health.erp_sales.latest={erp_sales['latest']!r} (business date, not import_time={today!r}) ✓")
+
+
 if __name__ == "__main__":
     print("=== T07 freshness gate smoke ===")
     test_coverage_structure()
@@ -255,4 +346,5 @@ if __name__ == "__main__":
     test_false_freshness_imported_at_new_business_date_old()
     test_uae_store()
     test_t07_skip_stale_detect_returns_sales_skip()
+    test_get_data_health_erp_sales_uses_business_date()
     print("\n✓ All T07 freshness gate smoke passed")

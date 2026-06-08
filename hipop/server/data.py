@@ -927,6 +927,9 @@ def get_data_health(store: str) -> Dict:
     tid_h, alias_h = _resolve_entity_for_store(store)
     latest_w1_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_w2_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
+    # 业务日：wf2_sku.as_of_date（ERP 实际覆盖的最新订单日，区别于 imported_at 导入时间）
+    # imported_at 可能今天刚跑但订单窗口仍是上周——暴露给 LLM 会造成"假新鲜"声明
+    erp_sales_biz_date = _date10(_scalar("SELECT MAX(as_of_date) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_w5_updated  = _date10(_scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_hub_updated = _date10(_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid_h,)))
     latest_alerts      = _date10(_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid_h,)))
@@ -950,7 +953,8 @@ def get_data_health(store: str) -> Dict:
 
     sources = {
         "erp_products":  {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
-        "erp_sales":     {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
+        # erp_sales.latest = 业务日（as_of_date），不用 imported_at，防止 LLM 误读导入时间为业务新鲜度
+        "erp_sales":     {"latest": erp_sales_biz_date, "import_time": latest_w2_imported, "stale_days": _stale_days(erp_sales_biz_date), "automation": "auto", "workflow": "wf2_sales"},
         "erp_stock":     {"latest": latest_w1_imported, "stale_days": _stale_days(latest_w1_imported), "automation": "auto",      "workflow": "wf1_stock"},
         "noon_orders":   {"latest": latest_noon_order,  "stale_days": _stale_days(latest_noon_order),  "automation": "needs_csv", "workflow": "wf2_sales", "csv_pattern": f"sales_noon_*_{s.upper()}_*.csv", "where": "紫鸟 noon 后台 → sales 页面 → export 最近 180 天 CSV"},
         "noon_stock":    {"latest": latest_noon_stock,  "stale_days": _stale_days(latest_noon_stock),  "automation": "needs_csv", "workflow": "wf1_stock", "csv_pattern": f"Inventory*{s.upper()}*.csv",   "where": "紫鸟 noon 后台 → my inventory → export"},

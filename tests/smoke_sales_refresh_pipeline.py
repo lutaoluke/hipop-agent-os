@@ -307,8 +307,12 @@ def test_freshness_advances():
     conn = _fresh_db(data)
     _seed(conn, seed)
     ingest_noon_csv_v2.process_csv_v2(tid, CSV_PATH, conn, entity_alias=alias)
-    # 压旧所有 wf2_sku.imported_at → 模拟"评级数据已陈旧"
-    conn.execute("UPDATE wf2_sku SET imported_at='2020-01-01 00:00:00' WHERE tenant_id=?", (tid,))
+    # 压旧所有 wf2_sku.imported_at + as_of_date → 模拟"评级数据已陈旧"
+    # as_of_date 是业务日（T07 fix：erp_sales.latest 用 as_of_date，不用 imported_at）
+    conn.execute(
+        "UPDATE wf2_sku SET imported_at='2020-01-01 00:00:00', as_of_date='2020-01-01' WHERE tenant_id=?",
+        (tid,),
+    )
     conn.commit()
     conn.close()
 
@@ -325,10 +329,12 @@ def test_freshness_advances():
 
     data.set_current_tenant(tid)
     h_after = data.get_data_health("KSA")["sources"]["erp_sales"]
-    today = datetime.date.today().isoformat()
-    check("刷新后：erp_sales.latest 推进到今天（数据真变新，非'插入恰在今天'）",
-          h_after["latest"] == today, f"after={h_after}")
-    check("刷新后：stale_days 归 0", h_after["stale_days"] == 0, f"after={h_after}")
+    # T07 fix: erp_sales.latest は as_of_date（最新订单日）而非 imported_at（今天）
+    # refresh 后 as_of_date 更新到 CSV 中最新订单日（2026-05-31），不是今天
+    check("刷新后：erp_sales.latest 推进（as_of_date 前进到 CSV 最新订单日 2026-05-31）",
+          h_after["latest"] == "2026-05-31", f"after={h_after}")
+    check("刷新后：stale_days 有值（数据真前进，stale_days is not None）",
+          h_after["stale_days"] is not None, f"after={h_after}")
     check("新鲜度时间戳确实前进（after > before）",
           h_after["latest"] > h_before["latest"], f"before={h_before} after={h_after}")
     return check.failures
@@ -368,7 +374,8 @@ def test_upload_path_and_health():
           len(after) >= 2 and all(v["sales_grade"] in ("A", "B", "C", "D")
                                   for v in after.values()), f"after={after}")
 
-    # data_health 新鲜度：noon_orders 反映真实最新订单日；erp_sales 今日刷新
+    # data_health 新鲜度：noon_orders 反映真实最新订单日；erp_sales 反映 CSV 中最新订单日
+    # T07 fix: erp_sales.latest 用 as_of_date（业务日），CSV 最新订单日 = 2026-05-31
     data.set_current_tenant(tid)
     h = data.get_data_health("KSA")
     src = h["sources"]
@@ -378,11 +385,10 @@ def test_upload_path_and_health():
     check("data_health.noon_orders.stale_days 非空（有真实新鲜度）",
           src["noon_orders"]["stale_days"] is not None,
           f"got {src['noon_orders']['stale_days']!r}")
-    today = datetime.date.today().isoformat()
-    check("data_health.erp_sales.latest==今天（wf2_sku 本次刷新）",
-          src["erp_sales"]["latest"] == today, f"got {src['erp_sales']['latest']!r}")
-    check("data_health.erp_sales.stale_days==0",
-          src["erp_sales"]["stale_days"] == 0, f"got {src['erp_sales']['stale_days']!r}")
+    check("data_health.erp_sales.latest==2026-05-31（CSV 最新订单业务日，非今天导入时间）",
+          src["erp_sales"]["latest"] == "2026-05-31", f"got {src['erp_sales']['latest']!r}")
+    check("data_health.erp_sales.stale_days 非空（有真实新鲜度）",
+          src["erp_sales"]["stale_days"] is not None, f"got {src['erp_sales']['stale_days']!r}")
     return check.failures
 
 
