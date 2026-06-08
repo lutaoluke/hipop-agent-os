@@ -11,9 +11,10 @@
   ERP/noon 库存 → wf1_stock.noon_saleable_qty / pending_inbound_qty / overseas_total_qty
   ERP/物流       → wf3_logistics_hub_v2.in_transit_total_qty (groups_json 按 KSA 过滤)
   以上三类       → wf_sales_cycle.py run_v2 → wf5_sales_cycle.weekly_total_replenish
-  工作台入口     → data.get_replenishment('ksa') → ORDER BY weekly_total_replenish DESC
+  工作台入口     → data.get_replenishment_view('ksa') → stock_readiness gate →
+                   get_replenishment → ORDER BY weekly_total_replenish DESC
 
-chat 工具 compute_replenishment 读的就是这条链的终端表，不读旧快照、不读其他源。
+chat 工具 compute_replenishment 读的就是这条链的终端，不读旧快照、不读其他源。
 
 ### T27/T29 FAIL 根因（接线缺失）
 TBU0010A、SAB0433A 在 wf2_sku (hipop_ksa) 里有销量记录（在列），
@@ -28,8 +29,13 @@ TBN0201A 不在 wf5_sales_cycle (hipop_ksa) 里，也不在 wf2_sku (hipop_ksa) 
 数据路径，不与 TBU0010A=7 / SAB0433A=6 处于同一口径。
 
 ### 缺数据时必须 not-ready，不能返回 0 或旧快照
-stock_readiness 对空 wf1_stock 返回 ready=False；
+stock_readiness 对空/过期 wf1_stock 返回 ready=False；
 get_replenishment_view 在 not-ready 时返回 rows=[]，不静默给 0。
+
+### 工作台入口实际状态（2026-06-08 核实）
+当前线上库存 age > 72h（status=incomplete），
+data.get_replenishment_view('ksa') 返回 rows=[]，不是 wf5 直查的 P51* 快照。
+工作台真实口径是"库存未就绪"，不是 P51* Top 5。
 
 ## 验收 / fail-then-pass
 - test_authoritative_field_is_weekly_total_replenish：
@@ -48,9 +54,16 @@ get_replenishment_view 在 not-ready 时返回 rows=[]，不静默给 0。
 - test_tbn0201a_not_in_ksa_entity：
   TBN0201A 不在 wf2_sku (hipop_ksa) 里，也不在 wf5_sales_cycle (hipop_ksa)；
   T29 的 2040 件与线上 KSA 权威口径不同源。
+- test_entry_point_respects_stock_readiness_gate：
+  直接调 data.get_replenishment_view('ksa') 线上入口；
+  若 stock_status.ready=False → rows 必须为空（入口正确 gate）；
+  若 ready=True → rows 按 weekly_total_replenish DESC，TBN0201A 不在其中。
 - test_missing_stock_returns_not_ready_not_zero：
   (独立临时库) 空 wf1_stock → stock_readiness ready=False，
   get_replenishment_view rows=[]，不静默给 0。
+- test_entry_point_ready_fixture_returns_ordered_wf5_rows：
+  (隔离 ready fixture) get_replenishment_view 通过就绪门后从 wf5 返回正确有序行；
+  证明入口链路完整、不旁路 wf5 直查。
 
 跑法：
   python3 tests/smoke_t27_t29_replenish_oracle.py
@@ -271,45 +284,52 @@ def test_tbn0201a_not_in_ksa_entity():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Test 6: 当前 KSA Top 5 补货是 P51* SKU（而非 TBU0010A/SAB0433A 或千件级 TBN*）
-#         → 钉死当前线上工作台实际返回的 Top 列表
+# Test 6: 工作台入口 get_replenishment_view 尊重库存就绪度门
+#         → not-ready 时 rows=[]；ready 时 rows 来自 wf5 有序排列
+#         （不旁路直查 wf5_sales_cycle）
 # ═══════════════════════════════════════════════════════════════════════════════
-def test_current_ksa_top5_replenish_are_live_authoritative():
-    """当前线上 KSA 补货 Top 5 来自 wf5_sales_cycle，不包含 T29 千件级 SKU。
+def test_entry_point_respects_stock_readiness_gate():
+    """工作台真实入口 get_replenishment_view('ksa') 的就绪度门验证。
 
-    线上权威：当前 wf5_sales_cycle (hipop_ksa) 按 weekly_total_replenish DESC 取 Top 5。
-    - TBU0010A / SAB0433A / TBN0201A 均不在 Top 5（接线缺失 + 非 KSA SKU）。
-    - Top 5 的 weekly_total_replenish 均远小于 T29 体验 run 中的 2040 件。
-    - 当 S1 修复 run_v2 接线后，Top 5 会变化——本 test 需同步更新。
+    直接调 data.get_replenishment_view 线上入口，而不是旁路直查 wf5_sales_cycle。
+    两条路径均验证：
+    - stock_status.ready=False -> rows 必须为空（入口正确 gate，不产出 Top）
+    - stock_status.ready=True  -> rows 来自 wf5，按 weekly_total_replenish DESC，
+                                   TBN0201A（非 KSA 实体 SKU）不在其中
+
+    当前线上库存 age > 72h（incomplete），入口走 not-ready 分支——
+    wf5 里有 P51* 行，但工作台实际对运营展示 rows=[]，不是 P51* Top 5。
+    S1 修复并刷新库存后本 test 走 ready 分支，无需修改断言。
     """
-    top5 = _live_fetch(
-        "SELECT partner_sku, weekly_total_replenish FROM wf5_sales_cycle "
-        "WHERE tenant_id=? AND entity_alias=? AND weekly_total_replenish > 0 "
-        "ORDER BY weekly_total_replenish DESC LIMIT 5",
-        (TENANT, KSA_ALIAS),
-    )
-    assert len(top5) > 0, \
-        "wf5_sales_cycle (hipop_ksa) 里没有任何 weekly_total_replenish > 0 的记录"
+    import importlib
+    import hipop.server.data as data_mod
+    importlib.reload(data_mod)
 
-    top5_skus = [r["partner_sku"] for r in top5]
-    top5_max  = top5[0]["weekly_total_replenish"]
+    view = data_mod.get_replenishment_view("ksa", limit=10)
+    stock_status = view["stock_status"]
+    rows = view.get("rows", [])
 
-    assert T27_SKU not in top5_skus, (
-        f"{T27_SKU} 出现在 Top 5——wf5_sales_cycle KSA 里已有该 SKU 的补货记录，"
-        f"接线缺失已修复，本 oracle 需更新预期值"
-    )
-    assert T28_SKU not in top5_skus, (
-        f"{T28_SKU} 出现在 Top 5——接线缺失已修复，本 oracle 需更新预期值"
-    )
-    assert T29_OUTLIER_SKU not in top5_skus, (
-        f"{T29_OUTLIER_SKU} 意外进入 KSA Top 5——请核实数据来源"
-    )
-
-    # T29 千件级异常量级（2040）远超当前任何 KSA 补货建议：证明量级口径不同
-    assert top5_max < 1000, (
-        f"当前 KSA Top 补货量 {top5_max} ≥ 1000 件——"
-        f"T29 体验 run 里的千件级数值（2040）疑似仍来自同一路径，请排查"
-    )
+    if not stock_status.get("ready"):
+        # not-ready 分支：入口必须封住 rows，不能把旧 wf5 快照漏出去
+        assert rows == [], (
+            f"stock_status.ready=False 时 rows 必须为空，实际返回了 {len(rows)} 行；"
+            f"status={stock_status.get('status')}, age={stock_status.get('stock_age_hours')}h"
+        )
+        known_not_ready = {"empty", "incomplete", "no_skus", "partial_noon"}
+        assert stock_status.get("status") in known_not_ready, (
+            f"not-ready 但 status 值未知: {stock_status.get('status')}"
+        )
+    else:
+        # ready 分支：rows 若非空则必须按 weekly_total_replenish DESC 排列
+        if len(rows) > 1:
+            qtys = [r.get("qty", 0) for r in rows]
+            assert qtys == sorted(qtys, reverse=True), (
+                f"ready 时 rows 应按 weekly_total_replenish DESC，实际: {qtys}"
+            )
+        row_skus = [r["partner_sku"] for r in rows]
+        assert T29_OUTLIER_SKU not in row_skus, (
+            f"{T29_OUTLIER_SKU} 出现在工作台 Top——非 KSA 实体 SKU，请核实数据来源"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -371,7 +391,7 @@ def test_missing_stock_returns_not_ready_not_zero():
                 wf5_replenish_qty INTEGER, lost_replenish_qty INTEGER,
                 current_pipeline INTEGER, target_pipeline INTEGER,
                 daily_rate REAL, trend TEXT, ops_advice TEXT,
-                risk_label TEXT, updated_at TEXT,
+                risk_label TEXT, trigger_reasons TEXT, updated_at TEXT,
                 PRIMARY KEY (tenant_id, entity_alias, partner_sku)
             )""")
         con.execute("""
@@ -421,6 +441,146 @@ def test_missing_stock_returns_not_ready_not_zero():
             pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 8: 隔离 ready fixture 验证工作台入口完整路径
+#         → stock ready 时 get_replenishment_view 从 wf5 返回正确有序行
+# ═══════════════════════════════════════════════════════════════════════════════
+def test_entry_point_ready_fixture_returns_ordered_wf5_rows():
+    """隔离 fixture（ready 状态）：get_replenishment_view 通过就绪门后从 wf5 返回补货行。
+
+    不依赖线上库存状态（线上当前 stale）——在隔离临时库里构造 ready 条件：
+    - 25 个 is_listed=1 的 SKU + 25 行对应的新鲜 wf1_stock（全有 noon_saleable_qty）
+    - 3 行 wf5_sales_cycle（已知 weekly_total_replenish 30/20/10）
+    然后调 data.get_replenishment_view('ksa') 真实入口，断言：
+    1. stock_status.ready == True
+    2. 返回 3 行，顺序为 FSKU_005(30) > FSKU_010(20) > FSKU_015(10)
+    3. 入口链路完整：stock_readiness gate 通过 -> get_replenishment -> wf5 rows
+    """
+    import datetime
+    import importlib
+
+    tmp = tempfile.NamedTemporaryFile(suffix="_ws124_ready.db", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    orig_env = os.environ.get("HIPOP_DB")
+    os.environ["HIPOP_DB"] = tmp_path
+    os.environ.pop("DB_URL", None)
+
+    try:
+        fresh_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        con = sqlite3.connect(tmp_path)
+
+        con.execute("""
+            CREATE TABLE sales_entities (
+                id INTEGER PRIMARY KEY, tenant_id BIGINT NOT NULL,
+                alias TEXT NOT NULL, country TEXT NOT NULL, platform TEXT,
+                store_name TEXT, store_id INT, currency TEXT,
+                active INT NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""")
+        con.execute("""
+            CREATE TABLE wf2_sku (
+                tenant_id INTEGER, entity_alias TEXT, partner_sku TEXT,
+                is_listed INTEGER DEFAULT 1, sales_30d REAL, title TEXT,
+                image_url TEXT, latest_price REAL, latest_profit_rate REAL,
+                imported_at TEXT,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+        con.execute("""
+            CREATE TABLE wf1_stock (
+                tenant_id BIGINT NOT NULL, entity_alias TEXT NOT NULL, partner_sku TEXT NOT NULL,
+                noon_total_qty INT, noon_saleable_qty INT, noon_unsaleable_qty INT,
+                noon_warehouses_json TEXT, pending_inbound_qty INT,
+                overseas_total_qty INT, overseas_breakdown_json TEXT,
+                yiwu_qty INT, dongguan_qty INT, total_stock INT,
+                imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+        con.execute("""
+            CREATE TABLE wf5_sales_cycle (
+                tenant_id INTEGER, entity_alias TEXT, partner_sku TEXT,
+                weekly_total_replenish INTEGER, urgency TEXT,
+                wf5_replenish_qty INTEGER, lost_replenish_qty INTEGER,
+                current_pipeline INTEGER, target_pipeline INTEGER,
+                daily_rate REAL, trend TEXT, ops_advice TEXT,
+                risk_label TEXT, trigger_reasons TEXT, updated_at TEXT,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+
+        # KSA entity: country='SA' (入口通过 _resolve_entity_for_store('ksa') -> 'SA')
+        con.execute(
+            "INSERT INTO sales_entities (id,tenant_id,alias,country,active) VALUES (1,1,'fix_ksa','SA',1)"
+        )
+
+        # 25 SKUs + 25 fresh stock rows (满足 MIN_ROWS=20 / COVERAGE=95% / NOON_COVERAGE=100%)
+        for i in range(1, 26):
+            sku = "FSKU_{:03d}".format(i)
+            con.execute(
+                "INSERT INTO wf2_sku (tenant_id,entity_alias,partner_sku,is_listed,sales_30d,title) "
+                "VALUES (1,'fix_ksa',?,1,5.0,?)",
+                (sku, "Test SKU {}".format(i)),
+            )
+            con.execute(
+                "INSERT INTO wf1_stock (tenant_id,entity_alias,partner_sku,noon_saleable_qty,imported_at) "
+                "VALUES (1,'fix_ksa',?,0,?)",
+                (sku, fresh_ts),
+            )
+
+        # 3 wf5 rows with known quantities (expected Top order: 005 > 010 > 015)
+        for sku, qty in [("FSKU_005", 30), ("FSKU_010", 20), ("FSKU_015", 10)]:
+            con.execute(
+                "INSERT INTO wf5_sales_cycle "
+                "(tenant_id,entity_alias,partner_sku,weekly_total_replenish,urgency,trend,ops_advice,updated_at) "
+                "VALUES (1,'fix_ksa',?,?,'low','稳定','补货',?)",
+                (sku, qty, fresh_ts),
+            )
+
+        con.commit()
+        con.close()
+
+        import hipop.server.data as data_mod
+        importlib.reload(data_mod)
+
+        view = data_mod.get_replenishment_view("ksa", limit=10)
+        stock_status = view["stock_status"]
+        rows = view.get("rows", [])
+
+        assert stock_status.get("ready") is True, (
+            "fixture 库存应 ready，实际: status={}, age={}h, "
+            "stock_rows={}, coverage={}".format(
+                stock_status.get("status"),
+                stock_status.get("stock_age_hours"),
+                stock_status.get("stock_rows"),
+                stock_status.get("coverage"),
+            )
+        )
+        assert len(rows) == 3, (
+            "应返回 3 行，实际 {}: {}".format(
+                len(rows), [r.get("partner_sku") for r in rows]
+            )
+        )
+        qtys = [r["qty"] for r in rows]
+        assert qtys == [30, 20, 10], (
+            "应按 weekly_total_replenish DESC 排列 [30,20,10]，实际 {}".format(qtys)
+        )
+        assert rows[0]["partner_sku"] == "FSKU_005", (
+            "Top 1 应是 FSKU_005 (qty=30)，实际 {}".format(rows[0]["partner_sku"])
+        )
+
+    finally:
+        if orig_env is not None:
+            os.environ["HIPOP_DB"] = orig_env
+        else:
+            os.environ.pop("HIPOP_DB", None)
+        import hipop.server.data as data_mod
+        importlib.reload(data_mod)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 # ── 运行 ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     tests = [
@@ -429,18 +589,19 @@ if __name__ == "__main__":
         test_tbu0010a_in_wf2_absent_in_wf5_ksa,
         test_sab0433a_in_wf2_absent_in_wf5_ksa,
         test_tbn0201a_not_in_ksa_entity,
-        test_current_ksa_top5_replenish_are_live_authoritative,
+        test_entry_point_respects_stock_readiness_gate,
         test_missing_stock_returns_not_ready_not_zero,
+        test_entry_point_ready_fixture_returns_ordered_wf5_rows,
     ]
     failed = 0
     for t in tests:
         try:
             t()
-            print(f"✓ {t.__name__}")
+            print("✓ {}".format(t.__name__))
         except Exception as e:
             failed += 1
-            print(f"✗ {t.__name__}: {e}")
+            print("✗ {}: {}".format(t.__name__, e))
             traceback.print_exc()
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    print("\n{}/{} passed".format(len(tests) - failed, len(tests)))
     import sys as _sys
     _sys.exit(0 if failed == 0 else 1)
