@@ -3,7 +3,7 @@
 验收（WS-122 round-2）：
   tool_query_sku 在任何 wf2_sku 快照新鲜度下，必须先走实时取数路径：
   1. 快照 as_of_date=今日但含旧值 65/662 + live 替身返回 25/201 → 工具返回 25/201
-  2. live 不可用/失败时 → sales_30d/history_total=null（不输出旧缓存确定数）
+  2. live 不可用/失败时 → 所有销量/订单派生字段为 null（不输出旧缓存确定数）
   3. provider _stale_skus_from_sku_result: live_sales_failed → result_stale_skus=[SKU]
   4. safety _check_stale_sales_claim: live_failed + 含销量数字 → T03 警告
 
@@ -43,7 +43,9 @@ SKU = "TBS0228A"
 TODAY = datetime.date.today().isoformat()
 # 快照含旧值（即使 as_of_date=今日，也应被 live 路径覆盖）
 SNAPSHOT_SALES_30D = 65
+SNAPSHOT_SALES_10D = 11
 SNAPSHOT_TOTAL_ORDERS = 662
+SNAPSHOT_WINDOW_ORDERS_30D = 7
 # live 源返回的真实值（测试替身）
 LIVE_SALES_30D = 25
 LIVE_HISTORY_TOTAL = 201
@@ -108,8 +110,52 @@ def _seed_wf2_sku(conn, as_of_date, sales_30d, total_orders=None) -> None:
         " latest_price, latest_profit_rate, is_listed, total_orders) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (TENANT_ID, ENTITY_ALIAS, SKU, "Test SKU T03 Live Path", as_of_date,
-         as_of_date + "T10:00:00", sales_30d, 5, "A", 50.0, 0.15, 1,
+         as_of_date + "T10:00:00", sales_30d, SNAPSHOT_SALES_10D, "A", 50.0, 0.15, 1,
          total_orders),
+    )
+    conn.commit()
+
+
+def _seed_wf2_orders(conn, as_of_date, count=SNAPSHOT_WINDOW_ORDERS_30D) -> None:
+    for idx in range(count):
+        conn.execute(
+            "INSERT OR REPLACE INTO wf2_orders "
+            "(tenant_id, entity_alias, partner_sku, item_nr, order_date, "
+            " status, is_cancelled, is_return, source, imported_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                TENANT_ID,
+                ENTITY_ALIAS,
+                SKU,
+                f"SMOKE-T03-LIVE-{idx}",
+                as_of_date,
+                "delivered",
+                1 if idx == 0 else 0,
+                1 if idx == 1 else 0,
+                "snapshot_fixture",
+                as_of_date + "T10:00:00",
+            ),
+        )
+    conn.commit()
+
+
+def _seed_wf5_sales_cycle(conn, updated_at) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO wf5_sales_cycle "
+        "(tenant_id, entity_alias, partner_sku, trend, daily_rate, urgency, "
+        " ops_advice, weekly_total_replenish, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            TENANT_ID,
+            ENTITY_ALIAS,
+            SKU,
+            "rising",
+            1.25,
+            "high",
+            "snapshot says replenish",
+            20,
+            updated_at + "T10:00:00",
+        ),
     )
     conn.commit()
 
@@ -143,6 +189,8 @@ def test_live_path_called_and_values_used() -> None:
     conn = _data.conn()
     _seed_entity(conn)
     _seed_wf2_sku(conn, TODAY, SNAPSHOT_SALES_30D, SNAPSHOT_TOTAL_ORDERS)
+    _seed_wf2_orders(conn, TODAY)
+    _seed_wf5_sales_cycle(conn, TODAY)
 
     live_calls: list = []
 
@@ -226,6 +274,28 @@ def test_live_unavailable_redacts_sales() -> None:
     check("live 失败 → sales_30d = null（不输出旧缓存 65）",
           item.get("sales_30d") is None,
           f"got sales_30d={item.get('sales_30d')!r} (旧缓存 {SNAPSHOT_SALES_30D} 泄漏!)")
+    check("live 失败 → sales_10d = null（不输出旧缓存 11）",
+          item.get("sales_10d") is None,
+          f"got sales_10d={item.get('sales_10d')!r} (旧缓存 {SNAPSHOT_SALES_10D} 泄漏!)")
+    check("live 失败 → total_orders_30d = null（不输出旧订单统计）",
+          item.get("total_orders_30d") is None,
+          f"got total_orders_30d={item.get('total_orders_30d')!r} "
+          f"(旧订单统计 {SNAPSHOT_WINDOW_ORDERS_30D} 泄漏!)")
+    check("live 失败 → cancel_rate_30d = null（不输出旧订单派生率）",
+          item.get("cancel_rate_30d") is None,
+          f"got cancel_rate_30d={item.get('cancel_rate_30d')!r}")
+    check("live 失败 → return_rate_30d = null（不输出旧订单派生率）",
+          item.get("return_rate_30d") is None,
+          f"got return_rate_30d={item.get('return_rate_30d')!r}")
+    check("live 失败 → profit_rate_pct = null（不输出旧利润率）",
+          item.get("profit_rate_pct") is None,
+          f"got profit_rate_pct={item.get('profit_rate_pct')!r}")
+    check("live 失败 → trend/daily_rate/urgency/advice/replenish 均不输出旧 wf5 信号",
+          all(item.get(k) is None for k in (
+              "trend", "daily_rate", "urgency", "ops_advice", "weekly_replenish")),
+          f"got trend={item.get('trend')!r}, daily_rate={item.get('daily_rate')!r}, "
+          f"urgency={item.get('urgency')!r}, ops_advice={item.get('ops_advice')!r}, "
+          f"weekly_replenish={item.get('weekly_replenish')!r}")
     check("live 失败 → history_total = null（不输出旧缓存 662）",
           item.get("history_total") is None,
           f"got history_total={item.get('history_total')!r} (旧缓存 {SNAPSHOT_TOTAL_ORDERS} 泄漏!)")

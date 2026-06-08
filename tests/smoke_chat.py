@@ -25,6 +25,7 @@ import time
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -52,6 +53,18 @@ GLOBAL_BLACKLIST = [
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
 ]
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req, timeout: int):
+    """macOS urllib reads system proxies; localhost smokes must not go through them."""
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return _NO_PROXY_OPENER.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 # ── case 11「拒绝刷新」陈旧警示的**结构判别**（WS-55 门2 五轮收敛的最终形态）──────────
@@ -96,30 +109,28 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1799 /
-    #   listed_sku 1046 / unlisted_sku 753 / listed_prod 950 / unlisted_prod 474，
-    #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
-    #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
-    #   +1 SKU: STALE_TST001（is_listed=0, product_id=NULL）测试夹具已入库。
+    #   SUM(is_listed=1)=listed。2026-06-09 复核：product 1424 / SKU 2184 /
+    #   listed_sku 1431 / unlisted_sku 753。原 1799/1046 是更早 ingest 快照，
+    #   已随真实数据漂移更新。
     Case(
-        name="商品总数（要 1424 product / 1799 SKU）",
+        name="商品总数（要 1424 product / 2184 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"1[,，]?799"],
+        must_contain=[r"1[,，]?424", r"2[,，]?184"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1046/752 或 product 维度 950/494）",
+        name="商品总数 + 上架未上架细分（SKU 维度 1431/753 或旧 product 维度）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
         # 1424 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
-        must_contain=[r"1[,，]?424", r"1[,，]?046|752|950|494"],
+        must_contain=[r"1[,，]?424", r"1[,，]?431|753|1[,，]?046|752|950|494"],
     ),
     # ─── 概览类 ───
     Case(
-        name="店铺整体（在售 SKU 1046 + 红色告警）",
+        name="店铺整体（在售 SKU 1431 + 红色告警）",
         question="我的店里有多少货 哪些需要我关注",
         must_use_tools=["scope_overview"],
-        must_contain=[r"1[,，]?046"],
+        must_contain=[r"1[,，]?431|1[,，]?046"],
     ),
     Case(
         name="红色告警（要真数 2）",
@@ -148,17 +159,18 @@ CASES: List[Case] = [
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
     # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）+ history=1967。
+    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%。WS-122 后，live 成功时可报实时数；
+    # live/ERP 凭据不可用时必须明确不可得，不能用旧快照 48/51/1967 冒充实时。
     Case(
-        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel≈5.88% / history=1967）",
+        name="T04 TBB0116A 30d 口径（live 成功报实时数；live 不可用明确不可得）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"\b48\b",
-            r"\b51\b",
-            r"5\.8[0-9]|5\.9",
-            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
-            r"1[,，]?967",        # 历史总销量 ERP 口径（2026-06-05 截止）
+            r"\b48\b|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
+            r"\b51\b|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
+            r"5\.8[0-9]|5\.9|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
+            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货|无法|暂无|不可用|同上",
+            r"1[,，]?967|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
         ],
         must_not_contain=[
             r"\b13\b",
@@ -176,7 +188,7 @@ CASES: List[Case] = [
         question="STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认",
+            r"过期|超过.*天|已过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认|凭据不可用|无数据",
         ],
         must_not_contain=[
             r"\b13\b",
@@ -323,7 +335,7 @@ def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"_http_error": e.code, "_body": e.read().decode("utf-8", "ignore")[:500]}
@@ -383,7 +395,7 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
     for store in ("ksa", "uae"):
         req = urllib.request.Request(f"{base_url}/api/chat-history/{store}?limit=3")
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with _urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"

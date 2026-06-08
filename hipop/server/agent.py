@@ -564,6 +564,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
         def _r(val):
             return None if data_stale_val else val
 
+        def _live_guarded_snapshot(val):
+            return _r(val) if live_ok else None
+
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
         sales_30d_out = live_result.get("sales_30d") if live_ok else None
         history_total_out = live_result.get("history_total") if live_ok else None
@@ -572,19 +575,19 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "sku": sku,
             "found": True,
             "title": r["title"],
-            "trend": _r(r["trend"]),
-            "profit_rate_pct": _r(round((r["latest_profit_rate"] or 0) * 100, 1)),
+            "trend": _live_guarded_snapshot(r["trend"]),
+            "profit_rate_pct": _live_guarded_snapshot(round((r["latest_profit_rate"] or 0) * 100, 1)),
             "sales_30d": sales_30d_out,
-            "sales_10d": _r(r["sales_10d"]),
-            "daily_rate": _r(r["daily_rate"]),
-            "urgency": r["urgency"],
-            "ops_advice": r["ops_advice"],
+            "sales_10d": _live_guarded_snapshot(r["sales_10d"]),
+            "daily_rate": _live_guarded_snapshot(r["daily_rate"]),
+            "urgency": _live_guarded_snapshot(r["urgency"]),
+            "ops_advice": _live_guarded_snapshot(r["ops_advice"]),
             "in_transit": r["in_transit_total_qty"],
             "has_stuck_batch": bool(r["has_stuck_batch"]),
-            "weekly_replenish": r["weekly_total_replenish"],
-            "total_orders_30d": _r(stats_30d.get("total_30d")),
-            "cancel_rate_30d": _r(stats_30d.get("cancel_rate_30d")),
-            "return_rate_30d": _r(stats_30d.get("return_rate_30d")),
+            "weekly_replenish": _live_guarded_snapshot(r["weekly_total_replenish"]),
+            "total_orders_30d": _live_guarded_snapshot(stats_30d.get("total_30d")),
+            "cancel_rate_30d": _live_guarded_snapshot(stats_30d.get("cancel_rate_30d")),
+            "return_rate_30d": _live_guarded_snapshot(stats_30d.get("return_rate_30d")),
             "history_total": history_total_out,
             "as_of_date": as_of,
             "data_stale": data_stale_val,
