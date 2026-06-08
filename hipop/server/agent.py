@@ -13,7 +13,7 @@ LLM Coordinator - 把 hipop 的 5 个 handler + 2 个新工具包装成 Anthropi
 每次 tool 调用都会写入 agent_actions 表 (action_type='execute')，并把 references_json
 回传给前端用于"📎 出处"展示。
 """
-import os, sys, json, sqlite3, time, contextvars
+import os, sys, json, sqlite3, time, contextvars, re
 from typing import List, Dict, Any, Optional
 
 # ── chat 当前请求 context（tenant_id + scope）─────────────
@@ -1843,6 +1843,83 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _deterministic_export_request(question: str) -> Optional[Dict[str, str]]:
+    q = question or ""
+    if not any(x in q for x in ("导出", "下载", "Excel", "excel", "表格")):
+        return None
+    if "物流" in q:
+        view = "logistics"
+    elif "补货" in q:
+        view = "replenish"
+    elif any(x in q for x in ("SKU", "sku", "库存", "健康")):
+        view = "sku_health"
+    else:
+        view = "sales"
+    return {"view": view, "format": "excel", "filter_desc": q[:80]}
+
+
+_SKU_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b", re.IGNORECASE)
+
+
+def _deterministic_sku_metric_request(question: str) -> Optional[Dict[str, str]]:
+    q = question or ""
+    metric_words = (
+        "近 30 天销量", "近30天销量", "30 天销量", "30天销量",
+        "30 天总单量", "30天总单量", "历史总销量", "退货率", "取消率",
+    )
+    if not any(x in q for x in metric_words):
+        return None
+    for token in _SKU_TOKEN_RE.findall(q):
+        sku = token.upper()
+        if sku in {"KSA", "UAE", "SKU", "ERP", "NOON", "CSV", "EXCEL"}:
+            continue
+        if any(ch.isdigit() for ch in sku) or "_" in sku:
+            return {"sku": sku}
+    return None
+
+
+def _fmt_num(value, suffix: str = "") -> str:
+    if value is None:
+        return "未返回"
+    try:
+        return f"{int(value):,}{suffix}"
+    except (TypeError, ValueError):
+        return f"{value}{suffix}"
+
+
+def _fmt_rate(value) -> str:
+    if value is None:
+        return "未返回"
+    try:
+        pct = float(value) * 100
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(pct) < 0.005:
+        return "0%"
+    return f"{pct:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def _render_sku_metric_reply(item: Dict[str, Any], store: str) -> str:
+    sku = item.get("sku") or ""
+    if not item.get("found"):
+        return (
+            f"未找到 SKU {sku} 在 {store} 店铺的记录。"
+            "请核实 SKU 编码是否正确，或确认它是否属于其他店铺。"
+        )
+    title = item.get("title") or sku
+    return (
+        f"以下是 {sku}（{title}）在 {store} 店铺的 30 天口径数据：\n\n"
+        "| 指标 | 数值 |\n"
+        "|---|---|\n"
+        f"| 近 30 天销量 | {_fmt_num(item.get('sales_30d'), ' 件')} |\n"
+        f"| 30 天总单量 | {_fmt_num(item.get('total_orders_30d'), ' 单')} |\n"
+        f"| 历史总销量 | {_fmt_num(item.get('history_total'), ' 件')} |\n"
+        f"| 退货率（30d） | {_fmt_rate(item.get('return_rate_30d'))} |\n"
+        f"| 取消率（30d） | {_fmt_rate(item.get('cancel_rate_30d'))} |\n"
+        f"| 数据口径截止日 | {item.get('as_of_date') or '未返回'} |"
+    )
+
+
 def _active_workflow_task(workflow: str) -> Optional[Dict]:
     rows = _data._fetch(
         "SELECT task_id, workflow, state FROM tasks "
@@ -1886,6 +1963,63 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+
+    direct_export = _deterministic_export_request(question)
+    if direct_export:
+        store = (scope.get("store") or "KSA").upper()
+        tool_args = {**direct_export, "store": store}
+        tool_result = _exec_tool("export_table", tool_args, user=scope)
+        if isinstance(tool_result, dict) and tool_result.get("ok") and tool_result.get("download_url"):
+            filename = tool_result.get("filename") or "导出文件.xlsx"
+            reply = (
+                f"已生成 {tool_result.get('row_count', 0)} 行 Excel："
+                f"[{filename}]({tool_result['download_url']})"
+            )
+        else:
+            reply = (
+                (tool_result or {}).get("message")
+                or (tool_result or {}).get("error")
+                or "导出失败。"
+            )
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["export_table"],
+            "tag": "执行",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_export_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_sku_metric = _deterministic_sku_metric_request(question)
+    if direct_sku_metric:
+        store = (scope.get("store") or "KSA").upper()
+        tool_result = _exec_tool(
+            "query_sku",
+            {"skus": [direct_sku_metric["sku"]], "store": store},
+            user=scope,
+        )
+        items = (tool_result or {}).get("items") if isinstance(tool_result, dict) else []
+        item = items[0] if items else {"sku": direct_sku_metric["sku"], "found": False}
+        reply = _render_sku_metric_reply(item, store)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["query_sku"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_sku_metric_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
