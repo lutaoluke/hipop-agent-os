@@ -2679,6 +2679,7 @@ def _logistics_task_evidence_check(task_id: str) -> Optional[str]:
         return ("物流后台任务**未确认创建成功**（任务表查询出错）。"
                 "请稍后在工作台任务面板确认任务状态，或重试。")
     if evidence is None:
+        # task row 不存在（含孤儿事件场景：agent_events 有记录但 tasks 行缺失）
         return ("物流后台任务**未确认创建成功**（任务行不存在）。"
                 "请稍后在工作台任务面板确认任务状态，或重试。")
     if not evidence.get("events"):

@@ -6,16 +6,18 @@
   3. _logistics_task_evidence_check：证据完整返回 None（无降级）
   4. _logistics_task_evidence_check：事件缺失返回「未确认创建成功」降级消息
   5. _logistics_task_evidence_check：任务表查询抛错也返回降级消息
+  6. _logistics_task_evidence_check：孤儿事件（agent_events 有记录但无 tasks 行）也降级
 
 fail-then-pass：
-  FAIL（修前）：direct_workflow 路径说「已触发」但不查证据 → 缺少降级路径
-  PASS（修后）：_logistics_task_evidence_check 接入 wf3 专项入口；
-               降级路径有测试覆盖；spawn_task 已落 task row + queued event（SUB-1）
+  FAIL（修前）：direct_workflow 路径说「已触发」但不查证据 → 缺少降级路径；
+               _logistics_task_evidence_check 只查 get_events_after，孤儿事件误放行
+  PASS（修后）：_logistics_task_evidence_check 改用 get_task_with_events，
+               同时核 task row 和 events；降级路径有完整测试覆盖。
 
 读写边界：
-  读：hipop.server.data.get_events_after / agent._logistics_task_evidence_check
+  读：hipop.server.data.get_task_with_events / agent._logistics_task_evidence_check
   读：hipop.server.runtime.spawn_task（只验 task row + event 写入，不真跑 worker）
-  写：无（smoke 不写业务表）
+  写：Test 6 直接插入 agent_events 孤儿记录（仅测试 DB，不触发业务逻辑）
 """
 
 import sys
@@ -160,8 +162,8 @@ def test_logistics_evidence_check_degrades_on_db_error():
     from hipop.server.agent import _logistics_task_evidence_check
     import unittest.mock as mock
 
-    # patch data.get_events_after 使其抛错，模拟 DB 异常
-    with mock.patch.object(_data, "get_events_after", side_effect=RuntimeError("DB error")):
+    # patch data.get_task_with_events 使其抛错，模拟 DB 异常
+    with mock.patch.object(_data, "get_task_with_events", side_effect=RuntimeError("DB error")):
         degrade_msg = _logistics_task_evidence_check("any-task-id")
 
     assert degrade_msg is not None, (
@@ -171,6 +173,47 @@ def test_logistics_evidence_check_degrades_on_db_error():
         f"降级消息必须包含「未确认创建成功」，实际: {degrade_msg!r}"
     )
     print(f"    DB error → degraded: {degrade_msg!r}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Test 6: 降级检查 — 孤儿事件（agent_events 有记录但 tasks 行不存在）
+# ──────────────────────────────────────────────────────────────
+
+def test_logistics_evidence_check_degrades_on_orphan_events():
+    """_logistics_task_evidence_check：agent_events 有记录但 tasks 行不存在（孤儿事件）→ 降级。
+
+    红队场景：直接向 agent_events 插入一条记录，不经过 spawn_task，tasks 表无对应行。
+    修前（只用 get_events_after）：events 非空 → 误返回 None（假成功放行）。
+    修后（改用 get_task_with_events）：task row 不存在 → 返回降级消息。
+
+    FAIL（修前）：get_events_after 找到孤儿事件，返回 None 放行假成功。
+    PASS（修后）：get_task_with_events 返回 None，触发「任务行不存在」降级。
+    """
+    import sqlite3
+    from hipop.server.agent import _logistics_task_evidence_check
+
+    orphan_task_id = "orphan-task-id-no-tasks-row"
+
+    # 直接向 agent_events 写孤儿记录（tasks 表无对应行）
+    conn = sqlite3.connect(_data.DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO agent_events (task_id, step_no, step_name, status, tenant_id) "
+            "VALUES (?, 1, 'orphan_step', 'queued', 1)",
+            (orphan_task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    degrade_msg = _logistics_task_evidence_check(orphan_task_id)
+    assert degrade_msg is not None, (
+        "孤儿事件（有 agent_events 无 tasks 行）时应返回降级消息，实际返回 None（假成功放行）"
+    )
+    assert "未确认创建成功" in degrade_msg, (
+        f"降级消息必须包含「未确认创建成功」，实际: {degrade_msg!r}"
+    )
+    print(f"    orphan event → degraded: {degrade_msg!r}")
 
 
 if __name__ == "__main__":
@@ -188,6 +231,8 @@ if __name__ == "__main__":
          test_logistics_evidence_check_degrades_on_missing_events),
         ("test_logistics_evidence_check_degrades_on_db_error",
          test_logistics_evidence_check_degrades_on_db_error),
+        ("test_logistics_evidence_check_degrades_on_orphan_events",
+         test_logistics_evidence_check_degrades_on_orphan_events),
     ]
 
     failed = 0
