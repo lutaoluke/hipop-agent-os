@@ -413,7 +413,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
 
     # 纯数字问题质量评价过滤（行级，不用 re.DOTALL 以免吃掉整表）
     if question and _PURE_NUM_RE.search(question):
-        cutoff_pat = re.compile(r'\n+(?:补充信息|其他信息|额外信息)[：:]')
+        cutoff_pat = re.compile(
+            r'\n+(?:补充信息|其他信息|额外信息|另外补充(?:几个)?(?:关键信息)?|'
+            r'补充几个关键信息)[：:]?'
+        )
         m = cutoff_pat.search(reply)
         if m:
             reply = reply[:m.start()]
@@ -457,9 +460,9 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
     # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词
     fake_task_evidence = re.search(
-        r"((?:状态|status)\s*(?:为|是|:)\s*accepted"
-        r"|任务.{0,20}accepted"
-        r"|SSE\s*(?:推送|进度|实时|订阅)"
+        r"((?:状态|status)[^。\n!?]{0,12}\baccepted\b"
+        r"|任务[^。\n!?]{0,20}\baccepted\b"
+        r"|SSE[^。\n!?]{0,20}(?:推送|进度|实时|订阅)"
         r"|前端.{0,10}(?:SSE|订阅).{0,10}(?:进度|推送))",
         reply,
         re.IGNORECASE,

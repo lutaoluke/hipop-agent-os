@@ -180,6 +180,8 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 "result_error": result.get("error") if isinstance(result, dict) else None,
                 "result_stale_skus": result_stale_skus,
                 "result_replenishment_blocked_skus": result_replenishment_blocked_skus,
+                "result_download_url": result.get("download_url") if isinstance(result, dict) else None,
+                "result_filename": result.get("filename") if isinstance(result, dict) else None,
             })
             msgs.append({
                 "role": "tool",

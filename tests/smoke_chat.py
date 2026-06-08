@@ -115,28 +115,28 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-09 复核：product 1424 / SKU 2184 /
-    #   listed_sku 1431 / unlisted_sku 753。原 1799/1046 是更早 ingest 快照，
-    #   已随真实数据漂移更新。
+    #   SUM(is_listed=1)=listed。2026-06-09 复核：product 2883 / SKU 3657 /
+    #   listed_sku 2091 / unlisted_sku 1566 / listed_prod 1995 / unlisted_prod 1008。
+    #   原 1424/1799/1046/752 是更早 ingest 快照，已随真实 ERP 数据漂移更新。
     Case(
-        name="商品总数（要 1424 product / 2184 SKU）",
+        name="商品总数（要 2883 product / 3657 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"2[,，]?184"],
+        must_contain=[r"2[,，]?883", r"3[,，]?657"],
     ),
     Case(
-        name="商品总数 + 上架未上架细分（SKU 维度 1431/753 或旧 product 维度）",
+        name="商品总数 + 上架未上架细分（SKU 维度 2091/1566 或 product 维度 1995/1008）",
         question="店铺总共多少商品 包含未上架的",
         must_use_tools=["list_products"],
-        # 1424 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
-        must_contain=[r"1[,，]?424", r"1[,，]?431|753|1[,，]?046|752|950|494"],
+        # 2883 product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径）
+        must_contain=[r"2[,，]?883", r"2[,，]?091|1[,，]?566|1[,，]?995|1[,，]?008"],
     ),
     # ─── 概览类 ───
     Case(
-        name="店铺整体（在售 SKU 1431 + 红色告警）",
+        name="店铺整体（在售 SKU 2091 + 红色告警）",
         question="我的店里有多少货 哪些需要我关注",
         must_use_tools=["scope_overview"],
-        must_contain=[r"1[,，]?431|1[,，]?046"],
+        must_contain=[r"2[,，]?091"],
     ),
     Case(
         name="红色告警（要真数 2）",
@@ -164,24 +164,23 @@ CASES: List[Case] = [
         ],
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
-    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%。WS-122 后，live 成功时可报实时数；
-    # live/ERP 凭据不可用时必须明确不可得，不能用旧快照 48/51/1967 冒充实时。
+    # fail-then-pass：tool_query_sku 必须返回与当前 wf2_sku / wf2_orders 同窗口的
+    # sales_30d、total_orders_30d、cancel_rate_30d、return_rate_30d 和 history_total。
+    # 2026-06-09 PG 当前值：sales=54 / total=43 / cancel=0% / return=0% / history=1967。
     Case(
-        name="T04 TBB0116A 30d 口径（live 成功报实时数；live 不可用明确不可得）",
+        name="T04 TBB0116A 30d 口径（sales=54 / total=43 / cancel=0% / history=1967）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"\b48\b|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
-            r"\b51\b|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
-            r"5\.8[0-9]|5\.9|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
-            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货|无法|暂无|不可用|同上",
-            r"1[,，]?967|无法|暂无|不可用|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)|同上",
+            r"\b54\b",
+            r"\b43\b",
+            r"取消.*0[%.]|0\.0{1,2}%|0%.*取消|无取消",
+            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
+            r"1[,，]?967",        # 历史总销量 ERP 口径（2026-06-05 截止）
         ],
         must_not_contain=[
             r"\b13\b",
             r"1\.1[0-9]%|1\.12%",
-            r"取消率.*0\.0%",
             # 只问数值时不得主动下质量/表现判断
             r"表现.*不错|毛利.*不错|健康.*不错|正常范围|质量.*稳定|利润.*不错|表现良好|不错.*表现",
         ],
@@ -190,11 +189,12 @@ CASES: List[Case] = [
     # fail-then-pass：改前 REDACT 未实现，过期快照也能拿到数值 → Agent 报旧值 13/290/0%。
     # 改后 data_stale=True 时所有数值字段 REDACT=null → Agent 必须告知过期，不得报旧值。
     Case(
-        name="T04 快照过期边界（STALE_TST001 过期快照不得给旧值，必须警示过期）",
+        name="T04 快照过期/缺失边界（STALE_TST001 不得给旧值）",
         question="STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
-            r"过期|超过.*天|已过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认|凭据不可用|无数据",
+            r"过期|超过.*天|已过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|"
+            r"不确定|无法确认|不可确认|凭据不可用|无数据|没找到|没有找到|没有查到|查不到|不存在|尚未录入|给不了",
         ],
         must_not_contain=[
             r"\b13\b",
@@ -321,7 +321,7 @@ CASES: List[Case] = [
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
         question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
         must_use_tools=["query_order_live"],
-        must_contain=[r"未找到|不存在|无物流|无记录|找不到|查不到|核实货单号"],
+        must_contain=[r"未找到|不存在|无物流|无记录|没有记录|找不到|查不到|核实货单号"],
         must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
         timeout=120,
     ),

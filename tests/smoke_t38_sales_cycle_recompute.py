@@ -240,6 +240,23 @@ def test_t38_safety_accepted_status_caught():
     print(f"    'accepted' 状态已被拦截: {warns[0][:60]}…")
 
 
+def test_t38_safety_current_status_accepted_caught():
+    """验门人 round-3 gap: '当前状态 accepted' 自然说法也必须被拦截。
+
+    FAIL (before fix): 只匹配 '状态为 accepted' / '状态: accepted'，中间无连接词时漏检。
+    PASS (after fix):  状态/status 与 accepted 之间允许少量自然语言间隔。
+    """
+    _, warns = _safety.sanitize_reply(
+        "当前状态 accepted，系统正在处理中。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert any("accepted" in w.lower() or "T38" in w or "假任务" in w for w in warns), (
+        f"'当前状态 accepted' 未被 _safety 拦截: {warns}"
+    )
+    print(f"    '当前状态 accepted' 已被拦截: {warns[0][:60]}…")
+
+
 def test_t38_safety_sse_progress_caught():
     """验门人 round-2 gap: SSE 进度声明且无 run_workflow → 必须拦截。
 
@@ -255,6 +272,23 @@ def test_t38_safety_sse_progress_caught():
         f"SSE 进度声明未被 _safety 拦截: {warns}"
     )
     print(f"    SSE 进度已被拦截: {warns[0][:60]}…")
+
+
+def test_t38_safety_sse_will_push_progress_caught():
+    """验门人 round-3 gap: 'SSE 将推送进度' 自然说法也必须被拦截。
+
+    FAIL (before fix): 只匹配 'SSE推送' / 'SSE进度' 紧邻词，'将' 插入后漏检。
+    PASS (after fix):  SSE 与进度/推送/订阅之间允许少量自然语言间隔。
+    """
+    _, warns = _safety.sanitize_reply(
+        "SSE 将推送进度，完成后自动刷新。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert any("SSE" in w or "T38" in w or "假任务" in w for w in warns), (
+        f"'SSE 将推送进度' 未被 _safety 拦截: {warns}"
+    )
+    print(f"    'SSE 将推送进度' 已被拦截: {warns[0][:60]}…")
 
 
 def test_t38_safety_accepted_real_workflow_passes():
@@ -370,6 +404,35 @@ def test_t38_chat_e2e_failure_has_no_fake_task_id():
     print(f"    E2E failure: no fake evidence in reply: {reply!r}")
 
 
+def test_t38_chat_e2e_duplicate_running_returns_real_existing_task():
+    """E2E duplicate path: governance denial with an existing task id is still real evidence.
+
+    FAIL (before fix): chat() collapses the denial to "工作流触发失败。" and workflow_task=None.
+    PASS (after fix):  workflow_task carries the existing running task_id/workflow, while reply says
+    no duplicate task was created.
+    """
+    existing_task_id = "c37cf4e9"
+    duplicate_denial = {
+        "action_type": "denied",
+        "tool": "run_workflow",
+        "reason": f"该 workflow 已有运行中实例: ['{existing_task_id}']（防并发抢资源）",
+        "proposal_id": "duplicate123",
+    }
+    result = _chat_with_fake_exec("重算销售周期", duplicate_denial)
+    wt = result.get("workflow_task")
+    assert wt is not None, "duplicate running path should return the existing real workflow_task"
+    assert wt["task_id"] == existing_task_id, (
+        f"workflow_task.task_id {wt['task_id']!r} != existing {existing_task_id!r}"
+    )
+    assert wt["workflow"] == "wf5_sales_cycle_v2", (
+        f"workflow_task.workflow {wt['workflow']!r} != wf5_sales_cycle_v2"
+    )
+    reply = result.get("reply", "")
+    assert "未新建重复任务" in reply, f"duplicate reply should be explicit, got: {reply!r}"
+    assert "accepted" not in reply.lower(), f"duplicate reply contains accepted: {reply!r}"
+    print(f"    E2E duplicate: existing workflow_task.task_id={wt['task_id']}")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────────────────────────────────
@@ -394,13 +457,16 @@ if __name__ == "__main__":
         test_t38_safety_uppercase_task_id_caught,
         test_t38_safety_uppercase_real_task_id_passes,
         test_t38_safety_accepted_status_caught,
+        test_t38_safety_current_status_accepted_caught,
         test_t38_safety_sse_progress_caught,
+        test_t38_safety_sse_will_push_progress_caught,
         test_t38_safety_accepted_real_workflow_passes,
         # 两态失败表达
         test_t38_failure_reply_has_no_fake_task_id,
         # E2E chat() → run_workflow 证据链
         test_t38_chat_e2e_workflow_task_has_real_task_id,
         test_t38_chat_e2e_failure_has_no_fake_task_id,
+        test_t38_chat_e2e_duplicate_running_returns_real_existing_task,
     ]
     failed = 0
     for t in tests:
