@@ -13,16 +13,31 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# Auto-load .env.local（DEEPSEEK_API_KEY 等），重启 uvicorn 不必每次手动 export
-_DOTENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env.local")
-if os.path.exists(_DOTENV_PATH):
-    for _line in open(_DOTENV_PATH):
-        _line = _line.strip()
-        if not _line or _line.startswith("#") or "=" not in _line:
-            continue
-        _k, _v = _line.split("=", 1)
-        _k, _v = _k.strip(), _v.strip().strip("'").strip('"')
-        os.environ.setdefault(_k, _v)
+# Auto-load env file（DEEPSEEK_API_KEY / DB_URL 等），重启 uvicorn 不必每次手动 export.
+# HIPOP_ENV_FILE lets smoke runner and server process bind to the same DB env.
+_DEFAULT_DOTENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env.local")
+
+
+def _load_env_file(path):
+    if not path:
+        return False
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        for _line in f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            _k, _v = _k.strip(), _v.strip().strip("'").strip('"')
+            os.environ.setdefault(_k, _v)
+    return True
+
+
+for _env_path in (os.environ.get("HIPOP_ENV_FILE"), _DEFAULT_DOTENV_PATH):
+    if _load_env_file(_env_path):
+        break
 
 from server.feishu import reply_text, send_card, send_text
 from server.intent import parse_intent
