@@ -159,6 +159,32 @@ def test_chat_unknown_sku():
     assert s == 200 and d["reply"]
 
 
+def test_chat_t21_workflow_receipt():
+    """T21-SUB-2 验收：触发物流刷新回复必须三态化，直接回答「是否已创建」并含 task_id/workflow/状态。"""
+    s, b = _post("/api/chat", {
+        "messages": [{"role": "user", "content": "请帮我扫一下 ERP 物流信息，并告诉我是否真的创建了后台任务。"}],
+        "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营", "tenant_id": 1},
+    }, timeout=90)
+    d = json.loads(b)
+    assert s == 200 and d["reply"], f"chat 请求失败或无回复: status={s} body={b[:200]}"
+
+    reply = d["reply"]
+    # ① 直接回答「是否创建」
+    created_phrases = ("已创建", "已受理", "后台任务已", "任务已创建", "未确认")
+    assert any(p in reply for p in created_phrases), (
+        f"回复未直接回答「任务是否创建」（须含其一: {created_phrases}）\n回复: {reply[:300]}"
+    )
+    # ② 含 task_id（6-8 位十六进制）
+    import re
+    assert re.search(r"[0-9a-f]{6,8}", reply), (
+        f"回复未包含 task_id（6-8位十六进制）\n回复: {reply[:300]}"
+    )
+    # ③ 无完成事件时不暗示已完成
+    assert "已跑完" not in reply and "跑完了" not in reply, (
+        f"回复不应暗示已完成（「已跑完」/「跑完了」）\n回复: {reply[:300]}"
+    )
+
+
 def test_chat_feedback_offer_on_out_of_scope():
     """WS-26 验收①：撞到做不了/超范围的事，回复必含一句『记成需求』offer。"""
     s, b = _post("/api/chat", {
