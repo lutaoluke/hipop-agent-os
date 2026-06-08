@@ -181,6 +181,29 @@ def test_sanitize_reply_successful_workflow_no_extra_banner():
     assert not workflow_failure_warns, f"成功工作流不应触发失败 banner: {warns}"
 
 
+def test_sanitize_reply_rewrites_mixed_workflow_result():
+    """round-8：一成一败必须改写成人话汇总，不能保留误导性“也已启动”。"""
+    tool_log = [
+        {"name": "run_workflow", "args": {"workflow": "wf2_products_v2"},
+         "ok": True, "task_id": "abc12345", "error": None},
+        {"name": "run_workflow", "args": {"workflow": "wf2_sales_v2"},
+         "ok": False, "task_id": None, "error": "permission_denied"},
+    ]
+    reply = "ERP 商品库刷新已启动（任务 abc12345），销量价格刷新也已启动。"
+    out, warns = _safety.sanitize_reply(reply, ["run_workflow"], tool_log=tool_log)
+    assert "商品库刷新成功，销量价格刷新失败" in out, \
+        f"混合结果应改写成人话汇总: {out}"
+    assert "销量价格刷新也已启动" not in out and "也已启动" not in out, \
+        f"混合结果不得保留失败项已启动的误导文案: {out}"
+    assert "abc12345" in out, f"成功项应保留真实 task_id: {out}"
+    assert "permission_denied" in out, f"失败项应展示失败原因: {out}"
+    assert "wf2_products_v2" in out and "wf2_sales_v2" in out, \
+        f"详情应包含技术 workflow 名，方便唯一定位: {out}"
+    workflow_failure_warns = [w for w in (warns or []) if "未点名该工作流" in w]
+    assert not workflow_failure_warns, \
+        f"改写后的详情已点名 workflow，不应再加技术 banner: {warns}"
+
+
 def test_sanitize_reply_adds_stale_query_sku_warning():
     """query_sku 返回 data_stale=True 时，reply 漏说陈旧也要被安全层补上。"""
     tool_log = [{
@@ -382,6 +405,23 @@ def test_chat_panel_terminal_error_sets_task_error():
         "chat_panel 收到 step 99 error 未把失败原因写入任务卡"
 
 
+def test_chat_panel_failed_task_is_clickable_without_task_id():
+    """round-8：启动失败项没有 task_id，也必须能点击展开错误详情。"""
+    path = os.path.join(os.path.dirname(HERE), "hipop", "server", "templates", "partials", "chat_panel.html")
+    with open(path) as f:
+        src = f.read()
+    assert "openTaskDetail(t)" in src, \
+        "chat_panel 任务卡未统一走 openTaskDetail(t) 点击入口"
+    assert "t.task_id || t.ok === false" in src, \
+        "失败项无 task_id 时也应有 cursor/title 点击入口"
+    assert "点击查看失败详情" in src, \
+        "失败项 title 应提示可查看失败详情"
+    assert "show_details" in src, \
+        "失败项需要可展开详情状态"
+    assert "t.ok === false && t.error && t.show_details" in src, \
+        "失败原因应通过点击展开，而不是只有不可点击 inline error"
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_workflow_name_dict_args,
@@ -400,6 +440,7 @@ if __name__ == "__main__":
         test_non_run_workflow_tool_ignored,
         test_sanitize_reply_with_failed_workflow_adds_banner,
         test_sanitize_reply_successful_workflow_no_extra_banner,
+        test_sanitize_reply_rewrites_mixed_workflow_result,
         test_sanitize_reply_adds_stale_query_sku_warning,
         test_provider_logs_query_sku_stale_skus_for_safety_hook,
         test_anthropic_provider_enriches_tool_log_on_failure,
@@ -419,6 +460,8 @@ if __name__ == "__main__":
         # round-6: managed worker error terminal SSE event
         test_managed_worker_error_writes_terminal_event,
         test_chat_panel_terminal_error_sets_task_error,
+        # round-8: mixed-result summary + failed item clickable detail
+        test_chat_panel_failed_task_is_clickable_without_task_id,
     ]
     failed = 0
     for t in tests:

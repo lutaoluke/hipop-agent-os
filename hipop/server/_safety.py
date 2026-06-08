@@ -152,6 +152,73 @@ def _extract_failed_workflows(tool_log: list) -> List[tuple]:
     return failed
 
 
+_WORKFLOW_RESULT_LABELS = {
+    "wf2_products_v2": "商品库刷新",
+    "wf2_sales_v2": "销量价格刷新",
+    "wf2_sales_refresh_v2": "销量刷新",
+    "wf1_stock_v2": "库存刷新",
+    "wf3_logistics_v2": "物流刷新",
+    "wf5_sales_cycle_v2": "销售周期刷新",
+    "wf6_alerts_v2": "告警刷新",
+    "refresh_all_v2": "全量刷新",
+}
+
+
+def _workflow_result_label(workflow: str) -> str:
+    return _WORKFLOW_RESULT_LABELS.get(workflow or "", workflow or "未知刷新")
+
+
+def _extract_workflow_results(tool_log: list) -> List[dict]:
+    """Collect run_workflow results in display order for mixed-result receipts."""
+    results: List[dict] = []
+    for t in (tool_log or []):
+        if t.get("name") != "run_workflow":
+            continue
+        wf_name = _extract_workflow_name(t.get("args") or {})
+        ok_val = t.get("ok")
+        error_msg = t.get("error") or t.get("result_error")
+        ok = bool(ok_val) if ok_val is not None else not bool(error_msg)
+        results.append({
+            "workflow": wf_name,
+            "label": _workflow_result_label(wf_name),
+            "ok": ok,
+            "task_id": t.get("task_id"),
+            "error": error_msg or "未知错误",
+        })
+    return results
+
+
+def _rewrite_mixed_workflow_result(reply: str, tool_log: list) -> str:
+    """Rewrite mixed run_workflow outcomes into the required human receipt.
+
+    When one refresh starts and another fails to start, keeping the model's
+    original prose is dangerous because it often says the failed item also
+    started. This receipt is built only from tool_log facts.
+    """
+    results = _extract_workflow_results(tool_log)
+    if not results:
+        return reply
+    has_success = any(r["ok"] for r in results)
+    has_failure = any(not r["ok"] for r in results)
+    if not (has_success and has_failure):
+        return reply
+
+    headline = "，".join(
+        f"{r['label']}{'成功' if r['ok'] else '失败'}"
+        for r in results
+    )
+    lines = [f"**刷新结果**：{headline}。", "", "**详情**："]
+    for r in results:
+        if r["ok"]:
+            task_text = f"任务号 {r['task_id']}" if r.get("task_id") else "已创建后台任务"
+            lines.append(f"- {r['label']}成功：{task_text}（{r['workflow']}）。")
+        else:
+            lines.append(f"- {r['label']}失败：{r['error']}（{r['workflow']}）。")
+    lines.append("")
+    lines.append("请点击下方对应项查看详情。")
+    return "\n".join(lines)
+
+
 def _reply_names_workflow(reply: str, wf_name: str) -> bool:
     """reply 是否点名了该 workflow（技术名称必须出现）。
 
@@ -461,6 +528,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             lines = reply.split('\n')
             lines = [ln for ln in lines if not _QUALITY_JUDGMENT_RE.search(ln)]
             reply = '\n'.join(lines).strip()
+
+    reply = _rewrite_mixed_workflow_result(reply, tool_log or [])
 
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))

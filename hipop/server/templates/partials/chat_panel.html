@@ -31,15 +31,15 @@
           <div class="pc-chat-bubble">
             <span x-html="formatContent(m.content)"></span>
             <template x-for="(t, ti) in (m.tasks && m.tasks.length ? m.tasks : (m.task ? [m.task] : []))" :key="ti">
-              <div style="margin-top:6px;padding:6px 8px;background:var(--bg-tertiary);border-radius:6px;font-size:11.5px;">
+                <div style="margin-top:6px;padding:6px 8px;background:var(--bg-tertiary);border-radius:6px;font-size:11.5px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;"
-                     :style="t.task_id ? 'cursor:pointer;' : ''"
-                     :title="t.task_id ? '点击查看任务详情' : ''"
-                     @click="t.task_id && window.open('/api/tasks/' + t.task_id, '_blank')">
+                     :style="(t.task_id || t.ok === false) ? 'cursor:pointer;' : ''"
+                     :title="t.task_id ? '点击查看任务详情' : (t.ok === false ? '点击查看失败详情' : '')"
+                     @click="openTaskDetail(t)">
                   <span style="font-weight:600;"><span x-text="t.ok === false ? '✗' : '⚙️'"></span> <span x-text="t.label || t.workflow"></span><span x-show="t.task_id" style="font-size:9.5px;color:var(--text-tertiary);margin-left:4px;" x-text="'#' + (t.task_id || '')"></span></span>
                   <span style="color:var(--text-tertiary);" x-text="t.ok === false ? '启动失败' : (t.done_count + '/' + t.total_steps + (t.finished ? (t.ok ? ' ✓' : ' ✗') : ' …'))"></span>
                 </div>
-                <template x-if="t.ok === false && t.error">
+                <template x-if="t.ok === false && t.error && t.show_details">
                   <div style="color:var(--text-danger);font-size:10.5px;margin-top:2px;" x-text="t.error"></div>
                 </template>
                 <template x-for="(s, i) in (t.steps || [])" :key="i">
@@ -110,14 +110,14 @@ function chatPanel() {
         if (m.tasks && Array.isArray(m.tasks)) {
           m.tasks = m.tasks.map(t => {
             if (t.ok && t.task_id) {
-              return Object.assign({steps: [], done_count: t.total_steps || 0, finished: true}, t);
+              return Object.assign({steps: [], done_count: t.total_steps || 0, finished: true, show_details: false}, t);
             }
-            return Object.assign({steps: [], done_count: 0, finished: true}, t);
+            return Object.assign({steps: [], done_count: 0, finished: true, show_details: false}, t);
           });
         } else if (m.task && m.task.task_id) {
           // old format: m.task is a single dict — normalize to m.tasks for uniform rendering
           m.task = Object.assign({
-            steps: [], done_count: m.task.total_steps || 0,
+            steps: [], done_count: m.task.total_steps || 0, show_details: false,
             finished: true, ok: true,
           }, m.task);
           m.tasks = [m.task];
@@ -196,11 +196,21 @@ function chatPanel() {
         for (const t of wfTasks) {
           this.attachTask(msg, t);
         }
-      } catch(e) {
+        } catch(e) {
         this.messages.push({who: "Agent", role: "agent", time: new Date().toTimeString().slice(0,5), content: "⚠️ 连接错误: " + e, tag: ""});
       }
       this.loading = false;
       this.scroll();
+    },
+    openTaskDetail(t) {
+      if (!t) return;
+      if (t.task_id) {
+        window.open('/api/tasks/' + t.task_id, '_blank');
+        return;
+      }
+      if (t.ok === false) {
+        t.show_details = !t.show_details;
+      }
     },
     attachTask(msg, t) {
       // 初始化 inline 进度状态并追加到 msg.tasks
@@ -215,6 +225,7 @@ function chatPanel() {
         error: t.error || null,
         steps: [],
         done_count: 0,
+        show_details: false,
         finished: t.ok === false,  // failed-to-start tasks are already "done"
       };
       msg.tasks.push(taskObj);
