@@ -180,11 +180,32 @@ def _check_inventory_selection_evidence(
     ]
 
 
-def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None) -> Tuple[str, List[str]]:
+# 纯数字问题检测：用户只问 X 是多少/分别是多少
+_PURE_NUM_RE = re.compile(r'分别是多少|各.*是多少|是多少\s*$|是多少[？?。，,]')
+# 质量/表现评价词（行级匹配，不用 DOTALL 以免吃掉整表）
+_QUALITY_JUDGMENT_RE = re.compile(
+    r'表现.{0,10}不错|毛利.{0,10}不错|健康.{0,10}不错|正常范围|质量.{0,10}稳定'
+    r'|利润.{0,10}不错|表现良好|不错.{0,10}表现|整体.{0,20}表现|非常健康|很健康'
+    r'|整体.*表现|表现良好'
+)
+
+
+def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] = None, question: Optional[str] = None) -> Tuple[str, List[str]]:
     """对 reply 做一遍体检，命中违规给头部加 banner。"""
     warnings: List[str] = []
     if not reply:
         return reply, warnings
+
+    # 纯数字问题质量评价过滤（行级，不用 re.DOTALL 以免吃掉整表）
+    if question and _PURE_NUM_RE.search(question):
+        cutoff_pat = re.compile(r'\n+(?:补充信息|其他信息|额外信息)[：:]')
+        m = cutoff_pat.search(reply)
+        if m:
+            reply = reply[:m.start()]
+        if _QUALITY_JUDGMENT_RE.search(reply):
+            lines = reply.split('\n')
+            lines = [ln for ln in lines if not _QUALITY_JUDGMENT_RE.search(ln)]
+            reply = '\n'.join(lines).strip()
 
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))

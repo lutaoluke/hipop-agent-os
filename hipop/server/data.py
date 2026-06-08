@@ -167,6 +167,63 @@ def _feishu_today_count() -> int:
     return _scalar(sql) or 0
 
 
+def sku_30d_stats(tenant_id: int, entity_alias: str, partner_sku: str,
+                  as_of_date: str) -> dict:
+    """从 wf2_orders 计算该 SKU 以 as_of_date 为截止日的 30d 窗口取消/退货统计。
+
+    口径（T04 权威口径，WS-113）：
+      - 时间窗：[as_of_date - 30d, as_of_date]（含两端）
+      - total_30d    = 窗口内全部订单数（含取消）
+      - cancel_30d   = 窗口内 is_cancelled=1 的订单数
+      - return_30d   = 窗口内 is_return=1 的订单数
+      - valid_30d    = total_30d - cancel_30d
+      - cancel_rate_30d = cancel_30d / total_30d（total>0 时），否则 None
+      - return_rate_30d = return_30d / valid_30d（valid>0 时），否则 None（0/0 返 None）
+
+    确定性规则写在这里，不靠 prompt。调用方（tool_query_sku）直接使用返回值，
+    不自己重算，避免口径漂移。
+
+    Raises: ValueError 若 as_of_date 不是合法 YYYY-MM-DD。
+    """
+    import datetime as _dt
+
+    try:
+        end_d = _dt.date.fromisoformat(as_of_date)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"as_of_date 必须是 YYYY-MM-DD，收到 {as_of_date!r}") from exc
+    start_d = end_d - _dt.timedelta(days=30)
+    cutoff = start_d.isoformat()
+
+    rows = _fetch(
+        """
+        SELECT COUNT(*) AS total_30d,
+               SUM(CASE WHEN is_cancelled = 1 THEN 1 ELSE 0 END) AS cancel_30d,
+               SUM(CASE WHEN is_return    = 1 THEN 1 ELSE 0 END) AS return_30d
+        FROM wf2_orders
+        WHERE tenant_id = ? AND entity_alias = ? AND partner_sku = ?
+          AND order_date >= ? AND order_date <= ?
+        """,
+        (tenant_id, entity_alias, partner_sku, cutoff, as_of_date),
+    )
+    row = rows[0] if rows else {}
+    total = int(row.get("total_30d") or 0)
+    cancel = int(row.get("cancel_30d") or 0)
+    ret = int(row.get("return_30d") or 0)
+    valid = total - cancel
+    cancel_rate = round(cancel / total, 6) if total > 0 else None
+    return_rate = round(ret / valid, 6) if valid > 0 else None
+    return {
+        "total_30d": total,
+        "cancel_30d": cancel,
+        "return_30d": ret,
+        "valid_30d": valid,
+        "cancel_rate_30d": cancel_rate,
+        "return_rate_30d": return_rate,
+        "as_of_date": as_of_date,
+        "window_start": cutoff,
+    }
+
+
 # ── store → entity_alias 解析（用于 HTTP API 把 KSA/UAE 转成 entity_alias） ──
 def _resolve_entity_for_store(store: str) -> tuple:
     """返回 (tenant_id, entity_alias)。tenant_id 从 contextvars 拿，store 推 country 查 sales_entities。"""
