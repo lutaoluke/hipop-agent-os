@@ -33,6 +33,8 @@ PASS 条件（修后 round-6）：
   - round-10 新增 refresh-done synonyms："已经刷新/数据刷好了/库存刷好了/
     刷好了/任务搞好了/工作流搞好了/数据更新到最新了/库存同步到最新了"。
     仅真实 task readback done/success 能放行。
+  - round-11 新增 process/recompute/import completion synonyms："后台流程已结束/
+    数据已重新计算/已导入最新数据"。仅真实 task readback done/success 能放行。
 """
 
 from __future__ import annotations
@@ -1034,6 +1036,68 @@ def test_round10_refresh_done_synonyms_not_washed_by_query_evidence():
         assert warns, f"query_sku 证据不应放行 round-10 完成态 {reply!r}"
 
 
+# ── Round-11 fail-then-pass: process/recompute/import completion synonyms ───
+
+ROUND11_REVIEWER_PROBES = (
+    "后台流程已结束。",
+    "数据已重新计算。",
+    "已导入最新数据。",
+)
+
+
+def test_round11_process_recompute_import_claims_block_run_workflow_only():
+    """round-11 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-10）：后台流程已结束 / 数据已重新计算 / 已导入最新数据
+                  未命中，返回 warns=[]。
+    PASS（round-11）：这些短句仍需真实 task readback；run_workflow 只算任务创建。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND11_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-11 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round11_process_recompute_import_claims_block_no_tool():
+    """同一 round-11 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND11_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-11 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round11_exact_probes():
+    """sanitize_reply 整合：round-11 exact probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for reply in ROUND11_REVIEWER_PROBES:
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-11 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def test_round11_process_recompute_import_allowed_with_real_task_readback():
+    """正路：真实 task readback done 时，round-11 完成/刷新声明允许通过。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND11_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round11_process_recompute_import_not_washed_by_query_evidence():
+    """query evidence 不能洗白 round-11 流程/重算/导入完成声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in ROUND11_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query_sku 证据不应放行 round-11 完成态 {reply!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1059,7 +1123,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 10)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 11)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1222,6 +1286,17 @@ if __name__ == "__main__":
          test_round10_refresh_done_synonyms_allowed_with_real_task_readback),
         ("test_round10_refresh_done_synonyms_not_washed_by_query_evidence",
          test_round10_refresh_done_synonyms_not_washed_by_query_evidence),
+        # Round-11 fail-then-pass: process/recompute/import completion synonyms
+        ("test_round11_process_recompute_import_claims_block_run_workflow_only",
+         test_round11_process_recompute_import_claims_block_run_workflow_only),
+        ("test_round11_process_recompute_import_claims_block_no_tool",
+         test_round11_process_recompute_import_claims_block_no_tool),
+        ("test_sanitize_reply_round11_exact_probes",
+         test_sanitize_reply_round11_exact_probes),
+        ("test_round11_process_recompute_import_allowed_with_real_task_readback",
+         test_round11_process_recompute_import_allowed_with_real_task_readback),
+        ("test_round11_process_recompute_import_not_washed_by_query_evidence",
+         test_round11_process_recompute_import_not_washed_by_query_evidence),
     ]
 
     failed = 0
