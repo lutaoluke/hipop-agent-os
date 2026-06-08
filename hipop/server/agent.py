@@ -1877,6 +1877,20 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
     from . import _safety
     final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used)
+
+    # WS-117 采购议价率口径生产接线（deterministic verifier，非 prompt）
+    from hipop.rules.procurement_rate import check_procurement_rate_reply as _check_procurement_rate
+    _procurement_warns = _check_procurement_rate(clean_reply)
+    if _procurement_warns:
+        hallu_warnings = list(hallu_warnings or []) + _procurement_warns
+        if not final_text.startswith("⚠️"):
+            _proc_banner = (
+                "⚠️ **系统检测到采购议价率口径可能有误**：\n"
+                + "\n".join(f"- {w}" for w in _procurement_warns)
+                + "\n\n---\n\n"
+            )
+            final_text = _proc_banner + final_text
+
     final_text = _maybe_append_stock_readiness_warning(final_text)
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
 

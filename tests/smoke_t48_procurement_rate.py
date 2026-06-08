@@ -99,6 +99,8 @@ _OLD_15PCT_PASS_RE = re.compile(
     # ↓ 新增：全角 ％ 变体 + 15个百分点以上才正常（验门人 round-5 实测绕过）
     r"|达到\s*15\s*[%％]"
     r"|15\s*(个)?百分点.{0,15}(以上|才).{0,5}(正常|合格|达标)"
+    # ↓ 新增：达15%即合格 变体（验门人 round-10 实测绕过 #28）
+    r"|达\s*15\s*[%％]\s*(就|即|可以?|为)?.{0,3}(合格|达标|正常|过线)"
 )
 
 # 公式业务语义词（出现任一 → 满足公式描述要求）
@@ -204,6 +206,19 @@ _PLUS_WRONG_TREATMENT_RE = re.compile(
     re.IGNORECASE
 )
 
+# plus 声称不计入议价率但仍计入绩效的矛盾口径（验门人 round-10 实测绕过 #25-#27）
+# 正确口径：plus 折扣「完全不计入」采购议价率和采购议价绩效两者。
+_PLUS_KPI_BACK_DOOR_RE = re.compile(
+    # Case 1: "但/不过 会/仍/还 计入/纳入 绩效"（plus 说不计入议价率，但绩效还是算）
+    r"plus.{0,80}(?:会|仍|还)\s*(?:计入|纳入).{0,20}(?:议价)?绩效"
+    r"|plus.{0,80}(?:会|仍|还)\s*纳入.{0,20}(?:采购端|议价)?绩效"
+    # Case 2: "绩效考核时 仍 纳入/计入"
+    r"|绩效考核时?\s*仍\s*(?:纳入|计入).{0,15}绩效"
+    # Case 3: "要把 plus ... 算进去/计入绩效"
+    r"|要把.{0,5}plus.{0,30}(?:一起)?.{0,5}(?:算进去|算进来|算入|计入|纳入)",
+    re.IGNORECASE
+)
+
 
 def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
     """T48 采购议价率公式与plus折扣口径 oracle（确定性规则，WS-117 round-3 收紧）。
@@ -216,6 +231,7 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
       5. 明确说明 plus 折扣不计入采购议价率/绩效
       6. 不把被否定/引用后废弃的正确分母当作通过证据
       7. 不包含"plus 先计入...后续扣减"等错误 plus 处理描述
+      8. 不包含"plus 不计入议价率，但仍计入绩效"等矛盾口径
 
     返回 (passed, fail_reasons)。
     """
@@ -224,7 +240,7 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
     # 检查 1：旧错误口径 + 绕过变种（"大于/高于 15%"）
     if _OLD_15PCT_PASS_RE.search(reply):
         fails.append(
-            "reply 包含旧错误口径或绕过变种（'15%合格线'/'大于15%'/'高于15%才达标'等），"
+            "reply 包含旧错误口径或绕过变种（'15%合格线'/'大于15%'/'高于15%才达标'/'达15%即合格'等），"
             "已废止；正确阈值为3%/6%"
         )
 
@@ -275,6 +291,13 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
         fails.append(
             "reply 含错误 plus 口径（'plus 先计入...后续扣减'/'不是完全不计入 plus'等），"
             "正确口径：plus 折扣完全不计入，不存在'先计后扣'机制"
+        )
+
+    # 检查 7：plus 不计入议价率但仍计入绩效的矛盾口径（round-10 实测绕过）
+    if _PLUS_KPI_BACK_DOOR_RE.search(reply):
+        fails.append(
+            "reply 含矛盾 plus 口径（声称不计入议价率但仍计入绩效/KPI），"
+            "正确口径：plus 折扣「同时」不计入采购议价率和采购议价绩效"
         )
 
     return (len(fails) == 0), fails
@@ -1046,6 +1069,203 @@ def test_concession_then_old_formula_final_assertion_fails():
     )
 
 
+# ── 验门人 round-10 实测绕过 fail-then-pass（bypass #25-#28）───────────────────
+
+def test_bypass25_plus_not_in_rate_but_in_kpi_old_passes_new_rejects():
+    """验门人绕过 #25（WS-117 round-10 实测）：plus不计入议价率，但会计入采购议价绩效。
+
+    旧 oracle 看到'plus折扣不计入'即通过，不检查是否接着说'但还是计入绩效' → PASS（漏洞）。
+    新 oracle 新增 _PLUS_KPI_BACK_DOOR_RE → 检出矛盾口径 → FAIL（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+        "plus折扣不计入采购议价率，但会计入采购议价绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'plus不计入议价率但会计入绩效'判 PASS（漏洞存在）"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝矛盾 plus 口径，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("plus" in f.lower() or "绩效" in f for f in new_fails), (
+        f"new_fails 应提及 plus/绩效矛盾，实际: {new_fails}"
+    )
+
+
+def test_bypass26_plus_not_in_rate_but_still_in_kpi_evaluation_old_passes_new_rejects():
+    """验门人绕过 #26（WS-117 round-10 实测）：plus不计入议价率；绩效考核时仍纳入采购端绩效。
+
+    旧 oracle 不检查'绩效考核时仍纳入'这种迂回表达 → PASS（漏洞）。
+    新 oracle 新增 _PLUS_KPI_BACK_DOOR_RE 检出 → FAIL（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+        "plus折扣不计入采购议价率；绩效考核时仍纳入采购端绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'绩效考核时仍纳入'绕过样例判 PASS（漏洞存在）"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝'绩效考核时仍纳入'绕过样例，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("plus" in f.lower() or "绩效" in f for f in new_fails), (
+        f"new_fails 应提及 plus/绩效矛盾，实际: {new_fails}"
+    )
+
+
+def test_bypass27_plus_not_in_rate_but_subsidy_counted_in_kpi_old_passes_new_rejects():
+    """验门人绕过 #27（WS-117 round-10 实测）：plus不计入议价率，但要把plus补贴一起算进去。
+
+    旧 oracle 看到'plus不计入'即通过，不检查'要把plus补贴算进去'的矛盾 → PASS（漏洞）。
+    新 oracle 新增 _PLUS_KPI_BACK_DOOR_RE → 检出 → FAIL（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+        "plus折扣不计入采购议价率，不过采购绩效要把plus平台补贴一起算进去。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'要把plus补贴算进去'绕过样例判 PASS（漏洞存在）"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝'要把plus补贴算进去'绕过样例，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("plus" in f.lower() or "绩效" in f for f in new_fails), (
+        f"new_fails 应提及 plus/绩效矛盾，实际: {new_fails}"
+    )
+
+
+def test_bypass28_da_15pct_ji_hege_old_passes_new_rejects():
+    """验门人绕过 #28（WS-117 round-10 实测）：采购议价率达15%即合格。
+
+    旧 oracle 未覆盖'达15%即合格'表达（只覆盖≥/大于/高于/超过等） → PASS（漏洞）。
+    新 oracle 新增 '达X%即/就合格' 模式 → FAIL（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率达15%即合格；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'达15%即合格'绕过样例判 PASS（漏洞存在）"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝'达15%即合格'绕过样例，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), (
+        f"new_fails 应提及 15% 旧口径，实际: {new_fails}"
+    )
+
+
+# ── 直接 verifier 测试（WS-117 round-11 生产接线，不 mock LLM）──────────────────
+# 验证 check_procurement_rate_reply 函数本身的检测能力（fail-then-pass：
+#   修前无此函数→warns=[]；修后→错误分母/plus矛盾口径被检出）
+
+def test_verifier_wrong_denominator_warns():
+    """直接测 verifier 函数（不 mock LLM）：错误分母（仅1688采购标准价）→ warns 非空。
+
+    fail-then-pass 模式：
+    - 修前（无 check_procurement_rate_reply 函数）：returns warns=[]（无检测）
+    - 修后（有函数）：检测到分母缺头程运费分摊 → warns 非空
+    """
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    wrong_reply = (
+        "采购议价率 = 议价差额 ÷ 1688采购标准价 × 100%。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入绩效。"
+    )
+    warns = check_procurement_rate_reply(wrong_reply)
+    assert warns, (
+        "错误分母（仅含1688采购标准价，缺少头程运费分摊）应触发 warns，"
+        f"但 warns=[]。检查 check_procurement_rate_reply 是否已实现。"
+    )
+    assert any("头程" in w or "分母" in w for w in warns), (
+        f"warns 应提及分母/头程运费问题，实际: {warns}"
+    )
+
+
+def test_verifier_correct_denominator_ok():
+    """直接测 verifier 函数（不 mock LLM）：正确分母 → warns=[]。"""
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    correct_reply = (
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入采购绩效。"
+    )
+    warns = check_procurement_rate_reply(correct_reply)
+    assert warns == [], (
+        f"正确公式不应触发 warns，实际: {warns}"
+    )
+
+
+def test_verifier_no_procurement_topic_no_warn():
+    """直接测 verifier 函数（不 mock LLM）：无采购议价率话题时不触发。"""
+    from hipop.rules.procurement_rate import check_procurement_rate_reply
+
+    unrelated_reply = "我们的在售SKU数量目前是1430个，其中KSA仓有850个。"
+    warns = check_procurement_rate_reply(unrelated_reply)
+    assert warns == [], (
+        f"无采购议价率话题时不应触发 warns，实际: {warns}"
+    )
+
+
+def test_agent_wires_verifier_for_wrong_procurement_formula():
+    """集成测试：agent.py 已接线 procurement_rate verifier（WS-117 round-11 生产接线）。
+
+    mock LLM 返回「错误分母（缺头程运费）」的回复，验证 chat() 返回的
+    hallucination_warnings 非空。这证明 check_procurement_rate_reply 已从 agent.py 调用。
+
+    fail-then-pass：
+    - 修前（无生产接线）：hallucination_warnings=None
+    - 修后（已接线）：hallucination_warnings 包含分母相关 warn
+    """
+    from hipop.server import _provider, agent
+
+    wrong_formula_reply = (
+        "采购议价率 = 议价差额 ÷ 1688采购标准价 × 100%。"
+        "阈值：3% 不合格，6% 正常。plus折扣不计入绩效。"
+    )
+
+    mock_result = _provider.ChatResult({
+        "reply": wrong_formula_reply,
+        "tool_log": [],
+        "refs_collected": [],
+        "workflow_task": None,
+    })
+
+    with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
+        result = agent.chat(
+            [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+            scope={
+                "store": "KSA",
+                "current_user": "smoke_t48",
+                "current_role": "owner",
+                "tenant_id": 1,
+                "user_id": 1,
+            },
+        )
+
+    warns = result.get("hallucination_warnings") or []
+    assert warns, (
+        "agent.chat() 对'错误分母（缺头程运费）'的回复应触发 hallucination_warnings，"
+        "但 hallucination_warnings=None。检查 check_procurement_rate_reply 是否已从 agent.py 调用。"
+        f"\nchat result reply（前200字）: {(result.get('reply') or '')[:200]}"
+    )
+    assert any("头程" in w or "分母" in w for w in warns), (
+        f"warns 应提及分母/头程运费问题，实际: {warns}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -1224,6 +1444,24 @@ if __name__ == "__main__":
          test_old_formula_final_assertion_fails),
         ("test_concession_then_old_formula_final_assertion_fails",
          test_concession_then_old_formula_final_assertion_fails),
+        # ── round-10 oracle bypasses (plus KPI contradiction + 达15%即合格) ──
+        ("test_bypass25_plus_not_in_rate_but_in_kpi_old_passes_new_rejects",
+         test_bypass25_plus_not_in_rate_but_in_kpi_old_passes_new_rejects),
+        ("test_bypass26_plus_not_in_rate_but_still_in_kpi_evaluation_old_passes_new_rejects",
+         test_bypass26_plus_not_in_rate_but_still_in_kpi_evaluation_old_passes_new_rejects),
+        ("test_bypass27_plus_not_in_rate_but_subsidy_counted_in_kpi_old_passes_new_rejects",
+         test_bypass27_plus_not_in_rate_but_subsidy_counted_in_kpi_old_passes_new_rejects),
+        ("test_bypass28_da_15pct_ji_hege_old_passes_new_rejects",
+         test_bypass28_da_15pct_ji_hege_old_passes_new_rejects),
+        # ── 直接 verifier 测试（round-11 生产接线，不 mock LLM）──
+        ("test_verifier_wrong_denominator_warns",
+         test_verifier_wrong_denominator_warns),
+        ("test_verifier_correct_denominator_ok",
+         test_verifier_correct_denominator_ok),
+        ("test_verifier_no_procurement_topic_no_warn",
+         test_verifier_no_procurement_topic_no_warn),
+        ("test_agent_wires_verifier_for_wrong_procurement_formula",
+         test_agent_wires_verifier_for_wrong_procurement_formula),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
