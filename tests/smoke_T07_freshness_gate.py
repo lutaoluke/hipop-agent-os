@@ -106,6 +106,71 @@ def test_detect_domain_patterns():
     print("  domain pattern matching ✓")
 
 
+def test_false_freshness_imported_at_new_business_date_old():
+    """回归：imported_at=今天但 as_of_date=旧日期时 sales gate 必须返回 covered=False。
+
+    旧代码用 MAX(imported_at) → covered=True（假新鲜，bug，验门人红队命中）。
+    新代码用 MAX(as_of_date) → covered=False（正确：业务日未覆盖）。
+    """
+    import tempfile, sqlite3, os as _os
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        tmp_db = f.name
+    try:
+        with sqlite3.connect(tmp_db) as c:
+            c.execute("""CREATE TABLE sales_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id BIGINT NOT NULL,
+                alias TEXT NOT NULL,
+                country TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                store_name TEXT NOT NULL,
+                active INT NOT NULL DEFAULT 1
+            )""")
+            c.execute("""CREATE TABLE wf2_sku (
+                tenant_id BIGINT NOT NULL,
+                entity_alias TEXT NOT NULL,
+                partner_sku TEXT NOT NULL,
+                as_of_date TEXT,
+                imported_at TEXT,
+                PRIMARY KEY (tenant_id, entity_alias, partner_sku)
+            )""")
+            c.execute(
+                "INSERT INTO sales_entities (tenant_id, alias, country, platform, store_name) "
+                "VALUES (1, 'hipop_ksa', 'SA', 'Noon', 'HIPOP-KSA')"
+            )
+            # imported_at = today (2026-06-08) but business date as_of_date = a week ago
+            c.execute(
+                "INSERT INTO wf2_sku (tenant_id, entity_alias, partner_sku, as_of_date, imported_at) "
+                "VALUES (1, 'hipop_ksa', 'TEST-SKU-001', '2026-06-01', '2026-06-08')"
+            )
+            c.commit()
+
+        orig_db_path = _data.DB_PATH
+        orig_db_url = _os.environ.pop("DB_URL", None)
+        try:
+            _data.DB_PATH = tmp_db
+            r = _data.check_freshness_coverage("KSA", "sales", "2026-06-08")
+        finally:
+            _data.DB_PATH = orig_db_path
+            if orig_db_url is not None:
+                _os.environ["DB_URL"] = orig_db_url
+    finally:
+        _os.unlink(tmp_db)
+
+    assert r["covered"] is False, (
+        f"假新鲜漏洞：imported_at=2026-06-08 但 as_of_date=2026-06-01，"
+        f"应 covered=False，实为 {r}"
+    )
+    assert r["latest_date"] == "2026-06-01", (
+        f"latest_date 应为业务日 as_of_date='2026-06-01'，实为 {r['latest_date']!r}"
+    )
+    assert r["action"] == "run_workflow", (
+        f"业务日未覆盖应触发 run_workflow，实为 {r['action']!r}"
+    )
+    print("  imported_at 新但 as_of_date 旧 → covered=False ✓（假新鲜防护）")
+
+
 def test_uae_store():
     """UAE store 也应正常返回结构（不崩）。"""
     r = _data.check_freshness_coverage("UAE", "sales")
@@ -119,5 +184,6 @@ if __name__ == "__main__":
     test_future_date_always_stale()
     test_unknown_domain_fail_open()
     test_detect_domain_patterns()
+    test_false_freshness_imported_at_new_business_date_old()
     test_uae_store()
     print("\n✓ All T07 freshness gate smoke passed")

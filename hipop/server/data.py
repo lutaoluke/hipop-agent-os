@@ -1032,9 +1032,10 @@ def check_freshness_coverage(store: str, domain: str, target_date: Optional[str]
             return None
 
     if domain == "sales":
-        # 主数据源: wf2_sku.imported_at（ERP 销量聚合，auto-refresh）
+        # 业务日：wf2_sku.as_of_date（ERP 数据覆盖到的最新订单日）
+        # 不用 imported_at：导入时间可能今天刚跑但订单窗口仍是上周——会误判为覆盖（假新鲜）
         latest = _date10(_scalar(
-            "SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            "SELECT MAX(as_of_date) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
             (tid, alias),
         ))
         stale_days = _stale(latest)
