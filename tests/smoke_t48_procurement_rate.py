@@ -92,6 +92,10 @@ _OLD_15PCT_PASS_RE = re.compile(
     r"|最低.{0,8}15\s*(个点|%|才)"
     r"|至少.{0,5}15\s*(%|个点|个)"
     r"|15\s*个点.{0,15}(才算|过线|合格|达标)"
+    # ↓ 新增：达到/以上/个百分点/中文十五 + 15% 阈值（验门人 round-4 实测绕过）
+    r"|达到\s*15\s*(%|个百分点|百分点|个点)"
+    r"|15\s*%\s*以上.{0,5}(达标|合格)"
+    r"|十五.{0,5}(个点|个百分点|百分点|%|以上|才达|才算|过线|合格|达标)"
 )
 
 # 公式业务语义词（出现任一 → 满足公式描述要求）
@@ -111,7 +115,9 @@ _FORMULA_SEMANTIC_RE = re.compile(
 _WRONG_FREIGHT_DENOMINATOR_RE = re.compile(
     r"头程.{0,8}(不进入|不计入|不纳入|不在|不包含|不含|不算).{0,20}(分母|公式|议价率|计算)"
     r"|头程.{0,5}运费?.{0,5}(另看|单算|另计|不.{0,5}进入.{0,10}分母)"
-    r"|(分母|除数|计算).{0,20}(不含|不包含).{0,10}头程",
+    r"|(分母|除数|计算).{0,20}(不含|不包含).{0,10}头程"
+    # ↓ 新增：头程运费只做成本参考（验门人 round-4 实测绕过 #11）
+    r"|头程.{0,8}运费?.{0,10}(只|仅).{0,5}(做|当|作为?|用于|是).{0,5}(成本|参考|核算)",
     re.IGNORECASE
 )
 
@@ -144,7 +150,10 @@ _PLUS_WRONG_TREATMENT_RE = re.compile(
     r"|不是完全不计入.{0,10}plus"
     r"|plus.{0,10}并非完全不计入"
     r"|plus.{0,20}部分计入"
-    r"|plus.{0,10}暂时计入",
+    r"|plus.{0,10}暂时计入"
+    # ↓ 新增：plus 计入后剔除 / 不是直接不计入（验门人 round-4 实测绕过 #12）
+    r"|plus.{0,15}计入.{0,20}(后|之后).{0,5}再?.{0,5}(剔除|扣除|剔减)"
+    r"|不是直接不计入.{0,10}plus",
     re.IGNORECASE
 )
 
@@ -607,6 +616,153 @@ def test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects():
     )
 
 
+def test_bypass7_daodao_15pct_caizuandao_old_passes_new_rejects():
+    """验门人绕过 #7（WS-117 round-4 实测）：'达到 15% 才算达标' 绕过旧 oracle。
+
+    旧 oracle 未覆盖'达到 X%'形式的 15% 阈值表达 → 判 PASS（漏洞）。
+    新 oracle 新增 '达到 15%' 等模式 → 拒绝。
+    """
+    bypass_reply = (
+        "采购议价率达到 15% 才算达标；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'达到 15% 才算达标'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'达到 15% 才算达标'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass8_daodao_15_ge_baifendian_old_passes_new_rejects():
+    """验门人绕过 #8（WS-117 round-4 实测）：'达到 15 个百分点才算合格' 绕过旧 oracle。
+
+    旧 oracle 未覆盖'个百分点'这一 15 个百分点的表达方式 → 判 PASS（漏洞）。
+    新 oracle 新增 '达到 15 个百分点' 等模式 → 拒绝。
+    """
+    bypass_reply = (
+        "采购议价率要达到 15 个百分点才算合格；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'达到 15 个百分点才算合格'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'达到 15 个百分点才算合格'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass9_15pct_yishang_wei_daobiao_old_passes_new_rejects():
+    """验门人绕过 #9（WS-117 round-4 实测）：'15% 以上为达标' 绕过旧 oracle。
+
+    旧 oracle 未覆盖'X% 以上为达标'形式 → 判 PASS（漏洞）。
+    新 oracle 新增 '15% 以上.达标' 等模式 → 拒绝。
+    """
+    bypass_reply = (
+        "采购议价率 15% 以上为达标；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'15% 以上为达标'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'15% 以上为达标'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass10_zhongwen_shiwu_ge_dian_old_passes_new_rejects():
+    """验门人绕过 #10（WS-117 round-4 实测）：'不能低于十五个点' 中文数字绕过旧 oracle。
+
+    旧 oracle 只检测阿拉伯数字'15'，不识别汉字'十五' → 判 PASS（漏洞）。
+    新 oracle 新增 '十五.个点' 等模式 → 拒绝。
+    """
+    bypass_reply = (
+        "采购议价率不能低于十五个点；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'不能低于十五个点'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'不能低于十五个点'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass11_freight_only_as_cost_reference_old_passes_new_rejects():
+    """验门人绕过 #11（WS-117 round-4 实测）：'头程运费只做成本参考' 绕过旧 oracle。
+
+    旧 oracle 检测到'头程运费'关键词即视为公式包含头程，但此处头程运费不在分母 → 判 PASS（漏洞）。
+    新 oracle 扩展 _WRONG_FREIGHT_DENOMINATOR_RE 识别'头程运费只做成本参考'等排除性描述 → 拒绝。
+    """
+    bypass_reply = (
+        "采购议价率 = 议价差额 ÷ 1688采购标准价 × 100%，头程运费只做成本参考。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'头程运费只做成本参考'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'头程运费只做成本参考'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("头程" in f or "分母" in f for f in new_fails), (
+        f"new_fails 应提及头程/分母，实际: {new_fails}"
+    )
+
+
+def test_bypass12_plus_count_then_deduct_old_passes_new_rejects():
+    """验门人绕过 #12（WS-117 round-4 实测）：'plus 计入后再剔除' 绕过旧 oracle。
+
+    旧 _PLUS_WRONG_TREATMENT_RE 未覆盖'计入后剔除'/'不是直接不计入'等部分计入表达 → 判 PASS（漏洞）。
+    新 oracle 新增对应模式 → 拒绝。
+    """
+    bypass_reply = (
+        "plus 折扣计入采购绩效后再剔除，不是直接不计入 plus。"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A：旧 oracle 应对'plus 计入后再剔除'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'plus 折扣计入采购绩效后再剔除'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("plus" in f.lower() for f in new_fails), (
+        f"new_fails 应提及 plus 口径，实际: {new_fails}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -749,6 +905,18 @@ if __name__ == "__main__":
          test_bypass5_bu_neng_di_yu_15pct_old_passes_new_rejects),
         ("test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects",
          test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects),
+        ("test_bypass7_daodao_15pct_caizuandao_old_passes_new_rejects",
+         test_bypass7_daodao_15pct_caizuandao_old_passes_new_rejects),
+        ("test_bypass8_daodao_15_ge_baifendian_old_passes_new_rejects",
+         test_bypass8_daodao_15_ge_baifendian_old_passes_new_rejects),
+        ("test_bypass9_15pct_yishang_wei_daobiao_old_passes_new_rejects",
+         test_bypass9_15pct_yishang_wei_daobiao_old_passes_new_rejects),
+        ("test_bypass10_zhongwen_shiwu_ge_dian_old_passes_new_rejects",
+         test_bypass10_zhongwen_shiwu_ge_dian_old_passes_new_rejects),
+        ("test_bypass11_freight_only_as_cost_reference_old_passes_new_rejects",
+         test_bypass11_freight_only_as_cost_reference_old_passes_new_rejects),
+        ("test_bypass12_plus_count_then_deduct_old_passes_new_rejects",
+         test_bypass12_plus_count_then_deduct_old_passes_new_rejects),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
