@@ -1916,7 +1916,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
     # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
     from . import _safety
-    final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used, question=question)
+    final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used, tool_log=tool_log, question=question)
     clean_reply = _strip_safety_banner(final_text)
     final_text = _maybe_append_stock_readiness_warning(final_text)
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
