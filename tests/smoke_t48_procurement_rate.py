@@ -74,28 +74,28 @@ if str(REPO) not in sys.path:
 #   - "大于 15%" / "高于 15% 才达标" 等"大于/高于"绕过变种（验门人 WS-117 实测绕过）
 #   - "超过 15%"（同语义）
 _OLD_15PCT_PASS_RE = re.compile(
-    r"≥\s*15\s*%\s*(才算|算|为)?合格"
-    r"|15\s*%\s*才算合格"
-    r"|议价率\s*[≥>＞]\s*15\s*%"
-    r"|合格\s*线\s*[：:]\s*15\s*%"
-    r"|15\s*%.*合格线"
-    r"|合格.*15\s*%"
+    r"≥\s*15\s*[%％]\s*(才算|算|为)?合格"
+    r"|15\s*[%％]\s*才算合格"
+    r"|议价率\s*[≥>＞]\s*15\s*[%％]"
+    r"|合格\s*线\s*[：:]\s*15\s*[%％]"
+    r"|15\s*[%％].*合格线"
+    r"|合格.*15\s*[%％]"
     # ↓ 新增：绕过变种（验门人实测 passed=True，修后必须拒绝）
-    r"|必须大于\s*15\s*%"
-    r"|大于\s*15\s*%.{0,10}(才|低于|要)"
-    r"|高于\s*15\s*%.{0,10}(才达标|达标|合格|才算)"
-    r"|超过\s*15\s*%.{0,10}(才|才算|才达标|合格)"
-    r"|15\s*%.{0,5}才达标"
-    r"|达标.{0,10}15\s*%"
+    r"|必须大于\s*15\s*[%％]"
+    r"|大于\s*15\s*[%％].{0,10}(才|低于|要)"
+    r"|高于\s*15\s*[%％].{0,10}(才达标|达标|合格|才算)"
+    r"|超过\s*15\s*[%％].{0,10}(才|才算|才达标|合格)"
+    r"|15\s*[%％].{0,5}才达标"
+    r"|达标.{0,10}15\s*[%％]"
     # ↓ 新增：不低于/不能低于/最低/至少 + 15%/15个点（验门人 round-3 实测绕过）
-    r"|不能?低于\s*15\s*(%|个点|个)"
-    r"|最低.{0,8}15\s*(个点|%|才)"
-    r"|至少.{0,5}15\s*(%|个点|个)"
+    r"|不能?低于\s*15\s*([%％]|个点|个)"
+    r"|最低.{0,8}15\s*(个点|[%％]|才)"
+    r"|至少.{0,5}15\s*([%％]|个点|个)"
     r"|15\s*个点.{0,15}(才算|过线|合格|达标)"
     # ↓ 新增：达到/以上/个百分点/中文十五 + 15% 阈值（验门人 round-4 实测绕过）
-    r"|达到\s*15\s*(%|个百分点|百分点|个点)"
-    r"|15\s*%\s*以上.{0,5}(达标|合格)"
-    r"|十五.{0,5}(个点|个百分点|百分点|%|以上|才达|才算|过线|合格|达标)"
+    r"|达到\s*15\s*([%％]|个百分点|百分点|个点)"
+    r"|15\s*[%％]\s*以上.{0,5}(达标|合格|正常)"
+    r"|十五.{0,5}(个点|个百分点|百分点|[%％]|以上|才达|才算|过线|合格|达标)"
     # ↓ 新增：全角 ％ 变体 + 15个百分点以上才正常（验门人 round-5 实测绕过）
     r"|达到\s*15\s*[%％]"
     r"|15\s*(个)?百分点.{0,15}(以上|才).{0,5}(正常|合格|达标)"
@@ -113,17 +113,14 @@ _FORMULA_SEMANTIC_RE = re.compile(
     re.IGNORECASE
 )
 
-# 错误分母描述：明确将头程运费排除在公式分母之外（验门人实测绕过样例 #2）
-# 旧 oracle 只检查"头程运费"是否出现，不验证它是否在分母里 → 此为修复点
-_WRONG_FREIGHT_DENOMINATOR_RE = re.compile(
-    r"头程.{0,8}(不进入|不计入|不纳入|不在|不包含|不含|不算).{0,20}(分母|公式|议价率|计算)"
-    r"|头程.{0,5}运费?.{0,5}(另看|单算|另计|不.{0,5}进入.{0,10}分母)"
-    r"|(分母|除数|计算).{0,20}(不含|不包含).{0,10}头程"
-    # ↓ 新增：头程运费只做成本参考（验门人 round-4 实测绕过 #11）
-    r"|头程.{0,8}运费?.{0,10}(只|仅).{0,5}(做|当|作为?|用于|是).{0,5}(成本|参考|核算)"
-    # ↓ 新增：头程运费会影响成本 / 作为单独成本项（验门人 round-5 实测绕过 #15/#16）
-    r"|头程.{0,8}运费?.{0,15}(会|将).{0,5}(影响|作用于).{0,10}(成本|核算)"
-    r"|头程.{0,8}运费?.{0,10}作为?.{0,5}(单独|独立|分开|另立).{0,5}(成本|费用|项)",
+# 正确分母描述：公式的分母/计算基数必须正向包含 1688采购标准价 + 头程运费分摊。
+# 不能只靠"出现头程运费"或枚举坏话术；缺任一 denominator component 即 FAIL。
+_CORRECT_DENOMINATOR_RE = re.compile(
+    r"([÷/]|除以|分母|计算基数|总成本基数|成本基数).{0,45}"
+    r"("
+    r"1688.{0,12}(标准价|标价|参考价).{0,18}(\+|＋|加上?|和|及|与|连同).{0,18}头程.{0,12}运费.{0,8}分摊"
+    r"|头程.{0,12}运费.{0,8}分摊.{0,18}(\+|＋|加上?|和|及|与|连同).{0,18}1688.{0,12}(标准价|标价|参考价)"
+    r")",
     re.IGNORECASE
 )
 
@@ -170,7 +167,7 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
     通过条件（AND）：
       1. 不包含任何 15% 作为合格/达标阈值的描述（含"大于/高于"绕过变种）
       2. 包含业务语义词（议价差额/头程运费等），有实质公式解释
-      3. 不存在"头程运费不进入分母"等明确排除头程运费的描述
+      3. 正向证明分母/计算基数同时包含 1688采购标准价 + 头程运费分摊
       4. 包含 3% 或 6% 阈值
       5. 明确说明 plus 折扣不计入采购议价率/绩效
       6. 不包含"plus 先计入...后续扣减"等错误 plus 处理描述
@@ -193,10 +190,10 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
             "不得仅写字母 H/(F+G) 而不给业务名称解释"
         )
 
-    # 检查 3：错误分母描述（"头程运费另看，不进入分母"等绕过变种）
-    if _WRONG_FREIGHT_DENOMINATOR_RE.search(reply):
+    # 检查 3：正确分母正向证明（1688采购标准价 + 头程运费分摊）
+    if not _CORRECT_DENOMINATOR_RE.search(reply):
         fails.append(
-            "reply 明确将头程运费排除在分母之外（'头程运费另看/不进入分母'等），"
+            "reply 未证明头程运费分摊在采购议价率分母/计算基数中；"
             "正确公式分母 = 1688采购标准价 + 头程运费分摊"
         )
 
@@ -852,6 +849,72 @@ def test_bypass16_freight_as_separate_cost_item_old_passes_new_rejects():
     )
 
 
+def test_bypass17_fullwidth_pct_yishang_old_passes_new_rejects():
+    """验门人绕过 #17（WS-117 round-6 实测）：15％ 以上为达标 绕过旧 oracle。"""
+    bypass_reply = (
+        "采购议价率 15％ 以上为达标；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 15％ 以上为达标 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 15％ 以上为达标，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass18_fullwidth_must_greater_than_old_passes_new_rejects():
+    """验门人绕过 #18（WS-117 round-6 实测）：必须大于 15％ 绕过旧 oracle。"""
+    bypass_reply = (
+        "采购议价率必须大于 15％，低于要备注；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 必须大于 15％ 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 必须大于 15％，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), f"new_fails 应提及 15%，实际: {new_fails}"
+
+
+def test_bypass19_freight_single_accounting_old_passes_new_rejects():
+    """验门人绕过 #19（WS-117 round-6 实测）：头程运费单独核算但不在分母。"""
+    bypass_reply = (
+        "采购议价率 = 议价差额 ÷ 1688采购标准价 × 100%，头程运费单独核算。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 头程运费单独核算 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 头程运费单独核算，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("头程" in f or "分母" in f for f in new_fails), (
+        f"new_fails 应提及头程/分母，实际: {new_fails}"
+    )
+
+
+def test_bypass20_freight_not_in_denominator_old_passes_new_rejects():
+    """验门人绕过 #20（WS-117 round-6 实测）：头程运费另行计入成本，不放进分母。"""
+    bypass_reply = (
+        "采购议价率分母用1688采购标准价，头程运费分摊另行计入成本，不放进议价率分母。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 头程运费不放进分母 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 头程运费不放进分母，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("头程" in f or "分母" in f for f in new_fails), (
+        f"new_fails 应提及头程/分母，实际: {new_fails}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -1014,6 +1077,14 @@ if __name__ == "__main__":
          test_bypass15_freight_influences_cost_old_passes_new_rejects),
         ("test_bypass16_freight_as_separate_cost_item_old_passes_new_rejects",
          test_bypass16_freight_as_separate_cost_item_old_passes_new_rejects),
+        ("test_bypass17_fullwidth_pct_yishang_old_passes_new_rejects",
+         test_bypass17_fullwidth_pct_yishang_old_passes_new_rejects),
+        ("test_bypass18_fullwidth_must_greater_than_old_passes_new_rejects",
+         test_bypass18_fullwidth_must_greater_than_old_passes_new_rejects),
+        ("test_bypass19_freight_single_accounting_old_passes_new_rejects",
+         test_bypass19_freight_single_accounting_old_passes_new_rejects),
+        ("test_bypass20_freight_not_in_denominator_old_passes_new_rejects",
+         test_bypass20_freight_not_in_denominator_old_passes_new_rejects),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
