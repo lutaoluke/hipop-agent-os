@@ -179,7 +179,16 @@ def test_chat_t21_workflow_receipt():
     assert re.search(r"[0-9a-f]{6,8}", reply), (
         f"回复未包含 task_id（6-8位十六进制）\n回复: {reply[:300]}"
     )
-    # ③ 无完成事件时不暗示已完成
+    # ③ 含 workflow 名称
+    assert "wf3_logistics_v2" in reply, (
+        f"回复未包含 workflow 名称 wf3_logistics_v2\n回复: {reply[:300]}"
+    )
+    # ④ 含三态状态词
+    state_words = ("已排队", "待执行", "已开始", "已完成", "执行失败", "已受理", "未确认")
+    assert any(w in reply for w in state_words), (
+        f"回复不含三态状态词（须含其一: {state_words}）\n回复: {reply[:300]}"
+    )
+    # ⑤ 无完成事件时不暗示已完成
     assert "已跑完" not in reply and "跑完了" not in reply, (
         f"回复不应暗示已完成（「已跑完」/「跑完了」）\n回复: {reply[:300]}"
     )
