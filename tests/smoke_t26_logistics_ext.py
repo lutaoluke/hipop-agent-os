@@ -89,3 +89,26 @@ def test_t26ext_tracking_safety_no_false_positive_when_tool_called():
     out, warns = sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
     t26ext_warns = [w for w in warns if "T26-ext 跟踪号" in w]
     assert not t26ext_warns, f"已调工具时不应触发跟踪号误报: {t26ext_warns}"
+
+
+if __name__ == "__main__":
+    import traceback
+    tests = [
+        test_t26ext_sku_safety_blocks_pretend_querying_without_tool,
+        test_t26ext_sku_safety_injects_not_found_when_tool_returned_missing,
+        test_t26ext_sku_safety_passes_when_reply_already_says_not_found,
+        test_t26ext_sku_safety_no_false_positive_when_sku_has_orders,
+        test_t26ext_tracking_safety_blocks_pretend_querying_without_tool,
+        test_t26ext_tracking_safety_no_false_positive_when_tool_called,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"✓ {t.__name__}")
+        except Exception as e:
+            failed += 1
+            print(f"✗ {t.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(0 if failed == 0 else 1)
