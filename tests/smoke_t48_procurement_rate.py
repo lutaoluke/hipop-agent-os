@@ -149,12 +149,22 @@ _NEGATED_CORRECT_DENOMINATOR_RE = re.compile(
 )
 
 # 明确断言旧分母（只用 1688 标准价，不含头程运费分摊）必须失败。
-_OLD_DENOMINATOR_ASSERTION_RE = re.compile(
-    rf"(?:实际(?:应)?按|真实(?:计算)?(?:用|按)|实际(?:分母|计算)?|最终(?:用|按)|分母|计算基数)"
-    rf".{{0,30}}(?:议价差额\s*[÷/]\s*\(?\s*)?(?:只用|仅用)?\s*{_DENOM_1688}"
+_OLD_DENOMINATOR_DIVIDER = r"(?:[÷/]|除以)"
+_OLD_DENOMINATOR_FORMULA = (
+    rf"议价差额\s*{_OLD_DENOMINATOR_DIVIDER}\s*\(?\s*(?:只用|仅用)?\s*{_DENOM_1688}"
     rf"(?!\s*{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT})"
-    rf"|议价差额\s*[÷/]\s*\(?\s*(?:只用|仅用)?\s*{_DENOM_1688}"
-    rf"(?!\s*{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT})",
+)
+_CONCESSION_OLD_DENOMINATOR_RE = re.compile(
+    rf"(?:虽然|尽管|有人说).{{0,90}}{_CORRECT_DENOMINATOR_EVIDENCE}"
+    rf".{{0,45}}(?:但|但是|不过).{{0,35}}(?:真实|实际).{{0,20}}"
+    rf"(?:{_OLD_DENOMINATOR_FORMULA}|{_DENOM_1688})",
+    re.IGNORECASE
+)
+_OLD_DENOMINATOR_ASSERTION_RE = re.compile(
+    rf"(?:实际(?:应|仍)?按|真实(?:计算)?(?:仍)?(?:用|按)|实际(?:分母|计算)?|最终(?:用|按)|分母|计算基数)"
+    rf".{{0,30}}(?:{_OLD_DENOMINATOR_FORMULA}|(?:只用|仅用)?\s*{_DENOM_1688}"
+    rf"(?!\s*{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT}))"
+    rf"|{_OLD_DENOMINATOR_FORMULA}",
     re.IGNORECASE
 )
 
@@ -240,7 +250,7 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
         )
 
     # 检查 3c：最终或实际计算断言旧分母（只用 1688 标准价）即 FAIL
-    if _OLD_DENOMINATOR_ASSERTION_RE.search(reply):
+    if _CONCESSION_OLD_DENOMINATOR_RE.search(reply) or _OLD_DENOMINATOR_ASSERTION_RE.search(reply):
         fails.append(
             "reply 断言采购议价率实际分母只用 1688采购标准价，缺少头程运费分摊；"
             "这是已废止的旧公式"
@@ -1018,6 +1028,24 @@ def test_old_formula_final_assertion_fails():
     )
 
 
+def test_concession_then_old_formula_final_assertion_fails():
+    """验门人绕过 #24（WS-117 round-10 实测）：让步句引用正确分母后，转折为旧公式。"""
+    bypass_reply = (
+        "虽然有人说分母是1688采购标准价加头程运费分摊，"
+        "但真实计算仍按议价差额除以1688采购标准价。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 让步转折旧公式 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 让步转折后回退旧公式，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("分母" in f or "公式" in f or "头程" in f for f in new_fails), (
+        f"new_fails 应提及公式/分母/头程，实际: {new_fails}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -1194,6 +1222,8 @@ if __name__ == "__main__":
          test_quote_then_deny_correct_formula_fails),
         ("test_old_formula_final_assertion_fails",
          test_old_formula_final_assertion_fails),
+        ("test_concession_then_old_formula_final_assertion_fails",
+         test_concession_then_old_formula_final_assertion_fails),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
