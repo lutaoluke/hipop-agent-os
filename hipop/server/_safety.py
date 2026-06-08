@@ -114,23 +114,27 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-# T36/T38: 任务号提及模式（8位小写十六进制前缀）；T38 扩展连接词"是"/"为"
-_TASK_ID_MENTION_RE = re.compile(r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：是为]*([0-9a-f]{8})\b')
+# T36/T38: 任务号提及模式（8位十六进制，大小写均捕获）；T38 扩展连接词"是"/"为"
+_TASK_ID_MENTION_RE = re.compile(
+    r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：是为]*([0-9a-fA-F]{8})\b'
+)
 
 
 def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
-    """T36: reply 中出现未由 run_workflow 工具返回的 task_id → banner。
+    """T36/T38: reply 中出现未由 run_workflow 工具返回的 task_id → banner。
 
     只信 tool_log 里 name=="run_workflow" 条目的 task_id；其他工具
     （query_sku、query_order_live 等）返回的 task_id 不能洗白任务号声明。
+    大小写归一（T38：38377C42 与 38377c42 视为同一 id）。
     """
     warns: List[str] = []
-    mentioned = set(_TASK_ID_MENTION_RE.findall(reply))
+    # 大小写归一：捕获后全部小写
+    mentioned = {m.lower() for m in _TASK_ID_MENTION_RE.findall(reply)}
     if not mentioned:
         return warns
     # T36 防伪关键：只有 run_workflow 工具调用返回的 task_id 才算真实任务号
     real_ids = {
-        t["task_id"] for t in (tool_log or [])
+        (t["task_id"] or "").lower() for t in (tool_log or [])
         if t.get("name") == "run_workflow" and t.get("task_id")
     }
     fake = mentioned - real_ids
@@ -448,6 +452,22 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "⚠️ Agent 宣称已触发/启动工作流，但本轮没真调 run_workflow tool — "
             "这是 hallucinate（实际没创建后台任务，请重发"
             "『帮我扫一下 ERP 物流』之类更明确的指令）"
+        )
+
+    # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
+    # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词
+    fake_task_evidence = re.search(
+        r"((?:状态|status)\s*(?:为|是|:)\s*accepted"
+        r"|任务.{0,20}accepted"
+        r"|SSE\s*(?:推送|进度|实时|订阅)"
+        r"|前端.{0,10}(?:SSE|订阅).{0,10}(?:进度|推送))",
+        reply,
+        re.IGNORECASE,
+    )
+    if fake_task_evidence and "run_workflow" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 回复含假任务证据（accepted 状态或 SSE 进度），但本轮没真调 run_workflow — "
+            "这是 T38 禁止的假任务启动证据"
         )
 
     # 新型撒谎模式：用过去时编"任务还在跑、等 ingest 完" 绕开上面的 hook

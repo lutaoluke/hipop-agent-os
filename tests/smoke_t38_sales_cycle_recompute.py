@@ -189,6 +189,88 @@ def test_t38_real_run_workflow_task_id_passes_safety():
     print("    run_workflow 真实 task_id 被正确放行")
 
 
+def test_t38_safety_uppercase_task_id_caught():
+    """验门人 round-2 gap: 大写 task_id 38377C42 必须被 _safety 拦截（修前漏检）。
+
+    FAIL (before fix): _TASK_ID_MENTION_RE 只匹配 [0-9a-f]，38377C42 逃过检测。
+    PASS (after fix):  大小写归一后与 real_ids 比对，38377C42 → 38377c42 → 无 real_ids → 拦截。
+    """
+    _, warns = _safety.sanitize_reply(
+        "销售周期重算任务号是 38377C42，当前状态 accepted。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert any("38377c42" in w.lower() or "task_id" in w or "编造" in w for w in warns), (
+        f"大写 task_id 38377C42 未被 _safety 拦截: {warns}"
+    )
+    print(f"    大写 task_id 已被拦截: {warns[0][:60]}…")
+
+
+def test_t38_safety_uppercase_real_task_id_passes():
+    """大写真实 task_id（run_workflow 返回的）不应被误报为假。"""
+    real_task_id_upper = "AB123456"
+    real_task_id_lower = "ab123456"
+    tool_log = [{"name": "run_workflow", "task_id": real_task_id_lower}]
+    _, warns = _safety.sanitize_reply(
+        f"销售周期重算任务已创建，任务号 {real_task_id_upper}，当前状态已排队。",
+        tools_used=["run_workflow"],
+        tool_log=tool_log,
+    )
+    fake_id_warns = [w for w in warns if "ab123456" in w.lower() or "编造" in w]
+    assert not fake_id_warns, (
+        f"大写真实 task_id 被误报为假: {fake_id_warns}"
+    )
+    print("    大写真实 task_id 正确放行（大小写归一）")
+
+
+def test_t38_safety_accepted_status_caught():
+    """验门人 round-2 gap: 'accepted' 状态单独出现且无 run_workflow → 必须拦截。
+
+    FAIL (before fix): 'accepted' 未在 promise_workflow 或 _check_fake_task_ids 中捕获。
+    PASS (after fix):  fake_task_evidence 正则捕获 '状态.*accepted'，无 run_workflow → 警告。
+    """
+    _, warns = _safety.sanitize_reply(
+        "你的重算任务状态为 accepted，系统正在处理中。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert any("accepted" in w.lower() or "T38" in w or "假任务" in w for w in warns), (
+        f"'accepted' 状态未被 _safety 拦截: {warns}"
+    )
+    print(f"    'accepted' 状态已被拦截: {warns[0][:60]}…")
+
+
+def test_t38_safety_sse_progress_caught():
+    """验门人 round-2 gap: SSE 进度声明且无 run_workflow → 必须拦截。
+
+    FAIL (before fix): SSE 推送进度未在任何检测规则中捕获。
+    PASS (after fix):  fake_task_evidence 正则捕获 'SSE.*进度'，无 run_workflow → 警告。
+    """
+    _, warns = _safety.sanitize_reply(
+        "任务已创建，前端将通过 SSE 推送进度，完成后自动刷新。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert any("SSE" in w or "T38" in w or "假任务" in w for w in warns), (
+        f"SSE 进度声明未被 _safety 拦截: {warns}"
+    )
+    print(f"    SSE 进度已被拦截: {warns[0][:60]}…")
+
+
+def test_t38_safety_accepted_real_workflow_passes():
+    """'accepted' + 真实 run_workflow 不被误拦。"""
+    _, warns = _safety.sanitize_reply(
+        "已受理销售周期重算（wf5_sales_cycle_v2），任务 ID：ab123456，当前状态：已排队。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow", "task_id": "ab123456"}],
+    )
+    accepted_warns = [w for w in warns if "accepted" in w.lower() or "SSE" in w]
+    assert not accepted_warns, (
+        f"真实 run_workflow 后的回复被误拦: {accepted_warns}"
+    )
+    print("    真实 run_workflow 回复放行（无误报）")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # 两态失败表达测试（创建前失败不能给 task_id）
 # ────────────────────────────────────────────────────────────────────────────
@@ -304,10 +386,16 @@ if __name__ == "__main__":
         test_t38_stock_still_routes_to_wf1,
         test_t38_no_trigger_word_returns_none,
         test_t38_negation_guard_still_works,
-        # Safety 回归组
+        # Safety 基础组
         test_t38_safety_fake_triggered_caught,
         test_t38_safety_fake_task_id_caught,
         test_t38_real_run_workflow_task_id_passes_safety,
+        # Safety 扩展组（验门人 round-2 gaps）
+        test_t38_safety_uppercase_task_id_caught,
+        test_t38_safety_uppercase_real_task_id_passes,
+        test_t38_safety_accepted_status_caught,
+        test_t38_safety_sse_progress_caught,
+        test_t38_safety_accepted_real_workflow_passes,
         # 两态失败表达
         test_t38_failure_reply_has_no_fake_task_id,
         # E2E chat() → run_workflow 证据链
