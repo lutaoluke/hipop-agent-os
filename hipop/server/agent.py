@@ -2009,12 +2009,17 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
     if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
         return None
-    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下")):
+    # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
+    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
+                                 "重跑", "重新计算")):
         return None
     if "物流" in q:
         return {"workflow": "wf3_logistics_v2", "label": "物流刷新"}
     if "库存" in q:
         return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
+    # T38: 销售周期/补货建议 → wf5_sales_cycle_v2（低风险内部重算，直跑）
+    if any(k in q for k in ("销售周期", "补货建议")):
+        return {"workflow": "wf5_sales_cycle_v2", "label": "销售周期与补货重算"}
     return None
 
 
