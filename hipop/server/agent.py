@@ -446,15 +446,30 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                 stats_30d = _data.sku_30d_stats(tid, alias, sku, as_of)
             except Exception:
                 stats_30d = {}
+        # 快照时效门：as_of_date 超 3 天或缺失 → data_stale=True，数值 REDACT 为 null。
+        # 目的：防止过期快照被 LLM 当成新鲜数据呈现；LLM 必须告知数据过期。
+        import datetime as _dt
+        stale_days_val: int = 0
+        data_stale_val: bool = not as_of
+        if as_of:
+            try:
+                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(as_of)).days)
+                data_stale_val = stale_days_val > 3
+            except Exception:
+                data_stale_val = True
+
+        def _r(val):
+            return None if data_stale_val else val
+
         item = {
             "sku": sku,
             "found": True,
             "title": r["title"],
-            "trend": r["trend"],
-            "profit_rate_pct": round((r["latest_profit_rate"] or 0) * 100, 1),
-            "sales_30d": r["sales_30d"],
-            "sales_10d": r["sales_10d"],
-            "daily_rate": r["daily_rate"],
+            "trend": _r(r["trend"]),
+            "profit_rate_pct": _r(round((r["latest_profit_rate"] or 0) * 100, 1)),
+            "sales_30d": _r(r["sales_30d"]),
+            "sales_10d": _r(r["sales_10d"]),
+            "daily_rate": _r(r["daily_rate"]),
             "urgency": r["urgency"],
             "ops_advice": r["ops_advice"],
             "in_transit": r["in_transit_total_qty"],
@@ -462,12 +477,14 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "weekly_replenish": r["weekly_total_replenish"],
             # 30d 口径取消/退货率（口径：以 as_of_date 为截止的 30d 窗口）。
             # 与 sales_30d 同窗口，不与全历史 cancel_rate/return_rate 混用。
-            "total_orders_30d": stats_30d.get("total_30d"),
-            "cancel_rate_30d": stats_30d.get("cancel_rate_30d"),
-            "return_rate_30d": stats_30d.get("return_rate_30d"),
+            "total_orders_30d": _r(stats_30d.get("total_30d")),
+            "cancel_rate_30d": _r(stats_30d.get("cancel_rate_30d")),
+            "return_rate_30d": _r(stats_30d.get("return_rate_30d")),
             # 历史总销量：来自 wf2_sku.total_orders（noon 全历史聚合），口径与 30d 不同。
-            "history_total": r.get("total_orders"),
+            "history_total": _r(r.get("total_orders")),
             "as_of_date": as_of,
+            "data_stale": data_stale_val,
+            "stale_days": stale_days_val,
         }
         out.append(item)
         refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
@@ -1896,7 +1913,8 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
     # final_text = 展示版（可能带 banner）；clean_reply = 持久化版（无 banner，防历史自激）
     from . import _safety
-    final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used)
+    final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used, question=question)
+    clean_reply = _strip_safety_banner(final_text)
     final_text = _maybe_append_stock_readiness_warning(final_text)
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
 

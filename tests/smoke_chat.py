@@ -85,7 +85,7 @@ CASES: List[Case] = [
         name="数据更新时间问答（不能假说今天）",
         question="KSA 店铺什么时候更新的数据",
         must_use_tools=["data_health_check"],
-        must_contain=[r"5\s*月|2026-05"],                 # 真日期任一表达
+        must_contain=[r"5\s*月|2026-05|05-\d{2}|[3-9]\s*天前|\d{2}\s*天前"],  # 真日期（5月 / 05-08 / X天前 任一）
         must_not_contain=[
             "全部.{0,30}今天.{0,15}更新",
             r"\bas_of_date.*today\b",
@@ -96,15 +96,16 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1798 /
-    #   listed_sku 1046 / unlisted_sku 752 / listed_prod 950 / unlisted_prod 494，
+    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1799 /
+    #   listed_sku 1046 / unlisted_sku 753 / listed_prod 950 / unlisted_prod 474，
     #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
     #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
+    #   +1 SKU: STALE_TST001（is_listed=0, product_id=NULL）测试夹具已入库。
     Case(
-        name="商品总数（要 1424 product / 1798 SKU）",
+        name="商品总数（要 1424 product / 1799 SKU）",
         question="店铺总共多少商品",
         must_use_tools=["list_products"],
-        must_contain=[r"1[,，]?424", r"1[,，]?798"],
+        must_contain=[r"1[,，]?424", r"1[,，]?799"],
     ),
     Case(
         name="商品总数 + 上架未上架细分（SKU 维度 1046/752 或 product 维度 950/494）",
@@ -146,23 +147,41 @@ CASES: List[Case] = [
         ],
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
-    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d 字段，
-    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）。
+    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
+    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）+ history=1967。
     Case(
-        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel_rate≈5.88%）",
-        question="TBB0116A 近 30 天销量多少，退货率和取消率分别是多少",
+        name="T04 TBB0116A 30d 口径（sales=48 / total=51 / cancel≈5.88% / history=1967）",
+        question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
             r"\b48\b",
             r"\b51\b",
             r"5\.8[0-9]|5\.9",
             r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
+            r"1[,，]?967",        # 历史总销量 ERP 口径（2026-06-05 截止）
         ],
         must_not_contain=[
             r"\b13\b",
-            r"10\.0%|10%",
             r"1\.1[0-9]%|1\.12%",
             r"取消率.*0\.0%",
+            # 只问数值时不得主动下质量/表现判断
+            r"表现.*不错|毛利.*不错|健康.*不错|正常范围|质量.*稳定|利润.*不错|表现良好|不错.*表现",
+        ],
+    ),
+    # ─── T04 快照过期边界（STALE_TST001）───
+    # fail-then-pass：改前 REDACT 未实现，过期快照也能拿到数值 → Agent 报旧值 13/290/0%。
+    # 改后 data_stale=True 时所有数值字段 REDACT=null → Agent 必须告知过期，不得报旧值。
+    Case(
+        name="T04 快照过期边界（STALE_TST001 过期快照不得给旧值，必须警示过期）",
+        question="STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
+        must_use_tools=["query_sku"],
+        must_contain=[
+            r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认",
+        ],
+        must_not_contain=[
+            r"\b13\b",
+            r"\b290\b",
+            r"取消率.*0\.0%|退货率.*0\.0%",
         ],
     ),
     # ─── 门控 tool（必须真调，不能编结果）───
@@ -312,6 +331,7 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
         return False, reasons
 
     reply = resp.get("reply") or ""
+    clean_reply = resp.get("clean_reply") or reply
     tools = resp.get("tools_used") or []
     warns = resp.get("hallucination_warnings") or []
 
@@ -328,7 +348,7 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
 
     blacklist = GLOBAL_BLACKLIST + c.must_not_contain
     for bw in blacklist:
-        if re.search(bw, reply):
+        if re.search(bw, clean_reply):  # use clean_reply to avoid safety banner self-contamination
             reasons.append(f"reply 含禁忌词: {bw!r}")
 
     if c.expected_workflow:
