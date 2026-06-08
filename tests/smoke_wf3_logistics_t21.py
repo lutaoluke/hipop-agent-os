@@ -7,23 +7,33 @@
   4. _logistics_task_evidence_check：事件缺失返回「未确认创建成功」降级消息
   5. _logistics_task_evidence_check：任务表查询抛错也返回降级消息
   6. _logistics_task_evidence_check：孤儿事件（agent_events 有记录但无 tasks 行）也降级
+  7. chat() E2E：T21 消息成功路径 workflow_task.workflow==wf3_logistics_v2 + durable 证据
+  8. chat() E2E：governance 拒绝时回复含具体原因，不泛化为「工作流触发失败」
+  9. chat() E2E：证据缺失时回复含「未确认创建成功」，不允许假成功
 
 fail-then-pass：
   FAIL（修前）：direct_workflow 路径说「已触发」但不查证据 → 缺少降级路径；
-               _logistics_task_evidence_check 只查 get_events_after，孤儿事件误放行
-  PASS（修后）：_logistics_task_evidence_check 改用 get_task_with_events，
-               同时核 task row 和 events；降级路径有完整测试覆盖。
+               _logistics_task_evidence_check 只查 get_events_after，孤儿事件误放行；
+               governance 拒绝时返回泛化「工作流触发失败」；
+               chat() 无 E2E 端到端覆盖
+  PASS（修后）：_logistics_task_evidence_check 改用 get_task_with_events；
+               else 分支暴露 governance reason；chat() E2E 全路径有 smoke 覆盖。
 
 读写边界：
   读：hipop.server.data.get_task_with_events / agent._logistics_task_evidence_check
   读：hipop.server.runtime.spawn_task（只验 task row + event 写入，不真跑 worker）
   写：Test 6 直接插入 agent_events 孤儿记录（仅测试 DB，不触发业务逻辑）
+
+CI 说明（Tests 7-9）：
+  governance.decide mock 为 Allow/Deny，跳过 Haiku LLM 调用（CI 无 API key）。
+  缺 anthropic SDK 时显式 FAIL，不 SKIP（与 smoke_t21_sub2_entry.py 保持一致）。
 """
 
 import sys
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -216,6 +226,116 @@ def test_logistics_evidence_check_degrades_on_orphan_events():
     print(f"    orphan event → degraded: {degrade_msg!r}")
 
 
+# ──────────────────────────────────────────────────────────────
+# Test 7: E2E chat() 成功路径
+# ──────────────────────────────────────────────────────────────
+
+def test_chat_t21_e2e_success():
+    """chat() T21 消息→确定性路由→wf3_logistics_v2：workflow_task.workflow 正确 + task row + ≥1 event。
+
+    governance.decide mock 为 Allow（跳过 CI 无 API key 的 Haiku 调用）。
+
+    FAIL（修前）：无 E2E chat() smoke → 接线缺失无法发现。
+    PASS（修后）：workflow_task.workflow == 'wf3_logistics_v2'，task row + ≥1 event，reply 非空。
+    """
+    from hipop.server.agent import chat
+    from hipop.server.governance import Decision
+
+    messages = [{"role": "user", "content": "请帮我扫一下 ERP 物流信息，并告诉我是否真的创建了后台任务。"}]
+    scope = {"store": "KSA", "current_user": "tester", "current_role": "ops",
+             "tenant_id": 1, "user_id": 1}
+
+    with patch("hipop.server.governance.decide",
+               return_value=Decision(kind="Allow", reason="test-allow")):
+        result = chat(messages, scope)
+
+    assert isinstance(result, dict), f"chat() 应返回 dict，实际: {type(result)}"
+    wt = result.get("workflow_task")
+    assert wt is not None, (
+        f"workflow_task 为 None，chat() 未走 direct_workflow 路径\n"
+        f"reply: {result.get('reply')!r}"
+    )
+    assert wt["workflow"] == "wf3_logistics_v2", (
+        f"workflow_task.workflow={wt['workflow']!r}，期望 wf3_logistics_v2"
+    )
+    task_id = wt["task_id"]
+    task = _runtime.task_status(task_id)
+    assert task is not None, f"tasks 行不存在 task_id={task_id}"
+    events = _data.get_events_after(task_id, 0)
+    assert len(events) >= 1, f"task_id={task_id} 无 durable event"
+    assert result.get("reply"), "reply 为空"
+    print(f"    E2E success: task_id={task_id} wf={wt['workflow']} reply={result['reply'][:60]!r}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Test 8: E2E chat() governance 拒绝 → 具体原因，非泛化失败
+# ──────────────────────────────────────────────────────────────
+
+def test_chat_t21_e2e_governance_deny_shows_reason():
+    """chat() T21 消息→governance 拒绝时，回复含具体原因，不泛化为「工作流触发失败」。
+
+    governance.decide mock 为 Deny（模拟已有运行中实例场景）。
+
+    FAIL（修前）：else 分支只用 message/error，governance Deny 的 reason 被丢弃
+                 → 用户看到泛化「工作流触发失败」，无法诊断。
+    PASS（修后）：else 分支优先取 reason，用户看到具体原因。
+    """
+    from hipop.server.agent import chat
+    from hipop.server.governance import Decision
+
+    deny_reason = "该 workflow 已有运行中实例: ['abc12345']（防并发抢资源）"
+    messages = [{"role": "user", "content": "帮我刷一下物流数据"}]
+    scope = {"store": "KSA", "current_user": "tester", "current_role": "ops",
+             "tenant_id": 1, "user_id": 1}
+
+    with patch("hipop.server.governance.decide",
+               return_value=Decision(kind="Deny", reason=deny_reason)):
+        result = chat(messages, scope)
+
+    reply = result.get("reply", "")
+    assert reply, "reply 为空"
+    assert "工作流触发失败" not in reply or deny_reason in reply, (
+        f"governance 拒绝时回复不应仅为泛化「工作流触发失败」\n实际: {reply!r}"
+    )
+    assert deny_reason in reply or "未确认创建成功" in reply or "已有运行中实例" in reply, (
+        f"governance 拒绝时回复必须含具体原因\n实际: {reply!r}"
+    )
+    print(f"    governance deny → reply={reply[:80]!r}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Test 9: E2E chat() 证据缺失 → 「未确认创建成功」
+# ──────────────────────────────────────────────────────────────
+
+def test_chat_t21_e2e_evidence_missing_degrades():
+    """chat() T21 消息→run_workflow ok→但证据缺失→回复含「未确认创建成功」。
+
+    mock get_task_with_events 返回 None（模拟 task row 不存在）。
+    governance.decide mock 为 Allow。
+
+    FAIL（修前）：chat() 不查证据，直接回「已触发」→ 假成功。
+    PASS（修后）：_logistics_task_evidence_check 返回降级消息，chat() 回「未确认创建成功」。
+    """
+    from hipop.server.agent import chat
+    from hipop.server.governance import Decision
+
+    messages = [{"role": "user", "content": "帮我扫一下物流"}]
+    scope = {"store": "KSA", "current_user": "tester", "current_role": "ops",
+             "tenant_id": 1, "user_id": 1}
+
+    with patch("hipop.server.governance.decide",
+               return_value=Decision(kind="Allow", reason="test-allow")), \
+         patch.object(_data, "get_task_with_events", return_value=None):
+        result = chat(messages, scope)
+
+    reply = result.get("reply", "")
+    assert reply, "reply 为空"
+    assert "未确认创建成功" in reply, (
+        f"证据缺失时 chat() 必须回「未确认创建成功」，实际: {reply!r}"
+    )
+    print(f"    evidence missing → reply={reply[:80]!r}")
+
+
 if __name__ == "__main__":
     print("▶ smoke_wf3_logistics_t21 — T21-SUB-3 物流入口专项 smoke + 降级")
     _setup()
@@ -233,6 +353,12 @@ if __name__ == "__main__":
          test_logistics_evidence_check_degrades_on_db_error),
         ("test_logistics_evidence_check_degrades_on_orphan_events",
          test_logistics_evidence_check_degrades_on_orphan_events),
+        ("test_chat_t21_e2e_success",
+         test_chat_t21_e2e_success),
+        ("test_chat_t21_e2e_governance_deny_shows_reason",
+         test_chat_t21_e2e_governance_deny_shows_reason),
+        ("test_chat_t21_e2e_evidence_missing_degrades",
+         test_chat_t21_e2e_evidence_missing_degrades),
     ]
 
     failed = 0

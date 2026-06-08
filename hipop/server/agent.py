@@ -2853,12 +2853,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
                 )
             else:
-                reply = (
+                reason = (
                     (tool_result or {}).get("message")
                     or (tool_result or {}).get("error")
                     or (tool_result or {}).get("reason")
-                    or "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
                 )
+                if reason:
+                    reply = reason
+                elif direct_workflow.get("workflow") == "wf3_logistics_v2":
+                    reply = ("物流后台任务**未确认创建成功**（工作流触发失败）。"
+                             "请稍后在工作台任务面板确认任务状态，或重试。")
+                else:
+                    reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
         return {
             "reply": reply,
             "clean_reply": reply,
