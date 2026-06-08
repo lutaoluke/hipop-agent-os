@@ -168,13 +168,9 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                     "affected_modules": result["affected_modules"],
                     "followup_prompt": result.get("followup_prompt"),
                 }
-            # T03: capture stale SKUs from query_sku so safety verifier can check
-            result_stale_skus = None
-            if tool_name == "query_sku" and isinstance(result, dict):
-                result_stale_skus = [
-                    item["sku"] for item in (result.get("items") or [])
-                    if item.get("data_stale") and item.get("sku")
-                ] or None
+            # T03: capture live_sales_failed SKUs from query_sku → safety verifier
+            from ._provider_anthropic import _stale_skus_from_sku_result
+            result_stale_skus = _stale_skus_from_sku_result(tool_name, result)
             tool_log.append({
                 "name": tool_name,
                 "args": tool_args_raw,

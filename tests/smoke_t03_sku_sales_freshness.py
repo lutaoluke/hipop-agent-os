@@ -187,7 +187,7 @@ def test_tool_stale_data() -> None:
 
 
 def test_tool_fresh_data() -> None:
-    """新鲜数据：data_stale=False，数值正常返回"""
+    """新鲜数据：data_stale=False；sales_30d 来自 live 源（T03 后：snapshot 新鲜度不再决定销量取数）"""
     print("\n── test_tool_fresh_data ─────────────────────────────────────")
     import hipop.server.data as _data
     import hipop.server.agent as _agent
@@ -201,7 +201,17 @@ def test_tool_fresh_data() -> None:
     _agent._chat_tenant.set(TENANT_ID)
     _agent._chat_scope.set({"tenant_id": TENANT_ID, "store": "KSA", "user": "test"})
 
-    result = _agent.tool_query_sku([SKU], store="KSA")
+    # T03 修后：注入 live fn，验证 sales_30d 来自 live 而非 snapshot
+    orig = _agent._sku_sales_live_fn
+    _agent._sku_sales_live_fn = lambda sku, n, t: {
+        "ok": True, "sales_30d": 30, "history_total": None,
+        "fetched_at": "2026-06-09T10:00:00Z", "source": "test_fresh_mock",
+    }
+    try:
+        result = _agent.tool_query_sku([SKU], store="KSA")
+    finally:
+        _agent._sku_sales_live_fn = orig
+
     items = result.get("items", [])
     assert items
     item = items[0]
@@ -209,9 +219,12 @@ def test_tool_fresh_data() -> None:
     check("新鲜数据 → data_stale=False",
           item.get("data_stale") is False,
           f"data_stale={item.get('data_stale')!r}, as_of_date={item.get('as_of_date')!r}")
-    check("新鲜数据 → sales_30d 有值（非 null）",
+    check("新鲜数据 → sales_30d 来自 live（非 null）",
           item.get("sales_30d") is not None,
           f"sales_30d={item.get('sales_30d')!r}")
+    check("新鲜数据 → 有 live_evidence（取数证据）",
+          isinstance(item.get("live_evidence"), dict),
+          f"live_evidence={item.get('live_evidence')!r}")
     check("新鲜数据 → stale_days == 0",
           item.get("stale_days") == 0,
           f"stale_days={item.get('stale_days')!r}")
@@ -252,38 +265,39 @@ def test_tool_null_as_of_date() -> None:
 
 
 def test_provider_stale_skus_logic() -> None:
-    """_provider 应将 data_stale=True 的 SKU 写入 result_stale_skus"""
+    """_provider _stale_skus_from_sku_result: live_sales_failed=True 的 SKU → result_stale_skus"""
     print("\n── test_provider_stale_skus_logic ─────────────────────────────")
 
     if SMOKE_SKIP_FIX:
-        # 改前：_provider 不含此逻辑，演示方式是直接运行逻辑看结果是 None
         print("  [SKIP] 改前演示跳过（_provider 无 result_stale_skus 逻辑）")
         return
 
-    # 模拟 _provider 的 result_stale_skus 计算逻辑（与 _provider_anthropic.py 同步）
+    # 使用 provider 真实函数（不复制逻辑）
+    from hipop.server._provider_anthropic import _stale_skus_from_sku_result
+
+    # 含 live_sales_failed=True 的 SKU → 应被提取
     mock_result = {
         "items": [
-            {"sku": SKU, "found": True, "data_stale": True, "sales_30d": None},
-            {"sku": "TBS0001A", "found": True, "data_stale": False, "sales_30d": 10},
+            {"sku": SKU, "found": True, "live_sales_failed": True, "sales_30d": None},
+            {"sku": "TBS0001A", "found": True, "live_evidence": {"fetched_at": "2026-06-09T10:00:00Z"}, "sales_30d": 10},
         ],
     }
-    tool_name = "query_sku"
-    result_stale_skus = None
-    if tool_name == "query_sku" and isinstance(mock_result, dict):
-        result_stale_skus = [
-            it["sku"] for it in (mock_result.get("items") or [])
-            if it.get("data_stale") and it.get("sku")
-        ] or None
 
-    check(f"result_stale_skus 包含陈旧 SKU {SKU!r}",
+    result_stale_skus = _stale_skus_from_sku_result("query_sku", mock_result)
+
+    check(f"result_stale_skus 包含 live_sales_failed SKU {SKU!r}",
           SKU in (result_stale_skus or []),
           f"result_stale_skus={result_stale_skus!r}")
-    check("result_stale_skus 不含新鲜 SKU TBS0001A",
+    check("result_stale_skus 不含 live_ok SKU TBS0001A（无误报）",
           "TBS0001A" not in (result_stale_skus or []),
           f"result_stale_skus={result_stale_skus!r}")
-    check("新鲜唯一 SKU → result_stale_skus=None（空列表折叠）",
-          [{"sku": "OK", "data_stale": False}] and True,  # 文档性断言
-          "")
+
+    # 全 live_ok → result_stale_skus=None
+    mock_fresh = {"items": [{"sku": "FRESH", "live_evidence": {"fetched_at": "t"}, "sales_30d": 10}]}
+    fresh_stale = _stale_skus_from_sku_result("query_sku", mock_fresh)
+    check("全 live_ok → result_stale_skus=None",
+          fresh_stale is None,
+          f"fresh_stale={fresh_stale!r}")
 
     mock_fresh = {"items": [{"sku": "FRESH", "data_stale": False}]}
     fresh_stale = [

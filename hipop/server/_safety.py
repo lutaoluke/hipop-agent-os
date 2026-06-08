@@ -343,9 +343,9 @@ _STALE_SALES_CLAIM_RE = re.compile(
 
 
 def _check_stale_sales_claim(reply: str, tool_log: list) -> List[str]:
-    """T03: query_sku 返回陈旧数据(data_stale=True)但回复中仍含具体销量数字 → 警告。
+    """T03: query_sku 实时取数失败(live_sales_failed=True)但回复中仍含具体销量数字 → 警告。
 
-    防止 LLM 忽略 data_stale=True 信号、把过期快照数值当实时结果呈现。
+    防止 LLM 把无法确认实时来源的销量数字当作确定值呈现给用户。
     """
     stale_skus: list = []
     for t in (tool_log or []):
@@ -358,9 +358,9 @@ def _check_stale_sales_claim(reply: str, tool_log: list) -> List[str]:
         return []
     sku_str = "、".join(sorted(set(stale_skus)))
     return [
-        f"⚠️ SKU {sku_str} 的 wf2_sku 快照已过期（data_stale=True），"
+        f"⚠️ SKU {sku_str} 的实时取数失败，"
         "Agent 回复中仍含具体销量数字 — 可能来自旧快照或幻觉（T03）。"
-        "请触发 wf2_sales_v2 刷新后再查询，或告知用户当前无法实时确认。"
+        "请告知用户当前无法实时确认销量，不得输出旧缓存数字。"
     ]
 
 
