@@ -309,7 +309,7 @@ CASES: List[Case] = [
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
         question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
         must_use_tools=["query_order_live"],
-        must_contain=[r"未找到|不存在|无物流|无记录|找不到|核实货单号"],
+        must_contain=[r"未找到|不存在|无物流|无记录|找不到|查不到|核实货单号"],
         must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
         timeout=120,
     ),
