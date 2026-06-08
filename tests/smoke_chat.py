@@ -58,6 +58,7 @@ class Case:
     must_warn: bool = False                                       # _safety 应该报警告
     expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
     allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
+    t07_guard: bool = False                                       # T07 freshness 结构不变量检查
     timeout: int = 60
 
 
@@ -302,6 +303,8 @@ _STALE_RE = (
     rf"|(?:{_STALE_DATA})(?:(?!{_STALE_OBJ}|旧).){{0,15}}?(?:{_STALE_DEG})?旧(?![的\s、]*(?:{_STALE_OBJ}))"
     # ③ 非"旧"族的陈旧 / 保守说法。
     r"|偏保守|过期|不新鲜|滞后|未更新"
+    # ④ 时效表达绑定数据名词：数据名词在前，时效词在后。
+    rf"|(?:noon|{_STALE_DATA})[^\n，。]{{0,12}}(?:\d+\s*天前|昨天|昨日|差\d+天)"
 )
 
 
@@ -526,6 +529,29 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T07 freshness gate（WS-118） ───
+    # 验收③：workflow_task=null + 模拟数的旧失败形态被拦住。
+    # 两种合法路径：
+    #   数据新鲜 → LLM 调查询工具直接答（tools_used 含查询工具，workflow_task=null）
+    #   数据陈旧 → freshness gate 触发 → workflow 被创建（workflow_task 非空）
+    #              OR 返回明确的"最新到X/数据不足"说明
+    # 严禁：workflow_task=null + 无查询工具 + 含模拟数字（T07 regression guard 见 check()）
+    Case(
+        name="T07-1 销量 TopN freshness gate（不能模拟数 + workflow_task=null）",
+        question="今天 KSA 销量最好的前5个 SKU 是哪些",
+        t07_guard=True,
+        must_not_contain=[
+            "已为你生成",
+            r"已触发.{0,10}但没有",
+        ],
+    ),
+    Case(
+        name="T07-2 最畅销商品查询（freshness gate 不误拦否定场景）",
+        question="不用刷新，就用现在的告诉我哪些 SKU 最畅销",
+        # 明确说"不用刷新"→ gate 应跳过 → LLM 答（用现有数据 + 必须给陈旧警示）
+        must_contain=[_STALE_RE],   # 陈旧警示（复用 case 11 的结构判别）
+        must_not_contain=["数据不足：sales", "目标日期.*暂未覆盖"],  # gate 不应触发
+    ),
     # ─── T26 货单负控（WS-106）────────────────────────────────────────────────────
     Case(
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
@@ -617,6 +643,35 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
+
+    if c.t07_guard:
+        # T07 结构不变量：对运营销量查询，回复必须由真实数据支撑，禁模拟数。
+        # 合法路径 A: workflow_task 非空（gate 触发了真实 workflow）
+        # 合法路径 B: query 工具被调用（LLM 用真实查询数据回答）
+        # 合法路径 C: reply 含结构化缺数说明（"最新到X"/"数据不足"）
+        # 违规路径: 上面三者均无 + reply 含类似"xx SKU 销量 nn 件"等具体数字组合
+        wt = resp.get("workflow_task")
+        query_tools = {"query_sku", "list_products", "scope_overview", "data_health_check",
+                       "compute_replenishment", "query_sku_live"}
+        has_workflow = bool(wt)
+        has_query_tool = bool(set(tools) & query_tools)
+        has_stale_indicator = bool(re.search(
+            r"最新到|数据不足|暂未覆盖|暂无数据|缺数|数据.{0,8}(最新|只到|截止到)",
+            reply,
+        ))
+        anchored = has_workflow or has_query_tool or has_stale_indicator
+        if not anchored:
+            # 进一步检查是否有"模拟数"特征：具体数字+SKU+单位组合
+            fake_num_re = re.compile(
+                r"(?:[A-Z]{2,}[0-9]{4,}[A-Z]?).{0,20}?(?:销量|卖了|共?\s*[0-9]+\s*(?:件|单|个|次))",
+            )
+            if fake_num_re.search(reply):
+                reasons.append(
+                    "T07 guard: workflow_task=null + 无查询工具 + 含模拟数字组合（旧 T07 失败形态）"
+                )
+            else:
+                # 没有模拟数字，但也没有任何数据支撑 — 空答/不知
+                pass  # 允许 Agent 给空/不确定答案
 
     return (len(reasons) == 0), reasons
 
