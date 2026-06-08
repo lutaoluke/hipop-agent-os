@@ -1078,7 +1078,7 @@ async def api_chat(body: dict, user: dict = Depends(_auth_mod.get_current_user))
             out.get("clean_reply") or out.get("reply") or "(无回复)",
             tag=out.get("tag") or "",
             references=out.get("references") or [],
-            task=out.get("workflow_task"),
+            task=out.get("workflow_tasks") or None,
         )
     except Exception:
         import traceback as _tb

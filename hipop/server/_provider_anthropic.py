@@ -21,7 +21,7 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
     refs_collected: list = []
     tool_log: list = []
     final_text = ""
-    workflow_task = None
+    workflow_tasks: list = []
     retried_auth = False
 
     msgs = list(messages)
@@ -62,15 +62,26 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 result = _agent._exec_tool(tool_name, tool_args, user=scope)
                 if isinstance(result, dict) and "references" in result:
                     refs_collected.extend(result["references"])
-                if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):
-                    workflow_task = {
-                        "task_id": result["task_id"],
-                        "workflow": result["workflow"],
-                        "label": result["label"],
-                        "total_steps": result["total_steps"],
-                        "affected_modules": result["affected_modules"],
-                        "followup_prompt": result.get("followup_prompt"),
-                    }
+                if tool_name == "run_workflow" and isinstance(result, dict):
+                    wf_name = tool_args.get("workflow", "unknown") if isinstance(tool_args, dict) else "unknown"
+                    if result.get("ok"):
+                        workflow_tasks.append({
+                            "ok": True,
+                            "task_id": result["task_id"],
+                            "workflow": result.get("workflow", wf_name),
+                            "label": result.get("label", wf_name),
+                            "total_steps": result.get("total_steps", 0),
+                            "affected_modules": result.get("affected_modules", []),
+                            "followup_prompt": result.get("followup_prompt"),
+                        })
+                    else:
+                        workflow_tasks.append({
+                            "ok": False,
+                            "workflow": result.get("workflow") or wf_name,
+                            "label": result.get("label") or wf_name,
+                            "error": result.get("error") or "触发失败",
+                            "task_id": None,
+                        })
                 entry: dict = {
                     "name": tool_name, "args": tool_args,
                     "result_keys": list(result.keys()) if isinstance(result, dict) else None,
@@ -94,5 +105,5 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
         "reply": final_text.strip() or "(无回复)",
         "tool_log": tool_log,
         "refs_collected": refs_collected,
-        "workflow_task": workflow_task,
+        "workflow_tasks": workflow_tasks,
     }

@@ -216,6 +216,69 @@ def test_agent_passes_tool_log_to_sanitize_reply():
         "agent.chat 调 sanitize_reply 时未传 tool_log=tool_log（T36-S3 死法：接线缺失）"
 
 
+# ── round-4: multi-task provider / agent 接线验证 ─────────────────────────────
+
+def test_anthropic_provider_returns_workflow_tasks_list():
+    """Anthropic provider 返回 workflow_tasks（list），不再返回单 workflow_task（dict）。"""
+    src = _read_server_src("_provider_anthropic.py")
+    assert '"workflow_tasks": workflow_tasks' in src or "'workflow_tasks': workflow_tasks" in src, \
+        "Anthropic provider 未返回 workflow_tasks list（round-4 接线缺失）"
+    assert '"workflow_task": workflow_task' not in src and "'workflow_task': workflow_task" not in src, \
+        "Anthropic provider 仍在返回旧的 workflow_task（未完成 round-4 迁移）"
+
+
+def test_openai_provider_returns_workflow_tasks_list():
+    """OpenAI provider 返回 workflow_tasks（list），不再返回单 workflow_task（dict）。"""
+    from hipop.server import _provider_openai
+    import inspect
+    src = inspect.getsource(_provider_openai.run)
+    assert '"workflow_tasks": workflow_tasks' in src or "'workflow_tasks': workflow_tasks" in src, \
+        "OpenAI provider 未返回 workflow_tasks list（round-4 接线缺失）"
+    assert '"workflow_task": workflow_task' not in src and "'workflow_task': workflow_task" not in src, \
+        "OpenAI provider 仍在返回旧的 workflow_task（未完成 round-4 迁移）"
+
+
+def test_anthropic_provider_appends_not_overwrites():
+    """Anthropic provider 用 workflow_tasks.append(...) 不是覆盖赋值 workflow_task = ..."""
+    src = _read_server_src("_provider_anthropic.py")
+    assert "workflow_tasks.append(" in src, \
+        "Anthropic provider 缺少 workflow_tasks.append 调用（多次 run_workflow 会被覆盖）"
+
+
+def test_openai_provider_appends_not_overwrites():
+    """OpenAI provider 用 workflow_tasks.append(...) 不是覆盖赋值 workflow_task = ..."""
+    from hipop.server import _provider_openai
+    import inspect
+    src = inspect.getsource(_provider_openai.run)
+    assert "workflow_tasks.append(" in src, \
+        "OpenAI provider 缺少 workflow_tasks.append 调用（多次 run_workflow 会被覆盖）"
+
+
+def test_agent_returns_workflow_tasks_not_single():
+    """agent.chat 返回 workflow_tasks（list），不再是 workflow_task（dict）。"""
+    src = _read_server_src("agent.py")
+    assert '"workflow_tasks": workflow_tasks' in src or "'workflow_tasks': workflow_tasks" in src, \
+        "agent.chat 未返回 workflow_tasks list（round-4 接线缺失）"
+
+
+def test_provider_appends_failed_task_to_list():
+    """Anthropic/OpenAI provider 对失败的 run_workflow 也 append 到 workflow_tasks（ok=False 条目）。"""
+    src = _read_server_src("_provider_anthropic.py")
+    assert '"ok": False' in src or "'ok': False" in src, \
+        "Anthropic provider 未对失败 run_workflow 生成 ok=False 条目（用户看不到失败项）"
+
+
+def test_chat_panel_uses_workflow_tasks():
+    """chat_panel.html 使用 workflow_tasks (list) 而不是单 workflow_task。"""
+    path = os.path.join(os.path.dirname(HERE), "hipop", "server", "templates", "partials", "chat_panel.html")
+    with open(path) as f:
+        src = f.read()
+    assert "workflow_tasks" in src, \
+        "chat_panel.html 未使用 workflow_tasks（前端无法展示多任务卡）"
+    assert "attachTask" in src, \
+        "chat_panel.html 缺少 attachTask 调用"
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_workflow_name_dict_args,
@@ -237,6 +300,14 @@ if __name__ == "__main__":
         test_anthropic_provider_enriches_tool_log_on_failure,
         test_openai_provider_enriches_tool_log_on_failure,
         test_agent_passes_tool_log_to_sanitize_reply,
+        # round-4: multi-task接线
+        test_anthropic_provider_returns_workflow_tasks_list,
+        test_openai_provider_returns_workflow_tasks_list,
+        test_anthropic_provider_appends_not_overwrites,
+        test_openai_provider_appends_not_overwrites,
+        test_agent_returns_workflow_tasks_not_single,
+        test_provider_appends_failed_task_to_list,
+        test_chat_panel_uses_workflow_tasks,
     ]
     failed = 0
     for t in tests:

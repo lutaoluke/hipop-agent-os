@@ -1859,7 +1859,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
     scope: {store, current_user, current_role, tenant_id, user_id, ...}
-    返回: {reply, clean_reply, references, action_id, tag, workflow_task, tools_used, provider, confidence}
+    返回: {reply, clean_reply, references, action_id, tag, workflow_tasks, tools_used, provider, confidence}
 
     走 _provider 抽象层，通过 LLM_PROVIDER env 切换 anthropic / qwen / deepseek / doubao。
     """
@@ -1879,23 +1879,31 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
         tool_result = _exec_tool("run_workflow", tool_args, user=scope)
-        workflow_task = None
+        workflow_tasks = []
         if isinstance(tool_result, dict) and tool_result.get("ok"):
             task_id = tool_result["task_id"]
-            workflow_task = {
+            workflow_tasks.append({
+                "ok": True,
                 "task_id": task_id,
-                "workflow": tool_result["workflow"],
-                "label": tool_result["label"],
-                "total_steps": tool_result["total_steps"],
-                "affected_modules": tool_result["affected_modules"],
+                "workflow": tool_result.get("workflow", direct_workflow["workflow"]),
+                "label": tool_result.get("label", direct_workflow.get("label", direct_workflow["workflow"])),
+                "total_steps": tool_result.get("total_steps", 0),
+                "affected_modules": tool_result.get("affected_modules", []),
                 "followup_prompt": tool_result.get("followup_prompt"),
-            }
+            })
             # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
             # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
             reply = _workflow_receipt_reply(
                 task_id, tool_result["workflow"], direct_workflow["label"]
             )
         else:
+            workflow_tasks.append({
+                "ok": False,
+                "workflow": direct_workflow["workflow"],
+                "label": direct_workflow.get("label", direct_workflow["workflow"]),
+                "error": (tool_result or {}).get("error") or "触发失败",
+                "task_id": None,
+            })
             reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
         return {
             "reply": reply,
@@ -1904,7 +1912,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "action_id": None,
             "tools_used": ["run_workflow"],
             "tag": "执行",
-            "workflow_task": workflow_task,
+            "workflow_tasks": workflow_tasks,
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
@@ -1922,7 +1930,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     clean_reply  = result["reply"]           # LLM 原文（无 banner）— 用于持久化 + 喂未来历史
     tool_log     = result["tool_log"]
     refs_collected = result["refs_collected"]
-    workflow_task  = result.get("workflow_task")
+    workflow_tasks = result.get("workflow_tasks", [])
     tools_used     = [t["name"] for t in tool_log]
 
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
@@ -1977,7 +1985,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "action_id": action_id,
         "tools_used": tools_used,
         "tag": ("hallucinate" if hallu_warnings else ("执行" if _safety._is_substantive_action(tool_log) else ("查询" if tool_log else None))),
-        "workflow_task": workflow_task,
+        "workflow_tasks": workflow_tasks,
         "provider": _provider.get_provider(),
         "confidence": round(confidence, 2),
         "judge_method": judge_method,
