@@ -1,4 +1,4 @@
-"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 7)
+"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 8)
 
 验收：chat 查询 / 工作流执行 / 状态回读 三条热点路径在同一分类框架下可区分，
 且无真实证据时旁路宣称被拦截。
@@ -24,6 +24,9 @@ PASS 条件（修后 round-6）：
   - round-7 新增更短的通用完成态/状态声明："操作完毕/操作已完成/已处理/
     已经处理/已刷新/已完成处理/一切正常"。仅 run_workflow 或无工具仍必须报警；
     有真实 task readback done/success 或查询证据时不误伤。
+  - round-8 新增 bare completion/update/sync 短句："已完成/完成了/已更新/
+    已同步/已经同步"。仅真实 task readback done/success 能放行；run_workflow、
+    无工具、query evidence 都不能洗白这些完成态声明。
 """
 
 from __future__ import annotations
@@ -828,6 +831,70 @@ def test_round7_generic_status_allowed_with_query_evidence():
         assert not warns, f"query_sku 证据下 {reply!r} 不应触发任务完成旁路，实得 warns={warns}"
 
 
+# ── Round-8 fail-then-pass: bare completion/update/sync claims ───────────────
+
+ROUND8_REVIEWER_PROBES = (
+    "已完成。",
+    "完成了。",
+    "已更新。",
+    "已同步。",
+    "已经同步。",
+)
+
+
+def test_round8_bare_completion_claims_block_run_workflow_only():
+    """round-8 验门人 probes：run_workflow only 时全部应 warns。
+
+    FAIL（round-7）：已完成 / 完成了 / 已更新 / 已同步 / 已经同步 等 bare
+                  短句未命中，返回 warns=[]。
+    PASS（round-8）：这些短句仍需真实 task readback；run_workflow 只算任务创建。
+    """
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in ROUND8_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-8 FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round8_bare_completion_claims_block_no_tool():
+    """同一 round-8 probe 集：无工具证据时全部应 warns。"""
+    for reply in ROUND8_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-8 FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_sanitize_reply_round8_exact_probes():
+    """sanitize_reply 整合：round-8 exact probes 全部出 banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for reply in ROUND8_REVIEWER_PROBES:
+        final, warns = sanitize_reply(
+            reply,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert warns, f"sanitize_reply round-8 FAIL：{reply!r} run_workflow only → warns=[]"
+        assert "⚠️" in final, f"banner 未出现: {final[:100]!r}"
+
+
+def test_round8_bare_claims_allowed_with_real_task_readback():
+    """正路：真实 task readback done 时，round-8 bare 完成声明允许通过。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND8_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round8_bare_claims_not_washed_by_query_evidence():
+    """bare 完成/更新/同步声明不能被 query evidence 洗白；需 task readback。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in ROUND8_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query_sku 证据不应放行 bare 完成态 {reply!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -853,7 +920,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 7)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 8)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -983,6 +1050,17 @@ if __name__ == "__main__":
          test_round7_short_claims_allowed_with_real_task_readback),
         ("test_round7_generic_status_allowed_with_query_evidence",
          test_round7_generic_status_allowed_with_query_evidence),
+        # Round-8 fail-then-pass: bare completion/update/sync claims
+        ("test_round8_bare_completion_claims_block_run_workflow_only",
+         test_round8_bare_completion_claims_block_run_workflow_only),
+        ("test_round8_bare_completion_claims_block_no_tool",
+         test_round8_bare_completion_claims_block_no_tool),
+        ("test_sanitize_reply_round8_exact_probes",
+         test_sanitize_reply_round8_exact_probes),
+        ("test_round8_bare_claims_allowed_with_real_task_readback",
+         test_round8_bare_claims_allowed_with_real_task_readback),
+        ("test_round8_bare_claims_not_washed_by_query_evidence",
+         test_round8_bare_claims_not_washed_by_query_evidence),
     ]
 
     failed = 0

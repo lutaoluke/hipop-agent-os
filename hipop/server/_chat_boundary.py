@@ -88,17 +88,23 @@ _COMPLETION_BYPASS_RE = re.compile(
     r")"
 )
 
-# Short status/completion claims that are too generic to put in the broad regex
-# above. They still need evidence when no query tool backs them, or when the only
-# action evidence is run_workflow (task creation).
+# Short completion claims that are too generic to put in the broad regex above.
+# These still need task-done evidence when no tool backs them, when the only
+# action evidence is run_workflow (task creation), or when query evidence would
+# otherwise wash out a bare "done/update/sync" claim.
 _SHORT_STATUS_BYPASS_RE = re.compile(
     r"(?:"
     r"操作.{0,4}(?:完毕|完(?:了)?|已完成|完成了?|成功了?)"
-    r"|已(?:完成处理|刷新)(?=$|[。！？!?,，、\s])"
+    r"|已(?:完成处理|刷新|完成|更新|同步)(?=$|[。！？!?,，、\s])"
+    r"|完成了(?=$|[。！？!?,，、\s])"
     r"|已经?处理(?=$|[。！？!?,，、\s])"
-    r"|一切正常"
+    r"|已经同步(?=$|[。！？!?,，、\s])"
     r")"
 )
+
+# Query evidence can support a generic status judgment, but not a bare
+# completion/update/sync claim.
+_QUERY_SAFE_SHORT_STATUS_RE = re.compile(r"一切正常")
 
 
 def classify_evidence(tool_log: list) -> EvidenceClass:
@@ -178,7 +184,8 @@ def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
     """
     completion_claim = _COMPLETION_BYPASS_RE.search(reply)
     short_status_claim = _SHORT_STATUS_BYPASS_RE.search(reply)
-    if not completion_claim and not short_status_claim:
+    query_safe_status_claim = _QUERY_SAFE_SHORT_STATUS_RE.search(reply)
+    if not completion_claim and not short_status_claim and not query_safe_status_claim:
         return []
 
     # Explicit task-done evidence → allowed
@@ -189,18 +196,19 @@ def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
     has_run_workflow = bool(names & WORKFLOW_TOOLS)
     has_query_evidence = bool(names & QUERY_TOOLS)
     # "一切正常" can be a normal query-backed status judgment. Do not force task
-    # readback unless the reply also contains a real completion/refresh claim or
-    # the tool evidence is only a workflow trigger.
-    if short_status_claim and not completion_claim and has_query_evidence and not has_run_workflow:
+    # readback unless the reply also contains a real completion/refresh claim,
+    # a bare completion/update/sync claim, or the evidence is only a workflow
+    # trigger.
+    if query_safe_status_claim and not completion_claim and not short_status_claim and has_query_evidence and not has_run_workflow:
         return []
 
     if has_run_workflow:
         return [
-            "⚠️ Agent 宣称任务/数据已完成、已刷新或已处理，但只有 run_workflow（任务创建）证据，"
+            "⚠️ Agent 宣称任务/数据已完成、已刷新、已更新、已同步或已处理，但只有 run_workflow（任务创建）证据，"
             "没有任务完成（task_result/status=done）的工具证据 — "
-            "已触发 ≠ 已完成，禁旁路生成已完成/已刷新/已处理声明"
+            "已触发 ≠ 已完成，禁旁路生成已完成/已刷新/已更新/已同步/已处理声明"
         ]
     return [
-        "⚠️ Agent 宣称任务/数据已完成、已刷新或已处理，但本轮没真调 run_workflow — "
-        "这是 hallucinate（禁旁路生成已完成/已刷新/已处理声明，请重发刷新指令让系统真跑）"
+        "⚠️ Agent 宣称任务/数据已完成、已刷新、已更新、已同步或已处理，但本轮没真调 run_workflow — "
+        "这是 hallucinate（禁旁路生成已完成/已刷新/已更新/已同步/已处理声明，请重发刷新指令让系统真跑）"
     ]
