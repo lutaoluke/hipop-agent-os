@@ -115,12 +115,46 @@ _FORMULA_SEMANTIC_RE = re.compile(
 
 # 正确分母描述：公式的分母/计算基数必须正向包含 1688采购标准价 + 头程运费分摊。
 # 不能只靠"出现头程运费"或枚举坏话术；缺任一 denominator component 即 FAIL。
+_DENOM_1688 = r"1688.{0,12}(?:标准价|标价|参考价)"
+_DENOM_JOIN = r"(?:\+|＋|加上?|和|及|与|连同)"
+_DENOM_FREIGHT = r"头程.{0,12}运费.{0,8}分摊"
+_CORRECT_DENOMINATOR_PAIR = (
+    rf"(?:{_DENOM_1688}.{{0,18}}{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT}"
+    rf"|{_DENOM_FREIGHT}.{{0,18}}{_DENOM_JOIN}.{{0,18}}{_DENOM_1688})"
+)
+_CORRECT_DENOMINATOR_EVIDENCE = (
+    rf"(?:{_CORRECT_DENOMINATOR_PAIR}"
+    rf"|分母.{{0,20}}{_DENOM_FREIGHT}"
+    rf"|{_DENOM_FREIGHT}.{{0,20}}分母)"
+)
 _CORRECT_DENOMINATOR_RE = re.compile(
-    r"([÷/]|除以|分母|计算基数|总成本基数|成本基数).{0,45}"
-    r"("
-    r"1688.{0,12}(标准价|标价|参考价).{0,18}(\+|＋|加上?|和|及|与|连同).{0,18}头程.{0,12}运费.{0,8}分摊"
-    r"|头程.{0,12}运费.{0,8}分摊.{0,18}(\+|＋|加上?|和|及|与|连同).{0,18}1688.{0,12}(标准价|标价|参考价)"
-    r")",
+    rf"([÷/]|除以|分母|计算基数|总成本基数|成本基数).{{0,45}}"
+    rf"{_CORRECT_DENOMINATOR_PAIR}",
+    re.IGNORECASE
+)
+
+# 被否定/引用的正确公式不能作为通过证据。
+_NEGATED_CORRECT_DENOMINATOR_RE = re.compile(
+    rf"(?:"
+    rf"(?:不是按|不是用|不按|不采用|不用于|不含|不包括|不放进).{{0,70}}"
+    rf"{_CORRECT_DENOMINATOR_EVIDENCE}"
+    rf"|有人.{{0,40}}{_CORRECT_DENOMINATOR_PAIR}.{{0,45}}"
+    rf"(?:但|不过).{{0,12}}(?:不采用|不用|不按|不是)"
+    rf"|{_CORRECT_DENOMINATOR_EVIDENCE}.{{0,45}}"
+    rf"(?:这个说法|说法).{{0,12}}不用于"
+    rf"|{_CORRECT_DENOMINATOR_PAIR}.{{0,45}}"
+    rf"(?:但|不过).{{0,12}}(?:不采用|不用|不按|不是)"
+    rf")",
+    re.IGNORECASE
+)
+
+# 明确断言旧分母（只用 1688 标准价，不含头程运费分摊）必须失败。
+_OLD_DENOMINATOR_ASSERTION_RE = re.compile(
+    rf"(?:实际(?:应)?按|真实(?:计算)?(?:用|按)|实际(?:分母|计算)?|最终(?:用|按)|分母|计算基数)"
+    rf".{{0,30}}(?:议价差额\s*[÷/]\s*\(?\s*)?(?:只用|仅用)?\s*{_DENOM_1688}"
+    rf"(?!\s*{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT})"
+    rf"|议价差额\s*[÷/]\s*\(?\s*(?:只用|仅用)?\s*{_DENOM_1688}"
+    rf"(?!\s*{_DENOM_JOIN}.{{0,18}}{_DENOM_FREIGHT})",
     re.IGNORECASE
 )
 
@@ -170,7 +204,8 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
       3. 正向证明分母/计算基数同时包含 1688采购标准价 + 头程运费分摊
       4. 包含 3% 或 6% 阈值
       5. 明确说明 plus 折扣不计入采购议价率/绩效
-      6. 不包含"plus 先计入...后续扣减"等错误 plus 处理描述
+      6. 不把被否定/引用后废弃的正确分母当作通过证据
+      7. 不包含"plus 先计入...后续扣减"等错误 plus 处理描述
 
     返回 (passed, fail_reasons)。
     """
@@ -195,6 +230,20 @@ def _t48_content_oracle(reply: str) -> tuple[bool, list[str]]:
         fails.append(
             "reply 未证明头程运费分摊在采购议价率分母/计算基数中；"
             "正确公式分母 = 1688采购标准价 + 头程运费分摊"
+        )
+
+    # 检查 3b：正确公式被否定/引用后弃用，不能作为通过证据
+    if _NEGATED_CORRECT_DENOMINATOR_RE.search(reply):
+        fails.append(
+            "reply 虽提到正确分母，但同时否定/引用后废弃该公式；"
+            "不得把'不是按/不采用/这个说法不用于'的正确公式当作通过证据"
+        )
+
+    # 检查 3c：最终或实际计算断言旧分母（只用 1688 标准价）即 FAIL
+    if _OLD_DENOMINATOR_ASSERTION_RE.search(reply):
+        fails.append(
+            "reply 断言采购议价率实际分母只用 1688采购标准价，缺少头程运费分摊；"
+            "这是已废止的旧公式"
         )
 
     # 检查 4：阈值（3% 或 6%）
@@ -915,6 +964,60 @@ def test_bypass20_freight_not_in_denominator_old_passes_new_rejects():
     )
 
 
+def test_negation_not_using_correct_formula_fails():
+    """验门人绕过 #21（WS-117 round-8 实测）：先写正确公式但明确说不是按它算。"""
+    bypass_reply = (
+        "采购议价率不是按议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%，"
+        "实际应按议价差额 ÷ 1688采购标准价 × 100%。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 否定正确公式后回退旧公式 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 否定正确公式后回退旧公式，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("分母" in f or "公式" in f or "头程" in f for f in new_fails), (
+        f"new_fails 应提及公式/分母/头程，实际: {new_fails}"
+    )
+
+
+def test_quote_then_deny_correct_formula_fails():
+    """验门人绕过 #22（WS-117 round-8 实测）：引用正确分母说法后声明不用于采购议价率。"""
+    bypass_reply = (
+        "分母包含1688采购标准价和头程运费分摊这个说法不用于采购议价率；"
+        "采购议价率实际分母只用1688采购标准价。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 引用正确分母后否定 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 引用正确分母后否定，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("分母" in f or "公式" in f or "头程" in f for f in new_fails), (
+        f"new_fails 应提及公式/分母/头程，实际: {new_fails}"
+    )
+
+
+def test_old_formula_final_assertion_fails():
+    """验门人绕过 #23（WS-117 round-8 实测）：有人会写正确公式但最终断言旧公式。"""
+    bypass_reply = (
+        "有人会写采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%，"
+        "但这里不采用；真实计算用议价差额 ÷ 1688采购标准价。"
+        "阈值：3% 不合格，6% 正常。plus 折扣不计入采购绩效。"
+    )
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, "Step A：旧 oracle 应对 最终断言旧公式 绕过样例判 PASS"
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        f"Step B：新 oracle 应拒绝 最终断言旧公式，但 passed=True；new_fails={new_fails}"
+    )
+    assert any("分母" in f or "公式" in f or "头程" in f for f in new_fails), (
+        f"new_fails 应提及公式/分母/头程，实际: {new_fails}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -1085,6 +1188,12 @@ if __name__ == "__main__":
          test_bypass19_freight_single_accounting_old_passes_new_rejects),
         ("test_bypass20_freight_not_in_denominator_old_passes_new_rejects",
          test_bypass20_freight_not_in_denominator_old_passes_new_rejects),
+        ("test_negation_not_using_correct_formula_fails",
+         test_negation_not_using_correct_formula_fails),
+        ("test_quote_then_deny_correct_formula_fails",
+         test_quote_then_deny_correct_formula_fails),
+        ("test_old_formula_final_assertion_fails",
+         test_old_formula_final_assertion_fails),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
