@@ -172,6 +172,7 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 "name": tool_name,
                 "args": tool_args_raw,
                 "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+                "result_error": result.get("error") if isinstance(result, dict) else None,
             })
             msgs.append({
                 "role": "tool",

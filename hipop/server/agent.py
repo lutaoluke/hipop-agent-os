@@ -1114,6 +1114,13 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     finally:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
+    if not in_transit and not completed:
+        return {
+            "ok": False,
+            "error": "sku_no_orders_in_erp",
+            "sku": sku,
+            "message": f"SKU {sku} 在 ERP 中无在途或近期完成货单记录，请核实 SKU 是否正确。",
+        }
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
     in_transit_out = []
     for o in in_transit[:15]:
@@ -1180,7 +1187,12 @@ def tool_query_order_live(order_no: str) -> Dict:
     # 找精确匹配
     match = [o for o in items if (o.get("delivery_order_no") or "").upper() == order_no.upper()]
     if not match:
-        return {"ok": False, "error": "order_not_found_in_erp", "order_no": order_no}
+        return {
+            "ok": False,
+            "error": "order_not_found_in_erp",
+            "order_no": order_no,
+            "message": f"货单号 {order_no} 在 ERP 中无记录，请核实货单号是否正确。",
+        }
     o = match[0]
     forwarder = (o.get("logistics") or {}).get("logistics_name", "")
     tracking = o.get("logistics_bill_no", "")
