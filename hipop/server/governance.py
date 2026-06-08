@@ -341,7 +341,13 @@ def decide(proposal: ActionProposal) -> Decision:
             approval_target="manager_via_feishu",
         )
 
-    # 4. medium/high 跑 Haiku（生成 plan_text 给用户 / 做次级校验）
+    # 4a. medium: 规格说"默认 Allow"；concurrent_running + 目标错误已在上方 deterministic 层 cover。
+    # 跳过 LLM 调用，消除对 DEEPSEEK_API_KEY / ANTHROPIC_API_KEY 的运行时依赖
+    # （E2E 发现 key 缺失时 _decide_with_llm 静默返回 Deny，阻断所有 workflow 触发）
+    if proposal.risk_level == "medium":
+        return Decision(kind="Allow", reason="medium-risk — 确定性前置检查通过，自动放行")
+
+    # 4b. high 跑 Haiku（需生成 plan_text 给用户确认）
     return _decide_with_llm(proposal)
 
 
