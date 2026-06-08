@@ -87,6 +87,11 @@ _OLD_15PCT_PASS_RE = re.compile(
     r"|超过\s*15\s*%.{0,10}(才|才算|才达标|合格)"
     r"|15\s*%.{0,5}才达标"
     r"|达标.{0,10}15\s*%"
+    # ↓ 新增：不低于/不能低于/最低/至少 + 15%/15个点（验门人 round-3 实测绕过）
+    r"|不能?低于\s*15\s*(%|个点|个)"
+    r"|最低.{0,8}15\s*(个点|%|才)"
+    r"|至少.{0,5}15\s*(%|个点|个)"
+    r"|15\s*个点.{0,15}(才算|过线|合格|达标)"
 )
 
 # 公式业务语义词（出现任一 → 满足公式描述要求）
@@ -544,6 +549,64 @@ def test_bypass4_plus_partial_count_old_passes_new_rejects():
     )
 
 
+def test_bypass5_bu_neng_di_yu_15pct_old_passes_new_rejects():
+    """验门人绕过 #5（WS-117 round-3 实测）：'不能低于 15%' 绕过旧 oracle 但被新 oracle 拒绝。
+
+    旧 oracle 未覆盖'不能低于/不低于 + 15%/15个点'等否定式阈值表达 → 判 PASS（漏洞）。
+    新 oracle 新增 '不能?低于 15%' 等模式 → 拒绝（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率不能低于 15%，低于要备注；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+        "plus 折扣不计入采购绩效。"
+    )
+    # Step A：旧 oracle 对此绕过样例判 PASS（漏洞存在）
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A fail-then-pass：旧 oracle 应对'不能低于 15%'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    # Step B：新 oracle 拒绝此绕过样例（漏洞已堵）
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'不能低于 15%'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), (
+        f"new_fails 应提及 15% 口径，实际: {new_fails}"
+    )
+
+
+def test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects():
+    """验门人绕过 #6（WS-117 round-3 实测）：'最低要 15 个点才算过线' 绕过旧 oracle。
+
+    旧 oracle 只识别 '%' 后缀的 15，不识别 '15 个点'（百分点表达）→ 判 PASS（漏洞）。
+    新 oracle 新增 '最低 15 个点' / '15 个点 才算过线' 等模式 → 拒绝（堵住）。
+    """
+    bypass_reply = (
+        "采购议价率最低要 15 个点才算过线；"
+        "采购议价率 = 议价差额 ÷ (1688采购标准价 + 头程运费分摊) × 100%。"
+        "阈值：3% 不合格，6% 正常。"
+        "plus 折扣不计入采购绩效。"
+    )
+    # Step A：旧 oracle 对此绕过样例判 PASS（漏洞存在）
+    old_passed = _old_oracle_bypass_check(bypass_reply)
+    assert old_passed, (
+        "Step A fail-then-pass：旧 oracle 应对'最低要 15 个点才算过线'绕过样例判 PASS，"
+        "此处失败说明旧 oracle 或样例有误"
+    )
+    # Step B：新 oracle 拒绝此绕过样例（漏洞已堵）
+    new_passed, new_fails = _t48_content_oracle(bypass_reply)
+    assert not new_passed, (
+        "Step B：新 oracle 应拒绝'最低要 15 个点才算过线'绕过样例，"
+        f"但 passed=True；new_fails={new_fails}"
+    )
+    assert any("15" in f for f in new_fails), (
+        f"new_fails 应提及 15% 口径，实际: {new_fails}"
+    )
+
+
 # ── 规则源接线验证（Option A：可审计规则文件）──────────────────────────────────
 
 def test_rules_file_procurement_rate_spec():
@@ -682,6 +745,10 @@ if __name__ == "__main__":
          test_bypass3_gaoshang_15pct_dazhun_old_passes_new_rejects),
         ("test_bypass4_plus_partial_count_old_passes_new_rejects",
          test_bypass4_plus_partial_count_old_passes_new_rejects),
+        ("test_bypass5_bu_neng_di_yu_15pct_old_passes_new_rejects",
+         test_bypass5_bu_neng_di_yu_15pct_old_passes_new_rejects),
+        ("test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects",
+         test_bypass6_zuidi_15_ge_dian_old_passes_new_rejects),
         ("test_rules_file_procurement_rate_spec",
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
