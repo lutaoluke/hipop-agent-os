@@ -302,15 +302,22 @@ CASES: List[Case] = [
 
 
 # ── runner ────────────────────────────────────────────────
+def _auth_headers() -> dict:
+    token = os.environ.get("HIPOP_AUTH_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
     body = json.dumps({
         "messages": [{"role": "user", "content": question}],
         "scope": {"store": store},
     }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_headers())
     req = urllib.request.Request(
         f"{base_url}/api/chat",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -372,7 +379,10 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
     切页面时 chat panel init() 会拿这个 endpoint；它一旦 500，整个 chat panel
     Alpine init 抛错，前端表现为'切页面无法继承聊天记录'。返回 None 为通过。"""
     for store in ("ksa", "uae"):
-        req = urllib.request.Request(f"{base_url}/api/chat-history/{store}?limit=3")
+        req = urllib.request.Request(
+            f"{base_url}/api/chat-history/{store}?limit=3",
+            headers=_auth_headers(),
+        )
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())

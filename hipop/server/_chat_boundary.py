@@ -51,6 +51,8 @@ TASK_DONE_TOOLS: frozenset = frozenset({
     "task_status_readback",
     "check_workflow_status",
     "get_task_status",
+    "get_task_with_events",
+    "api_task_status",
 })
 
 _TASK_DONE_STATUSES: frozenset = frozenset({
@@ -58,10 +60,14 @@ _TASK_DONE_STATUSES: frozenset = frozenset({
 })
 
 # Completion/refresh claim patterns that require task-done evidence.
-# Covers 已刷新/已经刷新/已更新; colloquial 完成了/好了/完了/处理好了 variants.
-_RESULT_TAIL_RE = r"(?:完成了?|成功了?|好了|完了|弄好了|搞定了|处理好了|行了)"
+# Covers 已刷新/已经刷新/已更新; colloquial 完成了/结束了/完毕/处理完 variants.
+_RESULT_TAIL_RE = (
+    r"(?:完成了?|成功了?|好了|完(?:了)?|完毕|结束了|弄好了|搞定了|"
+    r"处理好了|处理完(?:了)?|做好了|做完(?:了)?|跑好了|跑完(?:了)?|行了)"
+)
 _TASK_RESULT_TAIL_RE = (
-    r"(?:已?(?:跑完|完成|成功)(?:了)?|跑好了|处理好了|弄好了|搞定了|完了|行了)"
+    r"(?:已?(?:跑完|完成|成功|结束)(?:了)?|跑好了|跑完(?:了)?|处理好了|"
+    r"处理完(?:了)?|弄好了|搞定了|做好了|做完(?:了)?|完(?:了)?|完毕|结束了|行了)"
 )
 _COMPLETION_BYPASS_RE = re.compile(
     r"(数据.{0,8}已经?(?:刷新|更新)"        # 数据已刷新/已更新/已经刷新/已经更新
@@ -70,10 +76,10 @@ _COMPLETION_BYPASS_RE = re.compile(
     r"|已经?(?:刷新|更新|同步).{0,8}(?:完成|成功|好了|完了)"  # 已(经)刷新/更新/同步…完成/好了
     r"|(?:刷新|更新|同步).{0,5}(?:已完成|好了|完了|弄好了|搞定了)"  # 刷新/更新/同步已完成/好了
     r"|(?:数据|库存|销量).{0,10}(?:刷新|更新|同步).{0,5}(?:好了|完了|弄好了|搞定了)"  # 数据刷新好了
-    rf"|(?:数据|库存|销量).{{0,10}}(?:刷新|更新|同步|重算).{{0,8}}{_RESULT_TAIL_RE}"
-    rf"|(?:刷新|更新|同步|重算).{{0,8}}{_RESULT_TAIL_RE}"
+    rf"|(?:数据|库存|销量).{{0,10}}(?:刷新|更新|同步|重算|处理).{{0,8}}{_RESULT_TAIL_RE}"
+    rf"|(?:刷新|更新|同步|重算|处理).{{0,8}}{_RESULT_TAIL_RE}"
     rf"|(?:任务|后台任务|工作流).{{0,10}}{_TASK_RESULT_TAIL_RE}"
-    r"|(?:处理好了|搞定了)"                # bare "处理好了/搞定了" is still a task completion claim
+    r"|(?:处理好了|处理完(?:了)?|搞定了)"  # bare "处理好了/处理完/搞定了" is still a completion claim
     r"|工作流.{0,10}已完成"
     r"|后台任务.{0,10}已完成"
     r"|任务已(?:跑完|完成|成功)"
@@ -100,20 +106,46 @@ def classify_evidence(tool_log: list) -> EvidenceClass:
     return EvidenceClass.NONE
 
 
+def _iter_status_values(entry: dict):
+    """Yield explicit status/state values from supported task readback payloads."""
+    candidates = [
+        entry.get("status"),
+        entry.get("state"),
+    ]
+
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    candidates.extend([result.get("status"), result.get("state")])
+
+    for source in (entry, result):
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        candidates.extend([task.get("status"), task.get("state")])
+        events = source.get("events") if isinstance(source.get("events"), list) else []
+        for event in events:
+            if isinstance(event, dict):
+                candidates.extend([event.get("status"), event.get("state")])
+
+    for value in candidates:
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text:
+            yield text
+
+
 def _has_task_done_evidence(tool_log: list) -> bool:
     """Return True if tool_log contains explicit task-completion evidence.
 
     Looks for task_result / task_status_readback / check_workflow_status /
-    get_task_status entries whose result.status or top-level status is done/success.
+    get_task_status / get_task_with_events entries whose task state, event status,
+    result.status, or top-level status is done/success.
 
     run_workflow alone is NOT sufficient — it only proves task creation/trigger.
+    Provider summaries that only contain result_keys are also NOT sufficient.
     """
     for t in (tool_log or []):
         if t.get("name") not in TASK_DONE_TOOLS:
             continue
-        result = t.get("result") or {}
-        status = (result.get("status") or t.get("status") or "").lower()
-        if status in _TASK_DONE_STATUSES:
+        if any(status in _TASK_DONE_STATUSES for status in _iter_status_values(t)):
             return True
     return False
 
