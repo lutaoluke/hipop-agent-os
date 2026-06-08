@@ -496,6 +496,73 @@ def test_classify_task_done_running_still_workflow_trigger():
     )
 
 
+# ── Round-4 fail-then-pass: 口语化 好了/完了/弄好了/搞定了 变体 ──────────────────
+
+def test_bypass_data_refresh_hao_le_run_workflow_only():
+    """红队 round-4 probe #1：'数据刷新好了' + run_workflow only → warns。
+
+    FAIL（修前）：_COMPLETION_BYPASS_RE 无"刷新好了"分支（无"已"前缀）→ warns=[]。
+    PASS（修后）：(?:数据|库存|销量).{0,10}(?:刷新|更新|同步).{0,5}(?:好了|...) 命中 → warns。
+    """
+    warns = check_task_completion_bypass("数据刷新好了。", [{"name": "run_workflow"}])
+    assert warns, "round-4 probe #1 FAIL：'数据刷新好了' run_workflow only → warns=[]"
+
+
+def test_bypass_kucu_update_hao_le_run_workflow_only():
+    """红队 round-4 probe #2：'库存更新好了' + run_workflow only → warns。
+
+    FAIL（修前）：_COMPLETION_BYPASS_RE 无"更新好了"（无"已"前缀）分支 → warns=[]。
+    PASS（修后）：模式命中 → warns 非空。
+    """
+    warns = check_task_completion_bypass("库存更新好了。", [{"name": "run_workflow"}])
+    assert warns, "round-4 probe #2 FAIL：'库存更新好了' run_workflow only → warns=[]"
+
+
+def test_bypass_flush_hao_le_run_workflow_only():
+    """红队 round-4：'刷新好了' + run_workflow only → warns（动词好了变体）。"""
+    warns = check_task_completion_bypass("刷新好了。", [{"name": "run_workflow"}])
+    assert warns, "round-4 FAIL：'刷新好了' run_workflow only → warns=[]"
+
+
+def test_bypass_sync_hao_le_run_workflow_only():
+    """'同步好了' + run_workflow only → warns。"""
+    warns = check_task_completion_bypass("同步好了，你可以查了。", [{"name": "run_workflow"}])
+    assert warns, "'同步好了' run_workflow only → warns=[]"
+
+
+def test_sanitize_reply_data_refresh_hao_le():
+    """sanitize_reply 整合：run_workflow 单独时'数据刷新好了' → banner（probe #1）。"""
+    from hipop.server._safety import sanitize_reply
+
+    _, warns = sanitize_reply(
+        "数据刷新好了。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow"}],
+    )
+    assert warns, "sanitize_reply probe #1 FAIL：'数据刷新好了' run_workflow only → warns=[]"
+
+
+def test_sanitize_reply_kucu_update_hao_le():
+    """sanitize_reply 整合：run_workflow 单独时'库存更新好了' → banner（probe #2）。"""
+    from hipop.server._safety import sanitize_reply
+
+    _, warns = sanitize_reply(
+        "库存更新好了。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow"}],
+    )
+    assert warns, "sanitize_reply probe #2 FAIL：'库存更新好了' run_workflow only → warns=[]"
+
+
+def test_no_false_positive_hao_le_query_only():
+    """口语化"查好了"不被误判为任务完成声明（QUERY 路径）。"""
+    warns = check_task_completion_bypass(
+        "数据拉好了，共 50 行。",
+        [{"name": "query_sku"}],
+    )
+    assert not warns, f"误报：'数据拉好了' 不应触发完成声明拦截，实得 warns={warns}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -516,7 +583,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 3)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 4)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -596,6 +663,21 @@ if __name__ == "__main__":
          test_classify_task_readback_beats_workflow_trigger),
         ("test_classify_task_done_running_still_workflow_trigger",
          test_classify_task_done_running_still_workflow_trigger),
+        # Round-4 fail-then-pass: 口语化 好了/完了/弄好了/搞定了 变体
+        ("test_bypass_data_refresh_hao_le_run_workflow_only",
+         test_bypass_data_refresh_hao_le_run_workflow_only),
+        ("test_bypass_kucu_update_hao_le_run_workflow_only",
+         test_bypass_kucu_update_hao_le_run_workflow_only),
+        ("test_bypass_flush_hao_le_run_workflow_only",
+         test_bypass_flush_hao_le_run_workflow_only),
+        ("test_bypass_sync_hao_le_run_workflow_only",
+         test_bypass_sync_hao_le_run_workflow_only),
+        ("test_sanitize_reply_data_refresh_hao_le",
+         test_sanitize_reply_data_refresh_hao_le),
+        ("test_sanitize_reply_kucu_update_hao_le",
+         test_sanitize_reply_kucu_update_hao_le),
+        ("test_no_false_positive_hao_le_query_only",
+         test_no_false_positive_hao_le_query_only),
     ]
 
     failed = 0
