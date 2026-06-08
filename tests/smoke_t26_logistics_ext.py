@@ -118,6 +118,20 @@ def test_t26ext_lowercase_tracking_fake_query_blocked():
         f"'正在查 tracking 号' 应被拦截: {out[:200]}"
 
 
+def test_t26ext_uppercase_tracking_fake_query_blocked():
+    """Rule E: 全大写 TRACKING 假查话术必须被拦截（fail-then-pass: re.IGNORECASE 前漏）。"""
+    from hipop.server._safety import sanitize_reply
+    for phrase in [
+        "正在查 TRACKING 号。",
+        "我来查 TRACKING 物流状态，请稍等。",
+    ]:
+        out, warns = sanitize_reply(phrase, tools_used=[], tool_log=[])
+        assert any("T26-ext 跟踪号" in w for w in warns), \
+            f"全大写 TRACKING 假查应触发 T26-ext 跟踪号警告 ('{phrase}'): {warns}"
+        assert "被 _safety 拦掉" in out, \
+            f"全大写 TRACKING 假查应被拦截 ('{phrase}'): {out[:200]}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -129,6 +143,7 @@ if __name__ == "__main__":
         test_t26ext_tracking_safety_no_false_positive_when_tool_called,
         test_t26ext_lowercase_sku_fake_query_blocked,
         test_t26ext_lowercase_tracking_fake_query_blocked,
+        test_t26ext_uppercase_tracking_fake_query_blocked,
     ]
     failed = 0
     for t in tests:

@@ -525,15 +525,16 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         )
 
     # Rule E: 没调任何物流查询工具却说"我来查跟踪号" — 假称在查，直接删句
-    # 同时覆盖中文"跟踪号"和英文 tracking/TRACKING 变体
+    # re.IGNORECASE 覆盖 tracking/TRACKING/Tracking 等大小写变体（同 Rule C 做法）
     pretend_tracking_query = re.search(
         r"(我.{0,6}来.{0,6}查.{0,15}跟踪.{0,5}(号|状态|物流)"
         r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
         r"|帮.{0,5}查.{0,15}跟踪号"
         r"|让我.{0,5}查.{0,10}跟踪号"
-        r"|我来查.{0,10}[Tt]racking"
-        r"|正在查.{0,10}[Tt]racking)",
+        r"|我来查.{0,10}tracking"
+        r"|正在查.{0,10}tracking)",
         reply,
+        re.IGNORECASE,
     )
     if pretend_tracking_query and "query_order_live" not in tools_used and "query_sku_live" not in tools_used:
         warnings.append(
@@ -546,9 +547,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             r"|正在查.{0,10}跟踪.{0,5}(号|状态|物流)"
             r"|帮.{0,5}查.{0,15}跟踪号"
             r"|让我.{0,5}查.{0,10}跟踪号"
-            r"|我来查.{0,10}[Tt]racking"
-            r"|正在查.{0,10}[Tt]racking"
+            r"|我来查.{0,10}tracking"
+            r"|正在查.{0,10}tracking"
             r")[^。\n!?]*[。!?]?",
+            re.IGNORECASE,
         )
         reply = sentence_pat_tracking.sub(
             "[⚠️ 被 _safety 拦掉：未调物流查询工具，不许假称正在查跟踪号] ",
