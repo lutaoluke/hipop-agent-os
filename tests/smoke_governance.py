@@ -56,6 +56,55 @@ def test_governance_registry_has_destructive_tools():
         "query_sku 是 read-only，不应进 governance"
 
 
+def test_medium_risk_decide_allows_without_api_key():
+    """medium-risk decide() 必须在无 LLM API key 的环境下返回 Allow。
+
+    FAIL（修前）：decide() 调 _decide_with_llm → DEEPSEEK_API_KEY 缺失 → RuntimeError
+                 → Decision(kind="Deny") → run_workflow 被静默拦截，UI 显示「工作流触发失败。」
+    PASS（修后）：medium-risk 走确定性路径，直接 Allow，不调 LLM。
+
+    根因背景：governance 规格明确"medium 默认 Allow"，concurrent_running / 目标错误
+    已在 deterministic 前置层处理，LLM 裁决对 medium 是冗余的 + 引入环境依赖。
+    """
+    import dataclasses
+    from hipop.server import governance
+    from hipop.server.governance import ActionProposal, Decision
+
+    import time
+    proposal = ActionProposal(
+        proposal_id="smoke_medium_decide_test",
+        tool_name="run_workflow",
+        risk_level="medium",
+        raw_args={"workflow": "wf3_logistics_v2"},
+        bound_args={"workflow": "wf3_logistics_v2"},
+        target_object={
+            "table": "tasks",
+            "identifier": {"workflow": "wf3_logistics_v2", "tenant_id": 1},
+            "current_state": {"concurrent_running": []},
+        },
+        actor={"role": "ops", "tenant_id": 1, "source": "smoke_test"},
+        expected_effects=["triggers background task"],
+        decision_context={},
+        spec={"risk_level": "medium"},
+        created_at=time.time(),
+    )
+
+    saved = {}
+    for k in ("ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "DECISION_MODEL"):
+        saved[k] = os.environ.pop(k, None)
+    try:
+        result = governance.decide(proposal)
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    assert result.kind == "Allow", (
+        f"medium-risk decide() 在无 API key 时应返回 Allow，实际: {result.kind} — {result.reason}\n"
+        f"(FAIL 期望: Deny；PASS 期望: Allow)"
+    )
+
+
 def test_destructive_tool_goes_through_governance_pipeline():
     """端到端：高风险 tool 必须经 governance pipeline，不能裸跑。
 
@@ -91,6 +140,7 @@ if __name__ == "__main__":
         test_provider_files_have_no_local_exec_tool,
         test_agent_exec_tool_has_governance_dispatch,
         test_governance_registry_has_destructive_tools,
+        test_medium_risk_decide_allows_without_api_key,
         test_destructive_tool_goes_through_governance_pipeline,
     ]
     failed = 0

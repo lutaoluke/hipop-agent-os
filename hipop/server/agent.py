@@ -52,6 +52,7 @@ sys.path.insert(0, HIPOP_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
 from . import data as _data
+from ._workflow_reply import _workflow_receipt_reply
 
 import anthropic
 from . import _auth
@@ -1868,17 +1869,19 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         tool_result = _exec_tool("run_workflow", tool_args, user=scope)
         workflow_task = None
         if isinstance(tool_result, dict) and tool_result.get("ok"):
+            task_id = tool_result["task_id"]
             workflow_task = {
-                "task_id": tool_result["task_id"],
+                "task_id": task_id,
                 "workflow": tool_result["workflow"],
                 "label": tool_result["label"],
                 "total_steps": tool_result["total_steps"],
                 "affected_modules": tool_result["affected_modules"],
                 "followup_prompt": tool_result.get("followup_prompt"),
             }
-            reply = (
-                f"已触发{direct_workflow['label']}（{direct_workflow['workflow']}）。"
-                "跑完后我会按你的原问题继续回答。"
+            # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
+            # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
+            reply = _workflow_receipt_reply(
+                task_id, tool_result["workflow"], direct_workflow["label"]
             )
         else:
             reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
