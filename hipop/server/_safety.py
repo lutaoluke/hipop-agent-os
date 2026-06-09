@@ -473,6 +473,22 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "这是 T38 禁止的假任务启动证据"
         )
 
+    # Chat 没有人类可依赖的"稍后自动回来通知/答复"承诺；任务进度只能看任务面板，
+    # 或在完成后由用户重新提问。即使本轮真的调了 run_workflow，也不能把异步
+    # follow-up 说成 Agent 会主动回来。
+    auto_callback_promise = re.search(
+        r"((?:跑完|完成后|结束后|任务完成后|处理完)[^。\n!?]{0,18}"
+        r"(?:自动)?(?:回来|通知|告诉|答复|回复|回报|继续回答|接续答)"
+        r"|自动[^。\n!?]{0,8}(?:回来|通知|告诉|答复|回复|回报)"
+        r"|(?:我会|系统会)[^。\n!?]{0,12}(?:回来|通知|告诉|答复|回复|回报))",
+        reply,
+    )
+    if auto_callback_promise:
+        warnings.append(
+            "⚠️ Agent 承诺任务完成后自动回报/通知/答复，但 chat 不保证主动回调；"
+            "应让用户查看任务面板，完成后需要时再重试或重新提问"
+        )
+
     # 新型撒谎模式：用过去时编"任务还在跑、等 ingest 完" 绕开上面的 hook
     pretend_running = re.search(
         r"(之前触发.{0,20}(任务|物流|ingest).{0,20}(没|还在|跑完)|"

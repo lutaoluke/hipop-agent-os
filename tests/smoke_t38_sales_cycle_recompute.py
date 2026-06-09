@@ -291,6 +291,23 @@ def test_t38_safety_sse_will_push_progress_caught():
     print(f"    'SSE 将推送进度' 已被拦截: {warns[0][:60]}…")
 
 
+def test_t38_safety_auto_callback_promise_caught():
+    """验门人 round-4 gap: chat 不得承诺工作流跑完后自动回来通知/答复。
+
+    FAIL (before fix): 有真实 run_workflow 时，"跑完后会自动回来告诉你" 不报警。
+    PASS (after fix):  自动回报承诺独立报警；任务进度只能让用户看任务面板/重试。
+    """
+    _, warns = _safety.sanitize_reply(
+        "已启动 wf6_alerts_v2，跑完后会自动回来告诉你结果。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow", "task_id": "ab123456"}],
+    )
+    assert any("自动" in w and ("回" in w or "通知" in w or "答复" in w) for w in warns), (
+        f"自动回报承诺未被 _safety 拦截: {warns}"
+    )
+    print(f"    自动回报承诺已被拦截: {warns[0][:60]}…")
+
+
 def test_t38_safety_accepted_real_workflow_passes():
     """'accepted' + 真实 run_workflow 不被误拦。"""
     _, warns = _safety.sanitize_reply(
@@ -433,6 +450,58 @@ def test_t38_chat_e2e_duplicate_running_returns_real_existing_task():
     print(f"    E2E duplicate: existing workflow_task.task_id={wt['task_id']}")
 
 
+def test_t38_alert_count_query_uses_scope_overview_not_workflow():
+    """Round-5: '红色告警有几个' 是纯查询，必须只读 scope_overview，禁止 run_workflow。
+
+    FAIL (before fix): 问题落到 LLM；红队 stub 模拟它选择 data_health_check + run_workflow，
+    并承诺"跑完后会自动回来告诉你"。
+    PASS (after fix):  chat() 在 provider 前确定性路由到 scope_overview，返回真实红色告警数。
+    """
+    def fake_exec(name: str, args: dict, user: dict = None):
+        if name == "scope_overview":
+            return {
+                "store": args.get("store", "KSA"),
+                "sku_count": 2091,
+                "alerts_red": 2,
+                "alerts_pending": 5,
+                "references": [{"table": "wf6_logistics_alerts_v2", "where": "tenant_id=1 AND ops_status='待处理'"}],
+            }
+        return {"ok": True, "task_id": "badc0ffe", "workflow": args.get("workflow", name)}
+
+    provider_bad = {
+        "reply": "红色告警数据较旧，我已启动 wf6_alerts_v2，跑完后会自动回来告诉你。",
+        "tool_log": [
+            {"name": "data_health_check", "args": {"store": "KSA"}},
+            {"name": "run_workflow", "args": {"workflow": "wf6_alerts_v2"}, "task_id": "badc0ffe"},
+        ],
+        "refs_collected": [],
+        "workflow_task": {
+            "task_id": "badc0ffe",
+            "workflow": "wf6_alerts_v2",
+            "label": "物流告警生成",
+            "total_steps": 1,
+            "affected_modules": ["logistics"],
+            "followup_prompt": "红色告警有几个",
+        },
+    }
+
+    with patch.object(_agent, "_exec_tool", side_effect=fake_exec), \
+         patch.object(_prov, "chat_with_tools", return_value=provider_bad), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat([{"role": "user", "content": "红色告警有几个"}], _SCOPE)
+
+    tools = result.get("tools_used") or []
+    reply = result.get("reply") or ""
+    assert tools == ["scope_overview"], f"纯告警数量查询必须只用 scope_overview，实际 tools={tools}"
+    assert result.get("workflow_task") is None, f"纯查询不应创建 workflow_task: {result.get('workflow_task')!r}"
+    assert "run_workflow" not in tools, f"纯查询不应触发 run_workflow: {tools}"
+    assert re.search(r"\b2\b", reply), f"回复必须含真实红色告警数 2: {reply!r}"
+    assert not re.search(r"自动.{0,8}(回来|通知|答复|回报)|跑完后.{0,12}(告诉|通知|答复)", reply), (
+        f"回复不应承诺自动回报: {reply!r}"
+    )
+    print(f"    红色告警数量查询只读 scope_overview: {reply!r}")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────────────────────────────────
@@ -460,6 +529,7 @@ if __name__ == "__main__":
         test_t38_safety_current_status_accepted_caught,
         test_t38_safety_sse_progress_caught,
         test_t38_safety_sse_will_push_progress_caught,
+        test_t38_safety_auto_callback_promise_caught,
         test_t38_safety_accepted_real_workflow_passes,
         # 两态失败表达
         test_t38_failure_reply_has_no_fake_task_id,
@@ -467,6 +537,7 @@ if __name__ == "__main__":
         test_t38_chat_e2e_workflow_task_has_real_task_id,
         test_t38_chat_e2e_failure_has_no_fake_task_id,
         test_t38_chat_e2e_duplicate_running_returns_real_existing_task,
+        test_t38_alert_count_query_uses_scope_overview_not_workflow,
     ]
     failed = 0
     for t in tests:

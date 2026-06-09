@@ -1100,9 +1100,8 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         "affected_modules": affected,
         "followup_prompt": followup_prompt or None,
         "hint": (
-            f"已启动后台任务 {task_id}（{label}），前端将订阅 SSE 推送进度，"
-            f"完成后自动刷新 {affected}。"
-            + (f" 跑完后会自动重发『{followup_prompt}』给你接续答用户。" if followup_prompt else "")
+            f"已创建后台任务 {task_id}（{label}）。"
+            f"请在工作台任务面板查看进度；影响模块：{affected}。"
         ),
     }
 
@@ -2252,6 +2251,41 @@ def _current_workflow_task(workflow: str) -> Optional[dict]:
     return dict(rows[0]) if rows else None
 
 
+_READONLY_REFRESH_VERB_RE = re.compile(
+    r"刷新|同步|重算|跑一下|拉一下|扫|刷一下|重跑|重新计算|生成|创建|启动|触发|更新"
+)
+_ALERT_COUNT_QUERY_RE = re.compile(
+    r"(?:红色告警|告警)[^。\n!?]{0,12}(?:几个|多少|数量|数|总数)"
+    r"|(?:几个|多少|数量|总数)[^。\n!?]{0,12}(?:红色告警|告警)"
+)
+
+
+def _deterministic_readonly_request(question: str) -> Optional[Dict[str, Any]]:
+    """Pure read-only chat intents that must not be upgraded into run_workflow."""
+    q = (question or "").strip().lower()
+    if not q or _READONLY_REFRESH_VERB_RE.search(q):
+        return None
+    if _ALERT_COUNT_QUERY_RE.search(q):
+        return {"tool": "scope_overview", "intent": "alert_count"}
+    return None
+
+
+def _deterministic_readonly_reply(intent: str, tool_result: dict, store: str) -> str:
+    if not isinstance(tool_result, dict) or tool_result.get("error"):
+        reason = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "查询失败"
+        return f"本轮没有查到红色告警数量：{reason}。请稍后重试。"
+
+    if intent == "alert_count":
+        red = tool_result.get("alerts_red")
+        pending = tool_result.get("alerts_pending")
+        if red is None:
+            return "本轮没有查到红色告警数量：scope_overview 未返回告警数。请稍后重试。"
+        suffix = f"，待处理告警 {pending} 个" if pending is not None else ""
+        return f"{store.upper()} 当前红色告警 {red} 个{suffix}。"
+
+    return "本轮查询已完成。"
+
+
 _RUNNING_WORKFLOW_TASK_RE = re.compile(
     r"已有运行中实例:\s*\[\s*['\"]?([0-9a-fA-F]{8})"
 )
@@ -2324,6 +2358,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_export_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_readonly = _deterministic_readonly_request(question)
+    if direct_readonly:
+        store = (scope.get("store") or "KSA").upper()
+        tool_args = {"store": store}
+        tool_result = _exec_tool(direct_readonly["tool"], tool_args, user=scope)
+        reply = _deterministic_readonly_reply(
+            direct_readonly["intent"], tool_result or {}, store
+        )
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": [direct_readonly["tool"]],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_readonly_router",
             "hallucination_warnings": None,
         }
 
