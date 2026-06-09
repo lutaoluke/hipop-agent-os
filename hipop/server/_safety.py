@@ -916,6 +916,105 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             reply,
         )
 
+    # ── WS-133 全局禁编门：实时源失败 / 工作流失败 必须明说原因 ──────────────────────
+
+    # Rule F: query_order_live 返回 erp_login_failed_no_cache（ERP 登录失败，单货单无缓存）
+    # reply 必须说明 ERP 失败和无缓存；否则用户以为可以稍等，实际上根本没数据。
+    order_erp_login_failed = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "erp_login_failed_no_cache"
+    ]
+    if order_erp_login_failed and not re.search(
+        r"(ERP.{0,10}(失败|登录|无法)|实时.{0,5}失败|登录.{0,5}失败|查询失败|无缓存|没有缓存|暂时无法)",
+        reply,
+    ):
+        order_nos = [_get_tool_arg(t, "order_no") for t in order_erp_login_failed]
+        order_str = "、".join(filter(None, order_nos)) or "该货单"
+        erp_fail_prefix = (
+            f"**ERP 实时查询失败（{order_str}）**：ERP 登录失败，单货单查询无缓存兜底。"
+            "请稍后重试，或改用 query_sku_live 查 SKU 级缓存。\n\n"
+        )
+        reply = erp_fail_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live({order_str}) 返回 erp_login_failed_no_cache，"
+            "回复未说明 ERP 失败和无缓存，已自动补充（WS-133 Rule F）"
+        )
+
+    # Rule G: query_sku_live 返回实时失败 + 回退缓存（result_keys 含 live_query_failed_reason）
+    # reply 必须告知用户数据来自 wf3 缓存，不是实时；否则用户误以为是实时数据。
+    sku_live_failed_cache = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_sku_live"
+        and "live_query_failed_reason" in (t.get("result_keys") or [])
+    ]
+    if sku_live_failed_cache and not re.search(
+        r"(ERP.{0,10}失败|实时.{0,10}失败|缓存.{0,5}数据|wf3.{0,5}缓存|非实时|来自.{0,5}缓存"
+        r"|登录.{0,5}失败|实时拉失败|缓存版本)",
+        reply,
+    ):
+        sku_strs = [_get_tool_arg(t, "sku") for t in sku_live_failed_cache]
+        sku_str = "、".join(filter(None, sku_strs)) or "该 SKU"
+        live_fail_prefix = (
+            f"**⚠️ {sku_str} ERP 实时查询失败，以下数据来自 wf3 缓存（非实时）**："
+            "ERP 登录失败，已回退到缓存数据。若需准确实时数据请稍后重试。\n\n"
+        )
+        reply = live_fail_prefix + reply
+        warnings.append(
+            f"⚠️ query_sku_live({sku_str}) ERP 实时失败（live_query_failed_reason），"
+            "回复未标注为缓存数据，已自动补充（WS-133 Rule G）"
+        )
+
+    # Rule H: query_sku_live 或 query_order_live 返回 erp_fetch_error（网络/接口异常）
+    # reply 必须说明查询失败；否则 Agent 可能用旧数据或编默认值。
+    erp_fetch_errors = [
+        t for t in (tool_log or [])
+        if t.get("name") in ("query_sku_live", "query_order_live")
+        and (t.get("result_error") or "").startswith("erp_fetch_error")
+    ]
+    if erp_fetch_errors and not re.search(
+        r"(查询失败|ERP.{0,5}(失败|异常)|实时.{0,5}失败|获取失败|抓取失败|接口.{0,5}失败"
+        r"|网络.{0,5}(错误|异常)|请求失败|暂时无法.{0,5}(查|获取)|无法查询)",
+        reply,
+    ):
+        items = [
+            _get_tool_arg(t, "order_no") or _get_tool_arg(t, "sku")
+            for t in erp_fetch_errors
+        ]
+        item_str = "、".join(filter(None, items)) or "该查询"
+        fetch_fail_prefix = (
+            f"**ERP 查询异常（{item_str}）**：实时接口请求失败，当前无法获取数据。"
+            "请稍后重试。\n\n"
+        )
+        reply = fetch_fail_prefix + reply
+        warnings.append(
+            f"⚠️ ERP 查询异常 erp_fetch_error（{item_str}），"
+            "回复未说明失败原因，已自动补充（WS-133 Rule H）"
+        )
+
+    # Rule I: run_workflow 被调用但返回 ok=False（工作流创建失败），
+    # reply 不得宣称"已触发/任务已创建/已启动" — 这是假成功声明。
+    # 注意：仅在 run_workflow 有 result_error 时才检查（ok=True 时 result_error=None）。
+    wf_failed_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "run_workflow"
+        and t.get("result_error")  # ok=False → result dict 有 "error" key
+    ]
+    _WF_SUCCESS_CLAIM_RE = re.compile(
+        r"(已触发|已启动|已开始|任务已.{0,5}(创建|提交|启动|运行)|"
+        r"已为.{0,5}(你|您).{0,5}触发|系统已经在.{0,5}后台|后台.{0,5}(跑|运行)了)"
+    )
+    if wf_failed_entries and _WF_SUCCESS_CLAIM_RE.search(reply) and not re.search(
+        r"(失败|失败了|未能|无法触发|创建失败|启动失败|触发失败|工作流.{0,10}(失败|错误))",
+        reply,
+    ):
+        wf_names = [_get_tool_arg(t, "workflow") for t in wf_failed_entries]
+        wf_str = "、".join(filter(None, wf_names)) or "工作流"
+        warnings.append(
+            f"⚠️ run_workflow({wf_str}) 返回失败（{wf_failed_entries[0].get('result_error', '')[:60]}），"
+            "但回复宣称已触发/已启动 — 这是假成功声明（WS-133 Rule I）"
+        )
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"
