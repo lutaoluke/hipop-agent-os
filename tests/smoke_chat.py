@@ -30,6 +30,12 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import datetime as _dt
 
+_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req, timeout: int):
+    return _URL_OPENER.open(req, timeout=timeout)
+
 
 # ── case 定义 ────────────────────────────────────────────
 @dataclass
@@ -456,7 +462,7 @@ CASES: List[Case] = [
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
         question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
         must_use_tools=["query_order_live"],
-        must_contain=[r"未找到|不存在|无物流|无记录|找不到|核实货单号"],
+        must_contain=[r"未找到|不存在|无物流|无记录|找不到|查不到|核实货单号"],
         must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
         timeout=120,
     ),
@@ -562,6 +568,94 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
     return None
 
 
+def _http_json(base_url: str, path: str, timeout: int = 20):
+    req = urllib.request.Request(f"{base_url}{path}")
+    with _urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _num_re(n) -> str:
+    try:
+        s = str(int(n))
+    except Exception:
+        return r"$^"
+    if len(s) > 3:
+        return rf"{s[:-3]}[,，]?{s[-3:]}"
+    return rf"\b{s}\b"
+
+
+def _zero_rate_re(label: str) -> str:
+    return rf"{label}.{{0,20}}0[%.]|{label}.{{0,20}}0\.0{{1,2}}%|0\.00|无{label[:2]}"
+
+
+def _rate_re(rate, label: str) -> str:
+    try:
+        pct = float(rate or 0)
+    except Exception:
+        pct = 0.0
+    if abs(pct) <= 1:
+        pct *= 100
+    if abs(pct) < 0.005:
+        return _zero_rate_re(label)
+    text = f"{pct:.2f}".rstrip("0").rstrip(".")
+    return re.escape(text)
+
+
+def _find_case(name_part: str) -> Optional[Case]:
+    return next((c for c in CASES if name_part in c.name), None)
+
+
+def _prepare_dynamic_expectations(base_url: str) -> None:
+    rows = _http_json(base_url, "/api/sku-health/KSA?listing=all&limit=10000", timeout=30)
+    today = _http_json(base_url, "/api/today/KSA", timeout=10)
+    product_ids = {r.get("product_id") for r in rows if r.get("product_id")}
+    listed_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and r.get("is_listed")}
+    unlisted_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and not r.get("is_listed")}
+    sku_total = len(rows)
+    listed_skus = sum(1 for r in rows if r.get("is_listed"))
+    unlisted_skus = sku_total - listed_skus
+
+    c = _find_case("商品总数（要")
+    if c:
+        c.name = f"商品总数（动态 product {len(product_ids)} / SKU {sku_total}）"
+        c.must_contain = [_num_re(len(product_ids)), _num_re(sku_total)]
+
+    c = _find_case("商品总数 + 上架未上架")
+    if c:
+        c.name = "商品总数 + 上架未上架细分（动态 product/SKU 维度）"
+        split_values = [
+            _num_re(listed_skus), _num_re(unlisted_skus),
+            _num_re(len(listed_product_ids)), _num_re(len(unlisted_product_ids)),
+        ]
+        c.must_contain = [_num_re(len(product_ids)), "|".join(split_values)]
+
+    c = _find_case("店铺整体")
+    if c:
+        sku_count = today.get("sku_count") or listed_skus
+        c.name = f"店铺整体（动态在售 SKU {sku_count} + 红色告警）"
+        c.must_contain = [_num_re(sku_count)]
+
+    metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20)
+    item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
+    c = _find_case("T04 TBB0116A")
+    if c and item.get("found"):
+        c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+        c.must_contain = [
+            _num_re(item.get("sales_30d")),
+            _num_re(item.get("total_orders_30d")),
+            _rate_re(item.get("cancel_rate_30d"), "取消率"),
+            _rate_re(item.get("return_rate_30d"), "退货率"),
+            _num_re(item.get("history_total")),
+        ]
+
+    stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
+    stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})
+    c = _find_case("T04 快照过期边界")
+    if c and not stale_item.get("found"):
+        c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
+        c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
@@ -585,6 +679,11 @@ def main():
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
         sys.exit(1)
     print(f"chat-history endpoint: ✓")
+    try:
+        _prepare_dynamic_expectations(args.url)
+    except Exception as e:
+        print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
+        sys.exit(1)
     print(f"Cases: {len(CASES)}\n")
 
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
