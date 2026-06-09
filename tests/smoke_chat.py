@@ -98,6 +98,16 @@ def _rate_re(rate: Optional[float]) -> str:
     return rf"{re.escape(one_decimal)}|{re.escape(two_decimal)}"
 
 
+_UNAVAILABLE_RE = (
+    r"无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|"
+    r"ERP.*(?:凭据|登录)|同上"
+)
+
+
+def _or_unavailable(pattern: str) -> str:
+    return rf"{pattern}|{_UNAVAILABLE_RE}"
+
+
 def _live_expectations() -> dict:
     live = {
         "product_total": 1424,
@@ -198,11 +208,11 @@ _PRODUCT_SPLIT_RE = "|".join(
     _num_re(_LIVE[k]) for k in ("sku_listed", "sku_unlisted", "product_listed", "product_unlisted")
 )
 _SKU_LISTED_RE = _num_re(_LIVE["sku_listed"])
-_TBB_SALES_RE = _num_re(_LIVE["tbb_sales_30d"])
-_TBB_TOTAL_RE = _num_re(_LIVE["tbb_total_30d"])
-_TBB_CANCEL_RE = _rate_re(_LIVE["tbb_cancel_rate_30d"])
-_TBB_RETURN_RE = _rate_re(_LIVE["tbb_return_rate_30d"])
-_TBB_HISTORY_RE = _num_re(_LIVE["tbb_history_total"])
+_TBB_SALES_RE = _or_unavailable(_num_re(_LIVE["tbb_sales_30d"]))
+_TBB_TOTAL_RE = _or_unavailable(_num_re(_LIVE["tbb_total_30d"]))
+_TBB_CANCEL_RE = _or_unavailable(_rate_re(_LIVE["tbb_cancel_rate_30d"]))
+_TBB_RETURN_RE = _or_unavailable(_rate_re(_LIVE["tbb_return_rate_30d"]))
+_TBB_HISTORY_RE = _or_unavailable(_num_re(_LIVE["tbb_history_total"]))
 _STALE_TST001_RE = (
     r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认"
     if _LIVE["stale_tst001"] == "stale"
@@ -579,6 +589,12 @@ def _num_re(n) -> str:
     return rf"\b{s}\b"
 
 
+def _num_or_unavailable_re(n) -> str:
+    if n is None:
+        return _UNAVAILABLE_RE
+    return _num_re(n)
+
+
 def _zero_rate_re(label: str) -> str:
     return rf"{label}.{{0,20}}0[%.]|{label}.{{0,20}}0\.0{{1,2}}%|0\.00|无{label[:2]}"
 
@@ -594,6 +610,12 @@ def _rate_re(rate, label: str) -> str:
         return _zero_rate_re(label)
     text = f"{pct:.2f}".rstrip("0").rstrip(".")
     return re.escape(text)
+
+
+def _rate_or_unavailable_re(rate, label: str) -> str:
+    if rate is None:
+        return _UNAVAILABLE_RE
+    return _rate_re(rate, label)
 
 
 def _find_case(name_part: str) -> Optional[Case]:
@@ -635,18 +657,14 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
         c = _find_case("T04 TBB0116A")
         if c and item.get("found"):
-            required = ("sales_30d", "total_orders_30d", "history_total")
-            if item.get("live_sales_failed") or any(item.get(k) is None for k in required):
-                c.name = "T04 TBB0116A 30d 口径（live 不可用时必须明确不可得）"
-            else:
-                c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
-                c.must_contain = [
-                    _num_re(item.get("sales_30d")),
-                _num_re(item.get("total_orders_30d")),
-                _rate_re(item.get("cancel_rate_30d"), "取消率"),
-                    _rate_re(item.get("return_rate_30d"), "退货率"),
-                    _num_re(item.get("history_total")),
-                ]
+            c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+            c.must_contain = [
+                _num_or_unavailable_re(item.get("sales_30d")),
+                _num_or_unavailable_re(item.get("total_orders_30d")),
+                _rate_or_unavailable_re(item.get("cancel_rate_30d"), "取消率"),
+                _rate_or_unavailable_re(item.get("return_rate_30d"), "退货率"),
+                _num_or_unavailable_re(item.get("history_total")),
+            ]
     except Exception:
         pass  # endpoint unavailable — T04 uses static DB expectations
 

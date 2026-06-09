@@ -2519,19 +2519,15 @@ def _format_pct(value) -> str:
     return f"{pct:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_metric_value(value) -> str:
+    return "暂无数据" if value is None else str(value)
+
+
 def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
     items = (tool_result or {}).get("items") or []
     item = next((x for x in items if (x.get("sku") or "").upper() == sku.upper()), None)
     if not item or not item.get("found"):
         return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
-    if item.get("live_sales_failed") or any(
-        item.get(k) is None for k in ("sales_30d", "total_orders_30d", "history_total")
-    ):
-        msg = item.get("live_sales_message") or item.get("live_sales_error") or "实时取数不可用"
-        return (
-            f"{sku} 当前无法实时确认 30 天销量、30 天总单量和历史总销量：{msg}。"
-            "我不会用旧快照数字冒充实时口径；请刷新/恢复 ERP 实时源后再查。"
-        )
     if item.get("data_stale"):
         as_of = item.get("as_of_date") or "未知日期"
         stale_days = item.get("stale_days")
@@ -2540,9 +2536,9 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
     as_of = item.get("as_of_date") or "当前快照"
     return (
         f"{sku} 30 天口径截至 {as_of}："
-        f"30 天销量 {item.get('sales_30d')}，"
-        f"30 天总单量 {item.get('total_orders_30d')}，"
-        f"历史总销量 {item.get('history_total')}，"
+        f"30 天销量 {_format_metric_value(item.get('sales_30d'))}，"
+        f"30 天总单量 {_format_metric_value(item.get('total_orders_30d'))}，"
+        f"历史总销量 {_format_metric_value(item.get('history_total'))}，"
         f"退货率 {_format_pct(item.get('return_rate_30d'))}%，"
         f"取消率 {_format_pct(item.get('cancel_rate_30d'))}%。"
     )
