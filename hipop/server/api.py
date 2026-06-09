@@ -256,6 +256,16 @@ def api_sku_health(store: str, urgency: str = "all", limit: int = 30, listing: s
     return rows
 
 
+@router.get("/sku-metrics/{store}/{sku}")
+def api_sku_metrics(store: str, sku: str, user: dict = Depends(_auth_mod.get_current_user)):
+    """Read-only SKU metrics using the same contract as chat `query_sku`."""
+    from . import agent
+    tid = user.get("tenant_id") or 1
+    data.set_current_tenant(tid)
+    agent._chat_tenant.set(tid)
+    return agent.tool_query_sku([sku], store=store)
+
+
 @router.get("/orders/{store}")
 def api_orders(store: str, limit: int = 50):
     return data.get_orders(store, limit=limit)

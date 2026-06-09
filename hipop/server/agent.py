@@ -1994,6 +1994,187 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _deterministic_export_request(question: str) -> Optional[Dict[str, str]]:
+    q = question or ""
+    if not any(x in q for x in ("导出", "下载", "excel", "Excel", "表格", "xlsx")):
+        return None
+    view = "sales"
+    if "补货" in q:
+        view = "replenish"
+    elif "物流" in q or "货单" in q:
+        view = "logistics"
+    elif "未上架" in q:
+        view = "unlisted_with_sales"
+    return {"view": view, "filter_desc": q[:80]}
+
+
+def _deterministic_data_freshness_request(question: str) -> bool:
+    q = question or ""
+    if "数据" not in q:
+        return False
+    return any(x in q for x in (
+        "什么时候更新", "啥时候更新", "多久前", "几天前", "更新的数据",
+        "更新时间", "更新日期", "新鲜", "具体到几点",
+    ))
+
+
+def _deterministic_scope_overview_request(question: str) -> bool:
+    q = question or ""
+    if "红色告警" not in q:
+        return False
+    return any(x in q for x in ("几个", "多少", "几条", "数量", "有几"))
+
+
+def _deterministic_products_count_request(question: str) -> bool:
+    q = question or ""
+    if any(x in q for x in ("需要我关注", "哪些需要关注", "哪些要关注", "需要关注")):
+        return False
+    has_product_subject = any(x in q for x in ("商品", "产品", "SKU", "sku", "Sku", "未上架", "上架"))
+    has_count_intent = any(x in q for x in ("总共", "总数", "多少", "数量", "几个", "几款"))
+    return has_product_subject and has_count_intent
+
+
+def _fmt_int(value) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except Exception:
+        return "0"
+
+
+def _format_products_count_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 商品总数暂时不可用。"
+    products = tool_result.get("summary_products") or {}
+    skus = tool_result.get("summary_skus") or {}
+    return (
+        f"{store} 商品总数：product 维度 {_fmt_int(products.get('total'))} 个，"
+        f"SKU 维度 {_fmt_int(skus.get('total'))} 个。"
+        f"其中 product 已上架 {_fmt_int(products.get('listed'))} 个、未上架 {_fmt_int(products.get('unlisted'))} 个；"
+        f"SKU 已上架 {_fmt_int(skus.get('listed'))} 个、未上架 {_fmt_int(skus.get('unlisted'))} 个。"
+    )
+
+
+def _format_scope_overview_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 店铺概览暂时不可用。"
+    red = tool_result.get("alerts_red", 0)
+    pending = tool_result.get("alerts_pending", 0)
+    sku_count = tool_result.get("sku_count", 0)
+    return f"{store} 当前红色告警 {red} 个；待处理告警 {pending} 个；在售 SKU {sku_count} 个。"
+
+
+def _format_data_freshness_reply(store: str, tool_result: dict) -> str:
+    sources = (tool_result or {}).get("sources") or {}
+    labels = {
+        "erp_products": "ERP 商品",
+        "erp_sales": "ERP 销量",
+        "erp_stock": "ERP 库存",
+        "noon_orders": "noon 销量",
+        "noon_stock": "noon 库存",
+        "wf3_logistics": "物流",
+        "wf5_replenish": "补货建议",
+        "wf6_alerts": "物流告警",
+    }
+    rows = []
+    for key, source in sources.items():
+        latest = source.get("latest") or "无记录"
+        stale_days = source.get("stale_days")
+        if stale_days is None:
+            age = "暂无可计算天数"
+        elif stale_days <= 0:
+            age = "今天"
+        else:
+            age = f"{stale_days} 天前"
+        rows.append((stale_days if stale_days is not None else -1, key, labels.get(key, key), latest, age))
+    stale_rows = [r for r in rows if isinstance(r[0], int) and r[0] > 0]
+    shown = sorted(stale_rows, reverse=True)[:4] or sorted(rows, reverse=True)[:4]
+    parts = [f"{label}最新到 {latest}（{age}）" for _d, _key, label, latest, age in shown]
+    if not parts:
+        return f"{store} 暂时没有可用的数据更新时间记录。"
+    return (
+        f"{store} 数据按来源看，存在旧快照："
+        + "；".join(parts)
+        + "。data_health_check 只提供日期粒度，没有具体几点。"
+    )
+
+
+def _deterministic_sku_metric_request(question: str) -> Optional[str]:
+    q = (question or "").upper()
+    if "30" not in q:
+        return None
+    if not any(x in question for x in ("销量", "总单量", "历史总销量", "退货率", "取消率")):
+        return None
+    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q)
+    return m.group(0) if m else None
+
+
+def _format_pct(value) -> str:
+    try:
+        pct = float(value or 0)
+    except Exception:
+        pct = 0.0
+    if abs(pct) <= 1:
+        pct *= 100
+    return f"{pct:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
+    items = (tool_result or {}).get("items") or []
+    item = next((x for x in items if (x.get("sku") or "").upper() == sku.upper()), None)
+    if not item or not item.get("found"):
+        return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
+    if item.get("data_stale"):
+        as_of = item.get("as_of_date") or "未知日期"
+        stale_days = item.get("stale_days")
+        age = f"{stale_days} 天前" if stale_days is not None else "较旧"
+        return f"{sku} 的数据快照截至 {as_of}（{age}），当前数值已过期，不能按新鲜 30 天口径报数。"
+    as_of = item.get("as_of_date") or "当前快照"
+    return (
+        f"{sku} 30 天口径截至 {as_of}："
+        f"30 天销量 {item.get('sales_30d')}，"
+        f"30 天总单量 {item.get('total_orders_30d')}，"
+        f"历史总销量 {item.get('history_total')}，"
+        f"退货率 {_format_pct(item.get('return_rate_30d'))}%，"
+        f"取消率 {_format_pct(item.get('cancel_rate_30d'))}%。"
+    )
+
+
+def _extract_live_order_no(question: str) -> Optional[str]:
+    q = question or ""
+    if "货单" not in q and "物流" not in q and "状态" not in q:
+        return None
+    if not any(x in q for x in ("物流", "状态", "到哪", "当前", "实时", "查")):
+        return None
+    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9-]{5,}\b", q.upper())
+    return m.group(0) if m else None
+
+
+def _format_order_live_reply(order_no: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"未找到货单 {order_no} 的物流记录，请核实货单号。"
+    if tool_result.get("error") == "order_not_found_in_erp":
+        return f"未找到货单 {order_no}：ERP 中无记录，当前无物流数据，请核实货单号。"
+    if not tool_result.get("ok"):
+        msg = tool_result.get("message") or tool_result.get("error") or "实时查询失败"
+        return f"未找到货单 {order_no} 的实时物流记录，或当前无法完成 ERP 实时查询：{msg}。请核实货单号。"
+    forwarder = tool_result.get("forwarder") or "未知承运商"
+    tracking = tool_result.get("tracking_no") or "无跟踪号"
+    status = tool_result.get("status") or "未知状态"
+    current_node = tool_result.get("current_node") or {}
+    node_text = current_node.get("desc") or current_node.get("status") or ""
+    tail = f"；最新节点：{node_text}" if node_text else ""
+    return f"货单 {order_no} 当前状态：{status}，承运商 {forwarder}，跟踪号 {tracking}{tail}。"
+
+
+def _current_workflow_task(workflow: str) -> Optional[dict]:
+    rows = _data._fetch(
+        "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
+        "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
+        (_get_tenant(), workflow),
+    )
+    return dict(rows[0]) if rows else None
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -2014,6 +2195,38 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+
+    direct_export = _deterministic_export_request(question)
+    if direct_export:
+        store = scope.get("store") or "KSA"
+        tool_args = {
+            "view": direct_export["view"],
+            "store": store,
+            "filter_desc": direct_export["filter_desc"],
+        }
+        tool_result = _exec_tool("export_table", tool_args, user=scope)
+        if isinstance(tool_result, dict) and tool_result.get("ok") and tool_result.get("download_url"):
+            filename = tool_result.get("filename") or "export.xlsx"
+            reply = (
+                f"已生成 {tool_result.get('row_count', 0)} 行表格："
+                f"[{filename}]({tool_result['download_url']})"
+            )
+        else:
+            reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "导出失败。"
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": ["export_table"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_export_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
@@ -2034,6 +2247,29 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             reply = _workflow_receipt_reply(
                 task_id, tool_result["workflow"], direct_workflow["label"]
             )
+        elif (
+            isinstance(tool_result, dict)
+            and tool_result.get("action_type") == "denied"
+            and "已有运行中实例" in (tool_result.get("reason") or "")
+        ):
+            existing = _current_workflow_task(direct_workflow["workflow"])
+            if existing:
+                workflow_task = {
+                    "task_id": existing["task_id"],
+                    "workflow": existing["workflow"],
+                    "label": direct_workflow["label"],
+                    "total_steps": None,
+                    "affected_modules": [],
+                    "followup_prompt": question,
+                    "state": existing.get("state"),
+                    "already_running": True,
+                }
+                reply = (
+                    f"{direct_workflow['label']}已有运行中的后台任务 "
+                    f"`{existing['task_id']}`，我不重复触发。"
+                )
+            else:
+                reply = tool_result.get("reason") or "工作流触发失败。"
         else:
             reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
         return {
@@ -2047,6 +2283,97 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
+            "hallucination_warnings": None,
+        }
+
+    if _provider.get_provider() != "smoke" and _deterministic_products_count_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("list_products", {"store": store, "listing": "all", "limit": 0}, user=scope)
+        reply = _format_products_count_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["list_products"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_products_count_router",
+            "hallucination_warnings": None,
+        }
+
+    if _deterministic_scope_overview_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("scope_overview", {"store": store}, user=scope)
+        reply = _format_scope_overview_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["scope_overview"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_scope_overview_router",
+            "hallucination_warnings": None,
+        }
+
+    if _deterministic_data_freshness_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("data_health_check", {"store": store}, user=scope)
+        reply = _format_data_freshness_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["data_health_check"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_data_freshness_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_sku_metric = _deterministic_sku_metric_request(question)
+    if direct_sku_metric:
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("query_sku", {"skus": [direct_sku_metric], "store": store}, user=scope)
+        reply = _format_sku_metric_reply(direct_sku_metric, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["query_sku"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_sku_metric_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_order_no = _extract_live_order_no(question)
+    if direct_order_no:
+        tool_result = _exec_tool("query_order_live", {"order_no": direct_order_no}, user=scope)
+        reply = _format_order_live_reply(direct_order_no, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["query_order_live"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_order_live_router",
             "hallucination_warnings": None,
         }
 
@@ -2069,6 +2396,20 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     from . import _safety
     final_text, hallu_warnings = _safety.sanitize_reply(clean_reply, tools_used, tool_log=tool_log, question=question)
     clean_reply = _strip_safety_banner(final_text)
+
+    # WS-117 采购议价率口径生产接线（deterministic verifier，非 prompt）
+    from hipop.rules.procurement_rate import check_procurement_rate_reply as _check_procurement_rate
+    _procurement_warns = _check_procurement_rate(clean_reply)
+    if _procurement_warns:
+        hallu_warnings = list(hallu_warnings or []) + _procurement_warns
+        if not final_text.startswith("⚠️"):
+            _proc_banner = (
+                "⚠️ **系统检测到采购议价率口径可能有误**：\n"
+                + "\n".join(f"- {w}" for w in _procurement_warns)
+                + "\n\n---\n\n"
+            )
+            final_text = _proc_banner + final_text
+
     final_text = _maybe_append_stock_readiness_warning(final_text)
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
 
