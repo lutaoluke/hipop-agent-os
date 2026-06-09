@@ -1211,8 +1211,9 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         EXEC_RUNNING as _EXEC_RUNNING, EXEC_CREATE_FAILED as _EXEC_CREATE_FAILED,
         ContractViolation as _ExecContractViolation,
     )
-    _durable_events = _data.get_events_after(task_id, 0)
     try:
+        # 回读放进 try 内：DB 读失败同样视为"无可查记录" → fail-closed，不冒充已启动。
+        _durable_events = _data.get_events_after(task_id, 0)
         execution_record = _build_execution_record(
             status=_EXEC_RUNNING,
             task_id=task_id,
@@ -1222,7 +1223,7 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
             context="run_workflow",
         )
         exec_hint = _render_execution_suffix(execution_record)
-    except _ExecContractViolation as _e:
+    except (_ExecContractViolation, Exception) as _e:
         # fail-closed：任务没产生可查的真实记录 → 如实标 create_failed，不冒充已启动。
         execution_record = _build_execution_record(
             status=_EXEC_CREATE_FAILED, workflow=workflow,
@@ -1230,9 +1231,14 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         )
         exec_hint = _render_execution_suffix(execution_record)
 
-    return {
-        "ok": True,
-        "task_id": task_id,
+    # WS-144 round-1：失败语义不许只藏在 execution_record 内层。
+    # create_failed → 外层 ok=False + error，让"只看 ok"的下游也能确定识别失败，
+    # 不会把没落库的任务误读成已启动（验门人 14:37 指出的歧义）。
+    exec_failed = execution_record["status"] == _EXEC_CREATE_FAILED
+    result = {
+        "ok": not exec_failed,
+        # 没产生可查真实任务时不外泄生成的临时 id 冒充"已创建任务"。
+        "task_id": None if exec_failed else task_id,
         "workflow": workflow,
         "label": label,
         "total_steps": len(steps),
@@ -1241,6 +1247,9 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         "execution_record": execution_record,
         "hint": f"{exec_hint}请在工作台任务面板查看进度；影响模块：{affected}。",
     }
+    if exec_failed:
+        result["error"] = execution_record.get("reason") or "工作流任务未确认创建成功"
+    return result
 
 
 def tool_query_1688_similar(image_url: str, pack: int = 1,

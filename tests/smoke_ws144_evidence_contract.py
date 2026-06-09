@@ -277,11 +277,54 @@ def test_run_workflow_attaches_execution_record():
         check("execution_record 通过 assert_execution_real", False, str(e))
 
 
+def test_run_workflow_create_failed_surfaces_in_ok():
+    """WS-144 round-1：执行没落库可查记录时，失败必须在外层 ok 上被确定识别，
+    不许只藏在 execution_record.status=create_failed 内层（验门人 14:37 指出的歧义）。
+
+    fail-then-pass：改前 tool_run_workflow 恒返回 ok=True，下游只看 ok 会把
+    create_failed 误读成已启动 → 本断言 FAIL；改后 create_failed → ok=False + error。
+    """
+    print("\n── test_run_workflow_create_failed_surfaces_in_ok ───────────")
+    _data = _fresh_db()
+    import hipop.server.agent as _agent
+    from hipop.runtime import workflow_runners as _runners
+    from hipop.server import api as _api
+
+    _agent._chat_tenant.set(TENANT_ID)
+    _agent._chat_scope.set({"tenant_id": TENANT_ID, "store": "KSA", "user": "test",
+                            "current_user_email": "t@e.com", "current_role": "ops"})
+
+    # 强制 legacy 路径 + no-op 线程；并让 durable 回读返回空 → 模拟"任务没落库可查记录"。
+    orig_list = _runners.list_runners
+    orig_run = _api._run_workflow
+    orig_events = _data.get_events_after
+    _runners.list_runners = lambda: []
+    _api._run_workflow = lambda *a, **k: None
+    _data.get_events_after = lambda *a, **k: []  # 无可查步骤 → 契约判 create_failed
+    try:
+        result = _agent.tool_run_workflow("wf1_stock")
+    finally:
+        _runners.list_runners = orig_list
+        _api._run_workflow = orig_run
+        _data.get_events_after = orig_events
+
+    check("无可查记录时 ok=False（失败在外层可识别）",
+          result.get("ok") is False, str(result)[:250])
+    check("失败时外层带 error", bool(result.get("error")), str(result)[:250])
+    rec = result.get("execution_record")
+    check("execution_record.status=create_failed",
+          isinstance(rec, dict) and rec.get("status") == "create_failed", str(rec)[:250])
+    check("失败时不外泄冒充的 task_id", result.get("task_id") is None, str(result)[:250])
+    hint = result.get("hint") or ""
+    check("失败 hint 明示失败（不冒充已创建/已启动）", "失败" in hint, hint)
+
+
 def main():
     test_query_evidence_unit()
     test_execution_record_unit()
     test_query_formatter_enforces_evidence()
     test_run_workflow_attaches_execution_record()
+    test_run_workflow_create_failed_surfaces_in_ok()
 
     print("\n" + "=" * 60)
     failed = [n for n, ok in _results if not ok]
