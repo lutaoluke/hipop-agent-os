@@ -23,6 +23,11 @@ _chat_scope: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_scope",
 _last_replenishment_stock_status: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "last_replenishment_stock_status", default=None
 )
+# WS-145 肯定执行意图门:chat() 入口按本轮句式语气求出的门决策。
+# _exec_tool 据此拒绝「非执行语气下偷偷 run_workflow」（LLM 不许绕）。
+_chat_intent: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "chat_intent", default=None
+)
 
 
 def _get_tenant() -> int:
@@ -1865,6 +1870,20 @@ def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
     smoke_governance.py 会跑 inspect.getsource 检查 provider 没自定义 _exec_tool。
     """
     try:
+        # WS-145 肯定执行意图门:非执行语气（否定/询问/假设/只问影响面）下，
+        # LLM 不许偷偷 run_workflow 落任务 —— 在工具执行入口确定性拦死，不靠 prompt。
+        if name == "run_workflow":
+            _intent = _chat_intent.get()
+            if _intent is not None and getattr(_intent, "blocks_llm_execution", False):
+                return {
+                    "ok": False,
+                    "error": "execution_intent_gate_blocked",
+                    "blocked_by": "execution_intent_gate",
+                    "message": (
+                        "本轮是非执行语气（否定/询问/假设/只问影响面），未创建任何后台任务。"
+                        "需要执行请明确说「帮我刷新/重算…」。"
+                    ),
+                }
         from . import rbac as _rbac
         if user and not _rbac.tool_allowed(user, name):
             return {
@@ -2351,11 +2370,15 @@ def _ensure_export_download_link(reply: str, tool_log: list) -> str:
 
 def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
-    if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
+    # WS-145 肯定执行意图门:只有「肯定祈使 + 低风险」才进真实执行路由。
+    # 否定/询问/假设/只问影响面的句子（即使含「刷新/重算」）一律不路由（结构判别，
+    # 非逐句关键词黑名单）。高风险动作在 chat() 走 confirm-first，不到这里。
+    from . import _execution_intent_gate as _intent_gate
+    if not _intent_gate.enters_execution(question or ""):
         return None
     # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
-    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
-                                 "重跑", "重新计算")):
+    if not any(v in q for v in ("刷新", "刷库存", "刷库", "同步", "重算", "跑一下", "拉一下",
+                                 "扫", "刷一下", "重跑", "重新计算")):
         return None
     if "物流" in q:
         return {"workflow": "wf3_logistics_v2", "label": "物流刷新"}
@@ -2772,6 +2795,31 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
 
+    # WS-145 肯定执行意图门:本轮句式语气 + 风险分层一次求出，注入 contextvar，
+    # 供 _exec_tool 在非执行语气下拒绝 run_workflow（LLM 不许绕）。
+    from . import _execution_intent_gate as _intent_gate
+    _intent_decision = _intent_gate.evaluate(question or "")
+    _chat_intent.set(_intent_decision)
+
+    # 高风险动作（外部通知/交易·采购·订单/不可回滚/跨店批量覆盖）即使肯定句也不自动执行:
+    # 先 confirm，不自动补调。确定性短路，绝不落任务。
+    if _intent_decision.needs_confirm_first:
+        reply = _intent_gate.confirm_first_reply(question or "")
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "确认",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "execution_intent_gate_confirm_first",
+            "hallucination_warnings": None,
+        }
+
     direct_export = _deterministic_export_request(question)
     if direct_export:
         store = scope.get("store") or "KSA"
@@ -2939,6 +2987,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                              "请稍后在工作台任务面板确认任务状态，或重试。")
                 else:
                     reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
+                # WS-145 自动补调策略:确定性路由这一次触发即「自动补调一次」。
+                # 失败后 policy 判定转 plan→confirm（不无限重试），追加下一步 + 需确认，
+                # 绝不返回「已触发/已完成」假证据。
+                from . import _execution_intent_gate as _intent_gate
+                if (
+                    _intent_gate.decide_recovery(_intent_gate.RiskTier.LOW_AUTO, 1)
+                    == _intent_gate.RecoveryAction.PLAN_CONFIRM
+                ):
+                    reply = reply.rstrip() + (
+                        "\n\n下一步:这步自动补调一次仍未成功，我不再自动重复触发——"
+                        "回「确认」我再试一次，或回「取消」改用上传/手动核对。"
+                    )
         return {
             "reply": reply,
             "clean_reply": reply,
