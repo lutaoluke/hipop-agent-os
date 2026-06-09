@@ -85,11 +85,14 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                     }
                 # T03: capture live_sales_failed SKUs from query_sku → safety verifier
                 result_stale_skus = _stale_skus_from_sku_result(tool_name, result)
+                from .replenishment_evidence import blocked_skus_from_tool_result
+                result_replenishment_blocked_skus = blocked_skus_from_tool_result(tool_name, result)
                 tool_log.append({
                     "name": tool_name, "args": tool_args,
                     "result_keys": list(result.keys()) if isinstance(result, dict) else None,
                     "result_error": result.get("error") if isinstance(result, dict) else None,
                     "result_stale_skus": result_stale_skus,
+                    "result_replenishment_blocked_skus": result_replenishment_blocked_skus,
                 })
                 tool_results.append({
                     "type": "tool_result",
