@@ -61,6 +61,23 @@ def run_v2(tenant_id: int, max_pages: int | None = None,
 
     conn = _data.conn()
     today_iso = datetime.now().date().isoformat()
+
+    # Preflight: 拉 wf2_sku 全量 SKU 作为宇宙集，空则红灯停止
+    known_skus: dict = {}  # alias → set[partner_sku]
+    for ent in entities:
+        rows = conn.execute(
+            "SELECT partner_sku FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            (tenant_id, ent["alias"]),
+        ).fetchall()
+        known_skus[ent["alias"]] = {r[0] for r in rows}
+    empty_entities = [alias for alias, skus in known_skus.items() if len(skus) == 0]
+    if empty_entities:
+        conn.close()
+        raise RuntimeError(
+            f"tenant={tenant_id} 以下 entity 的 SKU master 为空: {empty_entities}，"
+            "请先跑 wf2_sku preflight 更新商品主数据"
+        )
+
     bucket = {e["alias"]: {} for e in entities}
 
     # 拉每个仓（去重）
@@ -96,6 +113,18 @@ def run_v2(tenant_id: int, max_pages: int | None = None,
                     rec["overseas_total_qty"] += qty
                     if qty:
                         rec["_overseas_breakdown"][w["name"]] = qty
+
+    # 全量 SKU preflight：wf2_sku 里有但 ERP 未返回的 SKU → qty=0（不保留旧值）
+    for ent in entities:
+        alias = ent["alias"]
+        for sku in known_skus.get(alias, set()):
+            if sku not in bucket[alias]:
+                bucket[alias][sku] = {
+                    "partner_sku": sku,
+                    "yiwu_qty": 0, "dongguan_qty": 0,
+                    "overseas_total_qty": 0,
+                    "_overseas_breakdown": {},
+                }
 
     # 写库
     counts = {}
