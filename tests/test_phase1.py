@@ -33,6 +33,22 @@ def _load_chat_dynamic_expectations_smoke():
     return mod
 
 
+def _load_ws149_sku_query_paths_smoke():
+    path = REPO_ROOT / "tests" / "smoke_ws149_sku_query_paths.py"
+    spec = importlib.util.spec_from_file_location("smoke_ws149_sku_query_paths", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ws149_query_sku_live_boundary_fail_closed():
+    """WS-149: realtime SKU logistics must not silently fallback to stale wf3 cache."""
+    smoke = _load_ws149_sku_query_paths_smoke()
+    smoke.test_query_sku_live_login_failure_fails_closed_without_wf3_cache()
+    smoke.test_query_sku_live_success_labels_live_source_and_time()
+
+
 def test_chat_stale_tst001_dynamic_expectations_auth_boundary():
     """WS-143: chat dynamic prep reuses auth and keeps stale/missing fail-closed."""
     smoke = _load_chat_dynamic_expectations_smoke()

@@ -1320,45 +1320,8 @@ def _erp_token_or_error(tid: int):
     if not token:
         return None, {"ok": False, "error": "erp_login_failed",
                        "message": f"ERP 凭据存在但 playwright 登录失败 "
-                                   "（dbuyerp 可能在风控同账号短时间多次登），稍后重试或用 wf3 缓存"}
+                                   "（dbuyerp 可能在风控同账号短时间多次登），稍后重试"}
     return token, None
-
-
-def _query_sku_from_cache(sku: str, tid: int) -> dict:
-    """ERP 拿不到 token 时的 fallback：从 wf3_logistics_hub_v2 缓存读。
-    数据可能 N 天前但总比 hallucinate 强。"""
-    from . import data as _data
-    _data.set_current_tenant(tid)
-    rows = _data._fetch(
-        "SELECT sku, in_transit_total_qty, total_transit_qty, transit_batches_json, "
-        "       updated_at FROM wf3_logistics_hub_v2 "
-        "WHERE tenant_id=? AND sku=?",
-        (tid, sku),
-    )
-    if not rows:
-        return {"ok": True, "sku": sku, "fetched_from": "wf3_cache_no_data",
-                "in_transit_total_qty": 0, "stale_warn": "wf3 缓存里这个 SKU 没数据"}
-    r = rows[0]
-    try:
-        import json as _json
-        batches = _json.loads(r.get("transit_batches_json") or "[]")
-    except Exception:
-        batches = []
-    upd = r.get("updated_at")
-    return {
-        "ok": True,
-        "sku": sku,
-        "fetched_from": "wf3_logistics_hub_v2 cache (ERP 实时拿不到 token 时的兜底)",
-        "stale_warn": f"⚠️ 此为 wf3 缓存数据，更新于 {upd}（非实时）。若需实时请稍后重试。",
-        "in_transit_total_qty": r.get("in_transit_total_qty") or 0,
-        "total_transit_qty": r.get("total_transit_qty") or 0,
-        "cache_updated_at": str(upd) if upd else None,
-        "in_transit_orders": [
-            {"order_no": b.get("order_no"), "qty": b.get("qty"),
-             "forwarder": b.get("forwarder"), "tracking_no": b.get("tracking_no")}
-            for b in batches[:10]
-        ],
-    }
 
 
 def _patch_wls_token(token: str):
@@ -1406,23 +1369,64 @@ def _physical_tracking_url(forwarder: str, tracking_no: str) -> str:
     return f"{base}{sep}msg={tracking_no}" if "tracking" in base.lower() else f"{base}{sep}no={tracking_no}"
 
 
+def _utc_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     """实时查单 SKU ERP 在途货单 — 不读 wf3 缓存，每次直连。
     with_nodes=True 时对每个在途货单跑 playwright 抓物流站节点（慢 5-10s/单）。
     默认 False（只 ERP 拉单 + tracking_no，快），用户问'节点'/'卡哪'时设 True。"""
     tid = _get_tenant()
+    fetched_at = _utc_now_iso()
+    live_source = "ERP /delivery (realtime)"
     token, err = _erp_token_or_error(tid)
     if err:
+        if err.get("error") == "no_erp_credentials":
+            return {
+                "ok": False,
+                "error": "sku_live_unavailable_no_erp_credentials",
+                "sku": sku,
+                "source": live_source,
+                "fetched_at": fetched_at,
+                "cache_fallback": False,
+                "message": (
+                    f"当前无法实时查询 SKU {sku} 的在途物流：本店铺 ERP 账号未配置。"
+                    "请先配置 dbuyerp 后重试；本工具不返回 wf3 旧缓存。"
+                ),
+            }
         if err.get("error") == "erp_login_failed":
-            cache_resp = _query_sku_from_cache(sku, tid)
-            cache_resp["live_query_failed_reason"] = err["message"]
-            return cache_resp
-        return err
+            return {
+                "ok": False,
+                "error": "erp_login_failed_no_cache",
+                "sku": sku,
+                "source": live_source,
+                "fetched_at": fetched_at,
+                "cache_fallback": False,
+                "live_query_failed_reason": err["message"],
+                "message": (
+                    f"ERP 实时查询 SKU {sku} 失败（{err['message']}），"
+                    "无法确认当前在途或近期完成货单；已按实时查询契约 fail closed，"
+                    "不返回 wf3 旧缓存。请稍后重试。"
+                ),
+            }
+        out = dict(err)
+        out.update({"sku": sku, "source": live_source, "fetched_at": fetched_at, "cache_fallback": False})
+        return out
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
         in_transit, completed = _wls.collect_sku_orders(sku, token)
     except Exception as e:
-        return {"ok": False, "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}"}
+        return {
+            "ok": False,
+            "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}",
+            "sku": sku,
+            "source": live_source,
+            "fetched_at": fetched_at,
+            "cache_fallback": False,
+            "message": "ERP 实时查询失败，无法确认当前在途或近期完成货单；不返回 wf3 旧缓存。",
+        }
     finally:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
@@ -1431,6 +1435,9 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
             "ok": False,
             "error": "sku_no_orders_in_erp",
             "sku": sku,
+            "source": live_source,
+            "fetched_at": fetched_at,
+            "cache_fallback": False,
             "message": f"SKU {sku} 在 ERP 中无在途或近期完成货单记录，请核实 SKU 是否正确。",
         }
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
@@ -1453,6 +1460,9 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     return {
         "ok": True,
         "sku": sku,
+        "source": live_source,
+        "fetched_at": fetched_at,
+        "cache_fallback": False,
         "fetched_from": ("ERP realtime + 物流站节点抓取" if with_nodes else "ERP realtime"),
         "in_transit_count": len(in_transit),
         "in_transit_total_qty": in_t_qty,
@@ -1488,7 +1498,7 @@ def tool_query_order_live(order_no: str) -> Dict:
         if err.get("error") == "erp_login_failed":
             return {"ok": False, "error": "erp_login_failed_no_cache",
                      "message": f"ERP 实时查失败（{err['message']}），单货单查询没缓存兜底。"
-                                 "请用 query_sku_live(sku) 查整 SKU 的缓存。"}
+                                 "请稍后重试；单 SKU 实时查询也不返回 wf3 旧缓存。"}
         return err
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
@@ -2213,7 +2223,7 @@ scope: {scope}
 - 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
 - 用户问多个 SKU → 对每个分别调 query_sku_live
 - query_sku_live 慢（5-15s）但准（直连 ERP），值得
-- query_sku_live 返回里有 `stale_warn` 或 `live_query_failed_reason` 时：必须明告用户「ERP 实时拉失败，给你的是 wf3 缓存（更新于 X），稍后可重试」，**不许**当作实时数据呈现
+- query_sku_live 返回 `ok=false`（例如 `erp_login_failed_no_cache`，且 `cache_fallback=false`）时：必须明告用户「ERP 实时不可用，无法确认当前在途」，**不许**把 wf3 旧缓存当作实时数据呈现
 
 ## tool 速查
 | 用户问 | 调 |
