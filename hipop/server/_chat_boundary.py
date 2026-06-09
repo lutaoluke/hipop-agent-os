@@ -81,7 +81,7 @@ _NON_RESULT_ALREADY_RE = (
     r"在|正在|查|查询|拉取|拉|看|为|给)"
 )
 _NON_RESULT_BARE_LE_RE = (
-    r"(?:(?:[^\s，。！？!?；;\n]{0,4})(?:查|看|拉)|"
+    r"(?:(?:[^\s，。！？!?；;\n]{0,4})(?:查|看|拉|知道|明白|了解|可以|辛苦|感谢|谢谢)|"
     r"触发|启动|开始|排队|创建|提交|受理|导出|生成|通知)"
 )
 _COMPLETION_STATE_RE = (
@@ -116,8 +116,11 @@ _STRUCTURAL_RESULT_CLAIM_RES = (
         rf"(?P<claim>{_CLAUSE_TOKEN}{_COMPLETION_STATE_RE}){_CLAIM_BOUNDARY}"
     ),
     # 任意短语 + 了：更新了 / 同步了 / 处理了 / 完成了。
-    # Query/read actions such as 查了/看了/拉了 are excluded here.
+    # Requires phrase-start boundary to avoid matching tails (e.g. 道了 from 知道了).
+    # Cognitive/ack/courtesy verbs (知道/明白/了解/可以/辛苦/感谢/谢谢) are excluded
+    # via _NON_RESULT_BARE_LE_RE — so 好的知道了/明白了/辛苦了 do not trigger.
     re.compile(
+        rf"(?:^|(?<=[{_CLAUSE_SEPARATORS}\s]))"
         rf"(?P<claim>(?!{_NON_RESULT_BARE_LE_RE}){_CLAUSE_TOKEN}了)"
         rf"{_CLAIM_BOUNDARY}"
     ),
