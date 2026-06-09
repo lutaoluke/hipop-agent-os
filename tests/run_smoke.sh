@@ -17,6 +17,14 @@ elif [ -f ".env.local" ]; then
   # shellcheck disable=SC1091
   source ".env.local"
   set +a
+elif _GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" && \
+     [ -f "${_GIT_COMMON%/.git}/.env.local" ]; then
+  # In a git worktree the common .git dir points to the main checkout —
+  # fall back to that repo's .env.local so DB_URL/JWT_SECRET are available.
+  set -a
+  # shellcheck disable=SC1090
+  source "${_GIT_COMMON%/.git}/.env.local"
+  set +a
 fi
 
 URL="${HIPOP_URL:-http://localhost:8765}"
