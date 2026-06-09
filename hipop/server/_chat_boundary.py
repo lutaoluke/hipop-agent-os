@@ -69,7 +69,24 @@ _RESULT_TAIL_RE = (
 _TASK_RESULT_TAIL_RE = (
     r"(?:已?(?:跑完|完成|成功|结束)(?:了)?|跑好了|跑完(?:了)?|处理好了|"
     r"处理完(?:了)?|弄好了|搞定了|搞好了|做好了|做完(?:了)?|"
-    r"完(?:了)?|完毕|结束了|行了)"
+    r"完(?:了)?|完毕|结束了|收尾了?|行了)"
+)
+
+# Proof-required result claims: these are intentionally grammatical categories,
+# not exact phrase patches. Query-only actions such as 查好了/看好了 stay out of
+# the action set and remain allowed with query evidence.
+_TASK_RESULT_SUBJECT_RE = r"(?:任务|后台任务|工作流|流程|后台流程|操作)"
+_DATA_RESULT_SUBJECT_RE = r"(?:数据|库存|销量|最新数据|最新库存|最新销量)"
+_RESULT_ACTION_RE = r"(?:刷|刷新|更新|同步|重算|重新计算|重新算|算|计算|处理|导入)"
+_PROOF_RESULT_TAIL_RE = (
+    r"(?:完成了?|成功(?:完成|了)?|好了|完(?:了)?|完毕|结束了?|"
+    r"弄好了|搞定了|搞好了|处理好了|处理完(?:了)?|做好了|做完(?:了)?|"
+    r"跑好了|跑完(?:了)?|到最新了?|收尾了?|算好了|导入完毕|行了)"
+)
+_PROOF_REQUIRED_RESULT_RE = re.compile(
+    rf"(?:{_TASK_RESULT_SUBJECT_RE}).{{0,12}}(?:{_PROOF_RESULT_TAIL_RE})"
+    rf"|(?:{_DATA_RESULT_SUBJECT_RE}).{{0,12}}(?:{_RESULT_ACTION_RE}).{{0,8}}(?:{_PROOF_RESULT_TAIL_RE})"
+    rf"|(?:{_RESULT_ACTION_RE}).{{0,8}}(?:{_PROOF_RESULT_TAIL_RE})"
 )
 _COMPLETION_BYPASS_RE = re.compile(
     r"(数据.{0,8}已经?(?:刷新|更新)"        # 数据已刷新/已更新/已经刷新/已经更新
@@ -192,7 +209,7 @@ def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
     exempted any reply that had run_workflow in tool_log, which meant a reply like
     '数据已刷新完成，任务已完成' would pass with only run_workflow evidence.
     """
-    completion_claim = _COMPLETION_BYPASS_RE.search(reply)
+    completion_claim = _COMPLETION_BYPASS_RE.search(reply) or _PROOF_REQUIRED_RESULT_RE.search(reply)
     short_status_claim = _SHORT_STATUS_BYPASS_RE.search(reply)
     query_safe_status_claim = _QUERY_SAFE_SHORT_STATUS_RE.search(reply)
     if not completion_claim and not short_status_claim and not query_safe_status_claim:
