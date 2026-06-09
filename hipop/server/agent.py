@@ -1189,9 +1189,47 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         from uuid import uuid4
         import threading
         task_id = uuid4().hex[:8]
+        # WS-144：legacy thread 路径也先同步写一条 durable queued event，保证执行记录
+        # 有 ≥1 个真实步骤可查（不靠后台线程异步落库，否则返回时无证据 = 接线缺失）。
+        _data.set_current_tenant(tid)
+        _data.write_event(
+            task_id, 0, "任务排队", "queued",
+            _json.dumps({"workflow": workflow, "label": label,
+                         "affected_modules": affected, "total_steps": len(steps),
+                         "tenant_id": tid, "runtime": "legacy_thread"}, ensure_ascii=False),
+            actor=actor,
+        )
         threading.Thread(
             target=_api._run_workflow, args=(task_id, workflow, tid, actor), daemon=True,
         ).start()
+
+    # WS-144 统一执行记录契约（样板执行工具）：回读 durable events 证明任务真实落库，
+    # 据此构造 execution_record。没有真实 task_id + ≥1 步骤就不算"已执行/已启动"。
+    from hipop.scripts.evidence_contract import (
+        build_execution_record as _build_execution_record,
+        render_execution_suffix as _render_execution_suffix,
+        EXEC_RUNNING as _EXEC_RUNNING, EXEC_CREATE_FAILED as _EXEC_CREATE_FAILED,
+        ContractViolation as _ExecContractViolation,
+    )
+    _durable_events = _data.get_events_after(task_id, 0)
+    try:
+        execution_record = _build_execution_record(
+            status=_EXEC_RUNNING,
+            task_id=task_id,
+            workflow=workflow,
+            steps=[{"step_no": e.get("step_no"), "step_name": e.get("step_name"),
+                    "status": e.get("status")} for e in _durable_events],
+            context="run_workflow",
+        )
+        exec_hint = _render_execution_suffix(execution_record)
+    except _ExecContractViolation as _e:
+        # fail-closed：任务没产生可查的真实记录 → 如实标 create_failed，不冒充已启动。
+        execution_record = _build_execution_record(
+            status=_EXEC_CREATE_FAILED, workflow=workflow,
+            reason=f"任务未落库可查记录：{_e}", context="run_workflow",
+        )
+        exec_hint = _render_execution_suffix(execution_record)
+
     return {
         "ok": True,
         "task_id": task_id,
@@ -1200,10 +1238,8 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         "total_steps": len(steps),
         "affected_modules": affected,
         "followup_prompt": followup_prompt or None,
-        "hint": (
-            f"已创建后台任务 {task_id}（{label}）。"
-            f"请在工作台任务面板查看进度；影响模块：{affected}。"
-        ),
+        "execution_record": execution_record,
+        "hint": f"{exec_hint}请在工作台任务面板查看进度；影响模块：{affected}。",
     }
 
 
@@ -1796,6 +1832,24 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         }
 
     items = [dict(r) for r in rows]
+    # WS-144 统一证据契约（样板查询工具）：每个出数的数字必须带来源/取数时间/口径。
+    # total_stock 是跨源聚合（noon 官方仓 + ERP 各仓 + pending），故 source=merged，
+    # sub_sources 显式列出 noon/erp，coverage 写清口径——缺任一三要素本调用直接 raise，
+    # 不允许无证据出数。
+    from hipop.scripts.evidence_contract import (
+        build_query_evidence as _build_query_evidence,
+        SOURCE_NOON as _SRC_NOON, SOURCE_ERP as _SRC_ERP, SOURCE_MERGED as _SRC_MERGED,
+    )
+    evidence = _build_query_evidence(
+        source=_SRC_MERGED,
+        fetched_at=latest_ts,
+        coverage=(
+            f"{store} total_stock = noon官方仓 + 海外仓 + 国内仓(义乌/东莞) + 送仓未上架(pending)；"
+            f"Top{limit}（返回 {len(items)} 行）；noon可售(saleable)不含 pending，与 total_stock 不同"
+        ),
+        sub_sources=[_SRC_NOON, _SRC_ERP],
+        context="total_stock_topn",
+    )
     return {
         "fail_closed": False,
         "store": store,
@@ -1810,6 +1864,7 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         "n_requested": limit,
         "n_returned": len(items),
         "items": items,
+        "evidence": evidence,
         "references": [
             {"table": "wf1_stock",
              "where": (
@@ -2414,10 +2469,22 @@ def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if tool_result.get("empty"):
         return tool_result.get("message") or f"{store} 暂无库存数据。"
     items = tool_result.get("items") or []
-    stale_days = tool_result.get("stale_days")
-    age_hint = f"（数据截至 {stale_days} 天前）" if stale_days else ""
+    # WS-144 统一证据契约：出数前强制校验证据三要素（来源/取数时间/口径）。
+    # 无证据 → fail-closed 不出数，不许旁路旧字段直接渲染裸数字。
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="total_stock_topn_reply")
+    except _ContractViolation as _e:
+        return (
+            f"{store} 总库存查询缺少可追溯证据（来源/取数时间/口径），"
+            f"按规则不出数。详情：{_e}"
+        )
     lines = [
-        f"{store} 总库存最高的 {len(items)} 个 SKU{age_hint}，",
+        f"{store} 总库存最高的 {len(items)} 个 SKU，",
         "**口径**：total_stock = noon官方仓 + 海外仓 + 国内仓 + 送仓未上架(pending)，"
         "与 noon 可售数(saleable)不同。",
         "",
@@ -2430,6 +2497,8 @@ def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
         lines.append(
             f"{i}. **{sku}**  总库存 {total:,}（可售 {saleable:,} / 送仓未上架 {pending:,}）"
         )
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
     return "\n".join(lines)
 
 
