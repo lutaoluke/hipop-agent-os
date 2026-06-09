@@ -40,13 +40,13 @@ def _workflow_receipt_reply(task_id: str, workflow: str, label: str) -> str:
         note = "请查看工作台任务面板了解详情，或重试。"
     elif "done" in event_statuses and state in ("done", "done_unverified"):
         state_label = "已完成"
-        note = "任务已完成，我会继续回答你的原问题。"
+        note = "任务已完成；如需最新结论，请重新提问。"
     elif state == "running" or "started" in event_statuses:
         state_label = "已开始执行"
-        note = "完成后我会继续回答你的原问题。"
+        note = "请在工作台任务面板查看进度；完成后如需最新结论，请重新提问。"
     else:
         state_label = "已排队/待执行"
-        note = "完成后我会继续回答你的原问题。"
+        note = "请在工作台任务面板查看进度；完成后如需最新结论，请重新提问。"
 
     return (
         f"已受理{label}（{workflow}），后台任务已创建。\n"

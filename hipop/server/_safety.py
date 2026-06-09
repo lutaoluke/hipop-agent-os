@@ -74,6 +74,17 @@ _SELECTION_INVENTORY_GATE_RE = re.compile(
     r"已查询.{0,20}库存数据|已拉取.{0,20}库存数据|根据.{0,10}完整数据.{0,40}库存"
 )
 
+# T38: 完成态假证据 — "已重新计算/跑完了/任务已完成" 等宣称
+# sanitize_reply() 仅被 LLM 路径调用；确定性 _workflow_receipt_reply() 在此之前退出，
+# 所以任何到达这里的完成声明都是 LLM 自编，无真实回读证据。
+_DONE_CLAIM_RE = re.compile(
+    r"已重新计算"
+    r"|重算.{0,5}(?:完|好|了)"
+    r"|跑完了|跑好了"
+    r"|(?:销售周期|补货).{0,15}(?:已完成|完成了|跑完)"
+    r"|任务.{0,5}已完成"
+)
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -114,23 +125,27 @@ def _check_fake_fields(text: str) -> List[str]:
     return warns
 
 
-# T36: 任务号提及模式（8位小写十六进制前缀）
-_TASK_ID_MENTION_RE = re.compile(r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：]*([0-9a-f]{8})\b')
+# T36/T38: 任务号提及模式（8位十六进制，大小写均捕获）；T38 扩展连接词"是"/"为"
+_TASK_ID_MENTION_RE = re.compile(
+    r'任务\s*(?:号|[Ii][Dd]|编号)?[\s:：是为]*([0-9a-fA-F]{8})\b'
+)
 
 
 def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
-    """T36: reply 中出现未由 run_workflow 工具返回的 task_id → banner。
+    """T36/T38: reply 中出现未由 run_workflow 工具返回的 task_id → banner。
 
     只信 tool_log 里 name=="run_workflow" 条目的 task_id；其他工具
     （query_sku、query_order_live 等）返回的 task_id 不能洗白任务号声明。
+    大小写归一（T38：38377C42 与 38377c42 视为同一 id）。
     """
     warns: List[str] = []
-    mentioned = set(_TASK_ID_MENTION_RE.findall(reply))
+    # 大小写归一：捕获后全部小写
+    mentioned = {m.lower() for m in _TASK_ID_MENTION_RE.findall(reply)}
     if not mentioned:
         return warns
     # T36 防伪关键：只有 run_workflow 工具调用返回的 task_id 才算真实任务号
     real_ids = {
-        t["task_id"] for t in (tool_log or [])
+        (t["task_id"] or "").lower() for t in (tool_log or [])
         if t.get("name") == "run_workflow" and t.get("task_id")
     }
     fake = mentioned - real_ids
@@ -409,7 +424,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
 
     # 纯数字问题质量评价过滤（行级，不用 re.DOTALL 以免吃掉整表）
     if question and _PURE_NUM_RE.search(question):
-        cutoff_pat = re.compile(r'\n+(?:补充信息|其他信息|额外信息)[：:]')
+        cutoff_pat = re.compile(
+            r'\n+(?:补充信息|其他信息|额外信息|另外补充(?:几个)?(?:关键信息)?|'
+            r'补充几个关键信息)[：:]?'
+        )
         m = cutoff_pat.search(reply)
         if m:
             reply = reply[:m.start()]
@@ -448,6 +466,53 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "⚠️ Agent 宣称已触发/启动工作流，但本轮没真调 run_workflow tool — "
             "这是 hallucinate（实际没创建后台任务，请重发"
             "『帮我扫一下 ERP 物流』之类更明确的指令）"
+        )
+
+    # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
+    # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词
+    fake_task_evidence = re.search(
+        r"((?:状态|status)[^。\n!?]{0,12}\baccepted\b"
+        r"|任务[^。\n!?]{0,20}\baccepted\b"
+        r"|SSE[^。\n!?]{0,20}(?:推送|进度|实时|订阅)"
+        r"|前端.{0,10}(?:SSE|订阅).{0,10}(?:进度|推送))",
+        reply,
+        re.IGNORECASE,
+    )
+    if fake_task_evidence and "run_workflow" not in tools_used:
+        warnings.append(
+            "⚠️ Agent 回复含假任务证据（accepted 状态或 SSE 进度），但本轮没真调 run_workflow — "
+            "这是 T38 禁止的假任务启动证据"
+        )
+
+    # T38: 完成态假证据 — LLM 路径无法读回任务完成状态，任何完成声明均是编造
+    done_claim = _DONE_CLAIM_RE.search(reply)
+    if done_claim:
+        if "run_workflow" not in tools_used:
+            warnings.append(
+                "⚠️ Agent 宣称重算已完成，但本轮没真调 run_workflow — 假完成证据（T38）"
+            )
+        else:
+            # run_workflow 只创建任务，LLM 没有 task-status readback 工具；
+            # 真实完成回执走 _workflow_receipt_reply()，在 sanitize_reply() 之前退出。
+            warnings.append(
+                "⚠️ Agent 宣称任务已完成，但仅有创建证据（run_workflow），无完成回读 — "
+                "假完成声明（T38）"
+            )
+
+    # Chat 没有人类可依赖的"稍后自动回来通知/答复"承诺；任务进度只能看任务面板，
+    # 或在完成后由用户重新提问。即使本轮真的调了 run_workflow，也不能把异步
+    # follow-up 说成 Agent 会主动回来。
+    auto_callback_promise = re.search(
+        r"((?:跑完|完成后|结束后|任务完成后|处理完)[^。\n!?]{0,18}"
+        r"(?:自动)?(?:回来|通知|告诉|答复|回复|回报|继续回答|接续答)"
+        r"|自动[^。\n!?]{0,8}(?:回来|通知|告诉|答复|回复|回报)"
+        r"|(?:我会|系统会)[^。\n!?]{0,12}(?:回来|通知|告诉|答复|回复|回报))",
+        reply,
+    )
+    if auto_callback_promise:
+        warnings.append(
+            "⚠️ Agent 承诺任务完成后自动回报/通知/答复，但 chat 不保证主动回调；"
+            "应让用户查看任务面板，完成后需要时再重试或重新提问"
         )
 
     # 新型撒谎模式：用过去时编"任务还在跑、等 ingest 完" 绕开上面的 hook

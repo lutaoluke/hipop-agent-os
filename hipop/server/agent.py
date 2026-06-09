@@ -13,7 +13,7 @@ LLM Coordinator - 把 hipop 的 5 个 handler + 2 个新工具包装成 Anthropi
 每次 tool 调用都会写入 agent_actions 表 (action_type='execute')，并把 references_json
 回传给前端用于"📎 出处"展示。
 """
-import os, sys, json, sqlite3, time, contextvars
+import os, sys, json, sqlite3, time, contextvars, re
 from typing import List, Dict, Any, Optional
 
 # ── chat 当前请求 context（tenant_id + scope）─────────────
@@ -1100,9 +1100,8 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         "affected_modules": affected,
         "followup_prompt": followup_prompt or None,
         "hint": (
-            f"已启动后台任务 {task_id}（{label}），前端将订阅 SSE 推送进度，"
-            f"完成后自动刷新 {affected}。"
-            + (f" 跑完后会自动重发『{followup_prompt}』给你接续答用户。" if followup_prompt else "")
+            f"已创建后台任务 {task_id}（{label}）。"
+            f"请在工作台任务面板查看进度；影响模块：{affected}。"
         ),
     }
 
@@ -1325,6 +1324,16 @@ def tool_query_order_live(order_no: str) -> Dict:
     tid = _get_tenant()
     token, err = _erp_token_or_error(tid)
     if err:
+        if err.get("error") == "no_erp_credentials":
+            return {
+                "ok": False,
+                "error": "order_lookup_unavailable_no_erp_credentials",
+                "order_no": order_no,
+                "message": (
+                    f"当前未找到货单号 {order_no} 的实时 ERP 记录：本店铺 ERP 账号未配置，"
+                    "无法确认该货单是否存在。请核实货单号是否正确，或先配置 dbuyerp 后重试。"
+                ),
+            }
         if err.get("error") == "erp_login_failed":
             return {"ok": False, "error": "erp_login_failed_no_cache",
                      "message": f"ERP 实时查失败（{err['message']}），单货单查询没缓存兜底。"
@@ -2005,16 +2014,38 @@ def _maybe_append_stock_readiness_warning(reply: str) -> str:
     return text.rstrip() + "\n\n" + warning
 
 
+def _ensure_export_download_link(reply: str, tool_log: list) -> str:
+    """If export_table produced a file, make the real /api/download link visible."""
+    text = reply or ""
+    for t in (tool_log or []):
+        if t.get("name") != "export_table":
+            continue
+        url = t.get("result_download_url")
+        if not url or url in text:
+            continue
+        filename = t.get("result_filename") or url.rsplit("/", 1)[-1] or "导出文件.xlsx"
+        if "(download_url)" in text:
+            text = text.replace("(download_url)", f"({url})")
+        else:
+            text = text.rstrip() + f"\n\n下载链接：[{filename}]({url})"
+    return text
+
+
 def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
     if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
         return None
-    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下")):
+    # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
+    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
+                                 "重跑", "重新计算")):
         return None
     if "物流" in q:
         return {"workflow": "wf3_logistics_v2", "label": "物流刷新"}
     if "库存" in q:
         return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
+    # T38: 销售周期/补货建议 → wf5_sales_cycle_v2（低风险内部重算，直跑）
+    if any(k in q for k in ("销售周期", "补货建议")):
+        return {"workflow": "wf5_sales_cycle_v2", "label": "销售周期与补货重算"}
     return None
 
 
@@ -2212,12 +2243,73 @@ def _format_order_live_reply(order_no: str, tool_result: dict) -> str:
 
 
 def _current_workflow_task(workflow: str) -> Optional[dict]:
-    rows = _data._fetch(
-        "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
-        "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
-        (_get_tenant(), workflow),
-    )
-    return dict(rows[0]) if rows else None
+    try:
+        rows = _data._fetch(
+            "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
+            "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
+            (_get_tenant(), workflow),
+        )
+        return dict(rows[0]) if rows else None
+    except Exception:
+        return None
+
+
+_READONLY_REFRESH_VERB_RE = re.compile(
+    r"刷新|同步|重算|跑一下|拉一下|扫|刷一下|重跑|重新计算|生成|创建|启动|触发|更新"
+)
+_ALERT_COUNT_QUERY_RE = re.compile(
+    r"(?:红色告警|告警)[^。\n!?]{0,12}(?:几个|多少|数量|数|总数)"
+    r"|(?:几个|多少|数量|总数)[^。\n!?]{0,12}(?:红色告警|告警)"
+)
+
+
+def _deterministic_readonly_request(question: str) -> Optional[Dict[str, Any]]:
+    """Pure read-only chat intents that must not be upgraded into run_workflow."""
+    q = (question or "").strip().lower()
+    if not q or _READONLY_REFRESH_VERB_RE.search(q):
+        return None
+    if _ALERT_COUNT_QUERY_RE.search(q):
+        return {"tool": "scope_overview", "intent": "alert_count"}
+    return None
+
+
+def _deterministic_readonly_reply(intent: str, tool_result: dict, store: str) -> str:
+    if not isinstance(tool_result, dict) or tool_result.get("error"):
+        reason = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "查询失败"
+        return f"本轮没有查到红色告警数量：{reason}。请稍后重试。"
+
+    if intent == "alert_count":
+        red = tool_result.get("alerts_red")
+        pending = tool_result.get("alerts_pending")
+        if red is None:
+            return "本轮没有查到红色告警数量：scope_overview 未返回告警数。请稍后重试。"
+        suffix = f"，待处理告警 {pending} 个" if pending is not None else ""
+        return f"{store.upper()} 当前红色告警 {red} 个{suffix}。"
+
+    return "本轮查询已完成。"
+
+
+_RUNNING_WORKFLOW_TASK_RE = re.compile(
+    r"已有运行中实例:\s*\[\s*['\"]?([0-9a-fA-F]{8})"
+)
+
+
+def _existing_workflow_task_id(tool_result: dict) -> Optional[str]:
+    """Return the real task id when governance denies only because the workflow is already running."""
+    if not isinstance(tool_result, dict) or tool_result.get("action_type") != "denied":
+        return None
+    reason = tool_result.get("reason") or ""
+    m = _RUNNING_WORKFLOW_TASK_RE.search(reason)
+    return m.group(1).lower() if m else None
+
+
+def _workflow_registry_summary(workflow: str, fallback_label: str) -> tuple[str, int, list]:
+    try:
+        from . import api as _api
+        label, steps, affected = _api.WORKFLOW_REGISTRY.get(workflow, (fallback_label, [], []))
+        return label, len(steps), affected
+    except Exception:
+        return fallback_label, 0, []
 
 
 def chat(messages: List[Dict], scope: Dict) -> Dict:
@@ -2272,6 +2364,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    direct_readonly = _deterministic_readonly_request(question)
+    if direct_readonly:
+        store = (scope.get("store") or "KSA").upper()
+        tool_args = {"store": store}
+        tool_result = _exec_tool(direct_readonly["tool"], tool_args, user=scope)
+        reply = _deterministic_readonly_reply(
+            direct_readonly["intent"], tool_result or {}, store
+        )
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": [direct_readonly["tool"]],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_readonly_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
@@ -2314,9 +2428,55 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     f"`{existing['task_id']}`，我不重复触发。"
                 )
             else:
-                reply = tool_result.get("reason") or "工作流触发失败。"
+                # DB not yet updated; parse ID from denial reason string
+                extracted_id = _existing_workflow_task_id(tool_result)
+                if extracted_id:
+                    workflow = direct_workflow["workflow"]
+                    label, total_steps, affected = _workflow_registry_summary(
+                        workflow, direct_workflow["label"]
+                    )
+                    workflow_task = {
+                        "task_id": extracted_id,
+                        "workflow": workflow,
+                        "label": label,
+                        "total_steps": total_steps,
+                        "affected_modules": affected,
+                        "followup_prompt": question,
+                    }
+                    reply = (
+                        f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
+                        f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
+                        "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                    )
+                else:
+                    reply = tool_result.get("reason") or "工作流触发失败。"
         else:
-            reply = (tool_result or {}).get("message") or (tool_result or {}).get("error") or "工作流触发失败。"
+            existing_task_id = _existing_workflow_task_id(tool_result or {})
+            if existing_task_id:
+                workflow = direct_workflow["workflow"]
+                label, total_steps, affected = _workflow_registry_summary(
+                    workflow, direct_workflow["label"]
+                )
+                workflow_task = {
+                    "task_id": existing_task_id,
+                    "workflow": workflow,
+                    "label": label,
+                    "total_steps": total_steps,
+                    "affected_modules": affected,
+                    "followup_prompt": question,
+                }
+                reply = (
+                    f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
+                    f"任务 ID：{existing_task_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
+                    "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                )
+            else:
+                reply = (
+                    (tool_result or {}).get("message")
+                    or (tool_result or {}).get("error")
+                    or (tool_result or {}).get("reason")
+                    or "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
+                )
         return {
             "reply": reply,
             "clean_reply": reply,
@@ -2481,6 +2641,8 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
 
     final_text = _maybe_append_stock_readiness_warning(final_text)
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
+    final_text = _ensure_export_download_link(final_text, tool_log)
+    clean_reply = _ensure_export_download_link(clean_reply, tool_log)
 
     # judge + confidence 真逻辑（混合：启发式 + 低置信/destructive 触发 LLM judge）
     judge, confidence, judge_method = _compute_judge_confidence(
