@@ -168,11 +168,15 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                     "affected_modules": result["affected_modules"],
                     "followup_prompt": result.get("followup_prompt"),
                 }
+            # T03: capture live_sales_failed SKUs from query_sku → safety verifier
+            from ._provider_anthropic import _stale_skus_from_sku_result
+            result_stale_skus = _stale_skus_from_sku_result(tool_name, result)
             tool_log.append({
                 "name": tool_name,
                 "args": tool_args_raw,
                 "result_keys": list(result.keys()) if isinstance(result, dict) else None,
                 "result_error": result.get("error") if isinstance(result, dict) else None,
+                "result_stale_skus": result_stale_skus,
             })
             msgs.append({
                 "role": "tool",

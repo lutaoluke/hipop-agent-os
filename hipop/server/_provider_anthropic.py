@@ -13,6 +13,18 @@ from . import _auth
 # 只做 RBAC 绕过了 governance，2026-05-26 删掉。详见 agent.py _exec_tool docstring。
 
 
+def _stale_skus_from_sku_result(tool_name: str, result: Any) -> "list | None":
+    """T03: 从 query_sku 结果提取 live_sales_failed SKU 列表，供 safety 验门。
+    抽成函数避免 provider 各自重写逻辑；smoke 可直接 import 测试而不复制。"""
+    if tool_name != "query_sku" or not isinstance(result, dict):
+        return None
+    stale = [
+        item["sku"] for item in (result.get("items") or [])
+        if item.get("live_sales_failed") and item.get("sku")
+    ]
+    return stale or None
+
+
 def run(messages: List[Dict], system: str, tools: List[Dict],
         tool_funcs: Dict[str, Callable], scope: dict) -> dict:
     client = _auth.get_client()
@@ -71,10 +83,13 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                         "affected_modules": result["affected_modules"],
                         "followup_prompt": result.get("followup_prompt"),
                     }
+                # T03: capture live_sales_failed SKUs from query_sku → safety verifier
+                result_stale_skus = _stale_skus_from_sku_result(tool_name, result)
                 tool_log.append({
                     "name": tool_name, "args": tool_args,
                     "result_keys": list(result.keys()) if isinstance(result, dict) else None,
                     "result_error": result.get("error") if isinstance(result, dict) else None,
+                    "result_stale_skus": result_stale_skus,
                 })
                 tool_results.append({
                     "type": "tool_result",
