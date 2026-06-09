@@ -3137,6 +3137,27 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _deterministic_multi_workflow_request(question: str) -> List[Dict[str, str]]:
+    q = (question or "").lower()
+    if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
+        return []
+    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
+                                 "重跑", "重新计算")):
+        return []
+
+    if "erp" not in q:
+        return []
+
+    wants_products = "商品库" in q or any(k in q for k in ("商品", "产品"))
+    wants_sales_price = "销量价格" in q or ("销量" in q and "价格" in q)
+    if wants_products and wants_sales_price:
+        return [
+            {"workflow": "wf2_products_v2", "label": "ERP 商品库刷新"},
+            {"workflow": "wf2_sales_v2", "label": "销量价格刷新"},
+        ]
+    return []
+
+
 def _deterministic_export_request(question: str) -> Optional[Dict[str, str]]:
     q = question or ""
     if not any(x in q for x in ("导出", "下载", "excel", "Excel", "表格", "xlsx")):
@@ -4311,6 +4332,106 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_stock_refusal_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_workflows = _deterministic_multi_workflow_request(question)
+    if direct_workflows:
+        workflow_tasks = []
+        reply_parts = []
+        for direct_workflow in direct_workflows:
+            workflow = direct_workflow["workflow"]
+            label = direct_workflow["label"]
+            tool_args = {"workflow": workflow, "followup_prompt": question}
+            tool_result = _exec_tool("run_workflow", tool_args, user=scope)
+            if isinstance(tool_result, dict) and tool_result.get("ok"):
+                task_id = tool_result["task_id"]
+                workflow_tasks.append({
+                    "ok": True,
+                    "task_id": task_id,
+                    "workflow": tool_result.get("workflow", workflow),
+                    "label": tool_result.get("label", label),
+                    "total_steps": tool_result.get("total_steps", 0),
+                    "affected_modules": tool_result.get("affected_modules", []),
+                    "followup_prompt": tool_result.get("followup_prompt"),
+                })
+                reply_parts.append(_workflow_receipt_reply(
+                    task_id, tool_result.get("workflow", workflow), label
+                ))
+                continue
+
+            existing_task_id = None
+            if (
+                isinstance(tool_result, dict)
+                and tool_result.get("action_type") == "denied"
+                and "已有运行中实例" in (tool_result.get("reason") or "")
+            ):
+                existing = _current_workflow_task(workflow)
+                if existing:
+                    existing_task_id = existing["task_id"]
+                    workflow_tasks.append({
+                        "ok": True,
+                        "task_id": existing_task_id,
+                        "workflow": existing["workflow"],
+                        "label": label,
+                        "total_steps": None,
+                        "affected_modules": [],
+                        "followup_prompt": question,
+                        "state": existing.get("state"),
+                        "already_running": True,
+                    })
+                    reply_parts.append(
+                        f"{label}（{workflow}）已有运行中的后台任务 `{existing_task_id}`，"
+                        "本轮未新建重复任务。请在工作台任务面板查看进度。"
+                    )
+                    continue
+                existing_task_id = _existing_workflow_task_id(tool_result)
+
+            if existing_task_id:
+                label2, total_steps, affected = _workflow_registry_summary(workflow, label)
+                workflow_tasks.append({
+                    "ok": True,
+                    "task_id": existing_task_id,
+                    "workflow": workflow,
+                    "label": label2,
+                    "total_steps": total_steps,
+                    "affected_modules": affected,
+                    "followup_prompt": question,
+                    "already_running": True,
+                })
+                reply_parts.append(
+                    f"{label2}（{workflow}）已有同类后台任务在运行，未新建重复任务。\n"
+                    f"任务 ID：{existing_task_id}｜当前状态：运行中或排队。\n"
+                    "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                )
+                continue
+
+            reason = (
+                (tool_result or {}).get("message")
+                or (tool_result or {}).get("error")
+                or (tool_result or {}).get("reason")
+                or "触发失败"
+            )
+            workflow_tasks.append({
+                "ok": False,
+                "workflow": workflow,
+                "label": label,
+                "error": reason,
+                "task_id": None,
+            })
+            reply_parts.append(f"{label}（{workflow}）启动失败：{reason}。")
+
+        return {
+            "reply": "\n\n".join(reply_parts),
+            "clean_reply": "\n\n".join(reply_parts),
+            "references": [],
+            "action_id": None,
+            "tools_used": ["run_workflow"],
+            "tag": "执行",
+            "workflow_tasks": workflow_tasks,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_multi_workflow_router",
             "hallucination_warnings": None,
         }
 
