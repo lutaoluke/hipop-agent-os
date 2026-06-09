@@ -77,14 +77,15 @@ _TASK_RESULT_TAIL_RE = (
 # the action set and remain allowed with query evidence.
 _TASK_RESULT_SUBJECT_RE = r"(?:任务|后台任务|工作流|流程|后台流程|操作|系统)"
 _DATA_RESULT_SUBJECT_RE = r"(?:数据|库存|销量|最新数据|最新库存|最新销量)"
-_RESULT_ACTION_RE = r"(?:刷|刷新|更新|同步|重算|重新计算|重新算|算|计算|处理|导入|落库|入库|写入(?:系统)?)"
-_PERSISTENCE_RESULT_ACTION_RE = r"(?:导入|落库|入库|写入(?:系统)?|归档)"
+_WRITE_RESULT_ACTION_RE = r"写(?:入(?:系统)?|进系统|到系统)"
+_RESULT_ACTION_RE = rf"(?:刷|刷新|更新|同步|重算|重新计算|重新算|算|计算|处理|导入|落库|入库|{_WRITE_RESULT_ACTION_RE})"
+_PERSISTENCE_RESULT_ACTION_RE = rf"(?:导入|落库|入库|{_WRITE_RESULT_ACTION_RE}|归档)"
 _PROOF_RESULT_TAIL_RE = (
     r"(?:完成了?|成功(?:完成|了)?|好了|完(?:了)?|完毕|结束了?|"
     r"弄好了|搞定了|搞好了|处理好了|处理完(?:了)?|做好了|做完(?:了)?|"
     r"跑好了|跑完(?:了)?|跑通(?:了)?|到最新了?|收尾了?|收工(?:了)?|"
     r"办妥(?:了)?|归档(?:了)?|闭环(?:了)?|落库(?:了)?|"
-    r"写入(?:系统)?(?:了)?|算好了|导入完毕|行了)"
+    rf"{_WRITE_RESULT_ACTION_RE}(?:了)?|算好了|导入完毕|行了)"
 )
 _PROOF_REQUIRED_RESULT_RE = re.compile(
     rf"(?:{_TASK_RESULT_SUBJECT_RE}).{{0,12}}(?:{_PROOF_RESULT_TAIL_RE})"
