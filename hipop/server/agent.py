@@ -2490,6 +2490,42 @@ def _deterministic_total_stock_topn_request(question: str) -> "Optional[int]":
     return 10
 
 
+def _deterministic_feishu_rejection_request(question: str) -> Optional[Dict[str, str]]:
+    """WS-150: Deterministic Feishu/notify rejection router.
+
+    工作台飞书集成当前为只读（拉取告警、同步决策）。主动发飞书/通知群由确定性门拦下，
+    不进入 LLM 自由发挥，不调用真实工具，也不声称已发。
+    """
+    from . import _execution_intent_gate as _intent_gate
+
+    # 只在肯定执行意图时拦（否定/疑问/假设等已被执行意图门处理）
+    if not _intent_gate.has_execution_verb(question or ""):
+        return None
+
+    # 检查是否命中飞书/通知关键词（与 _EXTERNAL_NOTIFY 对齐）
+    feishu_triggers = re.compile(
+        r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|"
+        r"通知群|群通知|发通知|推送(?:通知|消息|到群|给|到飞书)|推到.{0,4}群|推进.{0,3}群|发到群|"
+        r"发邮件|发短信|发消息给|@[一-鿿A-Za-z]|"
+        r"通知(?:一下|下)?(?:刘鹤|老板|大家|对方|同事|运营|相关人?|群|"
+        r"[一-鿿]{2,3}(?:同事|经理|总监?|老板))"
+    )
+
+    if not feishu_triggers.search(question or ""):
+        return None
+
+    return {
+        "message": (
+            "工作台飞书集成当前为**只读**（从飞书拉取告警、补货决策反馈），暂不支持主动发飞书 / 通知群 / 推送消息。\n"
+            "如需通知，请：\n"
+            "1. **手动转发**：在飞书 app 复制本次分析结果、手工发给相关人\n"
+            "2. **工作台飞书表**：wf6_logistics_alerts 和补货决策表每次更新后会自动同步到飞书 Bitable，"
+            "运营可在飞书里查看最新决策\n"
+            "\n需要主动通知能力时可反馈产品迭代。"
+        )
+    }
+
+
 def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if not isinstance(tool_result, dict):
         return f"{store} 库存查询暂不可用，请稍后重试。"
@@ -2895,6 +2931,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "execution_intent_gate_confirm_first",
+            "hallucination_warnings": None,
+        }
+
+    # WS-150: 飞书确定性拒绝路由 — 拦下"发飞书/通知群"请求，返固定拒绝，不进入 LLM 自由发挥。
+    feishu_rejection = _deterministic_feishu_rejection_request(question)
+    if feishu_rejection:
+        return {
+            "reply": feishu_rejection["message"],
+            "clean_reply": feishu_rejection["message"],
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "拒绝",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_feishu_rejection",
             "hallucination_warnings": None,
         }
 
