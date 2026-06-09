@@ -126,6 +126,19 @@ def _seed_wf3(conn, updated_at) -> None:
     conn.commit()
 
 
+def _seed_fresh_order_source(conn) -> None:
+    """Positive fixture: satisfy the noon order-source freshness gate too."""
+    conn.execute(
+        "INSERT OR REPLACE INTO wf2_orders "
+        "(tenant_id, entity_alias, partner_sku, item_nr, order_date, status, "
+        " is_cancelled, is_return, source, imported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (TENANT_ID, ENTITY_ALIAS, SKU, "T29-FRESH-ORDER", TODAY,
+         "delivered", 0, 0, "snapshot_fixture", TODAY + "T10:00:00"),
+    )
+    conn.commit()
+
+
 _mock_live = {
     "ok": True, "sku": SKU,
     "sales_30d": 9, "history_total": 99,
@@ -271,6 +284,7 @@ def test_all_timestamps_present_passes() -> None:
     _seed_wf2_sku(conn, TODAY + "T08:00:00")
     _seed_wf5(conn, TODAY + "T08:00:00")
     _seed_wf3(conn, TODAY + "T09:00:00")
+    _seed_fresh_order_source(conn)
 
     result = _call_tool(_agent)
     item = (result.get("items") or [{}])[0]
