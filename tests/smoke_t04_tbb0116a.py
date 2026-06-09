@@ -327,11 +327,66 @@ def test_sku_30d_stats_window_boundary():
     return check.failures
 
 
+def test_tool_query_sku_redacts_when_noon_orders_stale():
+    """T04 chat guard: noon orders stale must redact sales metrics even if wf2_sku was refreshed today."""
+    print("== test_tool_query_sku_redacts_when_noon_orders_stale ==")
+    from hipop.server import data
+    from hipop.server import agent
+
+    data.set_current_tenant(TENANT_ID)
+    conn = _fresh_db(data)
+    _seed_entity(conn)
+    _seed_sku(conn)
+    _seed_orders_30d(conn)
+
+    today = datetime.date.today().isoformat()
+    stale_order_date = (datetime.date.today() - datetime.timedelta(days=5)).isoformat()
+    conn.execute(
+        "UPDATE wf2_sku SET as_of_date=? WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (today, TENANT_ID, ENTITY_ALIAS, PARTNER_SKU),
+    )
+    conn.execute("DELETE FROM wf2_orders WHERE tenant_id=? AND entity_alias=?", (TENANT_ID, ENTITY_ALIAS))
+    conn.execute(
+        "INSERT OR REPLACE INTO wf2_orders "
+        "(tenant_id, entity_alias, partner_sku, item_nr, order_date, status, "
+        " is_cancelled, is_return, seller_price, customer_paid, currency) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (TENANT_ID, ENTITY_ALIAS, PARTNER_SKU, "T04-STALE",
+         stale_order_date, "delivered", 0, 0, 9.9, 9.9, "SAR"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = agent.tool_query_sku([PARTNER_SKU], store="KSA")
+    item = (result.get("items") or [{}])[0]
+    check = _Checker()
+
+    check("query_sku 标记 data_stale=True（noon_orders 旧）",
+          item.get("data_stale") is True,
+          f"got {item}")
+    check("sales_30d 被 REDACT",
+          item.get("sales_30d") is None,
+          f"got {item.get('sales_30d')!r}")
+    check("total_orders_30d 被 REDACT",
+          item.get("total_orders_30d") is None,
+          f"got {item.get('total_orders_30d')!r}")
+    check("history_total 被 REDACT",
+          item.get("history_total") is None,
+          f"got {item.get('history_total')!r}")
+    check("stale_reason 点名 noon_orders_stale",
+          "noon_orders_stale" in (item.get("stale_reason") or ""),
+          f"got {item.get('stale_reason')!r}")
+
+    return check.failures
+
+
 def run():
     failures = []
     failures += test_sku_30d_stats_data_layer()
     print()
     failures += test_sku_30d_stats_window_boundary()
+    print()
+    failures += test_tool_query_sku_redacts_when_noon_orders_stale()
     print()
     if failures:
         print(f"✗ {len(failures)} 项断言失败: {failures}")

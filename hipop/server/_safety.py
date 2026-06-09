@@ -85,6 +85,14 @@ _DONE_CLAIM_RE = re.compile(
     r"|任务.{0,5}已完成"
 )
 
+_STALE_REPLY_RE = re.compile(
+    r"陈旧|过期|不新鲜|滞后|偏旧|较旧|"
+    r"旧(?:的)?\s*(?:数据|口径|快照|销量|库存)|"
+    r"(?:数据|销量|库存|口径|快照|同步|noon).{0,15}旧|"
+    r"\bstale\b",
+    re.IGNORECASE,
+)
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -122,6 +130,178 @@ def _check_fake_fields(text: str) -> List[str]:
         alias_hits = [a for a in LEGIT_FIELD_ALIASES if a in text]
         names = ", ".join(hits + alias_hits)
         warns.append(f"⚠️ Agent 提到的字段不在 wf2/wf5 表中: {names} — 数字可能是编造的")
+    return warns
+
+
+# T36-S3: 检测工作流失败时 reply 是否未说明失败原因
+def _extract_workflow_name(args) -> str:
+    """从 run_workflow args 安全取 workflow 名（dict 或 JSON string 两种形式）。"""
+    if isinstance(args, dict):
+        return args.get("workflow", "unknown")
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                return parsed.get("workflow", "unknown")
+        except Exception:
+            pass
+    return "unknown"
+
+
+def _extract_failed_workflows(tool_log: list) -> List[tuple]:
+    """从 tool_log 中收集所有 run_workflow 失败条目，返回 [(wf_name, error_msg), ...]。"""
+    failed = []
+    for t in (tool_log or []):
+        if t.get("name") != "run_workflow":
+            continue
+        ok = t.get("ok")
+        has_error = bool(t.get("error"))
+        if ok is False or (ok is None and has_error):
+            wf_name = _extract_workflow_name(t.get("args") or {})
+            error_msg = t.get("error") or "未知错误"
+            failed.append((wf_name, error_msg))
+    return failed
+
+
+_WORKFLOW_RESULT_LABELS = {
+    "wf2_products_v2": "商品库刷新",
+    "wf2_sales_v2": "销量价格刷新",
+    "wf2_sales_refresh_v2": "销量刷新",
+    "wf1_stock_v2": "库存刷新",
+    "wf3_logistics_v2": "物流刷新",
+    "wf5_sales_cycle_v2": "销售周期刷新",
+    "wf6_alerts_v2": "告警刷新",
+    "refresh_all_v2": "全量刷新",
+}
+
+
+def _workflow_result_label(workflow: str) -> str:
+    return _WORKFLOW_RESULT_LABELS.get(workflow or "", workflow or "未知刷新")
+
+
+def _extract_workflow_results(tool_log: list) -> List[dict]:
+    """Collect run_workflow results in display order for mixed-result receipts."""
+    results: List[dict] = []
+    for t in (tool_log or []):
+        if t.get("name") != "run_workflow":
+            continue
+        wf_name = _extract_workflow_name(t.get("args") or {})
+        ok_val = t.get("ok")
+        error_msg = t.get("error") or t.get("result_error")
+        ok = bool(ok_val) if ok_val is not None else not bool(error_msg)
+        results.append({
+            "workflow": wf_name,
+            "label": _workflow_result_label(wf_name),
+            "ok": ok,
+            "task_id": t.get("task_id"),
+            "error": error_msg or "未知错误",
+        })
+    return results
+
+
+def _rewrite_mixed_workflow_result(reply: str, tool_log: list) -> str:
+    """Rewrite mixed run_workflow outcomes into the required human receipt.
+
+    When one refresh starts and another fails to start, keeping the model's
+    original prose is dangerous because it often says the failed item also
+    started. This receipt is built only from tool_log facts.
+    """
+    results = _extract_workflow_results(tool_log)
+    if not results:
+        return reply
+    has_success = any(r["ok"] for r in results)
+    has_failure = any(not r["ok"] for r in results)
+    if not (has_success and has_failure):
+        return reply
+
+    headline = "，".join(
+        f"{r['label']}{'成功' if r['ok'] else '失败'}"
+        for r in results
+    )
+    lines = [f"**刷新结果**：{headline}。", "", "**详情**："]
+    for r in results:
+        if r["ok"]:
+            task_text = f"任务号 {r['task_id']}" if r.get("task_id") else "已创建后台任务"
+            lines.append(f"- {r['label']}成功：{task_text}（{r['workflow']}）。")
+        else:
+            lines.append(f"- {r['label']}失败：{r['error']}（{r['workflow']}）。")
+    lines.append("")
+    lines.append("请点击下方对应项查看详情。")
+    return "\n".join(lines)
+
+
+def _reply_names_workflow(reply: str, wf_name: str) -> bool:
+    """reply 是否点名了该 workflow（技术名称必须出现）。
+
+    验收口径："哪条失败+原因" — reply 必须包含 workflow 技术标识符
+    （如 wf2_sales_v2 / wf2_products_v2），仅说"有一个工作流失败了"或
+    "销量价格刷新失败"均不满足要求（无法唯一定位失败来源）。
+    """
+    if not wf_name or wf_name == "unknown":
+        return False
+    return wf_name in reply
+
+
+# 成功声明模式（同行内）
+_SUCCESS_CLAIM_RE = re.compile(
+    r'(?:成功|✅|✓|√|已启动|已开始|started successfully|已完成|已触发|启动成功)'
+)
+# 失败声明模式（覆盖失败表述，用于排除包含明确失败语言的行）
+_FAILURE_CLAIM_RE = re.compile(
+    r'(?:失败|error|failed|错误|启动失败|failure)',
+    re.IGNORECASE,
+)
+
+
+def _workflow_claimed_succeeded(reply: str, wf_name: str) -> bool:
+    """reply 中是否把 wf_name 标成了"成功"（当工作流实际失败时的假成功声明）。
+
+    按行扫描：找到包含 wf_name 的行，若同行有成功语言且无失败语言覆盖，视为假声明。
+    这样能准确捕获 Markdown 表格行（| wf2_sales_v2 | 成功 |）和内联句子，
+    同时不误伤正确写法（ERP 商品库刷新成功…, wf2_sales_v2 启动失败…）。
+    """
+    if not wf_name or wf_name == "unknown":
+        return False
+    for line in reply.split('\n'):
+        if wf_name not in line:
+            continue
+        # 同行有明确失败语言 → 不算假成功声明（模型如实描述了失败）
+        if _FAILURE_CLAIM_RE.search(line):
+            continue
+        # 同行有成功语言且无失败语言覆盖 → 假声明
+        if _SUCCESS_CLAIM_RE.search(line):
+            return True
+    return False
+
+
+def _check_failed_workflow_claimed_success(reply: str, tool_log: list) -> List[str]:
+    """T36-S3: run_workflow 返回 ok=False 时检测两种假成功声明。
+
+    覆盖两种 provider 形状：
+    - Anthropic: tool_log[i].args 是 dict
+    - OpenAI-compat (deepseek/qwen/doubao): tool_log[i].args 是 JSON string
+
+    两种需要 banner 的情况：
+    1. reply 未点名失败 workflow（原有逻辑）
+    2. reply 点名了失败 workflow 但仍声称其"成功/已启动"（红队新增）
+    """
+    warns: List[str] = []
+    failed = _extract_failed_workflows(tool_log)
+
+    if not failed:
+        return warns
+
+    for wf_name, error_msg in failed:
+        if not _reply_names_workflow(reply, wf_name):
+            warns.append(
+                f"⚠️ 工作流 {wf_name} 实际启动失败（{error_msg}），"
+                f"但 Agent 回复未点名该工作流 — 请明确告知用户 {wf_name} 失败及原因"
+            )
+        elif _workflow_claimed_succeeded(reply, wf_name):
+            warns.append(
+                f"⚠️ 工作流 {wf_name} 实际启动失败（{error_msg}），"
+                f"但 Agent 回复声称 {wf_name} 已成功/已启动 — 请明确告知用户失败及原因"
+            )
     return warns
 
 
@@ -317,6 +497,37 @@ def _get_tool_arg(t: dict, key: str):
     return (args.get(key) or "") if isinstance(args, dict) else ""
 
 
+def _stale_query_skus(tool_log: list) -> List[str]:
+    skus: List[str] = []
+    for t in (tool_log or []):
+        if t.get("name") != "query_sku":
+            continue
+        stale = t.get("result_stale_skus") or []
+        if isinstance(stale, str):
+            stale = [stale]
+        for sku in stale:
+            sku_s = str(sku or "").strip()
+            if sku_s and sku_s not in skus:
+                skus.append(sku_s)
+    return skus
+
+
+def _ensure_stale_query_sku_warning(reply: str, tool_log: list) -> Tuple[str, List[str]]:
+    """query_sku 返回旧快照时，LLM 漏警示也要让用户看见。"""
+    stale_skus = _stale_query_skus(tool_log)
+    if not stale_skus or _STALE_REPLY_RE.search(reply or ""):
+        return reply, []
+
+    sku_str = "、".join(stale_skus)
+    prefix = (
+        f"**数据过期提醒**：SKU {sku_str} 的销量/订单快照是旧数据，"
+        "本次查询返回的数值已被隐藏；请刷新或上传最新 noon CSV 后再确认。\n\n"
+    )
+    return prefix + reply, [
+        f"⚠️ query_sku 返回 data_stale=True（{sku_str}），但回复未明确说明数据过期/旧快照，已自动补充提示（T04）"
+    ]
+
+
 def _check_inventory_selection_evidence(
     reply: str, tools_used: List[str], tool_log: List
 ) -> List[str]:
@@ -436,12 +647,17 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             lines = [ln for ln in lines if not _QUALITY_JUDGMENT_RE.search(ln)]
             reply = '\n'.join(lines).strip()
 
+    reply = _rewrite_mixed_workflow_result(reply, tool_log or [])
+
     warnings.extend(_check_urls(reply))
     warnings.extend(_check_fake_timestamps(reply))
     warnings.extend(_check_fake_fields(reply))
     warnings.extend(_check_stale_sales_claim(reply, tool_log or []))
     warnings.extend(_check_blocked_replenishment_claim(reply, tool_log or []))
     warnings.extend(_check_fake_task_ids(reply, tool_log or []))
+    warnings.extend(_check_failed_workflow_claimed_success(reply, tool_log or []))
+    reply, stale_query_warnings = _ensure_stale_query_sku_warning(reply, tool_log or [])
+    warnings.extend(stale_query_warnings)
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
     # WS-128: two-phase task completion/refresh bypass gate

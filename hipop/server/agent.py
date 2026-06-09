@@ -574,6 +574,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
 
     out = []
     refs = []
+    import datetime as _dt
+
+    def _date10(v):
+        if v is None:
+            return ""
+        if hasattr(v, "isoformat"):
+            return v.isoformat()[:10]
+        return str(v)[:10]
+
+    def _days_old(date_str: str):
+        if not date_str:
+            return None
+        try:
+            return max(0, (_dt.date.today() - _dt.date.fromisoformat(date_str[:10])).days)
+        except Exception:
+            return None
+
+    # SKU sales/order metrics depend on noon orders. A fresh ERP product ingest can move
+    # wf2_sku.as_of_date to today while noon order CSV is still old; in that case sales
+    # numbers must be redacted instead of presented as current.
+    latest_noon_order = _date10(_data._scalar(
+        "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
+        (tid, alias),
+    ))
+    noon_order_stale_days = _days_old(latest_noon_order)
+    noon_orders_stale = (noon_order_stale_days is None) or (noon_order_stale_days > 3)
+
     for sku in skus[:3]:
         # ── T03 门：强制走实时取数路径拿销量数字 ──────────────────────
         live_fn = _sku_sales_live_fn if _sku_sales_live_fn is not None else _erp_sku_stats_live
@@ -612,16 +639,29 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                 stats_30d = _data.sku_30d_stats(tid, alias, sku, as_of)
             except Exception:
                 stats_30d = {}
-        # 快照时效门：非销量字段超 3 天 → REDACT。
+        # 快照时效门：as_of_date 超 3 天/缺失，或 noon 订单源超 3 天/缺失
+        # → data_stale=True，销量/订单数值 REDACT 为 null。
+        # 目的：防止过期快照被 LLM 当成新鲜数据呈现；LLM 必须告知数据过期。
         import datetime as _dt
         stale_days_val: int = 0
+        stale_reasons: List[str] = []
         data_stale_val: bool = not as_of
+        if data_stale_val:
+            stale_reasons.append("wf2_sku_as_of_missing")
         if as_of:
             try:
-                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(as_of)).days)
-                data_stale_val = stale_days_val > 3
+                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(str(as_of)[:10])).days)
+                if stale_days_val > 3:
+                    data_stale_val = True
+                    stale_reasons.append("wf2_sku_as_of_stale")
             except Exception:
                 data_stale_val = True
+                stale_reasons.append("wf2_sku_as_of_invalid")
+        if noon_orders_stale:
+            data_stale_val = True
+            stale_reasons.append("noon_orders_stale")
+            if noon_order_stale_days is not None:
+                stale_days_val = max(stale_days_val, noon_order_stale_days)
 
         def _r(val):
             return None if data_stale_val else val
@@ -654,6 +694,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "as_of_date": as_of,
             "data_stale": data_stale_val,
             "stale_days": stale_days_val,
+            "stale_reason": ",".join(stale_reasons) or None,
+            "noon_order_latest": latest_noon_order,
+            "noon_order_stale_days": noon_order_stale_days,
         }
 
         if live_has_sales:
@@ -2692,7 +2735,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
     scope: {store, current_user, current_role, tenant_id, user_id, ...}
-    返回: {reply, clean_reply, references, action_id, tag, workflow_task, tools_used, provider, confidence}
+    返回: {reply, clean_reply, references, action_id, tag, workflow_tasks, tools_used, provider, confidence}
 
     走 _provider 抽象层，通过 LLM_PROVIDER env 切换 anthropic / qwen / deepseek / doubao。
     """
@@ -2766,17 +2809,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
         tool_result = _exec_tool("run_workflow", tool_args, user=scope)
-        workflow_task = None
+        workflow_tasks = []
         if isinstance(tool_result, dict) and tool_result.get("ok"):
             task_id = tool_result["task_id"]
-            workflow_task = {
+            workflow_tasks.append({
+                "ok": True,
                 "task_id": task_id,
-                "workflow": tool_result["workflow"],
-                "label": tool_result["label"],
-                "total_steps": tool_result["total_steps"],
-                "affected_modules": tool_result["affected_modules"],
+                "workflow": tool_result.get("workflow", direct_workflow["workflow"]),
+                "label": tool_result.get("label", direct_workflow.get("label", direct_workflow["workflow"])),
+                "total_steps": tool_result.get("total_steps", 0),
+                "affected_modules": tool_result.get("affected_modules", []),
                 "followup_prompt": tool_result.get("followup_prompt"),
-            }
+            })
             # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
             # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
             reply = _workflow_receipt_reply(
@@ -2795,7 +2839,8 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         ):
             existing = _current_workflow_task(direct_workflow["workflow"])
             if existing:
-                workflow_task = {
+                workflow_tasks.append({
+                    "ok": True,
                     "task_id": existing["task_id"],
                     "workflow": existing["workflow"],
                     "label": direct_workflow["label"],
@@ -2804,7 +2849,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     "followup_prompt": question,
                     "state": existing.get("state"),
                     "already_running": True,
-                }
+                })
                 reply = (
                     f"{direct_workflow['label']}已有运行中的后台任务 "
                     f"`{existing['task_id']}`，我不重复触发。"
@@ -2817,14 +2862,15 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     label, total_steps, affected = _workflow_registry_summary(
                         workflow, direct_workflow["label"]
                     )
-                    workflow_task = {
+                    workflow_tasks.append({
+                        "ok": True,
                         "task_id": extracted_id,
                         "workflow": workflow,
                         "label": label,
                         "total_steps": total_steps,
                         "affected_modules": affected,
                         "followup_prompt": question,
-                    }
+                    })
                     reply = (
                         f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
                         f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
@@ -2839,20 +2885,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                 label, total_steps, affected = _workflow_registry_summary(
                     workflow, direct_workflow["label"]
                 )
-                workflow_task = {
+                workflow_tasks.append({
+                    "ok": True,
                     "task_id": existing_task_id,
                     "workflow": workflow,
                     "label": label,
                     "total_steps": total_steps,
                     "affected_modules": affected,
                     "followup_prompt": question,
-                }
+                })
                 reply = (
                     f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
                     f"任务 ID：{existing_task_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
                     "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
                 )
             else:
+                workflow_tasks.append({
+                    "ok": False,
+                    "workflow": direct_workflow["workflow"],
+                    "label": direct_workflow.get("label", direct_workflow["workflow"]),
+                    "error": (tool_result or {}).get("error") or "触发失败",
+                    "task_id": None,
+                })
                 reason = (
                     (tool_result or {}).get("message")
                     or (tool_result or {}).get("error")
@@ -2872,7 +2926,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "action_id": None,
             "tools_used": ["run_workflow"],
             "tag": "执行",
-            "workflow_task": workflow_task,
+            "workflow_tasks": workflow_tasks,
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
@@ -3044,7 +3098,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     clean_reply  = result["reply"]           # LLM 原文（无 banner）— 用于持久化 + 喂未来历史
     tool_log     = result["tool_log"]
     refs_collected = result["refs_collected"]
-    workflow_task  = result.get("workflow_task")
+    workflow_tasks = result.get("workflow_tasks", [])
     tools_used     = [t["name"] for t in tool_log]
 
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
@@ -3115,7 +3169,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "action_id": action_id,
         "tools_used": tools_used,
         "tag": ("hallucinate" if hallu_warnings else ("执行" if _safety._is_substantive_action(tool_log) else ("查询" if tool_log else None))),
-        "workflow_task": workflow_task,
+        "workflow_tasks": workflow_tasks,
         "provider": _provider.get_provider(),
         "confidence": round(confidence, 2),
         "judge_method": judge_method,
