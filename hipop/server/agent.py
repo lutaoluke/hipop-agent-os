@@ -2243,12 +2243,15 @@ def _format_order_live_reply(order_no: str, tool_result: dict) -> str:
 
 
 def _current_workflow_task(workflow: str) -> Optional[dict]:
-    rows = _data._fetch(
-        "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
-        "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
-        (_get_tenant(), workflow),
-    )
-    return dict(rows[0]) if rows else None
+    try:
+        rows = _data._fetch(
+            "SELECT task_id, workflow, state FROM tasks WHERE tenant_id=? AND workflow=? "
+            "AND state IN ('running','queued') ORDER BY COALESCE(last_heartbeat, started_at) DESC LIMIT 1",
+            (_get_tenant(), workflow),
+        )
+        return dict(rows[0]) if rows else None
+    except Exception:
+        return None
 
 
 _READONLY_REFRESH_VERB_RE = re.compile(
