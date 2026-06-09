@@ -181,6 +181,19 @@ def test_scan_complete_claim_blocked():
     print(f"    warns={warns[0]!r}")
 
 
+def _queued_event(task_id: str) -> dict:
+    """Production spawn_task writes this durable event before init events."""
+    return {
+        "id": 1,
+        "task_id": task_id,
+        "step_no": 0,
+        "step_name": "任务排队",
+        "status": "queued",
+        "message": "",
+        "created_at": "2026-06-09T00:00:00",
+    }
+
+
 # ── Test 8: spawn 成功 + init event 写失败 → task_id 存在 + lifecycle_error ──────
 
 def test_spawn_success_event_write_failure_partial_success():
@@ -213,6 +226,7 @@ def test_spawn_success_event_write_failure_partial_success():
         with patch("hipop.server.agent._data") as mock_data:
             mock_data.set_current_tenant.return_value = None
             mock_data.write_event.side_effect = _event_fail
+            mock_data.get_events_after.return_value = [_queued_event(_fake_task_id)]
             with patch("hipop.server.agent._get_tenant", return_value=1):
                 try:
                     result = tool_run_workflow("wf1_stock_v2")
@@ -274,7 +288,7 @@ def test_exec_tool_run_workflow_event_store_down_preserves_task_id():
     result = None
     with patch("hipop.server.runtime.spawn_task", side_effect=_spawn_ok):
         with patch("hipop.server.data.write_event", side_effect=_event_fail):
-            with patch("hipop.server.data._fetch", return_value=[]):
+            with patch("hipop.server.data.get_events_after", return_value=[_queued_event(_fake_task_id)]):
                 with patch("hipop.server.data.set_current_tenant"):
                     with patch("hipop.server.agent._get_tenant", return_value=1):
                         with patch("hipop.server.rbac.tool_allowed", return_value=True):
