@@ -619,7 +619,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                    w2.total_orders, w2.as_of_date, w2.imported_at,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
-                   h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
+                   w5.updated_at AS wf5_updated_at,
+                   h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input,
+                   h.updated_at AS wf3_updated_at
             FROM wf2_sku w2
             LEFT JOIN wf5_sales_cycle w5
               ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
@@ -633,6 +635,13 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             continue
         r = rows[0]
         as_of = r.get("as_of_date")
+        # 事实源契约（WS-129）：每个来源的时间戳门，NULL → fail-closed
+        wf3_updated_at = r.get("wf3_updated_at") or None
+        wf5_updated_at = r.get("wf5_updated_at") or None
+        imported_at_full = r.get("imported_at") or None
+        wf3_ok = bool(wf3_updated_at)   # wf3_logistics_hub_v2 timestamp gate
+        wf5_ok = bool(wf5_updated_at)   # wf5_sales_cycle timestamp gate
+        wf2_ok = bool(imported_at_full) # wf2_sku.imported_at snapshot gate
         stats_30d: dict = {}
         if as_of:
             try:
@@ -667,25 +676,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             return None if data_stale_val else val
 
         def _live_guarded_snapshot(val):
-            return _r(val) if live_has_sales else None
+            # wf5-sourced fields: gated on live freshness AND wf5 timestamp
+            return _r(val) if (live_has_sales and wf5_ok) else None
+
+        def _wf2(val):
+            # wf2 snapshot-sourced fields: gated on imported_at AND live freshness
+            return _r(val) if (live_has_sales and wf2_ok) else None
 
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
-        sales_30d_out = live_result.get("sales_30d") if live_ok else None
-        history_total_out = live_result.get("history_total") if live_ok else None
+        # partial-live fail-closed: live_ok=True but sales_30d=None → also block history_total
+        sales_30d_out = live_result.get("sales_30d") if live_has_sales else None
+        history_total_out = live_result.get("history_total") if live_has_sales else None
 
         item = {
             "sku": sku,
             "found": True,
             "title": r["title"],
             "trend": _live_guarded_snapshot(r["trend"]),
-            "profit_rate_pct": _live_guarded_snapshot(round((r["latest_profit_rate"] or 0) * 100, 1)),
+            "profit_rate_pct": _wf2(round((r["latest_profit_rate"] or 0) * 100, 1)),
             "sales_30d": sales_30d_out,
-            "sales_10d": _live_guarded_snapshot(r["sales_10d"]),
+            "sales_10d": _wf2(r["sales_10d"]),
             "daily_rate": _live_guarded_snapshot(r["daily_rate"]),
             "urgency": _live_guarded_snapshot(r["urgency"]),
             "ops_advice": _live_guarded_snapshot(r["ops_advice"]),
-            "in_transit": r["in_transit_total_qty"],
-            "has_stuck_batch": bool(r["has_stuck_batch"]),
+            "in_transit": r["in_transit_total_qty"] if wf3_ok else None,
+            "in_transit_source": "erp" if wf3_ok else None,
+            "in_transit_updated_at": wf3_updated_at,
+            "has_stuck_batch": bool(r["has_stuck_batch"]) if wf3_ok else None,
             "weekly_replenish": _live_guarded_snapshot(r["weekly_total_replenish"]),
             "total_orders_30d": _live_guarded_snapshot(stats_30d.get("total_30d")),
             "cancel_rate_30d": _live_guarded_snapshot(stats_30d.get("cancel_rate_30d")),
@@ -697,6 +714,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "stale_reason": ",".join(stale_reasons) or None,
             "noon_order_latest": latest_noon_order,
             "noon_order_stale_days": noon_order_stale_days,
+            "wf5_updated_at": wf5_updated_at,
+            "wf2_imported_at": imported_at_full,
         }
 
         if live_has_sales:
@@ -709,7 +728,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             if live_ok:
                 item["live_sales_error"] = "live_ok_but_missing_sales_30d"
                 item["live_sales_message"] = (
-                    "当前无法实时确认 SKU 销量（实时接口返回但关键指标缺失），已降级（不输出旧缓存确定数）"
+                    "实时源可达但销量数据缺失，无法给出确定数字"
+                    "（sales_30d/history_total 均已拒绝输出，不泄出裸数字）"
                 )
             else:
                 item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
