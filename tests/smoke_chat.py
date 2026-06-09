@@ -106,7 +106,7 @@ def ensure_smoke_user_tenant1() -> None:
 def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
     ensure_smoke_user_tenant1()
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
     body = json.dumps({"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD}).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url}/api/auth/login",
@@ -687,6 +687,26 @@ def _rate_or_unavailable_re(rate, label: str) -> str:
     return _rate_re(rate, label)
 
 
+def _t04_must_contain_patterns(item: dict) -> list:
+    """Build T04 must_contain patterns from an /api/sku-metrics item.
+
+    When data_stale=True the agent returns a blanket stale message (no numbers),
+    so all metric patterns must use _UNAVAILABLE_RE instead of concrete values.
+    """
+    data_stale = item.get("data_stale")
+
+    def _d(val):
+        return None if data_stale else val
+
+    return [
+        _num_or_unavailable_re(_d(item.get("sales_30d"))),
+        _num_or_unavailable_re(_d(item.get("total_orders_30d"))),
+        _rate_or_unavailable_re(_d(item.get("cancel_rate_30d")), "取消率"),
+        _rate_or_unavailable_re(_d(item.get("return_rate_30d")), "退货率"),
+        _num_or_unavailable_re(_d(item.get("history_total"))),
+    ]
+
+
 def _find_case(name_part: str) -> Optional[Case]:
     return next((c for c in CASES if name_part in c.name), None)
 
@@ -727,13 +747,7 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         c = _find_case("T04 TBB0116A")
         if c and item.get("found"):
             c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
-            c.must_contain = [
-                _num_or_unavailable_re(item.get("sales_30d")),
-                _num_or_unavailable_re(item.get("total_orders_30d")),
-                _rate_or_unavailable_re(item.get("cancel_rate_30d"), "取消率"),
-                _rate_or_unavailable_re(item.get("return_rate_30d"), "退货率"),
-                _num_or_unavailable_re(item.get("history_total")),
-            ]
+            c.must_contain = _t04_must_contain_patterns(item)
     except Exception:
         pass  # endpoint unavailable — T04 uses static DB expectations
 
