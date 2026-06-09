@@ -117,8 +117,37 @@ _ERROR_FABRICATION_RE = re.compile(
     r"|当前.{0,5}(?:没有|无).{0,3}在途"
     r"|没有在途库存"
     r"|没有在途"
-    r"|库存.{0,3}正常"
-    r"|状态.{0,3}正常"
+    r"|(?:状态|库存|一切|都).{0,4}正常"          # 状态/库存/一切正常 等积极结论
+    r"|预计.{0,8}(?:到仓|到货|到达|送达|送到|签收|抵达)"  # ETA 同义扩展
+    r"|已\s*(?:发货|发出|揽收|签收|出库|发运|送达)"        # 已发货/已签收 等完成态
+)
+
+# ── WS-133 Round-5：结构判别（取代逐句加词的黑名单）─────────────────────────────
+# 教训（WS-55/WS-128 + 本 PR 前 4 轮）：对自由中文逐句枚举"编造措辞"永不收敛——
+# 红队每轮换同义词就能绕（货代为→货代是→物流商是→走的是…）。
+# 改为按"失败的查询不可能产生的确定结果"的【形状 + 闭集实体】判别：
+#   1) id 形 token（跟踪号/别的单号）且不等于被查询 id —— 失败查询拿不到新 id；
+#   2) 承运商闭集命中 —— 货代是有限现实实体，枚举=领域建模，非穷举措辞；
+#   3) 具体数量（N 件 / 在途 N）；
+#   4) 既有语义断言短语（在途/ETA/状态正常…，见 _ERROR_FABRICATION_RE）。
+
+# 真实承运商/货代闭集（有限现实域实体）
+_CARRIERS_CN = ["顺丰", "圆通", "中通", "申通", "韵达", "百世", "极兔",
+                "德邦", "京东", "邮政", "菜鸟", "跨越", "宅急送"]
+_CARRIERS_EN = ["EMS", "YTO", "STO", "ZTO", "YUNDA", "DHL", "UPS",
+                "FEDEX", "TNT", "ARAMEX", "SMSA", "DPD", "GLS"]
+_CARRIER_RE = re.compile(
+    "|".join(re.escape(c) for c in _CARRIERS_CN)
+    + "|" + "|".join(rf"\b{re.escape(c)}\b" for c in _CARRIERS_EN),
+    re.IGNORECASE,
+)
+# id 形 token：≥2 字母后接 ≥3 数字（YT123456 / SF123 / YT888），或 ≥8 位纯数字（长跟踪号）
+_ID_TOKEN_RE = re.compile(r"\b[A-Za-z]{2,}\d{3,}[A-Za-z0-9]*\b|\b\d{8,}\b")
+# 具体数量声明（物流/库存语境）
+_QTY_RESULT_RE = re.compile(
+    r"\d+\s*(?:件|个|箱|pcs|现货)"
+    r"|(?:在途|在库|现货|库存)\s*\d+",
+    re.IGNORECASE,
 )
 
 
@@ -523,6 +552,30 @@ def _get_tool_arg(t: dict, key: str):
         except Exception:
             args = {}
     return (args.get(key) or "") if isinstance(args, dict) else ""
+
+
+def _has_fabricated_result(reply: str, failed_entries: list) -> bool:
+    """实时查询/登录失败且无数据时，回复出现「失败查询不可能产生」的确定结果即判编造。
+
+    结构判别（非穷举措辞），见 _CARRIER_RE / _ID_TOKEN_RE / _QTY_RESULT_RE 注释。
+    被查询 id 本身在失败说明里复述是合法的（"货单 PD-X 查询失败"），需排除。
+    """
+    if _ERROR_FABRICATION_RE.search(reply) or _CARRIER_RE.search(reply) \
+            or _QTY_RESULT_RE.search(reply):
+        return True
+    # 被查询 id 集合（order_no / sku）——合法复述，从 id 形检测里剔除
+    qids = set()
+    for t in (failed_entries or []):
+        for k in ("order_no", "sku"):
+            v = _get_tool_arg(t, k)
+            if v:
+                qids.add(str(v).strip().upper())
+    for m in _ID_TOKEN_RE.finditer(reply):
+        tok = m.group(0).upper()
+        if any(tok == q or tok in q or q in tok for q in qids):
+            continue  # 复述被查询 id，放行
+        return True  # 出现新的 id 形 token = 失败查询编造出的结果
+    return False
 
 
 def _stale_query_skus(tool_log: list) -> List[str]:
@@ -963,10 +1016,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         and t.get("result_error") == "erp_login_failed_no_cache"
     ]
     if order_erp_login_failed and (
-        # 即使回复开头已说明 ERP 登录失败/无缓存，后缀只要再出现确定物流/库存结论
-        # （当前在途 / 预计到仓 / 货代为 X / 没有在途 / 库存正常）仍须告警 —
-        # 验门人 Round-3 打回点：不能因为出现"失败/无缓存"措辞就整条放行（洞F 修复）。
-        _ERROR_FABRICATION_RE.search(reply)
+        # 即使回复开头已说明 ERP 登录失败/无缓存，后缀只要再出现「失败查询不可能产生」
+        # 的确定结果（id 形跟踪号 / 承运商 / 数量 / 在途·ETA·状态正常…）仍须告警 —
+        # Round-5：结构判别（_has_fabricated_result），取代逐句加词的黑名单（洞F 收口）。
+        _has_fabricated_result(reply, order_erp_login_failed)
         or not re.search(
             r"(ERP.{0,10}(失败|登录|无法)|实时.{0,5}失败|登录.{0,5}失败|查询失败|无缓存|没有缓存|暂时无法)",
             reply,
@@ -992,8 +1045,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         and t.get("result_error") == "order_lookup_unavailable_no_erp_credentials"
     ]
     if order_no_credentials and (
-        # 即使回复开头已说明 ERP 未配置，后缀出现编造在途声明仍须拦截（洞2 修复）
-        _ERROR_FABRICATION_RE.search(reply)
+        # 即使回复开头已说明 ERP 未配置，后缀出现编造结果仍须拦截（Round-5 结构判别）
+        _has_fabricated_result(reply, order_no_credentials)
         or not re.search(
             r"(ERP.{0,10}(未配置|无配置|没配置|账号|凭据|credentials)|配置.{0,5}dbuyerp"
             r"|无法确认|ERP.{0,5}(失败|不可用)|账号未配|暂无凭据)",
@@ -1044,8 +1097,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         and (t.get("result_error") or "").startswith("erp_fetch_error")
     ]
     if erp_fetch_errors and (
-        # 即使回复已说明查询失败，后缀出现具体库存/在途声明仍须拦截（洞3 修复）
-        _ERROR_FABRICATION_RE.search(reply)
+        # 即使回复已说明查询失败，后缀出现编造结果仍须拦截（Round-5 结构判别）
+        _has_fabricated_result(reply, erp_fetch_errors)
         or not re.search(
             r"(查询失败|ERP.{0,5}(失败|异常)|实时.{0,5}失败|获取失败|抓取失败|接口.{0,5}失败"
             r"|网络.{0,5}(错误|异常)|请求失败|暂时无法.{0,5}(查|获取)|无法查询)",

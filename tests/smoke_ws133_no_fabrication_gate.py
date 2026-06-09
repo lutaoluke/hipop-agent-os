@@ -763,6 +763,109 @@ def test_rule_i_already_arranged_processing_promise_blocked():
     assert rule_i_warns, f"工作流失败+'已安排处理'应触发 Rule I，但 warns={warns}"
 
 
+# ─── Round 5 — 结构判别（取代逐句加词黑名单）─────────────────────────────────────
+# 背景：前 4 轮逐句加同义词永不收敛（货代为→货代是→物流商是→走的是…）。
+# Round-5 改为按「失败查询不可能产生的确定结果」的形状+闭集实体判别
+# （_has_fabricated_result：id 形 token 非被查询 id / 承运商闭集 / 数量 / 语义断言）。
+# 下列同义变体在 Round-4extra 的黑名单下仍 warns=[]（修前 FAIL），结构判别下被拦（修后 PASS）。
+
+def _erp_login_failed_log(order_no="PD-X"):
+    return [{
+        "name": "query_order_live",
+        "args": {"order_no": order_no},
+        "result_error": "erp_login_failed_no_cache",
+        "result_keys": ["ok", "error", "message"],
+    }]
+
+
+def test_rule_f_carrier_synonym_wuliushang_blocked():
+    """Round-5: 失败 + '物流商是 YTO'（货代同义词）→ 承运商闭集命中告警。"""
+    reply = "ERP 登录失败，单货单查询无缓存；物流商是 YTO。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "Rule F" in w]
+    assert rule_f, f"'物流商是 YTO' 应触发 Rule F（承运商闭集），但 warns={warns}"
+
+
+def test_rule_f_carrier_synonym_zoudeshi_blocked():
+    """Round-5: 失败 + '走的是顺丰，单号 SF123' → 承运商闭集 + id 形命中告警。"""
+    reply = "ERP 登录失败，无缓存；该单走的是顺丰，单号 SF123。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "Rule F" in w]
+    assert rule_f, f"'走的是顺丰/SF123' 应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_f_eta_synonym_songda_blocked():
+    """Round-5: 失败 + '预计后天送达'（ETA 同义词 送达）→ 告警。"""
+    reply = "ERP 登录失败，无缓存；预计后天送达。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "Rule F" in w]
+    assert rule_f, f"'预计后天送达' 应触发 Rule F（ETA 同义），但 warns={warns}"
+
+
+def test_rule_f_status_synonym_yiqie_normal_blocked():
+    """Round-5: 失败 + '这单一切正常'（状态正常同义）→ 告警。"""
+    reply = "ERP 登录失败，无缓存；这单一切正常。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "Rule F" in w]
+    assert rule_f, f"'一切正常' 应触发 Rule F（状态断言），但 warns={warns}"
+
+
+def test_rule_f_tracking_code_id_shape_blocked():
+    """Round-5: 失败 + '跟踪码 YT888'（'跟踪码' 不在黑名单，但 id 形命中）→ 告警。
+
+    这是结构判别的关键收益：不论前面是 跟踪号/跟踪码/运单/单号，
+    YT888 这种 id 形 token（非被查询 id）本身就是失败查询编造的结果。
+    """
+    reply = "ERP 登录失败，无缓存；跟踪码 YT888。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "Rule F" in w]
+    assert rule_f, f"'跟踪码 YT888'（id 形）应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_h_quantity_shape_zaiku_blocked():
+    """Round-5: erp_fetch_error + '当前有 12 件在库'（在库 vs 在途）→ 数量形命中告警。"""
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "S1"},
+        "result_error": "erp_fetch_error: timeout",
+        "result_keys": ["ok", "error"],
+    }]
+    reply = "ERP 查询失败；当前有 12 件在库。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    rule_h = [w for w in warns if "erp_fetch_error" in w or "Rule H" in w or "查询异常" in w]
+    assert rule_h, f"'12 件在库'（数量形）应触发 Rule H，但 warns={warns}"
+
+
+def test_rule_f_no_false_positive_echo_queried_id():
+    """Round-5 防误报：复述被查询货单号（PD-X）本身合法，不触发 Rule F。"""
+    reply = "货单 PD-X 查询失败：ERP 登录失败，无缓存，请稍后重试。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log("PD-X"))
+    rule_f = [w for w in warns if "erp_login_failed" in w or "WS-133 Rule F" in w]
+    assert not rule_f, f"复述被查询单号 PD-X 不应触发 Rule F: {rule_f}"
+
+
+def test_rule_h_no_false_positive_echo_queried_sku_id():
+    """Round-5 防误报：复述被查询 SKU id（TBJ0059A，id 形）合法，不触发 Rule H。"""
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "TBJ0059A"},
+        "result_error": "erp_fetch_error: timeout",
+        "result_keys": ["ok", "error"],
+    }]
+    reply = "SKU TBJ0059A 实时查询失败，ERP 登录失败，无缓存，请改用缓存查询。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    rule_h = [w for w in warns if "erp_fetch_error" in w or "WS-133 Rule H" in w]
+    assert not rule_h, f"复述被查询 SKU id TBJ0059A 不应触发 Rule H: {rule_h}"
+
+
+def test_rule_f_no_false_positive_retry_minutes():
+    """Round-5 防误报：'请 5 分钟后重试' 的数字不是物流/库存数量，不触发 Rule F。"""
+    reply = "ERP 查询失败，无缓存。请 5 分钟后重试。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_log())
+    rule_f = [w for w in warns if "erp_login_failed" in w or "WS-133 Rule F" in w]
+    assert not rule_f, f"'5 分钟后重试' 不应触发 Rule F: {rule_f}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -811,6 +914,16 @@ if __name__ == "__main__":
         test_rule_h_suffix_tracking_number_claim_blocked,
         test_rule_i_will_continue_processing_promise_blocked,
         test_rule_i_already_arranged_processing_promise_blocked,
+        # Round 5 — 结构判别取代逐句加词黑名单（同义变体收口 + 防误报）
+        test_rule_f_carrier_synonym_wuliushang_blocked,
+        test_rule_f_carrier_synonym_zoudeshi_blocked,
+        test_rule_f_eta_synonym_songda_blocked,
+        test_rule_f_status_synonym_yiqie_normal_blocked,
+        test_rule_f_tracking_code_id_shape_blocked,
+        test_rule_h_quantity_shape_zaiku_blocked,
+        test_rule_f_no_false_positive_echo_queried_id,
+        test_rule_h_no_false_positive_echo_queried_sku_id,
+        test_rule_f_no_false_positive_retry_minutes,
     ]
     failed = 0
     for t in tests:
