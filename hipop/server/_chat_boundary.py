@@ -59,86 +59,90 @@ _TASK_DONE_STATUSES: frozenset = frozenset({
     "done", "done_unverified", "success", "complete", "completed",
 })
 
-# Completion/refresh claim patterns that require task-done evidence.
-# Covers 已刷新/已经刷新/已更新; colloquial 完成了/结束了/完毕/处理完 variants.
-_RESULT_TAIL_RE = (
-    r"(?:完成了?|成功了?|好了|完(?:了)?|完毕|结束了|弄好了|搞定了|"
-    r"搞好了|处理好了|处理完(?:了)?|做好了|做完(?:了)?|跑好了|"
-    r"跑完(?:了)?|到最新了?|行了)"
+# Structural result/completion claims that require task-done evidence.
+#
+# This intentionally models sentence shape instead of action synonyms:
+#   - result-bearing subjects (task/workflow/data/inventory/system/etc.)
+#   - Chinese completion/result morphology ("已/已经 ...", "...完/好/完成/生效")
+#   - narrow exclusions for trigger-only and query-only states.
+#
+# run_workflow may justify "已创建/已排队/已开始", but never "已完成/已生效".
+_CLAUSE_SEPARATORS = "，。！？!?；;\n"
+_CLAUSE_CHUNK = rf"[^{_CLAUSE_SEPARATORS}]{{0,24}}"
+_CLAUSE_TOKEN = rf"[^{_CLAUSE_SEPARATORS}\s]{{1,18}}"
+_CLAIM_BOUNDARY = rf"(?=$|[{_CLAUSE_SEPARATORS}\s,、])"
+_RESULT_SUBJECT_RE = (
+    r"(?:任务|后台任务|工作流|流程|后台流程|操作|系统|数据|库存|销量|报表|"
+    r"最新数据|最新库存|最新销量)"
 )
-_TASK_RESULT_TAIL_RE = (
-    r"(?:已?(?:跑完|完成|成功|结束)(?:了)?|跑好了|跑完(?:了)?|处理好了|"
-    r"处理完(?:了)?|弄好了|搞定了|搞好了|做好了|做完(?:了)?|"
-    r"完(?:了)?|完毕|结束了|收尾了?|行了)"
+_ALREADY_RE = r"(?:已|已经)"
+_NON_RESULT_ALREADY_RE = (
+    r"(?:触发|启动|开始|排队|创建|提交|受理|待执行|进入|安排|"
+    r"在|正在|查|查询|拉取|拉|看|为|给)"
+)
+_NON_RESULT_BARE_LE_RE = (
+    r"(?:(?:[^\s，。！？!?；;\n]{0,4})(?:查|看|拉)|"
+    r"触发|启动|开始|排队|创建|提交|受理|导出|生成|通知)"
+)
+_COMPLETION_STATE_RE = (
+    r"(?:完成了?|成功(?:完成|了)?|好了?|完(?:了)?|完毕|结束了?|"
+    r"收尾了?|收工了?|办妥了?|搞定了?|搞好了?|闭环了?|"
+    r"跑通了?|走通了?|跑顺了?|到最新了?|生效了?|落地了?|"
+    r"收口了?|封存了?)"
 )
 
-# Proof-required result claims: these are intentionally grammatical categories,
-# not exact phrase patches. Query-only actions such as 查好了/看好了 stay out of
-# the action set and remain allowed with query evidence.
-_TASK_RESULT_SUBJECT_RE = r"(?:任务|后台任务|工作流|流程|后台流程|操作|系统)"
-_DATA_RESULT_SUBJECT_RE = r"(?:数据|库存|销量|最新数据|最新库存|最新销量)"
-_WRITE_RESULT_ACTION_RE = r"写(?:入(?:系统)?|进系统|到系统)"
-_RESULT_ACTION_RE = rf"(?:刷|刷新|更新|同步|重算|重新计算|重新算|算|计算|处理|导入|落库|入库|{_WRITE_RESULT_ACTION_RE})"
-_PERSISTENCE_RESULT_ACTION_RE = rf"(?:导入|落库|入库|{_WRITE_RESULT_ACTION_RE}|归档)"
-_PROOF_RESULT_TAIL_RE = (
-    r"(?:完成了?|成功(?:完成|了)?|好了|完(?:了)?|完毕|结束了?|"
-    r"弄好了|搞定了|搞好了|处理好了|处理完(?:了)?|做好了|做完(?:了)?|"
-    r"跑好了|跑完(?:了)?|跑通(?:了)?|到最新了?|收尾了?|收工(?:了)?|"
-    r"办妥(?:了)?|归档(?:了)?|闭环(?:了)?|落库(?:了)?|"
-    rf"{_WRITE_RESULT_ACTION_RE}(?:了)?|算好了|导入完毕|行了)"
+_STRUCTURAL_RESULT_CLAIM_RES = (
+    # 数据已经推送到系统 / 库存已覆盖线上系统 / 系统已经生效
+    re.compile(
+        rf"(?P<claim>{_RESULT_SUBJECT_RE}{_CLAUSE_CHUNK}"
+        rf"{_ALREADY_RE}(?!{_NON_RESULT_ALREADY_RE}){_CLAUSE_CHUNK})"
+    ),
+    # 已成功导入最新数据 / 已处理完库存
+    re.compile(
+        rf"(?P<claim>{_ALREADY_RE}(?!{_NON_RESULT_ALREADY_RE})"
+        rf"{_CLAUSE_CHUNK}{_RESULT_SUBJECT_RE})"
+    ),
+    # 流程跑通了 / 数据刷新好了 / 操作完毕
+    re.compile(
+        rf"(?P<claim>{_RESULT_SUBJECT_RE}{_CLAUSE_CHUNK}{_COMPLETION_STATE_RE})"
+    ),
+    # 已跑完 / 已重算完 / 已生效
+    re.compile(
+        rf"(?P<claim>{_ALREADY_RE}(?!{_NON_RESULT_ALREADY_RE})"
+        rf"{_CLAUSE_TOKEN}{_COMPLETION_STATE_RE}){_CLAIM_BOUNDARY}"
+    ),
+    # 处理好了 / 刷好了 / 完成了 / 流程落地了
+    re.compile(
+        rf"(?P<claim>{_CLAUSE_TOKEN}{_COMPLETION_STATE_RE}){_CLAIM_BOUNDARY}"
+    ),
+    # 任意短语 + 了：更新了 / 同步了 / 处理了 / 完成了。
+    # Query/read actions such as 查了/看了/拉了 are excluded here.
+    re.compile(
+        rf"(?P<claim>(?!{_NON_RESULT_BARE_LE_RE}){_CLAUSE_TOKEN}了)"
+        rf"{_CLAIM_BOUNDARY}"
+    ),
+    # Bare short "已更新/已同步/已刷新/已处理/完成" style status claims.
+    re.compile(
+        rf"(?P<claim>{_ALREADY_RE}(?!{_NON_RESULT_ALREADY_RE})"
+        rf"{_CLAUSE_TOKEN}){_CLAIM_BOUNDARY}"
+        rf"|(?P<bare>完成){_CLAIM_BOUNDARY}"
+    ),
 )
-_PROOF_REQUIRED_RESULT_RE = re.compile(
-    rf"(?:{_TASK_RESULT_SUBJECT_RE}).{{0,12}}(?:{_PROOF_RESULT_TAIL_RE})"
-    rf"|(?:{_DATA_RESULT_SUBJECT_RE}).{{0,12}}(?:{_RESULT_ACTION_RE}).{{0,8}}(?:{_PROOF_RESULT_TAIL_RE})"
-    rf"|(?:{_DATA_RESULT_SUBJECT_RE}).{{0,12}}(?:{_PERSISTENCE_RESULT_ACTION_RE})(?:了|完毕|完成|成功)?"
-    rf"|(?:{_RESULT_ACTION_RE}).{{0,8}}(?:{_PROOF_RESULT_TAIL_RE})"
-)
-_COMPLETION_BYPASS_RE = re.compile(
-    r"(数据.{0,8}已经?(?:刷新|更新)"        # 数据已刷新/已更新/已经刷新/已经更新
-    r"|库存.{0,8}已经?(?:刷新|更新)"        # 库存已刷新/已更新/已经刷新/已经更新
-    r"|销量.{0,8}已经?(?:刷新|更新)"        # 销量已刷新/已更新
-    r"|已经?(?:刷新|更新|同步).{0,8}(?:完成|成功|好了|完了)"  # 已(经)刷新/更新/同步…完成/好了
-    r"|(?:刷新|更新|同步).{0,5}(?:已完成|好了|完了|弄好了|搞定了)"  # 刷新/更新/同步已完成/好了
-    r"|(?:数据|库存|销量).{0,10}(?:刷|刷新|更新|同步).{0,5}(?:好了|完了|弄好了|搞定了)"  # 数据刷新/刷好了
-    rf"|(?:数据|库存|销量).{{0,10}}(?:刷|刷新|更新|同步|重算|处理).{{0,8}}{_RESULT_TAIL_RE}"
-    rf"|(?:刷|刷新|更新|同步|重算|处理).{{0,8}}{_RESULT_TAIL_RE}"
-    rf"|(?:任务|后台任务|工作流).{{0,10}}{_TASK_RESULT_TAIL_RE}"
-    r"|(?:处理好了|处理完(?:了)?|搞定了)"  # bare "处理好了/处理完/搞定了" is still a completion claim
-    r"|工作流.{0,10}已完成"
-    r"|后台流程.{0,10}已经?(?:结束|完成)"
-    r"|后台任务.{0,10}已完成"
-    r"|任务已(?:跑完|完成|成功)"
-    r"|(?:数据|库存|销量).{0,10}已(?:重新)?(?:计算|重算)"
-    r"|(?:数据|库存|销量).{0,10}已经?.{0,8}(?:计算|重算)"
-    r"|已(?:成功)?(?:导入|同步|更新).{0,8}最新(?:数据|库存|销量)"
-    r"|最新(?:数据|库存|销量).{0,8}已(?:成功)?(?:导入|同步|更新)"
-    r"|已重算.{0,5}完(?:成)?"
-    r"|已跑完"
+
+# Query-action phrases are read-only claims, not task/data completion claims.
+# They are excluded from this gate; other fake-query gates validate evidence.
+_QUERY_ACTION_SAFE_RE = re.compile(
+    r"(?P<claim>"
+    r"已处理查询结果"
+    r"|(?:数据|库存).{0,4}(?:已查到|查好了|看好了|拉好了)"
+    r"|(?:我)?(?:查|看|拉).{0,4}了"
+    r"|(?:查询|查).{0,6}(?:已完成|完成了?|完(?:了)?|好了|结束(?:了)?)"
     r")"
 )
 
-# Short completion claims that are too generic to put in the broad regex above.
-# These still need task-done evidence when no tool backs them, when the only
-# action evidence is run_workflow (task creation), or when query evidence would
-# otherwise wash out a bare "done/update/sync" claim.
-_SHORT_STATUS_BYPASS_RE = re.compile(
-    r"(?:"
-    r"操作.{0,4}(?:完毕|完(?:了)?|已完成|完成了?|成功了?)"
-    r"|已(?:完成处理|刷新|完成|更新|同步)(?=$|[。！？!?,，、\s])"
-    r"|完成了(?=$|[。！？!?,，、\s])"
-    r"|已经(?:完成|更新|刷新)(?=$|[。！？!?,，、\s])"
-    r"|(?:刷新|更新|同步|处理)了(?=$|[。！？!?,，、\s])"
-    r"|完成(?=$|[。！？!?,，、\s])"
-    r"|已经?处理(?=$|[。！？!?,，、\s])"
-    r"|已经同步(?=$|[。！？!?,，、\s])"
-    r")"
-)
-
-# Query evidence can support a generic query status judgment, but not a bare
-# task/data completion, persistence, update, or sync claim.
-_QUERY_SAFE_SHORT_STATUS_RE = re.compile(
-    r"(?:一切正常|(?:查询|查).{0,6}(?:已完成|完成了?|完(?:了)?|好了|结束(?:了)?))"
-)
+# Query evidence can support generic status judgments, but a safe status phrase
+# only exempts its own span; it cannot wash out a later result claim.
+_QUERY_STATUS_SAFE_RE = re.compile(r"(?P<claim>一切正常)")
 
 
 def _span_within(span: tuple, candidates: list) -> bool:
@@ -146,10 +150,31 @@ def _span_within(span: tuple, candidates: list) -> bool:
     return any(start >= safe_start and end <= safe_end for safe_start, safe_end in candidates)
 
 
-def _has_unsafe_short_status_claim(reply: str) -> bool:
-    """Return True when a short status claim is not part of a query-safe phrase."""
-    safe_spans = [m.span() for m in _QUERY_SAFE_SHORT_STATUS_RE.finditer(reply)]
-    return any(not _span_within(m.span(), safe_spans) for m in _SHORT_STATUS_BYPASS_RE.finditer(reply))
+def _match_span(match) -> tuple:
+    for name in ("claim", "bare"):
+        try:
+            span = match.span(name)
+        except IndexError:
+            continue
+        if span != (-1, -1):
+            return span
+    return match.span()
+
+
+def _query_safe_spans(reply: str, include_status: bool) -> list:
+    spans = [_match_span(m) for m in _QUERY_ACTION_SAFE_RE.finditer(reply)]
+    if include_status:
+        spans.extend(_match_span(m) for m in _QUERY_STATUS_SAFE_RE.finditer(reply))
+    return spans
+
+
+def _has_structural_result_claim(reply: str, safe_spans: list) -> bool:
+    """Return True when reply contains a non-query-safe result/completion claim."""
+    for pattern in _STRUCTURAL_RESULT_CLAIM_RES:
+        for match in pattern.finditer(reply):
+            if not _span_within(_match_span(match), safe_spans):
+                return True
+    return False
 
 
 def classify_evidence(tool_log: list) -> EvidenceClass:
@@ -214,7 +239,7 @@ def _has_task_done_evidence(tool_log: list) -> bool:
 
 
 def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
-    """Two-phase gate: block '已完成/已刷新' claims without task-done evidence.
+    """Two-phase gate: block structural result claims without task-done evidence.
 
     Phase 1 — no run_workflow at all → hallucinate banner (no task was even triggered).
     Phase 2 — run_workflow present but no task-done evidence → "已触发 ≠ 已完成" banner.
@@ -227,28 +252,32 @@ def check_task_completion_bypass(reply: str, tool_log: list) -> List[str]:
     exempted any reply that had run_workflow in tool_log, which meant a reply like
     '数据已刷新完成，任务已完成' would pass with only run_workflow evidence.
     """
-    completion_claim = _COMPLETION_BYPASS_RE.search(reply) or _PROOF_REQUIRED_RESULT_RE.search(reply)
-    short_status_claim = _SHORT_STATUS_BYPASS_RE.search(reply)
-    query_safe_status_claim = _QUERY_SAFE_SHORT_STATUS_RE.search(reply)
-    if not completion_claim and not short_status_claim and not query_safe_status_claim:
-        return []
-
-    # Explicit task-done evidence → allowed
-    if _has_task_done_evidence(tool_log):
-        return []
-
     names = {t.get("name") for t in (tool_log or [])}
     has_run_workflow = bool(names & WORKFLOW_TOOLS)
     has_query_evidence = bool(names & QUERY_TOOLS)
-    # "一切正常" / "查询完成" can be normal query-backed status judgments. Do
-    # not force task readback unless the reply also contains a real result
-    # claim or another unsafe short completion/update/sync phrase.
+
+    query_action_claim = _QUERY_ACTION_SAFE_RE.search(reply)
+    query_safe_status_claim = _QUERY_STATUS_SAFE_RE.search(reply)
+    safe_spans = _query_safe_spans(reply, include_status=has_query_evidence)
+    completion_claim = _has_structural_result_claim(reply, safe_spans)
+
+    if not completion_claim and not query_safe_status_claim:
+        return []
+    if query_action_claim and not completion_claim and not query_safe_status_claim:
+        return []
+
+    # Explicit task-done evidence → allowed.
+    if _has_task_done_evidence(tool_log):
+        return []
+
+    # "一切正常" / "查询完成" can be normal query-backed status judgments. A
+    # query-safe phrase does not exempt a separate result claim in the same reply
+    # because _has_structural_result_claim only ignores the safe phrase's span.
     if (
         query_safe_status_claim
         and not completion_claim
         and has_query_evidence
         and not has_run_workflow
-        and not _has_unsafe_short_status_claim(reply)
     ):
         return []
 
