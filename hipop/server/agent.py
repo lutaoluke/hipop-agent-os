@@ -1695,6 +1695,9 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         }
 
     limit = max(1, min(int(n or 10), 50))
+    # Per-row freshness: exclude rows whose own updated_at is stale, even if MAX is fresh.
+    # This prevents a single fresh-but-low-stock row from making stale high-stock rows appear.
+    cutoff = (_dt2.date.today() - _dt2.timedelta(days=_TOTAL_STOCK_TOPN_MAX_AGE_DAYS)).isoformat()
     rows = _data._fetch(
         """SELECT partner_sku,
                   COALESCE(total_stock, 0) AS total_stock,
@@ -1706,10 +1709,10 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
                   COALESCE(dongguan_qty, 0) AS dongguan_qty,
                   updated_at
            FROM wf1_stock
-           WHERE tenant_id=? AND entity_alias=?
+           WHERE tenant_id=? AND entity_alias=? AND updated_at >= ?
            ORDER BY total_stock DESC
            LIMIT ?""",
-        (tid, alias, limit),
+        (tid, alias, cutoff, limit),
     )
     if not rows:
         return {

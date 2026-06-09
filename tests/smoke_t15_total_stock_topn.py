@@ -221,9 +221,49 @@ def main():
     print(f"✓ fail-closed: 5 天陈旧数据不出数字，返 fail_closed=True + message")
 
     # ─────────────────────────────────────────────────────────────
+    # 阶段 4.5: 混合新鲜度 — fresh 低库存行 + stale 高库存行 → stale 行不出数
+    # 验门人 round-1 发现的 bug：旧实现用 MAX(updated_at) 判整批，导致 stale 高库存行
+    # 被当成 TopN 第 1 名返回。修复：逐行检查 updated_at，过期行不出数。
+    # ─────────────────────────────────────────────────────────────
+    _reset_db()
+    # 构造：1 条今日新鲜低库存行 (FRESH-LOW, total=10) + 1 条 5 天前过期高库存行 (STALE-HIGH, total=999)
+    c = sqlite3.connect(_TMP_DB)
+    today_iso = date.today().isoformat()
+    stale_iso = (date.today() - timedelta(days=5)).isoformat()
+    c.executemany(
+        "INSERT INTO wf1_stock (tenant_id, entity_alias, partner_sku, "
+        "noon_total_qty, noon_saleable_qty, noon_unsaleable_qty, "
+        "overseas_total_qty, yiwu_qty, dongguan_qty, "
+        "pending_inbound_qty, total_stock, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (TENANT, ALIAS, "FRESH-LOW", 5, 5, 0, 0, 3, 2, 0, 10, today_iso),
+            (TENANT, ALIAS, "STALE-HIGH", 500, 500, 0, 400, 50, 49, 0, 999, stale_iso),
+        ],
+    )
+    c.commit(); c.close()
+
+    # 改动前（旧实现）：MAX(updated_at) = today → fail_closed=False → STALE-HIGH 排第 1
+    # 改动后（新实现）：逐行过滤 → STALE-HIGH 被排除 → 只返 FRESH-LOW，或 TopN=1
+    result_mixed = _agent.tool_total_stock_topn(store="KSA", n=10)
+    assert not result_mixed.get("fail_closed"), \
+        f"有新鲜行时不应 fail_closed，实际：{result_mixed}"
+    items_mixed = result_mixed.get("items") or []
+    returned_skus = [r["partner_sku"] for r in items_mixed]
+    assert "STALE-HIGH" not in returned_skus, (
+        f"stale 行 (5 天前) 不应出现在 TopN 结果中，实际返回：{returned_skus}"
+    )
+    assert "FRESH-LOW" in returned_skus, (
+        f"fresh 行应被返回，实际：{returned_skus}"
+    )
+    print(f"✓ 混合新鲜度: STALE-HIGH(999, 5天前) 排除，FRESH-LOW(10, 今天) 保留 — 旧实现此处 FAIL")
+
+    # ─────────────────────────────────────────────────────────────
     # 阶段 5: 格式化回复 — 可售与总库存区分
     # ─────────────────────────────────────────────────────────────
     # 恢复新鲜数据
+    _reset_db()
+    _setup_db(pending_in_total_stock=True)
     c = sqlite3.connect(_TMP_DB)
     c.execute("UPDATE wf1_stock SET updated_at=? WHERE tenant_id=? AND entity_alias=?",
               (date.today().isoformat(), TENANT, ALIAS))
@@ -262,7 +302,7 @@ def main():
 
     print("✓ SYSTEM_PROMPT 含 total_stock_topn 路由条目")
 
-    print("\n7/7 passed")
+    print("\n8/8 passed")
 
 
 if __name__ == "__main__":
