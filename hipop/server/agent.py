@@ -2664,6 +2664,30 @@ def _active_workflow_task(workflow: str) -> Optional[Dict]:
     }
 
 
+def _logistics_task_evidence_check(task_id: str) -> Optional[str]:
+    """物流入口证据检查（T21-SUB-3）：用 SUB-1 统一回读接口验证 durable 任务证据。
+
+    返回 None → 证据完整（task row 存在 + ≥1 queued/started 事件），无需降级。
+    返回字符串 → 证据缺失，调用方将此字符串作为降级回复（替换「已触发」）。
+
+    任务表报错或事件缺失 → 回复降级为「未确认创建成功」，绝不返回假成功。
+    孤儿事件（agent_events 有记录但 tasks 行不存在）同样降级，不放行假成功。
+    """
+    try:
+        evidence = _data.get_task_with_events(task_id)
+    except Exception:
+        return ("物流后台任务**未确认创建成功**（任务表查询出错）。"
+                "请稍后在工作台任务面板确认任务状态，或重试。")
+    if evidence is None:
+        # task row 不存在（含孤儿事件场景：agent_events 有记录但 tasks 行缺失）
+        return ("物流后台任务**未确认创建成功**（任务行不存在）。"
+                "请稍后在工作台任务面板确认任务状态，或重试。")
+    if not evidence.get("events"):
+        return ("物流后台任务**未确认创建成功**（任务记录或事件缺失）。"
+                "请稍后在工作台任务面板确认任务状态，或重试。")
+    return None
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -2758,6 +2782,12 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             reply = _workflow_receipt_reply(
                 task_id, tool_result["workflow"], direct_workflow["label"]
             )
+            # T21-SUB-3 物流入口专项降级：用回读接口验证 durable 任务证据；
+            # 任务表报错或事件缺失时降级回复，不返回假成功。
+            if direct_workflow.get("workflow") == "wf3_logistics_v2":
+                degrade_msg = _logistics_task_evidence_check(task_id)
+                if degrade_msg:
+                    reply = degrade_msg
         elif (
             isinstance(tool_result, dict)
             and tool_result.get("action_type") == "denied"
@@ -2823,12 +2853,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
                 )
             else:
-                reply = (
+                reason = (
                     (tool_result or {}).get("message")
                     or (tool_result or {}).get("error")
                     or (tool_result or {}).get("reason")
-                    or "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
                 )
+                if reason:
+                    reply = reason
+                elif direct_workflow.get("workflow") == "wf3_logistics_v2":
+                    reply = ("物流后台任务**未确认创建成功**（工作流触发失败）。"
+                             "请稍后在工作台任务面板确认任务状态，或重试。")
+                else:
+                    reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
         return {
             "reply": reply,
             "clean_reply": reply,

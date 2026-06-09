@@ -52,6 +52,7 @@ class Case:
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
     expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
+    allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
     timeout: int = 60
 
 
@@ -64,6 +65,11 @@ GLOBAL_BLACKLIST = [
     "已为你导出",              # 没真调 export_table 不能这么说
     "已发到飞书",              # 没真调 notify_via_feishu 不能这么说
 ]
+
+EXISTING_WORKFLOW_DENY_RE = re.compile(
+    r"已有.{0,12}运行中实例|已有.{0,12}运行中的后台任务|已有.{0,12}实例.{0,12}运行中|防并发|already.{0,12}running",
+    re.IGNORECASE,
+)
 
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -423,6 +429,7 @@ CASES: List[Case] = [
         question="帮我刷一下物流数据",
         must_use_tools=["run_workflow"],
         expected_workflow="wf3_logistics_v2",    # 精确等值；老 wf3 / 别的 v2 都=选错
+        allow_existing_workflow_deny=True,        # 治理拒绝重复运行时不会创建新的 workflow_task
         must_not_contain=[
             "ERP_USERNAME.{0,10}未设",  # 真崩了报这个
         ],
@@ -535,7 +542,12 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
         wt = resp.get("workflow_task") or {}
         wf = wt.get("workflow") or ""
         if not wf:
-            reasons.append("未真触发任何 workflow（workflow_task 为空）")
+            if not (
+                c.allow_existing_workflow_deny
+                and "run_workflow" in tools
+                and EXISTING_WORKFLOW_DENY_RE.search(reply)
+            ):
+                reasons.append("未真触发任何 workflow（workflow_task 为空）")
         elif wf != c.expected_workflow:
             reasons.append(
                 f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"

@@ -119,6 +119,28 @@ def test_wf3_no_workflow_triggered_still_fails():
     assert not ok, "没真触发 workflow 应 FAIL"
 
 
+def test_wf3_existing_running_deny_without_workflow_task_passes():
+    c = _wf3_case()
+    resp = {
+        "reply": "该 workflow 已有运行中实例: ['2e46f7a0']（防并发抢资源）",
+        "tools_used": ["run_workflow"],
+        "workflow_task": None,
+    }
+    ok, reasons = smoke_chat.check(c, resp)
+    assert ok, f"已有运行中实例的防并发回复不应被误判为未触发: {reasons}"
+
+
+def test_wf3_generic_no_workflow_task_still_fails():
+    c = _wf3_case()
+    resp = {
+        "reply": "工作流触发失败。",
+        "tools_used": ["run_workflow"],
+        "workflow_task": None,
+    }
+    ok, _ = smoke_chat.check(c, resp)
+    assert not ok, "无 workflow_task 的泛化失败回复仍应 FAIL"
+
+
 def test_wf3_wrong_v2_workflow_still_fails():
     # 门2 红队洞：endswith("_v2") 会放行任意 v2。精确等值后，Agent 跑错别的 v2
     # 工作流（wf6_alerts_v2 / wf2_products_v2）在"刷新物流"这条 case 下必须 FAIL。
@@ -272,6 +294,8 @@ if __name__ == "__main__":
         test_wf3_prose_mention_with_correct_v2_passes,
         test_wf3_real_old_workflow_selection_still_fails,
         test_wf3_no_workflow_triggered_still_fails,
+        test_wf3_existing_running_deny_without_workflow_task_passes,
+        test_wf3_generic_no_workflow_task_still_fails,
         test_wf3_wrong_v2_workflow_still_fails,
         test_wf3_exact_correct_v2_passes,
         test_global_blacklist_drops_legit_alias,
