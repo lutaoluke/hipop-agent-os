@@ -684,8 +684,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             return _r(val) if (live_has_sales and wf2_ok) else None
 
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
-        sales_30d_out = live_result.get("sales_30d") if live_ok else None
-        history_total_out = live_result.get("history_total") if live_ok else None
+        # partial-live fail-closed: live_ok=True but sales_30d=None → also block history_total
+        sales_30d_out = live_result.get("sales_30d") if live_has_sales else None
+        history_total_out = live_result.get("history_total") if live_has_sales else None
 
         item = {
             "sku": sku,
@@ -727,7 +728,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             if live_ok:
                 item["live_sales_error"] = "live_ok_but_missing_sales_30d"
                 item["live_sales_message"] = (
-                    "当前无法实时确认 SKU 销量（实时接口返回但关键指标缺失），已降级（不输出旧缓存确定数）"
+                    "实时源可达但销量数据缺失，无法给出确定数字"
+                    "（sales_30d/history_total 均已拒绝输出，不泄出裸数字）"
                 )
             else:
                 item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
