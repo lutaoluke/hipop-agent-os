@@ -816,7 +816,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         and t.get("result_error") == "order_not_found_in_erp"
     ]
     if order_not_found_entries and not re.search(
-        r"(未找到|不存在|无物流|找不到|无记录|没有.{0,5}找到|该货单.{0,10}(不|无)|ERP.*无记录|核实货单号)",
+        # (?<!不是) 防止"不是不存在"绕过（否定否定 ≠ 未找到）。
+        # 删去原 `该货单.{0,10}(不|无)`：间隔过大会跨越"不是"匹配到下一个"不/无"，
+        # 被否定句绕过；具体场景已由 (?<!不是)不存在 / 无物流 / 无记录 / 找不到 等覆盖。
+        r"(未找到|(?<!不是)不存在|无物流|找不到|无记录|没有.{0,5}找到|ERP.*无记录|核实货单号)",
         reply,
     ):
         order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
@@ -868,7 +871,10 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         and t.get("result_error") == "sku_no_orders_in_erp"
     ]
     if sku_not_found_entries and not re.search(
-        r"(未找到|不存在|无货单|找不到|无记录|没有.{0,5}找到|该SKU.{0,10}(不|无)|ERP.*无记录|无在途|核实.*SKU)",
+        # (?<!不是) 防止"不是不存在"绕过（否定否定 ≠ 未找到）。
+        # 删去原 `该SKU.{0,10}(不|无)`：间隔过大允许跳过"不是"命中下一个"不/无"；
+        # 具体场景已由 (?<!不是)不存在 / 无货单 / 无记录 / 找不到 / 无在途 等覆盖。
+        r"(未找到|(?<!不是)不存在|无货单|找不到|无记录|没有.{0,5}找到|ERP.*无记录|无在途|核实.*SKU)",
         reply,
     ):
         sku_nos = [_get_tool_arg(t, "sku") for t in sku_not_found_entries]
@@ -941,6 +947,30 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "回复未说明 ERP 失败和无缓存，已自动补充（WS-133 Rule F）"
         )
 
+    # Rule F2: query_order_live 返回 order_lookup_unavailable_no_erp_credentials
+    # （ERP 账号未配置，与 erp_login_failed 不同）— reply 不得编造货单在途状态。
+    order_no_credentials = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "order_lookup_unavailable_no_erp_credentials"
+    ]
+    if order_no_credentials and not re.search(
+        r"(ERP.{0,10}(未配置|无配置|没配置|账号|凭据|credentials)|配置.{0,5}dbuyerp"
+        r"|无法确认|ERP.{0,5}(失败|不可用)|账号未配|暂无凭据)",
+        reply,
+    ):
+        order_nos2 = [_get_tool_arg(t, "order_no") for t in order_no_credentials]
+        order_str2 = "、".join(filter(None, order_nos2)) or "该货单"
+        no_cred_prefix = (
+            f"**无法查询货单 {order_str2}**：本店铺 ERP 账号未配置，"
+            "无法确认该货单是否存在。请先配置 dbuyerp 后重试。\n\n"
+        )
+        reply = no_cred_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live({order_str2}) 返回 order_lookup_unavailable_no_erp_credentials，"
+            "回复未说明 ERP 账号未配置，已自动补充（WS-133 Rule F2）"
+        )
+
     # Rule G: query_sku_live 返回实时失败 + 回退缓存（result_keys 含 live_query_failed_reason）
     # reply 必须告知用户数据来自 wf3 缓存，不是实时；否则用户误以为是实时数据。
     sku_live_failed_cache = [
@@ -1004,10 +1034,9 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         r"(已触发|已启动|已开始|任务已.{0,5}(创建|提交|启动|运行)|"
         r"已为.{0,5}(你|您).{0,5}触发|系统已经在.{0,5}后台|后台.{0,5}(跑|运行)了)"
     )
-    if wf_failed_entries and _WF_SUCCESS_CLAIM_RE.search(reply) and not re.search(
-        r"(失败|失败了|未能|无法触发|创建失败|启动失败|触发失败|工作流.{0,10}(失败|错误))",
-        reply,
-    ):
+    # 不设"已说失败"豁免——"虽然刚才失败，但现在已触发"类混淆句 既提失败又宣称成功，
+    # 属于更严重的编造；合法的失败回复（"触发失败，请重试"）不含成功声明词，不匹配此 RE。
+    if wf_failed_entries and _WF_SUCCESS_CLAIM_RE.search(reply):
         wf_names = [_get_tool_arg(t, "workflow") for t in wf_failed_entries]
         wf_str = "、".join(filter(None, wf_names)) or "工作流"
         warnings.append(

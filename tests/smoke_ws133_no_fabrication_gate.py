@@ -314,6 +314,150 @@ def test_no_false_positive_normal_replenishment_reply():
     assert not new_rule_warns, f"正常补货不应触发新规则: {new_rule_warns}"
 
 
+# ─── 验门人打回 Round 2：3 类洞补 guard ──────────────────────────────────────────
+
+# 洞1: order_lookup_unavailable_no_erp_credentials — 未被拦截
+
+def test_rule_f2_order_lookup_unavailable_no_erp_credentials_triggers_gate():
+    """洞1: query_order_live 返回 order_lookup_unavailable_no_erp_credentials
+    (ERP 账号未配置)，但回复编造了在途状态 → _safety 必须拦截。
+
+    FAIL（修前）：sanitize_reply 不识别此错误码，warns=[]。
+    PASS（修后）：warns 非空，含 ERP 未配置说明。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_lookup_unavailable_no_erp_credentials",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    fabricated_reply = "货单 PD-GHOST 当前在途，货代为 YTO，预计明天到仓。"
+    out, warns = _safety.sanitize_reply(fabricated_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"order_lookup_unavailable_no_erp_credentials 应触发警告，但 warns={warns}"
+    import re
+    assert re.search(r"ERP|配置|无法确认|未配置|账号|凭据|credentials", out), \
+        f"回复应包含 ERP 未配置说明: {out[:300]}"
+
+
+def test_rule_f2_no_false_positive_when_reply_says_unavailable():
+    """洞1: 回复已明确说明 ERP 未配置 → 不重复触发。"""
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_lookup_unavailable_no_erp_credentials",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    good_reply = "ERP 账号未配置，无法确认该货单是否存在，请先配置 dbuyerp 后重试。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    rule_f2_warns = [w for w in warns if "no_erp_credentials" in w or "Rule F2" in w or "WS-133 Rule F2" in w]
+    assert not rule_f2_warns, f"回复已说明 ERP 未配置，不应重复触发 Rule F2: {rule_f2_warns}"
+
+
+# 洞2: Rule B/D 可被否定句绕过（"不是不存在"）
+
+def test_rule_b_negative_sentence_bypass_blocked():
+    """洞2: order_not_found_in_erp 下，回复用否定句'该货单不是不存在'绕过门 → 必须仍触发。
+
+    FAIL（修前）：'不存在' 被正则命中当作'已说明未找到'，门放行。
+    PASS（修后）：用负向前置处理排除'不是不存在'上下文。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_not_found_in_erp",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    bypass_reply = "该货单不是不存在的，当前已在途，货代为 YTO，状态正常。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"否定句绕过 '不是不存在' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"未找到|不存在|无记录|核实货单号|无物流", out), \
+        f"应插入未找到前缀: {out[:300]}"
+
+
+def test_rule_d_negative_sentence_bypass_blocked():
+    """洞2: sku_no_orders_in_erp 下，回复用否定句'这个SKU不是不存在'绕过门 → 必须仍触发。
+
+    FAIL（修前）：'不存在' 被命中当作已说明，门放行。
+    PASS（修后）：负向处理后不再被绕过。
+    """
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "SKU-TEST"},
+        "result_error": "sku_no_orders_in_erp",
+        "result_keys": ["ok", "error", "sku", "message"],
+    }]
+    bypass_reply = "这个 SKU 不是不存在的，目前在途 12 件，货单号 PD-001。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    assert warns, f"否定句绕过 '不是不存在' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"未找到|不存在|无在途|无记录|核实.*SKU", out), \
+        f"应插入未找到前缀: {out[:300]}"
+
+
+def test_rule_b_legitimate_not_found_still_passes():
+    """洞2 反例: '该货单不存在'（非否定句）仍应被当作'已说明未找到'、不触发 Rule B。"""
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_not_found_in_erp",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    good_reply = "经查询，该货单不存在于 ERP，请核实货单号。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    t26_warns = [w for w in warns if "order_not_found_in_erp" in w or "T26" in w]
+    assert not t26_warns, f"合法'不存在'声明不应触发 Rule B: {t26_warns}"
+
+
+def test_rule_d_legitimate_not_found_still_passes():
+    """洞2 反例: 'SKU TBC 无在途记录'仍应被当作'已说明未找到'、不触发 Rule D。"""
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "TBC0168A"},
+        "result_error": "sku_no_orders_in_erp",
+        "result_keys": ["ok", "error", "sku", "message"],
+    }]
+    good_reply = "SKU TBC0168A 在 ERP 中无在途货单记录，请核实 SKU 是否正确。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    t26ext_warns = [w for w in warns if "sku_no_orders_in_erp" in w or "T26-ext SKU" in w]
+    assert not t26ext_warns, f"合法'无在途'声明不应触发 Rule D: {t26ext_warns}"
+
+
+# 洞3: Rule I 被"虽然刚才失败，但现在已触发"绕过
+
+def test_rule_i_concede_fail_then_claim_success_still_blocked():
+    """洞3: run_workflow 失败，但回复用'刚才失败，但现在已触发'绕过门 → 必须仍触发 Rule I。
+
+    FAIL（修前）：'失败' 被当作豁免条件，warns=[]。
+    PASS（修后）：豁免仅在回复不含成功声明时有效；既提失败又宣称已触发 → 仍拦截。
+    """
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "result_error": "unknown workflow: wf3_logistics_v2",
+        "result_keys": ["ok", "error"],
+    }]
+    bypass_reply = "虽然刚才失败，但现在已触发任务，后台运行。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    assert warns, f"'刚才失败但现在已触发' 应触发 Rule I，但 warns={warns}"
+    assert any("Rule I" in w or "WS-133 Rule I" in w or "假成功" in w for w in warns), \
+        f"应触发 Rule I 假成功警告: {warns}"
+
+
+def test_rule_i_genuine_failure_acknowledgment_still_passes():
+    """洞3 反例: 回复明确说工作流失败（无成功声明）→ 不触发 Rule I。"""
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "result_error": "erp_fetch_error: Cannot connect",
+        "result_keys": ["ok", "error"],
+    }]
+    good_reply = "工作流触发失败（ERP 连接失败），请检查 ERP 登录状态后重试，该任务未成功创建。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "Rule I" in w or "WS-133 Rule I" in w]
+    assert not rule_i_warns, f"明确说失败且无成功声明，不应触发 Rule I: {rule_i_warns}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -334,6 +478,15 @@ if __name__ == "__main__":
         test_t26_order_not_found_still_works,
         test_t26_sku_not_found_still_works,
         test_no_false_positive_normal_replenishment_reply,
+        # Round 2 — 验门人打回补洞
+        test_rule_f2_order_lookup_unavailable_no_erp_credentials_triggers_gate,
+        test_rule_f2_no_false_positive_when_reply_says_unavailable,
+        test_rule_b_negative_sentence_bypass_blocked,
+        test_rule_d_negative_sentence_bypass_blocked,
+        test_rule_b_legitimate_not_found_still_passes,
+        test_rule_d_legitimate_not_found_still_passes,
+        test_rule_i_concede_fail_then_claim_success_still_blocked,
+        test_rule_i_genuine_failure_acknowledgment_still_passes,
     ]
     failed = 0
     for t in tests:
