@@ -619,16 +619,38 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
         import datetime as _dt
         stale_days_val: int = 0
         data_stale_val: bool = not as_of
+        # stale_confirmed：as_of 成功解析且确实超阈值，才算「确认陈旧」。仅此情形
+        # 才允许走 found=False「查不到」短路。as_of 缺失/格式异常（不同 DB 驱动可能
+        # 回 date 对象或 'YYYY-MM-DD HH:MM:SS' 等）只做保守 REDACT，不据此判「查不到」。
+        stale_confirmed: bool = False
         if as_of:
-            try:
-                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(as_of)).days)
+            _parsed_as_of = None
+            if hasattr(as_of, "year") and hasattr(as_of, "month") and hasattr(as_of, "day"):
+                # date / datetime 对象（部分驱动直接返回，非字符串）
+                try:
+                    _parsed_as_of = _dt.date(as_of.year, as_of.month, as_of.day)
+                except Exception:
+                    _parsed_as_of = None
+            else:
+                try:
+                    # 容忍 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / ISO：取前 10 位日期段
+                    _parsed_as_of = _dt.date.fromisoformat(str(as_of).strip()[:10])
+                except Exception:
+                    _parsed_as_of = None
+            if _parsed_as_of is not None:
+                stale_days_val = max(0, (_dt.date.today() - _parsed_as_of).days)
                 data_stale_val = stale_days_val > 3
-            except Exception:
+                stale_confirmed = data_stale_val
+            else:
+                # as_of 存在但无法解析 → 保守 REDACT，但不据此短路成「查不到」，
+                # 交由下方 live 成功/失败逻辑决定 found 与 live_sales_failed（修 T03 CI 边界：
+                # 否则 live 失败会被误吞成「快照过期/SKU 查不到」，丢失实时失败证据）。
                 data_stale_val = True
+                stale_confirmed = False
 
-        # T04 口径一致：快照过期且无实时销量时，视为无有效数据（found=False）。
-        # 与 /api/sku-metrics 预检行为对齐：两者对 found/stale 判定保持一致。
-        if data_stale_val and not live_has_sales:
+        # T04 口径一致：仅「确认陈旧」（as_of 可解析且超阈值）且无实时销量时，才视为
+        # 无有效数据（found=False，回复「查不到」），与 /api/sku-metrics 预检对齐。
+        if stale_confirmed and not live_has_sales:
             imported_at_val = (r.get("imported_at") or "")[:10] or None
             out.append({
                 "sku": sku, "found": False, "data_stale": True,
