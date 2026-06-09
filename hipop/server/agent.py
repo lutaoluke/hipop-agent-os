@@ -1178,18 +1178,29 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     from . import runtime as _runtime
     if workflow in _runners.list_runners():
         # Managed Agents path: durable tasks row + events (same contract as /api/run-workflow)
-        task_id = _runtime.spawn_task(
-            workflow=workflow, tenant_id=tid, actor=actor,
-        )
-        _data.set_current_tenant(tid)
-        _data.write_event(
-            task_id, 1, "初始化", "done",
-            _json.dumps({"workflow": workflow, "label": label,
-                         "affected_modules": affected, "total_steps": len(steps),
-                         "tenant_id": tid,
-                         "runtime": "managed_agents"}, ensure_ascii=False),
-            actor=actor,
-        )
+        # WS-132: try/except so DB/filesystem failures return ok=False + creation_failed=True,
+        # distinguishing "not created" from "created but execution failed" (acceptance criterion 2).
+        try:
+            task_id = _runtime.spawn_task(
+                workflow=workflow, tenant_id=tid, actor=actor,
+            )
+            _data.set_current_tenant(tid)
+            _data.write_event(
+                task_id, 1, "初始化", "done",
+                _json.dumps({"workflow": workflow, "label": label,
+                             "affected_modules": affected, "total_steps": len(steps),
+                             "tenant_id": tid,
+                             "runtime": "managed_agents"}, ensure_ascii=False),
+                actor=actor,
+            )
+        except Exception as _spawn_err:
+            return {
+                "ok": False,
+                "error": f"任务创建失败: {type(_spawn_err).__name__}: {_spawn_err}",
+                "creation_failed": True,
+                "workflow": workflow,
+                "label": label,
+            }
     else:
         from uuid import uuid4
         import threading
