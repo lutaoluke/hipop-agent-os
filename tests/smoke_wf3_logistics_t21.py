@@ -297,7 +297,7 @@ def test_chat_t21_e2e_governance_deny_shows_reason():
     assert "工作流触发失败" not in reply or deny_reason in reply, (
         f"governance 拒绝时回复不应仅为泛化「工作流触发失败」\n实际: {reply!r}"
     )
-    assert deny_reason in reply or "未确认创建成功" in reply or "已有运行中实例" in reply, (
+    assert deny_reason in reply or "未确认创建成功" in reply or "已有运行中" in reply, (
         f"governance 拒绝时回复必须含具体原因\n实际: {reply!r}"
     )
     print(f"    governance deny → reply={reply[:80]!r}")

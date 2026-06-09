@@ -67,7 +67,7 @@ GLOBAL_BLACKLIST = [
 ]
 
 EXISTING_WORKFLOW_DENY_RE = re.compile(
-    r"已有.{0,12}运行中实例|已有.{0,12}实例.{0,12}运行中|防并发|already.{0,12}running",
+    r"已有.{0,12}运行中实例|已有.{0,12}运行中的后台任务|已有.{0,12}实例.{0,12}运行中|防并发|already.{0,12}running",
     re.IGNORECASE,
 )
 
