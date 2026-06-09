@@ -566,6 +566,46 @@ def test_rule_h_suffix_negative_inventory_claim_blocked():
         f"回复应包含失败说明: {out[:300]}"
 
 
+def test_rule_h_bare_no_transit_claim_blocked():
+    """洞3-B: 查询失败 + '该 SKU 没有在途'（无 '当前' 前缀）→ Rule H 仍须拦截。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 只检查 '当前...没有...在途'，裸 '没有在途' 逃过。
+    PASS（修后）：_ERROR_FABRICATION_RE 增加 '没有在途' 模式。
+    """
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "SDA1874A"},
+        "result_error": "erp_fetch_error: ConnectionError",
+        "result_keys": ["ok", "error"],
+    }]
+    bypass_reply = "ERP 查询失败；该 SKU 没有在途"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    assert warns, f"'ERP 查询失败；该 SKU 没有在途' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"查询失败|ERP.*失败|获取失败|暂时无法", out), \
+        f"应插入失败说明: {out[:300]}"
+
+
+def test_rule_h_inventory_normal_claim_blocked():
+    """洞3-C: 网络异常 + '当前库存正常' → Rule H 仍须拦截。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 不含 '库存正常' 模式，后缀编造逃过。
+    PASS（修后）：_ERROR_FABRICATION_RE 增加 '库存...正常' 模式。
+    """
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "TBJ0059A"},
+        "result_error": "erp_fetch_error: NetworkError",
+        "result_keys": ["ok", "error"],
+    }]
+    bypass_reply = "网络异常，暂时无法查询；当前库存正常"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    assert warns, f"'网络异常，暂时无法查询；当前库存正常' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"查询失败|ERP.*失败|网络.*错误|暂时无法|请求失败", out), \
+        f"应插入失败说明: {out[:300]}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -601,6 +641,8 @@ if __name__ == "__main__":
         test_rule_b_binmeiyou_excuse_bypass_blocked,
         test_rule_f2_suffix_transit_fabrication_blocked,
         test_rule_h_suffix_negative_inventory_claim_blocked,
+        test_rule_h_bare_no_transit_claim_blocked,
+        test_rule_h_inventory_normal_claim_blocked,
     ]
     failed = 0
     for t in tests:
