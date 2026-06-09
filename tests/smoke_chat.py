@@ -37,10 +37,13 @@ import datetime as _dt
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
 _URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_AUTH_OPENER: Optional[urllib.request.OpenerDirector] = None
+_AUTH_TOKEN = ""
 
 
 def _urlopen(req, timeout: int):
-    return _URL_OPENER.open(req, timeout=timeout)
+    opener = _AUTH_OPENER or _URL_OPENER
+    return opener.open(req, timeout=timeout)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
@@ -106,6 +109,7 @@ def ensure_smoke_user_tenant1() -> None:
 
 
 def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
+    global _AUTH_TOKEN
     ensure_smoke_user_tenant1()
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
@@ -120,6 +124,7 @@ def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
         payload = json.loads(r.read())
     if not payload.get("ok"):
         raise RuntimeError(f"smoke login failed: {payload}")
+    _AUTH_TOKEN = (payload.get("token") or "").strip()
     return opener
 
 
@@ -674,7 +679,7 @@ def _bind_runtime_expectations(cases: List[Case]) -> Optional[dict]:
 
 # ── runner ────────────────────────────────────────────────
 def _auth_headers() -> dict:
-    token = os.environ.get("HIPOP_AUTH_TOKEN", "").strip()
+    token = os.environ.get("HIPOP_AUTH_TOKEN", "").strip() or _AUTH_TOKEN
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -958,6 +963,8 @@ def main():
     except Exception as e:
         print(f"\n✗ smoke 登录失败：{type(e).__name__}: {e}")
         sys.exit(1)
+    global _AUTH_OPENER
+    _AUTH_OPENER = opener
     err = check_chat_history_endpoint(opener, args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
