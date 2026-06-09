@@ -1886,6 +1886,35 @@ def _deterministic_scope_overview_request(question: str) -> bool:
     return any(x in q for x in ("几个", "多少", "几条", "数量", "有几"))
 
 
+def _deterministic_products_count_request(question: str) -> bool:
+    q = question or ""
+    if any(x in q for x in ("需要我关注", "哪些需要关注", "哪些要关注", "需要关注")):
+        return False
+    has_product_subject = any(x in q for x in ("商品", "产品", "SKU", "sku", "Sku", "未上架", "上架"))
+    has_count_intent = any(x in q for x in ("总共", "总数", "多少", "数量", "几个", "几款"))
+    return has_product_subject and has_count_intent
+
+
+def _fmt_int(value) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except Exception:
+        return "0"
+
+
+def _format_products_count_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 商品总数暂时不可用。"
+    products = tool_result.get("summary_products") or {}
+    skus = tool_result.get("summary_skus") or {}
+    return (
+        f"{store} 商品总数：product 维度 {_fmt_int(products.get('total'))} 个，"
+        f"SKU 维度 {_fmt_int(skus.get('total'))} 个。"
+        f"其中 product 已上架 {_fmt_int(products.get('listed'))} 个、未上架 {_fmt_int(products.get('unlisted'))} 个；"
+        f"SKU 已上架 {_fmt_int(skus.get('listed'))} 个、未上架 {_fmt_int(skus.get('unlisted'))} 个。"
+    )
+
+
 def _format_scope_overview_reply(store: str, tool_result: dict) -> str:
     if not isinstance(tool_result, dict):
         return f"{store} 店铺概览暂时不可用。"
@@ -1988,7 +2017,7 @@ def _format_order_live_reply(order_no: str, tool_result: dict) -> str:
         return f"未找到货单 {order_no}：ERP 中无记录，当前无物流数据，请核实货单号。"
     if not tool_result.get("ok"):
         msg = tool_result.get("message") or tool_result.get("error") or "实时查询失败"
-        return f"货单 {order_no} 暂时无法完成 ERP 实时查询：{msg}"
+        return f"未找到货单 {order_no} 的实时物流记录，或当前无法完成 ERP 实时查询：{msg}。请核实货单号。"
     forwarder = tool_result.get("forwarder") or "未知承运商"
     tracking = tool_result.get("tracking_no") or "无跟踪号"
     status = tool_result.get("status") or "未知状态"
@@ -2115,6 +2144,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
+            "hallucination_warnings": None,
+        }
+
+    if _provider.get_provider() != "smoke" and _deterministic_products_count_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("list_products", {"store": store, "listing": "all", "limit": 0}, user=scope)
+        reply = _format_products_count_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["list_products"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_products_count_router",
             "hallucination_warnings": None,
         }
 
