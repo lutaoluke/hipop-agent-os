@@ -513,7 +513,17 @@ def execute_with_token(proposal: ActionProposal, token: ExecToken, tool_funcs: d
         return {"error": f"{type(e).__name__}: {e}"}
 
     # 3. 写 ExecutionRecord (审计)
-    write_execution_record(proposal, token, result, status="done")
+    # WS-132: audit write failure must not swallow task_id from tool result.
+    # If write_execution_record throws, inject lifecycle_error and return result as-is.
+    try:
+        write_execution_record(proposal, token, result, status="done")
+    except Exception as _audit_err:
+        if isinstance(result, dict):
+            result = dict(result)
+            result.setdefault(
+                "lifecycle_error",
+                f"审计事件写入失败: {type(_audit_err).__name__}: {_audit_err}",
+            )
     return result
 
 

@@ -237,6 +237,75 @@ def test_spawn_success_event_write_failure_partial_success():
     print(f"    task_id={result.get('task_id')!r} lifecycle_error={result.get('lifecycle_error')!r}")
 
 
+# ── Test 9: _exec_tool 路径：event store 宕机时 governance 审计失败不吞 task_id ────
+
+def test_exec_tool_run_workflow_event_store_down_preserves_task_id():
+    """走 _exec_tool → governance 真实路径：全局 event store 宕机时返回 task_id + lifecycle_error。
+
+    测试的真实 chat 路径：
+      _exec_tool → governance.propose_and_execute → execute_with_token
+      → tool_run_workflow（spawn 成功，init event 写失败 → lifecycle_error）
+      → governance.write_execution_record（也失败）
+      → 必须返回 task_id，不能只返回 RuntimeError
+
+    FAIL（修前 governance.py:515-517 无 try/except）：
+      write_execution_record 抛 OperationalError → execute_with_token 无 catch →
+      异常传到 _exec_tool line 1850 catch → {"error": "OperationalError: ..."} 无 task_id
+
+    PASS（修后 governance.py:515-517 有 try/except）：
+      write_execution_record 失败被捕获 → lifecycle_error 注入 result →
+      返回 {"ok": True, "task_id": ..., "lifecycle_error": "..."} task_id 保留
+    """
+    try:
+        from hipop.server.agent import _exec_tool
+    except ImportError as e:
+        print(f"    SKIP (missing dep: {e})")
+        return
+
+    _fake_task_id = "exec_tool_tid_abc123"
+
+    def _spawn_ok(*args, **kwargs):
+        return _fake_task_id
+
+    def _event_fail(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    raised = None
+    result = None
+    with patch("hipop.server.runtime.spawn_task", side_effect=_spawn_ok):
+        with patch("hipop.server.data.write_event", side_effect=_event_fail):
+            with patch("hipop.server.data._fetch", return_value=[]):
+                with patch("hipop.server.data.set_current_tenant"):
+                    with patch("hipop.server.agent._get_tenant", return_value=1):
+                        with patch("hipop.server.rbac.tool_allowed", return_value=True):
+                            try:
+                                result = _exec_tool(
+                                    "run_workflow",
+                                    {"workflow": "wf1_stock_v2"},
+                                    user={"role": "manager", "id": "u1",
+                                          "email": "t@t.com", "tenant_id": 1},
+                                )
+                            except Exception as e:
+                                raised = e
+
+    assert raised is None, (
+        f"_exec_tool 不应抛出异常: {type(raised).__name__}: {raised}"
+    )
+    assert result is not None, "应返回 dict"
+    assert result.get("task_id") == _fake_task_id, (
+        f"event store 宕机时仍应返回已创建的 task_id={_fake_task_id!r}，实际: {result}\n"
+        "修前 FAIL 预期：governance.write_execution_record 失败 → _exec_tool line 1850 "
+        "catch → 只返回 {error: RuntimeError} 无 task_id"
+    )
+    assert result.get("lifecycle_error"), (
+        f"应有 lifecycle_error 说明审计事件写失败原因: {result}"
+    )
+    assert "error" not in result or result.get("ok") is True, (
+        f"结果不应是纯错误 dict（无 task_id 的 RuntimeError）: {result}"
+    )
+    print(f"    task_id={result.get('task_id')!r} lifecycle_error={result.get('lifecycle_error')!r}")
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -251,6 +320,7 @@ if __name__ == "__main__":
         ("test_task_created_wording_no_false_positive", test_task_created_wording_no_false_positive),
         ("test_scan_complete_claim_blocked", test_scan_complete_claim_blocked),
         ("test_spawn_success_event_write_failure_partial_success", test_spawn_success_event_write_failure_partial_success),
+        ("test_exec_tool_run_workflow_event_store_down_preserves_task_id", test_exec_tool_run_workflow_event_store_down_preserves_task_id),
     ]
 
     failed = 0
