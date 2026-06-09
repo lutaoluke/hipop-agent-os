@@ -1192,8 +1192,14 @@ def get_chat_messages(store: str, limit: int = 50) -> List[Dict]:
             try: m["references"] = json.loads(r["references_json"])
             except Exception: m["references"] = []
         if r.get("task_json"):
-            try: m["task"] = json.loads(r["task_json"])
-            except Exception: m["task"] = None
+            try:
+                parsed = json.loads(r["task_json"])
+                if isinstance(parsed, list):
+                    m["tasks"] = parsed   # new format: list of workflow task entries
+                else:
+                    m["task"] = parsed    # old format: single task dict
+            except Exception:
+                m["task"] = None
         out.append(m)
     return out
 

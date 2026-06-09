@@ -250,13 +250,13 @@ def test_chat_t21_e2e_success():
         result = chat(messages, scope)
 
     assert isinstance(result, dict), f"chat() 应返回 dict，实际: {type(result)}"
-    wt = result.get("workflow_task")
+    wt_list = result.get("workflow_tasks") or []
+    if not wt_list and result.get("workflow_task"):
+        wt_list = [result.get("workflow_task")]
+    wt = next((t for t in wt_list if t.get("workflow") == "wf3_logistics_v2"), None)
     assert wt is not None, (
         f"workflow_task 为 None，chat() 未走 direct_workflow 路径\n"
         f"reply: {result.get('reply')!r}"
-    )
-    assert wt["workflow"] == "wf3_logistics_v2", (
-        f"workflow_task.workflow={wt['workflow']!r}，期望 wf3_logistics_v2"
     )
     task_id = wt["task_id"]
     task = _runtime.task_status(task_id)

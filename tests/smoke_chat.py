@@ -23,6 +23,7 @@ import json
 import re
 import time
 import argparse
+import http.cookiejar
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -39,6 +40,10 @@ _URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def _urlopen(req, timeout: int):
     return _URL_OPENER.open(req, timeout=timeout)
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 
 
 # ── case 定义 ────────────────────────────────────────────
@@ -70,6 +75,50 @@ EXISTING_WORKFLOW_DENY_RE = re.compile(
     r"已有.{0,12}运行中实例|已有.{0,12}运行中的后台任务|已有.{0,12}实例.{0,12}运行中|防并发|already.{0,12}running",
     re.IGNORECASE,
 )
+
+SMOKE_EMAIL = "smoke-chat@hipop.local"
+SMOKE_PASSWORD = "smoke-chat-pass"
+
+
+def ensure_smoke_user_tenant1() -> None:
+    """Create/update a tenant=1 smoke user so chat smokes exercise the auth path."""
+    os.environ.setdefault("DB_URL", "postgresql://hipop:hipop_dev_password@localhost:5432/hipop")
+    from hipop.server import auth as _auth
+    from hipop.server import data as _data
+
+    password_hash = _auth.hash_password(SMOKE_PASSWORD)
+    existing = _auth.get_user_by_email(SMOKE_EMAIL)
+    if existing:
+        with _data.conn() as c:
+            c.execute(
+                "UPDATE users SET tenant_id=?, password_hash=?, role=?, active=1 WHERE email=?",
+                (1, password_hash, "owner", SMOKE_EMAIL),
+            )
+            c.commit()
+        return
+    _auth.create_user(
+        1, SMOKE_EMAIL, SMOKE_PASSWORD,
+        display_name="Smoke Chat",
+        role="owner",
+    )
+
+
+def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
+    ensure_smoke_user_tenant1()
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    body = json.dumps({"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/api/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with opener.open(req, timeout=15) as r:
+        payload = json.loads(r.read())
+    if not payload.get("ok"):
+        raise RuntimeError(f"smoke login failed: {payload}")
+    return opener
 
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -106,7 +155,7 @@ def _rate_re(rate: Optional[float]) -> str:
 
 _UNAVAILABLE_RE = (
     r"无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|"
-    r"ERP.*(?:凭据|登录)|同上"
+    r"ERP.*(?:凭据|登录)|同上|过期|已过期"
 )
 
 
@@ -333,6 +382,9 @@ CASES: List[Case] = [
         ],
         must_not_contain=[
             r"\b13\b",
+            r"\b48\b",
+            r"\b51\b",
+            r"1[,，]?967",
             r"1\.1[0-9]%|1\.12%",
             # 只问数值时不得主动下质量/表现判断
             r"表现.*不错|毛利.*不错|健康.*不错|正常范围|质量.*稳定|利润.*不错|表现良好|不错.*表现",
@@ -487,7 +539,8 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
+def post_chat(opener: urllib.request.OpenerDirector, base_url: str, question: str,
+              store: str, timeout: int) -> dict:
     body = json.dumps({
         "messages": [{"role": "user", "content": question}],
         "scope": {"store": store},
@@ -501,7 +554,7 @@ def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with _urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"_http_error": e.code, "_body": e.read().decode("utf-8", "ignore")[:500]}
@@ -539,18 +592,22 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
             reasons.append(f"reply 含禁忌词: {bw!r}")
 
     if c.expected_workflow:
-        wt = resp.get("workflow_task") or {}
-        wf = wt.get("workflow") or ""
-        if not wf:
+        # T36-S3 round-4: backend now returns workflow_tasks (list); backward-compat old dict
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        found = next((t for t in wf_tasks if t.get("workflow") == c.expected_workflow), None)
+        if not wf_tasks:
             if not (
                 c.allow_existing_workflow_deny
                 and "run_workflow" in tools
                 and EXISTING_WORKFLOW_DENY_RE.search(reply)
             ):
-                reasons.append("未真触发任何 workflow（workflow_task 为空）")
-        elif wf != c.expected_workflow:
+                reasons.append("未真触发任何 workflow（workflow_tasks 为空）")
+        elif not found:
+            wf_names = [t.get("workflow", "?") for t in wf_tasks]
             reasons.append(
-                f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"
+                f"选错 workflow: {wf_names!r}（应精确含 {c.expected_workflow!r}；"
                 "老 wf3 / 其它 v2 工作流都=选错）")
 
     if c.must_warn and not warns:
@@ -559,7 +616,7 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     return (len(reasons) == 0), reasons
 
 
-def check_chat_history_endpoint(base_url: str) -> Optional[str]:
+def check_chat_history_endpoint(opener: urllib.request.OpenerDirector, base_url: str) -> Optional[str]:
     """GET /api/chat-history/<store> — 防 PG datetime[-8:-3] 之类的崩溃回归。
     切页面时 chat panel init() 会拿这个 endpoint；它一旦 500，整个 chat panel
     Alpine init 抛错，前端表现为'切页面无法继承聊天记录'。返回 None 为通过。"""
@@ -569,7 +626,7 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
             headers=_auth_headers(),
         )
         try:
-            with _urlopen(req, timeout=15) as r:
+            with opener.open(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
@@ -708,7 +765,12 @@ def main():
         f"stale={_LIVE['stale_tst001']}"
         + (f" error={_LIVE.get('_error')}" if _LIVE.get("_error") else "")
     )
-    err = check_chat_history_endpoint(args.url)
+    try:
+        opener = build_authenticated_opener(args.url)
+    except Exception as e:
+        print(f"\n✗ smoke 登录失败：{type(e).__name__}: {e}")
+        sys.exit(1)
+    err = check_chat_history_endpoint(opener, args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
@@ -729,7 +791,7 @@ def main():
     for i, c in enumerate(cases, 1):
         print(f"[{i}/{len(cases)}] {c.name} ", end="", flush=True)
         t = time.time()
-        resp = post_chat(args.url, c.question, c.store, c.timeout)
+        resp = post_chat(opener, args.url, c.question, c.store, c.timeout)
         ok, reasons = check(c, resp)
         elapsed = time.time() - t
         if ok:

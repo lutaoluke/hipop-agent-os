@@ -111,7 +111,7 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
     refs_collected: list = []
     tool_log: list = []
     final_text = ""
-    workflow_task = None
+    workflow_tasks: list = []
 
     for hop in range(6):
         resp = client.chat.completions.create(
@@ -159,21 +159,32 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 result = _agent._exec_tool(tool_name, tool_args, user=scope)
             if isinstance(result, dict) and "references" in result:
                 refs_collected.extend(result["references"])
-            if tool_name == "run_workflow" and isinstance(result, dict) and result.get("ok"):
-                workflow_task = {
-                    "task_id": result["task_id"],
-                    "workflow": result["workflow"],
-                    "label": result["label"],
-                    "total_steps": result["total_steps"],
-                    "affected_modules": result["affected_modules"],
-                    "followup_prompt": result.get("followup_prompt"),
-                }
+            if tool_name == "run_workflow" and isinstance(result, dict):
+                wf_name = tool_args.get("workflow", "unknown") if isinstance(tool_args, dict) else "unknown"
+                if result.get("ok"):
+                    workflow_tasks.append({
+                        "ok": True,
+                        "task_id": result["task_id"],
+                        "workflow": result.get("workflow", wf_name),
+                        "label": result.get("label", wf_name),
+                        "total_steps": result.get("total_steps", 0),
+                        "affected_modules": result.get("affected_modules", []),
+                        "followup_prompt": result.get("followup_prompt"),
+                    })
+                else:
+                    workflow_tasks.append({
+                        "ok": False,
+                        "workflow": result.get("workflow") or wf_name,
+                        "label": result.get("label") or wf_name,
+                        "error": result.get("error") or "触发失败",
+                        "task_id": None,
+                    })
             # T03: capture live_sales_failed SKUs from query_sku → safety verifier
             from ._provider_anthropic import _stale_skus_from_sku_result
             result_stale_skus = _stale_skus_from_sku_result(tool_name, result)
             from .replenishment_evidence import blocked_skus_from_tool_result
             result_replenishment_blocked_skus = blocked_skus_from_tool_result(tool_name, result)
-            tool_log.append({
+            entry: dict = {
                 "name": tool_name,
                 "args": tool_args_raw,
                 "result_keys": list(result.keys()) if isinstance(result, dict) else None,
@@ -182,7 +193,14 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 "result_replenishment_blocked_skus": result_replenishment_blocked_skus,
                 "result_download_url": result.get("download_url") if isinstance(result, dict) else None,
                 "result_filename": result.get("filename") if isinstance(result, dict) else None,
-            })
+            }
+            if tool_name == "run_workflow" and isinstance(result, dict):
+                # T36-S3: enrich for _safety._check_failed_workflow_claimed_success
+                ok_val = result.get("ok")
+                entry["ok"] = ok_val if ok_val is not None else ("error" not in result)
+                entry["task_id"] = result.get("task_id")
+                entry["error"] = result.get("error")
+            tool_log.append(entry)
             msgs.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -193,5 +211,5 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
         "reply": final_text.strip() or "(无回复)",
         "tool_log": tool_log,
         "refs_collected": refs_collected,
-        "workflow_task": workflow_task,
+        "workflow_tasks": workflow_tasks,
     }
