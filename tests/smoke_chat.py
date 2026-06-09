@@ -929,7 +929,7 @@ def _prepare_dynamic_expectations(base_url: str,
         if c and not stale_item.get("found"):
             c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前不存在时必须诚实未找到）"
             c.must_contain = [_STALE_TST001_MISSING_RE]
-        elif c and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
+        elif c and stale_item.get("found") and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
             c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前 fail-closed，不得给旧值）"
             c.must_contain = [_STALE_TST001_STALE_RE]
     except Exception:
