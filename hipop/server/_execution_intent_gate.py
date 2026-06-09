@@ -187,6 +187,25 @@ def classify_risk(question: str) -> RiskTier:
     return RiskTier.LOW_AUTO
 
 
+def is_unsupported_feishu_notify(question: str) -> bool:
+    """WS-150: 工作台飞书集成当前为只读，检测主动发飞书/通知群的请求。
+
+    这些请求虽然会被 _HIGH_RISK_RE 捕获，但应该返回确定性拒绝（unsupported），
+    而非让用户看到通用的高风险确认文案。
+    """
+    if not has_execution_verb(question or ""):
+        return False
+
+    feishu_notify_pattern = re.compile(
+        r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|"
+        r"通知群|群通知|发通知|推送(?:通知|消息|到群|给|到飞书)|推到.{0,4}群|推进.{0,3}群|发到群|"
+        r"发邮件|发短信|发消息给|@[一-鿿A-Za-z]|"
+        r"通知(?:一下|下)?(?:刘鹤|老板|大家|对方|同事|运营|相关人?|群|"
+        r"[一-鿿]{2,3}(?:同事|经理|总监?|老板))"
+    )
+    return bool(feishu_notify_pattern.search(question or ""))
+
+
 class GateDecision(NamedTuple):
     mood: IntentMood
     risk: RiskTier
@@ -195,6 +214,7 @@ class GateDecision(NamedTuple):
     enters_execution: bool        # 允许进真实执行路由（肯定 + 低风险）
     needs_confirm_first: bool     # 肯定 + 高风险 → 必须先 confirm，不自动执行
     blocks_llm_execution: bool    # 非执行语气 → LLM 也不许偷偷 run_workflow
+    unsupported_feishu_notify: bool  # WS-150: 工作台不支持主动发飞书/通知群 → 确定性拒绝
 
 
 def evaluate(question: str) -> GateDecision:
@@ -202,7 +222,9 @@ def evaluate(question: str) -> GateDecision:
     risk = classify_risk(question)
     has_exec = has_execution_verb(question)
     enters = (mood == IntentMood.EXECUTE) and (risk == RiskTier.LOW_AUTO) and has_exec
-    needs_confirm = (mood == IntentMood.EXECUTE) and (risk == RiskTier.HIGH_CONFIRM)
+    # WS-150: 工作台不支持主动发飞书 → 跳过通用 confirm-first，返回确定性拒绝
+    unsupported_notify = is_unsupported_feishu_notify(question)
+    needs_confirm = (mood == IntentMood.EXECUTE) and (risk == RiskTier.HIGH_CONFIRM) and not unsupported_notify
     blocks = has_exec and mood in (
         IntentMood.NEGATED,
         IntentMood.INTERROGATIVE,
@@ -217,6 +239,7 @@ def evaluate(question: str) -> GateDecision:
         enters_execution=enters,
         needs_confirm_first=needs_confirm,
         blocks_llm_execution=blocks,
+        unsupported_feishu_notify=unsupported_notify,
     )
 
 
@@ -261,6 +284,18 @@ def explain_reply(mood: IntentMood, question: str = "") -> str:
             "真要跑就说「帮我刷新…」，我再触发。"
         )
     return "本轮未执行。需要执行请明确说「帮我刷新/重算…」。"
+
+
+def unsupported_feishu_notify_reply() -> str:
+    """WS-150: 工作台飞书集成当前为只读，不支持主动发飞书/通知群。"""
+    return (
+        "工作台飞书集成当前为**只读**（从飞书拉取告警、补货决策反馈），暂不支持主动发飞书 / 通知群 / 推送消息。\n"
+        "如需通知，请：\n"
+        "1. **手动转发**：在飞书 app 复制本次分析结果、手工发给相关人\n"
+        "2. **工作台飞书表**：wf6_logistics_alerts 和补货决策表每次更新后会自动同步到飞书 Bitable，"
+        "运营可在飞书里查看最新决策\n\n"
+        "需要主动通知能力时可反馈产品迭代。"
+    )
 
 
 def confirm_first_reply(question: str = "") -> str:

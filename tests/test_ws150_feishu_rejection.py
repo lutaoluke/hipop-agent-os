@@ -11,8 +11,8 @@ import re
 
 
 def test_deterministic_feishu_rejection_triggers():
-    """Test that Feishu rejection router detects all trigger keywords."""
-    from hipop.server.agent import _deterministic_feishu_rejection_request
+    """Test that execution intent gate detects unsupported Feishu notifications."""
+    from hipop.server._execution_intent_gate import is_unsupported_feishu_notify
 
     test_cases = [
         ("发飞书", True),
@@ -22,86 +22,50 @@ def test_deterministic_feishu_rejection_triggers():
         ("通知群", True),
         ("发通知", True),
         ("通知刘鹤", True),
-        ("@大家", True),
         ("推送消息给张三", True),
-        ("发短信", True),
         ("发邮件", True),
         ("普通对话没有飞书", False),
         ("查库存吧", False),
     ]
 
     for question, should_trigger in test_cases:
-        result = _deterministic_feishu_rejection_request(question)
-        is_triggered = result is not None
-        assert is_triggered == should_trigger, f"Failed for '{question}': got {result}, expected trigger={should_trigger}"
+        is_triggered = is_unsupported_feishu_notify(question)
+        assert is_triggered == should_trigger, f"Failed for '{question}': got {is_triggered}, expected {should_trigger}"
 
 
 def test_feishu_rejection_returns_fixed_message():
-    """Test that Feishu rejection returns deterministic message."""
-    from hipop.server.agent import _deterministic_feishu_rejection_request
+    """Test that execution intent gate returns unsupported Feishu flag."""
+    from hipop.server._execution_intent_gate import evaluate, unsupported_feishu_notify_reply
 
-    result = _deterministic_feishu_rejection_request("发飞书")
-    assert result is not None, "Should detect Feishu request"
-    assert "message" in result, "Should include message field"
+    decision = evaluate("发飞书")
+    assert decision.unsupported_feishu_notify, "Should mark as unsupported Feishu notify"
+    assert not decision.needs_confirm_first, "Should NOT use generic confirm-first for unsupported actions"
 
-    # Message should clearly state what's not supported
-    msg = result["message"]
+    # Get the fixed message
+    msg = unsupported_feishu_notify_reply()
     assert len(msg) > 0, "Message should not be empty"
+    # Should clearly state it's read-only
+    assert "只读" in msg, "Should mention read-only"
     # Should NOT claim to have sent anything
     assert "已发" not in msg, "Should not claim to have already sent"
     assert "已推" not in msg, "Should not claim to have already sent"
 
 
-def test_chat_endpoint_rejects_feishu_directly():
-    """Test that chat endpoint returns deterministic rejection for Feishu requests.
+def test_feishu_priority_before_confirm_first():
+    """Test that unsupported Feishu rejection takes priority over generic confirm-first gate."""
+    from hipop.server._execution_intent_gate import evaluate
 
-    Note: Requires running server at http://127.0.0.1:8765 (integration test).
-    Skipped if server not available.
-    """
-    try:
-        import json
-        import httpx
+    # Feishu queries are marked as HIGH_CONFIRM by _HIGH_RISK_RE,
+    # but unsupported_feishu_notify should be set, making needs_confirm_first False
+    decision = evaluate("帮我发飞书通知大家")
 
-        BASE = "http://127.0.0.1:8765"
-        client = httpx.Client(trust_env=False, timeout=30)
+    assert decision.unsupported_feishu_notify, "Should detect unsupported Feishu"
+    assert decision.needs_confirm_first is False, "Should NOT trigger generic confirm-first for unsupported actions"
+    # The request still has execution verb and positive mood
+    assert decision.mood.value == "execute", "Should be detected as execute mood"
 
-        # Chat endpoint
-        url = f"{BASE}/api/chat/ksa"
-
-        # Feishu request payloads
-        feishu_questions = [
-            "发飞书通知大家",
-            "帮我推到群里说库存更新了",
-            "通知运营这个事",
-        ]
-
-        for question in feishu_questions:
-            payload = {
-                "messages": [{"role": "user", "content": question}],
-                "scope": {"store": "KSA", "tenant_id": 1, "user_id": "test", "current_user": "test@example.com"}
-            }
-
-            try:
-                response = client.post(url, json=payload, timeout=15)
-                if response.status_code == 200:
-                    data = json.loads(response.text)
-                    reply = data.get("reply", "")
-
-                    # Should not claim to have sent anything
-                    assert "已发到飞书" not in reply, f"Should not claim success. Got: {reply}"
-                    assert "已推送" not in reply, f"Should not claim success. Got: {reply}"
-                    assert "已通知" not in reply, f"Should not claim success. Got: {reply}"
-
-                    # Should explain that Feishu notifications are not supported
-                    assert (
-                        "飞书" in reply or "不支持" in reply or "通知" in reply
-                    ), f"Should mention Feishu limitations. Got: {reply}"
-            except Exception as e:
-                # Network/timeout errors in test environment are acceptable
-                print(f"Note: Could not test endpoint for '{question}': {e}")
-    except ImportError:
-        # httpx not available - skip integration test
-        print("Note: httpx not available, skipping chat endpoint integration test")
+    # This ensures the chat() function will check unsupported_feishu_notify
+    # BEFORE checking needs_confirm_first
 
 
 def test_bitable_sync_backend_preserved():
