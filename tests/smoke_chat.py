@@ -564,7 +564,7 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
 
 
 def _http_json(base_url: str, path: str, timeout: int = 20):
-    req = urllib.request.Request(f"{base_url}{path}")
+    req = urllib.request.Request(f"{base_url}{path}", headers=_auth_headers())
     with _urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -630,29 +630,35 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         c.name = f"店铺整体（动态在售 SKU {sku_count} + 红色告警）"
         c.must_contain = [_num_re(sku_count)]
 
-    metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20)
-    item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
-    c = _find_case("T04 TBB0116A")
-    if c and item.get("found"):
-        required = ("sales_30d", "total_orders_30d", "history_total")
-        if item.get("live_sales_failed") or any(item.get(k) is None for k in required):
-            c.name = "T04 TBB0116A 30d 口径（live 不可用时必须明确不可得）"
-        else:
-            c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
-            c.must_contain = [
-                _num_re(item.get("sales_30d")),
+    try:
+        metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20)
+        item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
+        c = _find_case("T04 TBB0116A")
+        if c and item.get("found"):
+            required = ("sales_30d", "total_orders_30d", "history_total")
+            if item.get("live_sales_failed") or any(item.get(k) is None for k in required):
+                c.name = "T04 TBB0116A 30d 口径（live 不可用时必须明确不可得）"
+            else:
+                c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+                c.must_contain = [
+                    _num_re(item.get("sales_30d")),
                 _num_re(item.get("total_orders_30d")),
                 _rate_re(item.get("cancel_rate_30d"), "取消率"),
-                _rate_re(item.get("return_rate_30d"), "退货率"),
-                _num_re(item.get("history_total")),
-            ]
+                    _rate_re(item.get("return_rate_30d"), "退货率"),
+                    _num_re(item.get("history_total")),
+                ]
+    except Exception:
+        pass  # endpoint unavailable — T04 uses static DB expectations
 
-    stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
-    stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})
-    c = _find_case("T04 快照过期边界")
-    if c and not stale_item.get("found"):
-        c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
-        c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
+    try:
+        stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
+        stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})
+        c = _find_case("T04 快照过期边界")
+        if c and not stale_item.get("found"):
+            c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
+            c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
+    except Exception:
+        pass  # endpoint unavailable — T04 stale case uses static expectations
 
 
 def main():
