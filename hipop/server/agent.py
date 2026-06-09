@@ -77,6 +77,14 @@ TOOLS = [
             "properties": {
                 "skus": {"type": "array", "items": {"type": "string"}, "description": "SKU 列表，如 ['TBJ0057A']"},
                 "store": {"type": "string", "description": "店铺代号 KSA 或 UAE", "enum": ["KSA", "UAE"]},
+                "allow_cache_on_live_failure": {
+                    "type": "boolean",
+                    "description": "仅当运营明确同意使用缓存时为 true；否则实时失败时必须先询问。",
+                },
+                "reject_cache_on_live_failure": {
+                    "type": "boolean",
+                    "description": "仅当运营明确拒绝使用缓存时为 true；此时实时失败必须 fail-closed。",
+                },
             },
             "required": ["skus"],
         },
@@ -560,7 +568,12 @@ def _erp_sku_stats_live(sku: str, nation_id: int, token) -> dict:
     }
 
 
-def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
+def tool_query_sku(
+    skus: List[str],
+    store: str = "KSA",
+    allow_cache_on_live_failure: bool = False,
+    reject_cache_on_live_failure: bool = False,
+) -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
 
@@ -580,6 +593,7 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     out = []
     refs = []
     import datetime as _dt
+    from hipop.scripts.freshness_gate import decide_freshness
 
     def _date10(v):
         if v is None:
@@ -677,21 +691,48 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             if noon_order_stale_days is not None:
                 stale_days_val = max(stale_days_val, noon_order_stale_days)
 
+        _live_error_msg = (
+            (live_result or {}).get("message")
+            or (live_result or {}).get("error")
+            or "实时源不可用"
+        )
+        sales_freshness_decision = decide_freshness(
+            live_ok=live_has_sales,
+            live_source=(live_result or {}).get("source"),
+            live_fetched_at=(live_result or {}).get("fetched_at"),
+            live_error=str(_live_error_msg),
+            cache_available=r.get("sales_30d") is not None,
+            cache_fetched_at=imported_at_full,
+            operator_cache_consent=bool(allow_cache_on_live_failure),
+            operator_cache_rejected=bool(reject_cache_on_live_failure),
+            cache_requires_consent=True,
+            subject=f"SKU {sku} 30 天销量",
+        )
+        sales_live_allowed = sales_freshness_decision.get("status") == "live"
+        sales_cache_allowed = sales_freshness_decision.get("status") == "cache_allowed"
+
         def _r(val):
             return None if data_stale_val else val
 
         def _live_guarded_snapshot(val):
-            # wf5-sourced fields: gated on live freshness AND wf5 timestamp
-            return _r(val) if (live_has_sales and wf5_ok) else None
+            # wf5-sourced fields: gated on live or explicitly consented cache freshness.
+            return _r(val) if ((sales_live_allowed or sales_cache_allowed) and wf5_ok) else None
 
         def _wf2(val):
-            # wf2 snapshot-sourced fields: gated on imported_at AND live freshness
-            return _r(val) if (live_has_sales and wf2_ok) else None
+            # wf2 snapshot-sourced fields: gated on imported_at AND the freshness decision.
+            return _r(val) if ((sales_live_allowed or sales_cache_allowed) and wf2_ok) else None
 
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
-        # partial-live fail-closed: live_ok=True but sales_30d=None → also block history_total
-        sales_30d_out = live_result.get("sales_30d") if live_has_sales else None
-        history_total_out = live_result.get("history_total") if live_has_sales else None
+        # live 失败时，只有 WS-131 门允许的「≤3天且已同意缓存」才输出缓存数。
+        if sales_live_allowed:
+            sales_30d_out = live_result.get("sales_30d")
+            history_total_out = live_result.get("history_total")
+        elif sales_cache_allowed:
+            sales_30d_out = r.get("sales_30d")
+            history_total_out = None
+        else:
+            sales_30d_out = None
+            history_total_out = None
 
         item = {
             "sku": sku,
@@ -721,12 +762,18 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "noon_order_stale_days": noon_order_stale_days,
             "wf5_updated_at": wf5_updated_at,
             "wf2_imported_at": imported_at_full,
+            "sales_freshness_decision": sales_freshness_decision,
         }
 
-        if live_has_sales:
+        if sales_live_allowed:
             item["live_evidence"] = {
                 "fetched_at": live_result.get("fetched_at"),
                 "source": live_result.get("source", "live"),
+            }
+        elif sales_cache_allowed:
+            item["cache_evidence"] = {
+                "fetched_at": sales_freshness_decision.get("fetched_at"),
+                "source": "cache",
             }
         else:
             item["live_sales_failed"] = True
@@ -1676,6 +1723,7 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
     """
     import datetime as _dt
     import json as _json
+    from hipop.scripts.freshness_gate import decide_freshness
 
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
@@ -1688,12 +1736,24 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
         (tid, alias, sku),
     )
     if not rows:
+        freshness_decision = decide_freshness(
+            live_ok=False,
+            live_error="库存拆分使用最近一次统一库存刷新",
+            cache_available=False,
+            cache_fetched_at=None,
+            operator_cache_consent=True,
+            cache_requires_consent=False,
+            subject=f"SKU {sku} 库存拆分",
+        )
         return {
             "ok": False,
             "fail_closed": True,
             "sku": sku,
             "store": store,
-            "message": f"SKU {sku} 在 wf1_stock 中无记录，请先运行库存刷新（wf1_stock_v2）。",
+            "freshness_decision": freshness_decision,
+            "message": freshness_decision.get("message") or (
+                f"SKU {sku} 在 wf1_stock 中无记录，请先运行库存刷新（wf1_stock_v2）。"
+            ),
             "references": [{"table": "wf1_stock", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"}],
         }
 
@@ -1707,7 +1767,16 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
         except Exception:
             stale_days = None
 
-    if stale_days is None or stale_days > _STOCK_SPLIT_MAX_AGE_DAYS:
+    freshness_decision = decide_freshness(
+        live_ok=False,
+        live_error="库存拆分使用最近一次统一库存刷新",
+        cache_available=True,
+        cache_fetched_at=updated_at,
+        operator_cache_consent=True,
+        cache_requires_consent=False,
+        subject=f"SKU {sku} 库存拆分",
+    )
+    if not freshness_decision.get("can_output_number"):
         age_desc = "数据缺失或时间戳无法解析" if stale_days is None else f"{stale_days} 天前"
         return {
             "ok": False,
@@ -1716,7 +1785,8 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
             "store": store,
             "stale_days": stale_days,
             "updated_at": updated_at or None,
-            "message": (
+            "freshness_decision": freshness_decision,
+            "message": freshness_decision.get("message") or (
                 f"SKU {sku} 库存快照超过 {_STOCK_SPLIT_MAX_AGE_DAYS} 天（{age_desc}），"
                 "拒绝出数。请先刷新库存（wf1_stock_v2）或上传最新 noon 库存 CSV。"
             ),
@@ -1818,6 +1888,7 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
         "stale_days": stale_days,
         "updated_at": updated_at[:10] if updated_at else None,
         "stale_warn": stale_warn,
+        "freshness_decision": freshness_decision,
         # T12: ERP 在途（来自 wf3，国际运输中，不计入 total_stock）
         "erp_in_transit": erp_in_transit,
         "erp_in_transit_source": "erp" if erp_in_transit is not None else None,
@@ -1853,9 +1924,14 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
     口径区分: total_stock 含 pending_inbound; noon_saleable_qty 仅 noon 可售，两者不同。
     """
     import datetime as _dt2
+    from hipop.scripts.freshness_gate import decide_freshness
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
 
+    row_count = _data._scalar(
+        "SELECT COUNT(*) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
+        (tid, alias),
+    ) or 0
     latest_row = _data._fetch(
         "SELECT MAX(updated_at) AS latest FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
         (tid, alias),
@@ -1869,6 +1945,15 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         except Exception:
             stale_days = None
 
+    freshness_decision = decide_freshness(
+        live_ok=False,
+        live_error="TopN 使用最近一次成功刷新的统一库存数据",
+        cache_available=row_count > 0,
+        cache_fetched_at=latest_ts,
+        operator_cache_consent=True,
+        cache_requires_consent=False,
+        subject=f"{store} 总库存 TopN",
+    )
     if stale_days is None or stale_days > _TOTAL_STOCK_TOPN_MAX_AGE_DAYS:
         return {
             "fail_closed": True,
@@ -1876,7 +1961,8 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
             "stale_days": stale_days,
             "latest_updated_at": latest_ts or None,
             "max_age_days": _TOTAL_STOCK_TOPN_MAX_AGE_DAYS,
-            "message": (
+            "freshness_decision": freshness_decision,
+            "message": freshness_decision.get("message") or (
                 f"库存快照超过 {_TOTAL_STOCK_TOPN_MAX_AGE_DAYS} 天（"
                 f"{'数据缺失' if stale_days is None else f'{stale_days} 天前'}），"
                 "不能出数（防止误导运营）。请先刷新库存（run_workflow wf1_stock_v2）或"
@@ -1949,6 +2035,7 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         "n_returned": len(items),
         "items": items,
         "evidence": evidence,
+        "freshness_decision": freshness_decision,
         "references": [
             {"table": "wf1_stock",
              "where": (
@@ -2740,6 +2827,12 @@ def _format_stock_split_reply(sku: str, tool_result: dict) -> str:
     ]
     if stale_warn:
         lines.append(stale_warn)
+    decision = tool_result.get("freshness_decision")
+    if isinstance(decision, dict) and decision.get("can_output_number"):
+        from hipop.scripts.freshness_gate import render_freshness_suffix as _render_freshness_suffix
+        suffix = _render_freshness_suffix(decision)
+        if suffix:
+            lines.append(suffix)
     return "\n".join(lines)
 
 
@@ -2762,7 +2855,14 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
     item = next((x for x in items if (x.get("sku") or "").upper() == sku.upper()), None)
     if not item or not item.get("found"):
         return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
-    if item.get("data_stale"):
+    decision = item.get("sales_freshness_decision")
+    suffix = ""
+    if isinstance(decision, dict):
+        if not decision.get("can_output_number"):
+            return decision.get("message") or f"{sku} 当前不能出数。"
+        from hipop.scripts.freshness_gate import render_freshness_suffix as _render_freshness_suffix
+        suffix = _render_freshness_suffix(decision)
+    elif item.get("data_stale"):
         as_of = item.get("as_of_date") or "未知日期"
         stale_days = item.get("stale_days")
         age = f"{stale_days} 天前" if stale_days is not None else "较旧"
@@ -2775,6 +2875,7 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
         f"历史总销量 {_format_metric_value(item.get('history_total'))}，"
         f"退货率 {_format_pct(item.get('return_rate_30d'))}%，"
         f"取消率 {_format_pct(item.get('cancel_rate_30d'))}%。"
+        f"{suffix}"
     )
 
 
@@ -3261,7 +3362,20 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     direct_sku_metric = _deterministic_sku_metric_request(question)
     if direct_sku_metric:
         store = scope.get("store") or "KSA"
-        tool_result = _exec_tool("query_sku", {"skus": [direct_sku_metric], "store": store}, user=scope)
+        from hipop.scripts.freshness_gate import (
+            operator_consented_to_cache as _operator_consented_to_cache,
+            operator_rejected_cache as _operator_rejected_cache,
+        )
+        tool_result = _exec_tool(
+            "query_sku",
+            {
+                "skus": [direct_sku_metric],
+                "store": store,
+                "allow_cache_on_live_failure": _operator_consented_to_cache(question),
+                "reject_cache_on_live_failure": _operator_rejected_cache(question),
+            },
+            user=scope,
+        )
         reply = _format_sku_metric_reply(direct_sku_metric, tool_result)
         return {
             "reply": reply,

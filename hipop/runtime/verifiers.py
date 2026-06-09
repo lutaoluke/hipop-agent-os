@@ -60,6 +60,86 @@ def _started_at_iso(epoch: float) -> str:
 DEFAULT_NOON_FRESHNESS_MAX_HOURS = 26.0
 
 
+def verify_freshness_gate_matrix(now=None) -> dict:
+    """WS-131 deterministic freshness gate verifier.
+
+    This is not tied to one workflow: query tools and answer formatters reuse the
+    same gate. The verifier keeps the acceptance matrix executable.
+    """
+    from hipop.scripts.freshness_gate import decide_freshness
+
+    cases = [
+        ("live_success", dict(
+            live_ok=True,
+            live_source="noon",
+            live_fetched_at="2026-06-09T11:59:00Z",
+            cache_available=True,
+            cache_fetched_at="2026-06-07T09:00:00",
+        ), "live", True),
+        ("two_day_cache_asks", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=True,
+            cache_fetched_at="2026-06-07T09:00:00",
+            operator_cache_consent=False,
+        ), "ask_cache_consent", False),
+        ("two_day_cache_consented", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=True,
+            cache_fetched_at="2026-06-07T09:00:00",
+            operator_cache_consent=True,
+        ), "cache_allowed", True),
+        ("two_day_cache_rejected", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=True,
+            cache_fetched_at="2026-06-07T09:00:00",
+            operator_cache_rejected=True,
+        ), "blocked", False),
+        ("four_day_cache_blocks", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=True,
+            cache_fetched_at="2026-06-05T09:00:00",
+            operator_cache_consent=True,
+        ), "blocked", False),
+        ("missing_time_blocks", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=True,
+            cache_fetched_at=None,
+            operator_cache_consent=True,
+        ), "blocked", False),
+        ("missing_cache_blocks", dict(
+            live_ok=False,
+            live_error="timeout",
+            cache_available=False,
+            cache_fetched_at=None,
+            operator_cache_consent=True,
+        ), "blocked", False),
+    ]
+    evidence = {}
+    failures = []
+    for name, kwargs, want_status, want_can_output in cases:
+        decision = decide_freshness(now=now, subject=name, **kwargs)
+        evidence[name] = decision
+        if decision.get("status") != want_status:
+            failures.append(
+                f"{name}: status {decision.get('status')!r} != {want_status!r}"
+            )
+        if bool(decision.get("can_output_number")) is not want_can_output:
+            failures.append(
+                f"{name}: can_output_number {decision.get('can_output_number')!r} "
+                f"!= {want_can_output!r}"
+            )
+    return {
+        "ok": not failures,
+        "evidence": evidence,
+        "verdict": "freshness gate matrix passed" if not failures else "; ".join(failures),
+    }
+
+
 def _noon_freshness_max_hours(override=None) -> float:
     """解析 noon 新鲜度阈值（小时）。见 DEFAULT_NOON_FRESHNESS_MAX_HOURS 的优先级注释。"""
     if override is not None:
