@@ -2850,6 +2850,24 @@ _FRESHNESS_GATE_SALES_RE = _re.compile(
 _FRESHNESS_GATE_SKIP_RE = _re.compile(
     r"(?:不用|不要|无需|先别).{0,8}(?:刷新|更新|同步)|就用现在的|先告诉我|不用等",
 )
+_FRESHNESS_TARGET_ISO_DATE_RE = _re.compile(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b")
+_FRESHNESS_TARGET_CN_DATE_RE = _re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日?")
+
+
+def _extract_freshness_target_date(question: str) -> Optional[str]:
+    """Extract an explicit target business date/window end_date from a question."""
+    import datetime as _dt
+
+    candidates = []
+    for rx in (_FRESHNESS_TARGET_ISO_DATE_RE, _FRESHNESS_TARGET_CN_DATE_RE):
+        for m in rx.finditer(question or ""):
+            try:
+                candidates.append(_dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            except ValueError:
+                continue
+    if not candidates:
+        return None
+    return max(candidates).isoformat()
 
 
 def _detect_operational_domain(question: str) -> Optional[str]:
@@ -2882,22 +2900,25 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
     domain = _detect_operational_domain(question)
     if not domain:
         return None
+    target_date = _extract_freshness_target_date(question)
 
     # sales_skip: 用户明确说不刷新但仍问销量排名。不拦截 LLM，但检查数据新鲜度，
     # 若数据陈旧则返回确定性陈旧后缀供调用方追加（代码级注入，不依赖 LLM wording）。
     if domain == "sales_skip":
-        freshness = _data.check_freshness_coverage(store, "sales")
+        freshness = _data.check_freshness_coverage(store, "sales", target_date)
         if freshness.get("covered"):
             return None  # 数据新鲜，直接让 LLM 答，无需额外提示
         latest = freshness.get("latest_date") or ""
+        target = freshness.get("target_date") or ""
+        target_s = f"目标日期 {target} 暂未覆盖" if target_date else "未更新到今天"
         suffix = (
-            f"\n\n（⚠️ 提示：当前销量数据未更新到今天"
+            f"\n\n（⚠️ 提示：当前销量数据{target_s}"
             + (f"，最新到 {latest}" if latest else "")
             + "，如需最新数据请随时刷新。）"
         )
         return {"_stale_skip": True, "_stale_suffix": suffix}
 
-    freshness = _data.check_freshness_coverage(store, domain)
+    freshness = _data.check_freshness_coverage(store, domain, target_date)
     if freshness.get("covered"):
         return None  # 数据新鲜 → 继续走 LLM（LLM 会调查询工具直接答）
 

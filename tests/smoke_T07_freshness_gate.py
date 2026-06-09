@@ -310,6 +310,56 @@ def test_false_freshness_imported_at_new_business_date_old():
     print("  imported_at 新但 as_of_date 旧 → covered=False ✓（假新鲜防护）")
 
 
+def test_route_uses_explicit_business_date_without_workflow():
+    """Route-level fail-then-pass: covered explicit business date must not trigger workflow.
+
+    Old behavior: _freshness_gate_route() ignored the explicit 2026-06-08 date and called
+    check_freshness_coverage(..., target_date=today), so this fixture was treated as stale
+    and run_workflow(wf2_sales_v2) fired.
+    """
+    with _freshness_fixture_db():
+        import types
+
+        anthropic_stub = types.ModuleType("anthropic")
+        anthropic_stub.Anthropic = object
+        sys.modules.setdefault("anthropic", anthropic_stub)
+        from hipop.server import agent as _agent
+
+        direct = _data.check_freshness_coverage("KSA", "sales", "2026-06-08")
+        assert direct["covered"] is True, f"fixture 应覆盖 2026-06-08，实为 {direct}"
+        assert _agent._extract_freshness_target_date("2026-06-08 前5销量 SKU 是哪些") == "2026-06-08"
+
+        calls = []
+        orig_exec_tool = _agent._exec_tool
+
+        def _fake_exec_tool(name, args, user=None):
+            calls.append((name, args, user))
+            return {
+                "ok": True,
+                "task_id": "T07ROUTE1",
+                "workflow": args.get("workflow"),
+                "label": "销量刷新",
+                "total_steps": 1,
+                "affected_modules": [],
+                "followup_prompt": args.get("followup_prompt"),
+            }
+
+        try:
+            _agent._exec_tool = _fake_exec_tool
+            routed = _agent._freshness_gate_route(
+                "KSA",
+                "2026-06-08 前5销量 SKU 是哪些",
+                {"tenant_id": 1, "store": "KSA"},
+            )
+        finally:
+            _agent._exec_tool = orig_exec_tool
+
+        assert routed is None, f"目标日已覆盖时应继续走查询工具而非 route 直接返回，实为 {routed}"
+        assert calls == [], f"目标日已覆盖时不应触发 workflow，实际调用 {calls}"
+
+    print("  route explicit target_date 2026-06-08 → covered, no workflow ✓")
+
+
 def test_uae_store():
     """UAE store 也应正常返回结构（不崩）。"""
     with _freshness_fixture_db():
@@ -416,6 +466,7 @@ if __name__ == "__main__":
     test_unknown_domain_fail_open()
     test_detect_domain_patterns()
     test_false_freshness_imported_at_new_business_date_old()
+    test_route_uses_explicit_business_date_without_workflow()
     test_uae_store()
     test_t07_skip_stale_detect_returns_sales_skip()
     test_get_data_health_erp_sales_uses_business_date()
