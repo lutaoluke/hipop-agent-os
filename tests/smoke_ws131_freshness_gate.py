@@ -182,6 +182,7 @@ def test_sku_live_failure_asks_then_uses_consented_cache() -> None:
     _data.set_current_tenant(TENANT)
     _agent._chat_tenant.set(TENANT)
     _agent._chat_scope.set({"tenant_id": TENANT, "store": "KSA", "user": "ws131"})
+    _agent._chat_question.set(f"{SKU} 近 30 天销量是多少")
     orig_live = _agent._sku_sales_live_fn
     _agent._sku_sales_live_fn = lambda sku, nation_id, token: {
         "ok": False, "error": "erp_timeout", "message": "ERP 实时取数超时"
@@ -194,6 +195,7 @@ def test_sku_live_failure_asks_then_uses_consented_cache() -> None:
         assert "是否使用缓存" in reply, reply
         assert "42" not in reply, reply
 
+        _agent._chat_question.set(f"{SKU} 同意使用缓存")
         with_consent = _agent.tool_query_sku(
             [SKU], store="KSA", allow_cache_on_live_failure=True,
         )
@@ -201,6 +203,7 @@ def test_sku_live_failure_asks_then_uses_consented_cache() -> None:
         assert "42" in reply2, reply2
         assert "缓存" in reply2 and "更新时间" in reply2, reply2
 
+        _agent._chat_question.set(f"{SKU} 不同意使用缓存")
         rejected = _agent.tool_query_sku(
             [SKU],
             store="KSA",
@@ -210,6 +213,34 @@ def test_sku_live_failure_asks_then_uses_consented_cache() -> None:
         reply3 = _agent._format_sku_metric_reply(SKU, rejected)
         assert "42" not in reply3, reply3
         assert "不同意" in reply3 and "不能使用缓存" in reply3, reply3
+    finally:
+        _agent._sku_sales_live_fn = orig_live
+
+
+def test_llm_tool_args_cannot_self_authorize_cache() -> None:
+    _reset_rows()
+    _seed_sku_cache(days_old=2)
+
+    import server.data as _data
+    from server import agent as _agent
+
+    _data.set_current_tenant(TENANT)
+    _agent._chat_tenant.set(TENANT)
+    _agent._chat_scope.set({"tenant_id": TENANT, "store": "KSA", "user": "ws131"})
+    _agent._chat_question.set(f"{SKU} 近 30 天销量是多少")
+    orig_live = _agent._sku_sales_live_fn
+    _agent._sku_sales_live_fn = lambda sku, nation_id, token: {
+        "ok": False, "error": "erp_timeout", "message": "ERP 实时取数超时"
+    }
+    try:
+        result = _agent.tool_query_sku(
+            [SKU], store="KSA", allow_cache_on_live_failure=True,
+        )
+        from server._provider_anthropic import _stale_skus_from_sku_result
+        assert SKU in (_stale_skus_from_sku_result("query_sku", result) or []), result
+        reply = _agent._format_sku_metric_reply(SKU, result)
+        assert "42" not in reply, reply
+        assert "是否使用缓存" in reply, reply
     finally:
         _agent._sku_sales_live_fn = orig_live
 
@@ -224,6 +255,7 @@ def test_sku_live_success_answers_with_source_time() -> None:
     _data.set_current_tenant(TENANT)
     _agent._chat_tenant.set(TENANT)
     _agent._chat_scope.set({"tenant_id": TENANT, "store": "KSA", "user": "ws131"})
+    _agent._chat_question.set(f"{SKU} 近 30 天销量是多少")
     orig_live = _agent._sku_sales_live_fn
     _agent._sku_sales_live_fn = lambda sku, nation_id, token: {
         "ok": True,
@@ -249,6 +281,7 @@ def test_sku_blocks_old_or_timestampless_cache() -> None:
     _data.set_current_tenant(TENANT)
     _agent._chat_tenant.set(TENANT)
     _agent._chat_scope.set({"tenant_id": TENANT, "store": "KSA", "user": "ws131"})
+    _agent._chat_question.set(f"{SKU} 同意使用缓存")
     orig_live = _agent._sku_sales_live_fn
     _agent._sku_sales_live_fn = lambda sku, nation_id, token: {
         "ok": False, "error": "erp_timeout", "message": "ERP 实时取数超时"
@@ -308,6 +341,7 @@ def main() -> None:
     tests = [
         test_pure_freshness_gate_matrix,
         test_sku_live_failure_asks_then_uses_consented_cache,
+        test_llm_tool_args_cannot_self_authorize_cache,
         test_sku_live_success_answers_with_source_time,
         test_sku_blocks_old_or_timestampless_cache,
         test_topn_uses_same_gate_and_displays_update_time,
@@ -316,7 +350,7 @@ def main() -> None:
         print(f"▶ {fn.__name__}")
         fn()
         print(f"✓ {fn.__name__}")
-    print("\n5/5 passed (WS-131 freshness gate)")
+    print("\n6/6 passed (WS-131 freshness gate)")
 
 
 if __name__ == "__main__":

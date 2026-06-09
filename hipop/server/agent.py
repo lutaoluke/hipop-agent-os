@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional
 # 由 chat() 入口 set，所有 tool 函数同线程读
 _chat_tenant: contextvars.ContextVar[int] = contextvars.ContextVar("chat_tenant", default=1)
 _chat_scope: contextvars.ContextVar[dict] = contextvars.ContextVar("chat_scope", default={})
+_chat_question: contextvars.ContextVar[str] = contextvars.ContextVar("chat_question", default="")
 _last_replenishment_stock_status: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "last_replenishment_stock_status", default=None
 )
@@ -77,14 +78,6 @@ TOOLS = [
             "properties": {
                 "skus": {"type": "array", "items": {"type": "string"}, "description": "SKU 列表，如 ['TBJ0057A']"},
                 "store": {"type": "string", "description": "店铺代号 KSA 或 UAE", "enum": ["KSA", "UAE"]},
-                "allow_cache_on_live_failure": {
-                    "type": "boolean",
-                    "description": "仅当运营明确同意使用缓存时为 true；否则实时失败时必须先询问。",
-                },
-                "reject_cache_on_live_failure": {
-                    "type": "boolean",
-                    "description": "仅当运营明确拒绝使用缓存时为 true；此时实时失败必须 fail-closed。",
-                },
             },
             "required": ["skus"],
         },
@@ -593,7 +586,11 @@ def tool_query_sku(
     out = []
     refs = []
     import datetime as _dt
-    from hipop.scripts.freshness_gate import decide_freshness
+    from hipop.scripts.freshness_gate import (
+        decide_freshness,
+        operator_consented_to_cache,
+        operator_rejected_cache,
+    )
 
     def _date10(v):
         if v is None:
@@ -696,6 +693,11 @@ def tool_query_sku(
             or (live_result or {}).get("error")
             or "实时源不可用"
         )
+        question_text = _chat_question.get() or ""
+        # The historical cache flags are accepted for backward compatibility only.
+        # Consent must come from the operator's current question, never from an LLM tool arg.
+        question_cache_consent = operator_consented_to_cache(question_text)
+        question_cache_rejected = operator_rejected_cache(question_text)
         sales_freshness_decision = decide_freshness(
             live_ok=live_has_sales,
             live_source=(live_result or {}).get("source"),
@@ -703,8 +705,8 @@ def tool_query_sku(
             live_error=str(_live_error_msg),
             cache_available=r.get("sales_30d") is not None,
             cache_fetched_at=imported_at_full,
-            operator_cache_consent=bool(allow_cache_on_live_failure),
-            operator_cache_rejected=bool(reject_cache_on_live_failure),
+            operator_cache_consent=question_cache_consent,
+            operator_cache_rejected=question_cache_rejected,
             cache_requires_consent=True,
             subject=f"SKU {sku} 30 天销量",
         )
@@ -3043,6 +3045,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+    _chat_question.set(question or "")
 
     # WS-145 肯定执行意图门:本轮句式语气 + 风险分层一次求出，注入 contextvar，
     # 供 _exec_tool 在非执行语气下拒绝 run_workflow（LLM 不许绕）。
@@ -3362,18 +3365,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     direct_sku_metric = _deterministic_sku_metric_request(question)
     if direct_sku_metric:
         store = scope.get("store") or "KSA"
-        from hipop.scripts.freshness_gate import (
-            operator_consented_to_cache as _operator_consented_to_cache,
-            operator_rejected_cache as _operator_rejected_cache,
-        )
         tool_result = _exec_tool(
             "query_sku",
-            {
-                "skus": [direct_sku_metric],
-                "store": store,
-                "allow_cache_on_live_failure": _operator_consented_to_cache(question),
-                "reject_cache_on_live_failure": _operator_rejected_cache(question),
-            },
+            {"skus": [direct_sku_metric], "store": store},
             user=scope,
         )
         reply = _format_sku_metric_reply(direct_sku_metric, tool_result)
