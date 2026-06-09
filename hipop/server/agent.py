@@ -1681,7 +1681,7 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
     alias = _resolve_entity_alias(store) or ""
 
     rows = _data._fetch(
-        "SELECT yiwu_qty, overseas_total_qty, overseas_breakdown_json, "
+        "SELECT yiwu_qty, dongguan_qty, overseas_total_qty, overseas_breakdown_json, "
         "       noon_total_qty, pending_inbound_qty, total_stock, "
         "       updated_at, imported_at "
         "FROM wf1_stock WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
@@ -1735,40 +1735,110 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
         overseas_saudi_1 = overseas_total
 
     yiwu = r.get("yiwu_qty") or 0
+    dongguan = r.get("dongguan_qty") or 0   # T12: 东莞国内仓，与义乌合计为 domestic
+    domestic = yiwu + dongguan              # T12: 国内仓合计（义乌+东莞）
     noon = r.get("noon_total_qty")
     noon_missing = noon is None
     noon = noon or 0
     inbound = r.get("pending_inbound_qty") or 0
-    total = yiwu + overseas_saudi_1 + noon + inbound
+    # total_stock from DB is authoritative (merge_stock_snapshot_v2 computes it);
+    # fall back to component sum if DB total is NULL.
+    total = r.get("total_stock")
+    if total is None:
+        total = yiwu + dongguan + overseas_total + noon + inbound
+
+    # T12: ERP 在途（国际在途）来自 wf3_logistics_hub_v2，不计入 total_stock。
+    # 带新鲜度门（>3天 → None，不出旧数）。
+    wf3_rows = _data._fetch(
+        "SELECT in_transit_total_qty, updated_at AS wf3_updated_at "
+        "FROM wf3_logistics_hub_v2 WHERE tenant_id=? AND sku=?",
+        (tid, sku),
+    )
+    erp_in_transit: Optional[int] = None
+    erp_in_transit_updated_at: Optional[str] = None
+    erp_in_transit_unavailable: Optional[str] = None
+    if wf3_rows:
+        wf3r = wf3_rows[0]
+        wf3_updated_at = wf3r.get("wf3_updated_at") or ""
+        wf3_stale_days: Optional[int] = None
+        if wf3_updated_at:
+            try:
+                wf3_stale_days = max(0, (
+                    _dt.date.today() - _dt.date.fromisoformat(wf3_updated_at[:10])
+                ).days)
+            except Exception:
+                wf3_stale_days = None
+        if wf3_stale_days is None or wf3_stale_days > _STOCK_SPLIT_MAX_AGE_DAYS:
+            erp_in_transit_unavailable = (
+                f"wf3 在途数据超过 {_STOCK_SPLIT_MAX_AGE_DAYS} 天（"
+                f"{'无时间戳' if wf3_stale_days is None else f'{wf3_stale_days} 天前'}），"
+                "拒绝出数。请先刷新物流（wf3_logistics_v2）。"
+            )
+        else:
+            wf3_in_transit = wf3r.get("in_transit_total_qty")
+            if wf3_in_transit is None:
+                erp_in_transit_unavailable = (
+                    "wf3_logistics_hub_v2.in_transit_total_qty 字段缺失/NULL，"
+                    "在途数据不可用。请先刷新物流（wf3_logistics_v2）。"
+                )
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+            else:
+                erp_in_transit = wf3_in_transit
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+    else:
+        erp_in_transit_unavailable = "wf3_logistics_hub_v2 无该 SKU 记录（在途数据未拉取）"
 
     stale_warn = None
     if stale_days and stale_days > 0:
         stale_warn = f"⚠️ 库存数据为 {stale_days} 天前（{updated_at[:10]}），请确认后使用。"
 
-    return {
+    imported_at = r.get("imported_at") or None
+
+    result: Dict = {
         "ok": True,
         "fail_closed": False,
         "sku": sku,
         "store": store,
         "split": {
+            # T11 keys (backward compat)
             "yiwu": yiwu,
             "overseas_saudi_1": overseas_saudi_1,
             "noon": noon,
             "inbound": inbound,
+            # T12 keys: 国内仓 = 义乌 + 东莞
+            "dongguan": dongguan,
+            "domestic": domestic,
         },
         "total": total,
         "noon_missing": noon_missing,
-        "noon_source": "noon FBN live / CSV 导入" if not noon_missing else "noon未拉取（NULL）",
-        "erp_source": "ERP 实时 ingest（wf1_stock_v2）",
+        "noon_source": "noon" if not noon_missing else None,
+        "noon_imported_at": imported_at,
+        "erp_source": "erp",
+        "erp_updated_at": updated_at[:10] if updated_at else None,
         "stale_days": stale_days,
         "updated_at": updated_at[:10] if updated_at else None,
         "stale_warn": stale_warn,
+        # T12: ERP 在途（来自 wf3，国际运输中，不计入 total_stock）
+        "erp_in_transit": erp_in_transit,
+        "erp_in_transit_source": "erp" if erp_in_transit is not None else None,
+        "erp_in_transit_updated_at": erp_in_transit_updated_at,
+        "erp_in_transit_not_in_total": True,   # 明确标注：在途不计入 total_stock
+        "erp_in_transit_unavailable": erp_in_transit_unavailable,
         "references": [
             {"table": "wf1_stock",
              "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'",
+             "source": "noon+erp",
              "as_of_date": updated_at[:10] if updated_at else None},
         ],
     }
+    if erp_in_transit is not None:
+        result["references"].append({
+            "table": "wf3_logistics_hub_v2",
+            "where": f"tenant_id={tid} AND sku='{sku}'",
+            "source": "erp",
+            "as_of_date": erp_in_transit_updated_at,
+        })
+    return result
 
 
 # T15 — 总库存 TopN（WS-139）
