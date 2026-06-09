@@ -964,19 +964,21 @@ def main():
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
         sys.exit(1)
     print(f"chat-history endpoint: ✓")
-    try:
-        _prepare_dynamic_expectations(args.url, opener)
-    except Exception as e:
-        print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
-        sys.exit(1)
-    print(f"Cases: {len(CASES)}\n")
-
+    # 顺序关键：先 SQLite 静态绑定（兜底），再动态覆盖（动态优先）。
+    # _bind_runtime_expectations 先写 must_contain；
+    # _prepare_dynamic_expectations 随后用服务端 /api/sku-metrics 真实值覆盖，让动态值赢。
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
     try:
         t04_exp = _bind_runtime_expectations(cases)
     except Exception as e:
         print(f"\n✗ T04 runtime fixture 检查失败：{e}")
         sys.exit(1)
+    try:
+        _prepare_dynamic_expectations(args.url, opener)
+    except Exception as e:
+        print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
+        sys.exit(1)
+    print(f"Cases: {len(CASES)}\n")
     if args.verbose and t04_exp:
         print(
             "T04 runtime fixture: "
