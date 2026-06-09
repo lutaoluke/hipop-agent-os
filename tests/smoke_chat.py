@@ -57,12 +57,14 @@ class Case:
     question: str
     store: str = "KSA"
     must_use_tools: List[str] = field(default_factory=list)
+    expected_tools: Optional[List[str]] = None                       # 若设置，tools_used 必须精确等于该列表
     must_contain: List[str] = field(default_factory=list)        # reply 必须含
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
     must_not_warn: bool = False                                   # _safety 不应产生 hallucination banner
     expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
     expected_workflows: List[str] = field(default_factory=list)   # 多 workflow 场景，每条都必须有结果
+    must_not_workflow_prefixes: List[str] = field(default_factory=list)  # 禁止创建指定前缀 workflow task
     require_task_evidence: bool = False                           # 成功 task_id 必须能从 /api/tasks 回读事件
     allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
     t07_guard: bool = False                                       # T07 freshness 结构不变量检查
@@ -519,6 +521,21 @@ CASES: List[Case] = [
         must_not_warn=True,
         timeout=120,
     ),
+    Case(
+        name="T36 负控：询问 ERP 商品库和销量价格上次刷新时间（不得创建 wf2 任务）",
+        question="请问 ERP 商品库和销量价格上次是什么时候刷新过？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"已触发|已创建|后台任务号|任务\s*ID|run_workflow",
+        ],
+        must_not_warn=True,
+    ),
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
     # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
     # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的
@@ -812,6 +829,9 @@ def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] =
         if t not in tools:
             reasons.append(f"未调用 tool: {t} (实际: {tools})")
 
+    if c.expected_tools is not None and tools != c.expected_tools:
+        reasons.append(f"tools_used 不匹配: {tools!r} != {c.expected_tools!r}")
+
     for kw in c.must_contain:
         if not re.search(kw, reply):
             reasons.append(f"reply 缺关键词: {kw!r}")
@@ -874,6 +894,16 @@ def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] =
                     err = check_task_evidence(opener, base_url, task_id, expected)
                     if err:
                         reasons.append(err)
+
+    if c.must_not_workflow_prefixes:
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        for wf_task in wf_tasks:
+            workflow = wf_task.get("workflow") or ""
+            blocked = next((p for p in c.must_not_workflow_prefixes if workflow.startswith(p)), None)
+            if blocked:
+                reasons.append(f"不应创建 workflow task: {workflow!r} 命中前缀 {blocked!r}")
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
