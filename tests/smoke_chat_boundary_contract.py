@@ -39,6 +39,8 @@ PASS 条件（修后 round-6）：
     数据已经完全重新计算/导入已经成功完成/已成功导入最新数据"。无工具、
     run_workflow only、query evidence 都不能洗白；仅真实 task readback done/success
     能放行。
+  - round-13 切到 proof-required 口径：完成/刷新/导入/跑完/收尾类结果声明
+    默认需要 task readback done/success 证据；查询类安全状态词独立放行。
 """
 
 from __future__ import annotations
@@ -1166,6 +1168,91 @@ def test_round12_process_import_variants_not_washed_by_query_evidence():
         assert warns, f"query_sku 证据不应放行 round-12 完成态 {reply!r}"
 
 
+# ── Round-13 fail-then-pass: proof-required result claims ────────────────────
+
+ROUND13_REVIEWER_PROBES = (
+    "后台流程已经跑完了。",
+    "流程已经结束了。",
+    "数据已经重新算好了。",
+    "最新库存已经导入完毕。",
+    "任务收尾了。",
+)
+
+QUERY_SAFE_RESULT_STATUS_PROBES = frozenset({
+    "一切正常。",
+})
+
+
+def _all_known_result_claim_probes():
+    """All known result-claim probes must obey the same proof-required rule."""
+    seen = set()
+    for group in (
+        ROUND_REVIEWER_PROBES,
+        ROUND6_REVIEWER_PROBES,
+        ROUND7_REVIEWER_PROBES,
+        ROUND8_REVIEWER_PROBES,
+        ROUND9_REVIEWER_PROBES,
+        ROUND10_REVIEWER_PROBES,
+        ROUND11_REVIEWER_PROBES,
+        ROUND12_REVIEWER_PROBES,
+        ROUND13_REVIEWER_PROBES,
+    ):
+        for reply in group:
+            if reply not in seen:
+                seen.add(reply)
+                yield reply
+
+
+def test_round13_all_known_result_claims_block_without_proof():
+    """proof-required：所有已知完成/刷新/导入/跑完/收尾声明无证据时都拦截。"""
+    for reply in _all_known_result_claim_probes():
+        warns = check_task_completion_bypass(reply, [])
+        assert warns, f"round-13 proof-required FAIL：无工具时 {reply!r} 应被拦截"
+
+
+def test_round13_all_known_result_claims_block_run_workflow_only():
+    """proof-required：run_workflow 只证明创建任务，不能放行结果声明。"""
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for reply in _all_known_result_claim_probes():
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-13 proof-required FAIL：run_workflow only 时 {reply!r} 应被拦截"
+
+
+def test_round13_all_known_result_claims_not_washed_by_query_evidence():
+    """proof-required：query evidence 不能洗白结果声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in _all_known_result_claim_probes():
+        if reply in QUERY_SAFE_RESULT_STATUS_PROBES:
+            continue
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"round-13 proof-required FAIL：query evidence 不应放行 {reply!r}"
+
+
+def test_round13_result_claims_allowed_with_real_task_readback():
+    """正路：真实 task readback done/success 才允许结果声明。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in _all_known_result_claim_probes():
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round13_query_safe_status_words_allowed_with_query_evidence():
+    """查询类安全状态词独立白名单：不因 proof-required 架构误拦。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in (
+        "数据已查到，共 50 行。",
+        "数据查好了，共 50 行。",
+        "库存看好了，没有异常。",
+        "已处理查询结果。",
+        "一切正常。",
+    ):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"query evidence 下查询安全状态 {reply!r} 不应触发任务完成旁路，实得 warns={warns}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1191,7 +1278,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 12)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 13)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1376,6 +1463,17 @@ if __name__ == "__main__":
          test_round12_process_import_variants_allowed_with_real_task_readback),
         ("test_round12_process_import_variants_not_washed_by_query_evidence",
          test_round12_process_import_variants_not_washed_by_query_evidence),
+        # Round-13 fail-then-pass: proof-required result claims
+        ("test_round13_all_known_result_claims_block_without_proof",
+         test_round13_all_known_result_claims_block_without_proof),
+        ("test_round13_all_known_result_claims_block_run_workflow_only",
+         test_round13_all_known_result_claims_block_run_workflow_only),
+        ("test_round13_all_known_result_claims_not_washed_by_query_evidence",
+         test_round13_all_known_result_claims_not_washed_by_query_evidence),
+        ("test_round13_result_claims_allowed_with_real_task_readback",
+         test_round13_result_claims_allowed_with_real_task_readback),
+        ("test_round13_query_safe_status_words_allowed_with_query_evidence",
+         test_round13_query_safe_status_words_allowed_with_query_evidence),
     ]
 
     failed = 0
