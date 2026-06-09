@@ -74,6 +74,17 @@ _SELECTION_INVENTORY_GATE_RE = re.compile(
     r"已查询.{0,20}库存数据|已拉取.{0,20}库存数据|根据.{0,10}完整数据.{0,40}库存"
 )
 
+# T38: 完成态假证据 — "已重新计算/跑完了/任务已完成" 等宣称
+# sanitize_reply() 仅被 LLM 路径调用；确定性 _workflow_receipt_reply() 在此之前退出，
+# 所以任何到达这里的完成声明都是 LLM 自编，无真实回读证据。
+_DONE_CLAIM_RE = re.compile(
+    r"已重新计算"
+    r"|重算.{0,5}(?:完|好|了)"
+    r"|跑完了|跑好了"
+    r"|(?:销售周期|补货).{0,15}(?:已完成|完成了|跑完)"
+    r"|任务.{0,5}已完成"
+)
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -472,6 +483,21 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "⚠️ Agent 回复含假任务证据（accepted 状态或 SSE 进度），但本轮没真调 run_workflow — "
             "这是 T38 禁止的假任务启动证据"
         )
+
+    # T38: 完成态假证据 — LLM 路径无法读回任务完成状态，任何完成声明均是编造
+    done_claim = _DONE_CLAIM_RE.search(reply)
+    if done_claim:
+        if "run_workflow" not in tools_used:
+            warnings.append(
+                "⚠️ Agent 宣称重算已完成，但本轮没真调 run_workflow — 假完成证据（T38）"
+            )
+        else:
+            # run_workflow 只创建任务，LLM 没有 task-status readback 工具；
+            # 真实完成回执走 _workflow_receipt_reply()，在 sanitize_reply() 之前退出。
+            warnings.append(
+                "⚠️ Agent 宣称任务已完成，但仅有创建证据（run_workflow），无完成回读 — "
+                "假完成声明（T38）"
+            )
 
     # Chat 没有人类可依赖的"稍后自动回来通知/答复"承诺；任务进度只能看任务面板，
     # 或在完成后由用户重新提问。即使本轮真的调了 run_workflow，也不能把异步

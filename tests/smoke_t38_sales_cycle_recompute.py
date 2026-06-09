@@ -503,6 +503,56 @@ def test_t38_alert_count_query_uses_scope_overview_not_workflow():
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Safety 完成态假证据组（验门人 round-5 gaps）
+# ────────────────────────────────────────────────────────────────────────────
+
+def test_t38_safety_done_claim_without_run_workflow_caught():
+    """T38 Gap-1: "已重新计算并跑完了" 无 run_workflow 证据 → sanitize_reply 必须产生 warning。
+
+    FAIL (before fix): warnings == []，假完成声明未被拦截。
+    PASS (after fix):  warnings 非空，含 T38 假完成证据提示。
+    """
+    _, warnings = _safety.sanitize_reply(
+        "销售周期和补货建议已重新计算并跑完了。",
+        tools_used=[],
+        tool_log=[],
+    )
+    assert warnings, (
+        "T38 Gap-1: '已重新计算并跑完了'(无 run_workflow) 未被 sanitize_reply 拦截，"
+        f"warnings={warnings!r}"
+    )
+    assert any("T38" in w or "完成" in w or "run_workflow" in w for w in warnings), (
+        f"warning 内容未提及 T38 假完成证据: {warnings!r}"
+    )
+    print(f"    Gap-1 已重新计算无 run_workflow 被拦截: {warnings[0]!r}")
+
+
+def test_t38_safety_task_completed_with_run_workflow_only_caught():
+    """T38 Gap-2: "任务已完成，任务 ID：ab123456" 仅有 run_workflow 创建证据（无 done 回读）
+    → sanitize_reply 必须产生 warning。
+
+    FAIL (before fix): warnings == []，LLM 编造的完成声明未被拦截。
+    PASS (after fix):  warnings 非空，含 T38 假完成声明提示。
+
+    原理：sanitize_reply() 仅在 LLM 路径调用；真实完成由 _workflow_receipt_reply()
+    在确定性路径返回，不经过 sanitize_reply()。因此任何到达此处的"已完成"均是编造。
+    """
+    _, warnings = _safety.sanitize_reply(
+        "任务已完成，任务 ID：ab123456。",
+        tools_used=["run_workflow"],
+        tool_log=[{"name": "run_workflow", "task_id": "ab123456"}],
+    )
+    assert warnings, (
+        "T38 Gap-2: '任务已完成'(仅 run_workflow 创建，无 done 回读) 未被拦截，"
+        f"warnings={warnings!r}"
+    )
+    assert any("T38" in w or "完成" in w or "回读" in w for w in warnings), (
+        f"warning 内容未提及 T38 假完成声明: {warnings!r}"
+    )
+    print(f"    Gap-2 任务已完成仅创建证据被拦截: {warnings[0]!r}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -538,6 +588,9 @@ if __name__ == "__main__":
         test_t38_chat_e2e_failure_has_no_fake_task_id,
         test_t38_chat_e2e_duplicate_running_returns_real_existing_task,
         test_t38_alert_count_query_uses_scope_overview_not_workflow,
+        # Safety 完成态假证据组（验门人 round-5 gaps）
+        test_t38_safety_done_claim_without_run_workflow_caught,
+        test_t38_safety_task_completed_with_run_workflow_only_caught,
     ]
     failed = 0
     for t in tests:
