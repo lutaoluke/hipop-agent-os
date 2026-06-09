@@ -962,9 +962,15 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_order_live"
         and t.get("result_error") == "erp_login_failed_no_cache"
     ]
-    if order_erp_login_failed and not re.search(
-        r"(ERP.{0,10}(失败|登录|无法)|实时.{0,5}失败|登录.{0,5}失败|查询失败|无缓存|没有缓存|暂时无法)",
-        reply,
+    if order_erp_login_failed and (
+        # 即使回复开头已说明 ERP 登录失败/无缓存，后缀只要再出现确定物流/库存结论
+        # （当前在途 / 预计到仓 / 货代为 X / 没有在途 / 库存正常）仍须告警 —
+        # 验门人 Round-3 打回点：不能因为出现"失败/无缓存"措辞就整条放行（洞F 修复）。
+        _ERROR_FABRICATION_RE.search(reply)
+        or not re.search(
+            r"(ERP.{0,10}(失败|登录|无法)|实时.{0,5}失败|登录.{0,5}失败|查询失败|无缓存|没有缓存|暂时无法)",
+            reply,
+        )
     ):
         order_nos = [_get_tool_arg(t, "order_no") for t in order_erp_login_failed]
         order_str = "、".join(filter(None, order_nos)) or "该货单"

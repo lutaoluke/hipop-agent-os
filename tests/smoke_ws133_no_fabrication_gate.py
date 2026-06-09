@@ -79,6 +79,53 @@ def test_rule_f_no_false_positive_for_successful_order_query():
     assert not rule_f_warns, f"正常订单查询不应触发 Rule F: {rule_f_warns}"
 
 
+# ─── Rule F 后缀编造收口（验门人 Round-3 打回点）─────────────────────────────────
+# erp_login_failed_no_cache 时，回复即使已说明"ERP 登录失败/无缓存"，
+# 后缀若又出现确定物流/库存结论仍必须告警 —— 不能因失败措辞整条放行。
+
+def _erp_login_failed_no_cache_log(order_no="PD-FAIL"):
+    return [{
+        "name": "query_order_live",
+        "args": {"order_no": order_no},
+        "result_error": "erp_login_failed_no_cache",
+        "result_keys": ["ok", "error", "message"],
+    }]
+
+
+def test_rule_f_suffix_in_transit_conclusion_still_warns():
+    """失败措辞 + 后缀"当前在途/预计到仓"编造结论 → 仍须告警。
+
+    FAIL（修前）：出现"ERP 登录失败/无缓存"措辞即整条放行，warns 为空。
+    PASS（修后）：_ERROR_FABRICATION_RE 命中后缀结论 → Rule F 告警。
+    """
+    reply = "ERP 登录失败，单货单查询无缓存；不过货单 PD-FAIL 当前在途，预计明天到仓。"
+    out, warns = _safety.sanitize_reply(
+        reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_no_cache_log()
+    )
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+后缀在途结论应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_f_suffix_negative_in_transit_conclusion_still_warns():
+    """失败措辞 + 后缀"当前没有在途，状态正常"编造结论 → 仍须告警。"""
+    reply = "ERP 查询失败且没有缓存；该货单当前没有在途，状态正常。"
+    out, warns = _safety.sanitize_reply(
+        reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_no_cache_log()
+    )
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+后缀'没有在途/状态正常'结论应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_f_suffix_forwarder_conclusion_still_warns():
+    """失败措辞 + 后缀"货代为 YTO，跟踪号"编造结论 → 仍须告警。"""
+    reply = "实时查询失败，无缓存可用；货代为 YTO，跟踪号 YT123456。"
+    out, warns = _safety.sanitize_reply(
+        reply, tools_used=["query_order_live"], tool_log=_erp_login_failed_no_cache_log()
+    )
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+后缀'货代为 X'结论应触发 Rule F，但 warns={warns}"
+
+
 # ─── Rule G: query_sku_live → live_query_failed_reason (ERP 失败返回缓存) ────────
 
 def test_rule_g_sku_live_query_failed_cache_returned_triggers_gate():
@@ -643,6 +690,10 @@ if __name__ == "__main__":
         test_rule_h_suffix_negative_inventory_claim_blocked,
         test_rule_h_bare_no_transit_claim_blocked,
         test_rule_h_inventory_normal_claim_blocked,
+        # Round 4 — 验门人打回 Rule F 后缀编造收口
+        test_rule_f_suffix_in_transit_conclusion_still_warns,
+        test_rule_f_suffix_negative_in_transit_conclusion_still_warns,
+        test_rule_f_suffix_forwarder_conclusion_still_warns,
     ]
     failed = 0
     for t in tests:
