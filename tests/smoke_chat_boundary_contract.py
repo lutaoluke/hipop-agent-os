@@ -43,6 +43,8 @@ PASS 条件（修后 round-6）：
     默认需要 task readback done/success 证据；查询类安全状态词独立放行。
   - round-14 新增持久化/闭环语义："收工/办妥/归档/落库/写入系统/跑通/闭环"
     仍必须 proof-required；同时 query evidence 下"查询完成/查完了"不误拦。
+  - round-15 新增写入系统动词变体："写进系统/写到系统"仍属于持久化
+    完成声明，无工具、run_workflow only、query evidence 都不能放行。
 """
 
 from __future__ import annotations
@@ -1192,6 +1194,13 @@ ROUND14_REVIEWER_PROBES = (
     "任务已闭环。",
 )
 
+ROUND15_REVIEWER_PROBES = (
+    "数据已经写进系统。",
+    "库存已经写进系统。",
+    "数据已经写到系统。",
+    "库存已经写到系统。",
+)
+
 QUERY_SAFE_RESULT_STATUS_PROBES = frozenset({
     "一切正常。",
 })
@@ -1211,6 +1220,7 @@ def _all_known_result_claim_probes():
         ROUND12_REVIEWER_PROBES,
         ROUND13_REVIEWER_PROBES,
         ROUND14_REVIEWER_PROBES,
+        ROUND15_REVIEWER_PROBES,
     ):
         for reply in group:
             if reply not in seen:
@@ -1296,6 +1306,50 @@ def test_round14_query_completion_does_not_wash_result_claims():
         assert warns, f"query completion 不应洗白结果声明 {reply!r}"
 
 
+# ── Round-15 fail-then-pass: 写进/写到系统持久化声明 ───────────────────────────
+
+def test_round15_write_to_system_variants_block_unproven_evidence_paths():
+    """写进/写到系统是持久化完成声明，三条无完成证据路径都必须拦。"""
+    evidence_paths = (
+        ("no_tool", []),
+        ("run_workflow_only", [{"name": "run_workflow", "task_id": "aabb1234"}]),
+        ("query_only", [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]),
+    )
+    for path_name, tool_log in evidence_paths:
+        for reply in ROUND15_REVIEWER_PROBES:
+            warns = check_task_completion_bypass(reply, tool_log)
+            assert warns, (
+                f"round-15 FAIL：{path_name} 不应放行持久化结果声明 {reply!r}"
+            )
+
+
+def test_round15_write_to_system_variants_allowed_with_real_task_readback():
+    """真实 task readback done/success 时，写进/写到系统声明才可放行。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND15_REVIEWER_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_sanitize_reply_round15_write_to_system_variants():
+    """sanitize_reply 整合：写进/写到系统无完成证据时必须带 warning。"""
+    from hipop.server._safety import sanitize_reply
+
+    evidence_paths = (
+        ([], []),
+        (["run_workflow"], [{"name": "run_workflow", "task_id": "aabb1234"}]),
+        (["query_sku"], [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]),
+    )
+    for tools_used, tool_log in evidence_paths:
+        for reply in ROUND15_REVIEWER_PROBES:
+            final, warns = sanitize_reply(reply, tools_used=tools_used, tool_log=tool_log)
+            assert warns, f"sanitize_reply 应拦截 round-15 持久化声明 {reply!r}"
+            assert "⚠️" in final, f"sanitize_reply 应把 warning banner 写入回复: {final[:120]!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1321,7 +1375,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 14)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 15)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1521,6 +1575,12 @@ if __name__ == "__main__":
          test_round14_query_completion_allowed_through_sanitize_reply),
         ("test_round14_query_completion_does_not_wash_result_claims",
          test_round14_query_completion_does_not_wash_result_claims),
+        ("test_round15_write_to_system_variants_block_unproven_evidence_paths",
+         test_round15_write_to_system_variants_block_unproven_evidence_paths),
+        ("test_round15_write_to_system_variants_allowed_with_real_task_readback",
+         test_round15_write_to_system_variants_allowed_with_real_task_readback),
+        ("test_sanitize_reply_round15_write_to_system_variants",
+         test_sanitize_reply_round15_write_to_system_variants),
     ]
 
     failed = 0
