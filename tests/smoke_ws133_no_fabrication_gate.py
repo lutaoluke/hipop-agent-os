@@ -653,6 +653,116 @@ def test_rule_h_inventory_normal_claim_blocked():
         f"应插入失败说明: {out[:300]}"
 
 
+# ─── Round 4 extra — 验门人 Round-4 红队扩展打回（Rule F 跟踪号/货代是/状态正常 + Rule H 跟踪号 + Rule I 继续处理）─────
+
+def test_rule_f_suffix_tracking_number_claim_blocked():
+    """Round-4 洞1a: ERP 登录失败 + 后缀"跟踪号是 YT123456" → Rule F 仍须告警。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 不含 '跟踪号是' 模式，warns=[]。
+    PASS（修后）：_ERROR_FABRICATION_RE 增加 '跟踪号.{0,3}(?:是|为)\\s*\\S+' → Rule F 告警。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-FAIL"},
+        "result_error": "erp_login_failed_no_cache",
+        "result_keys": ["ok", "error", "message"],
+    }]
+    bypass_reply = "ERP 登录失败，单货单查询无缓存；跟踪号是 YT123456。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+跟踪号声明应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_f_suffix_forwarder_is_claim_blocked():
+    """Round-4 洞1b: ERP 登录失败 + 后缀"货代是 YTO，跟踪号 YT123456" → Rule F 仍须告警。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 只含 '货代.{0,3}为'，不含 '货代是'，warns=[]。
+    PASS（修后）：_ERROR_FABRICATION_RE 改为 '货代.{0,3}(?:为|是)' → Rule F 告警。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-FAIL"},
+        "result_error": "erp_login_failed_no_cache",
+        "result_keys": ["ok", "error", "message"],
+    }]
+    bypass_reply = "ERP 登录失败，单货单查询无缓存；货代是 YTO，跟踪号 YT123456。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+货代是/跟踪号声明应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_f_suffix_status_normal_claim_blocked():
+    """Round-4 洞1c: ERP 查询失败 + 后缀"该货单状态正常" → Rule F 仍须告警。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 不含 '状态正常' 模式，warns=[]。
+    PASS（修后）：_ERROR_FABRICATION_RE 增加 '状态.{0,3}正常' → Rule F 告警。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-FAIL"},
+        "result_error": "erp_login_failed_no_cache",
+        "result_keys": ["ok", "error", "message"],
+    }]
+    bypass_reply = "ERP 查询失败且没有缓存；该货单状态正常。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    rule_f_warns = [w for w in warns if "erp_login_failed" in w or "Rule F" in w or "WS-133 Rule F" in w]
+    assert rule_f_warns, f"失败措辞+状态正常声明应触发 Rule F，但 warns={warns}"
+
+
+def test_rule_h_suffix_tracking_number_claim_blocked():
+    """Round-4 洞2: erp_fetch_error + 后缀"跟踪号是 YT999999" → Rule H 仍须告警。
+
+    FAIL（修前）：_ERROR_FABRICATION_RE 不含 '跟踪号是' 模式，warns=[]。
+    PASS（修后）：_ERROR_FABRICATION_RE 增加 '跟踪号.{0,3}(?:是|为)\\s*\\S+' → Rule H 告警。
+    """
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "SDA1874A"},
+        "result_error": "erp_fetch_error: timeout",
+        "result_keys": ["ok", "error"],
+    }]
+    bypass_reply = "ERP 查询失败（网络超时）；跟踪号是 YT999999。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    rule_h_warns = [w for w in warns if "erp_fetch_error" in w or "Rule H" in w or "WS-133 Rule H" in w]
+    assert rule_h_warns, f"失败措辞+跟踪号声明应触发 Rule H，但 warns={warns}"
+
+
+def test_rule_i_will_continue_processing_promise_blocked():
+    """Round-4 洞3: run_workflow 失败 + 回复"系统会继续处理" → Rule I 仍须告警。
+
+    FAIL（修前）：_WF_SUCCESS_CLAIM_RE 不含 '继续处理' 模式，warns=[]。
+    PASS（修后）：_WF_SUCCESS_CLAIM_RE 增加 '系统.{0,10}(会|将).{0,10}(继续|处理)' → Rule I 告警。
+    """
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf5_sales_cycle_v2"},
+        "ok": False,
+        "result_error": "unknown workflow: wf5_sales_cycle_v2",
+    }]
+    bypass_reply = "这个工作流暂时失败，不过系统会继续处理。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "run_workflow" in w or "Rule I" in w or "WS-133 Rule I" in w]
+    assert rule_i_warns, f"工作流失败+'系统会继续处理'应触发 Rule I，但 warns={warns}"
+
+
+def test_rule_i_already_arranged_processing_promise_blocked():
+    """Round-4 洞3b: run_workflow 失败 + 回复"已安排处理" → Rule I 仍须告警。
+
+    FAIL（修前）：_WF_SUCCESS_CLAIM_RE 不含 '已安排处理' 模式，warns=[]。
+    PASS（修后）：_WF_SUCCESS_CLAIM_RE 增加 '已安排.{0,10}处理' → Rule I 告警。
+    """
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "ok": False,
+        "result_error": "queue full",
+    }]
+    bypass_reply = "触发失败，但已安排处理，稍后会完成。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "run_workflow" in w or "Rule I" in w or "WS-133 Rule I" in w]
+    assert rule_i_warns, f"工作流失败+'已安排处理'应触发 Rule I，但 warns={warns}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -690,10 +800,17 @@ if __name__ == "__main__":
         test_rule_h_suffix_negative_inventory_claim_blocked,
         test_rule_h_bare_no_transit_claim_blocked,
         test_rule_h_inventory_normal_claim_blocked,
-        # Round 4 — 验门人打回 Rule F 后缀编造收口
+        # Round 4 — 验门人打回 Rule F 后缀编造收口（Coder-Opus 原始 3 probe）
         test_rule_f_suffix_in_transit_conclusion_still_warns,
         test_rule_f_suffix_negative_in_transit_conclusion_still_warns,
         test_rule_f_suffix_forwarder_conclusion_still_warns,
+        # Round 4 extra — 验门人 Round-4 红队扩展打回（5 个新 probe）
+        test_rule_f_suffix_tracking_number_claim_blocked,
+        test_rule_f_suffix_forwarder_is_claim_blocked,
+        test_rule_f_suffix_status_normal_claim_blocked,
+        test_rule_h_suffix_tracking_number_claim_blocked,
+        test_rule_i_will_continue_processing_promise_blocked,
+        test_rule_i_already_arranged_processing_promise_blocked,
     ]
     failed = 0
     for t in tests:
