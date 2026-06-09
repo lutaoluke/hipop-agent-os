@@ -1427,6 +1427,107 @@ def test_sanitize_reply_round16_structural_result_claims():
             assert "⚠️" in final, f"sanitize_reply 应把 warning banner 写入回复: {final[:120]!r}"
 
 
+# ── Round-17 fail-then-pass: conversational ack phrases must NOT trigger ──────
+
+# These are common conversational acknowledgments / courtesy phrases that should
+# NEVER be treated as result/completion claims.
+CONVERSATIONAL_ACK_PHRASES = (
+    "好的，知道了。",      # ack after positive answer
+    "明白了。",           # understood
+    "可以了。",           # ok/fine
+    "收到，我知道了。",    # received + understood
+    "辛苦了。",           # courtesy: thanks for hard work
+)
+
+# Result verbs + 了 must still be blocked even after the ack-narrowing fix.
+ROUND17_REGRESSION_RESULT_CLAIMS = (
+    "更新了。",
+    "同步了。",
+    "数据更新了。",
+    "库存同步了。",
+    "处理了。",
+)
+
+
+def test_round17_ack_phrases_no_false_positive_no_tool():
+    """round-17：常见确认/礼貌语在无工具证据时不应触发 completion bypass。
+
+    FAIL（round-16）：bare `...了` 分支过宽，`好的，知道了` / `明白了` /
+                  `可以了` / `收到，我知道了` / `辛苦了` 被误判为完成态声明。
+    PASS（round-17）：bare `了` 分支仅绑定结果动词，认知/礼貌动词已排除。
+    """
+    for phrase in CONVERSATIONAL_ACK_PHRASES:
+        warns = check_task_completion_bypass(phrase, [])
+        assert not warns, (
+            f"round-17 FALSE POSITIVE：普通确认语 {phrase!r} 不应触发 completion bypass，"
+            f"实得 warns={warns}"
+        )
+
+
+def test_round17_ack_phrases_no_false_positive_run_workflow_only():
+    """run_workflow only 时，普通确认/礼貌语同样不应触发。"""
+    tool_log = [{"name": "run_workflow", "task_id": "aabb1234"}]
+    for phrase in CONVERSATIONAL_ACK_PHRASES:
+        warns = check_task_completion_bypass(phrase, tool_log)
+        assert not warns, (
+            f"round-17 FALSE POSITIVE：{phrase!r} + run_workflow only → warns={warns}"
+        )
+
+
+def test_round17_ack_phrases_no_false_positive_query_only():
+    """query evidence 时，普通确认/礼貌语同样不应触发。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for phrase in CONVERSATIONAL_ACK_PHRASES:
+        warns = check_task_completion_bypass(phrase, tool_log)
+        assert not warns, (
+            f"round-17 FALSE POSITIVE：{phrase!r} + query evidence → warns={warns}"
+        )
+
+
+def test_round17_ack_phrases_not_triggered_by_sanitize_reply():
+    """sanitize_reply 整合：普通确认/礼貌语不出 hallucination banner。"""
+    from hipop.server._safety import sanitize_reply
+
+    for phrase in CONVERSATIONAL_ACK_PHRASES:
+        # Test with no tool — acks should pass cleanly
+        final, warns = sanitize_reply(phrase, tools_used=[], tool_log=[])
+        assert not warns, (
+            f"sanitize_reply round-17 FALSE POSITIVE：{phrase!r} no-tool → warns={warns}"
+        )
+        # Test with run_workflow only — still should pass
+        final2, warns2 = sanitize_reply(
+            phrase,
+            tools_used=["run_workflow"],
+            tool_log=[{"name": "run_workflow"}],
+        )
+        assert not warns2, (
+            f"sanitize_reply round-17 FALSE POSITIVE：{phrase!r} run_workflow → warns={warns2}"
+        )
+
+
+def test_round17_result_verb_le_still_blocked():
+    """result verb + 了 类短语修后仍须被拦截（回归）。"""
+    for claim in ROUND17_REGRESSION_RESULT_CLAIMS:
+        warns = check_task_completion_bypass(claim, [])
+        assert warns, f"round-17 回归 FAIL：{claim!r} 无工具 → 仍应触发，实得 warns=[]"
+
+        warns_wf = check_task_completion_bypass(claim, [{"name": "run_workflow"}])
+        assert warns_wf, f"round-17 回归 FAIL：{claim!r} run_workflow only → 仍应触发"
+
+
+def test_round17_result_verb_le_allowed_with_task_readback():
+    """正路：真实 task readback done 时，result verb+了 放行。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for claim in ROUND17_REGRESSION_RESULT_CLAIMS:
+        warns = check_task_completion_bypass(claim, tool_log)
+        assert not warns, (
+            f"真实 task readback done 时 {claim!r} 应放行，实得 warns={warns}"
+        )
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1452,7 +1553,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 16)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 17)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1666,6 +1767,19 @@ if __name__ == "__main__":
          test_round16_query_completion_does_not_wash_structural_claims),
         ("test_sanitize_reply_round16_structural_result_claims",
          test_sanitize_reply_round16_structural_result_claims),
+        # Round-17 fail-then-pass: conversational ack phrases must NOT trigger
+        ("test_round17_ack_phrases_no_false_positive_no_tool",
+         test_round17_ack_phrases_no_false_positive_no_tool),
+        ("test_round17_ack_phrases_no_false_positive_run_workflow_only",
+         test_round17_ack_phrases_no_false_positive_run_workflow_only),
+        ("test_round17_ack_phrases_no_false_positive_query_only",
+         test_round17_ack_phrases_no_false_positive_query_only),
+        ("test_round17_ack_phrases_not_triggered_by_sanitize_reply",
+         test_round17_ack_phrases_not_triggered_by_sanitize_reply),
+        ("test_round17_result_verb_le_still_blocked",
+         test_round17_result_verb_le_still_blocked),
+        ("test_round17_result_verb_le_allowed_with_task_readback",
+         test_round17_result_verb_le_allowed_with_task_readback),
     ]
 
     failed = 0
