@@ -2425,7 +2425,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     f"`{existing['task_id']}`，我不重复触发。"
                 )
             else:
-                reply = tool_result.get("reason") or "工作流触发失败。"
+                # DB not yet updated; parse ID from denial reason string
+                extracted_id = _existing_workflow_task_id(tool_result)
+                if extracted_id:
+                    workflow = direct_workflow["workflow"]
+                    label, total_steps, affected = _workflow_registry_summary(
+                        workflow, direct_workflow["label"]
+                    )
+                    workflow_task = {
+                        "task_id": extracted_id,
+                        "workflow": workflow,
+                        "label": label,
+                        "total_steps": total_steps,
+                        "affected_modules": affected,
+                        "followup_prompt": question,
+                    }
+                    reply = (
+                        f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
+                        f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
+                        "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                    )
+                else:
+                    reply = tool_result.get("reason") or "工作流触发失败。"
         else:
             existing_task_id = _existing_workflow_task_id(tool_result or {})
             if existing_task_id:
