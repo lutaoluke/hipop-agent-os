@@ -2469,24 +2469,75 @@ def _maybe_append_navigation_url(reply: str, tool_log: List[Dict]) -> str:
     return reply
 
 
+# T37: 库存刷新意图（刷/刷新/同步/重算 + 库存，任意语序）。单一来源，路由判定
+# 与拒绝词否决共用，避免正向 pattern 与否定 pattern 各写一份导致口径漂移。
+_STOCK_REFRESH_INTENT_RE = _re.compile(
+    r"(?:刷|刷新|同步|重算).{0,10}库存|库存.{0,5}(?:刷新|刷一下|同步|重算)"
+)
+# T38 宽口径库存动作词（扫/跑一下 等）也算库存刷新意图，用于把拒绝词否决扩展到
+# 宽口径路由（如「不要扫库存」），不只覆盖窄口径正向 pattern。
+_STOCK_REFRESH_WIDE_VERBS = ("刷", "刷新", "同步", "重算", "更新", "扫", "刷一下",
+                             "拉一下", "跑一下", "重跑", "重新计算")
+
+# T37 round-15（Luke 2026-06-09 指令①：路由层拒绝词过滤）。库存刷新是副作用动作；
+# 用户在消息任意位置表达「不做/暂停/禁止」这类明确拒绝，就必须否决路由，与词序无关。
+# 前 14 轮用「拒绝词必须紧贴在 刷/同步 之前」的位置型正则，运营换语序（如
+# 「库存先别同步」「ERP库存不用同步」「库存请勿重算」）即可穿透。本表是位置无关的
+# 拒绝标记，只在已检出库存刷新意图时才查询，误判面极小；且误判方向是「少触发一次
+# 副作用」（安全侧），不会造成未授权的后台任务。
+_STOCK_REFRESH_REFUSAL_MARKERS = (
+    # 「不/无需」族
+    "不用", "不要", "无需", "不需要", "不需", "不必", "不想", "不打算", "无须",
+    "不准", "不许", "不让", "甭", "莫", "休要", "拒绝",
+    # 「别/先别/暂」族（含「先不要 / 先不用」的子串「先不」）
+    "别", "先别", "暂时别", "先不", "暂时不", "暂不",
+    "没必要", "没必",
+    # 动作直接否定
+    "不刷", "不刷新", "不同步", "不重算", "不更新", "不拉", "不扫",
+    # 「请勿/停/暂停/缓/搁置」族——用 halt 词根（停/缓/搁）而非穷举后缀，
+    # 一次覆盖 停止/停下/停掉/停一下/叫停/喊停、暂缓/缓一缓/缓一下/先缓、搁置/搁一搁。
+    "请勿", "切勿", "勿", "停", "打住", "取消",
+    "暂停", "暂缓", "缓", "中止", "终止", "禁止", "严禁", "搁置", "搁",
+    # 英文常见拒绝（q 已 lower）
+    "don't", "don’t", "do not", "dont", "no need", "no sync", "hold off",
+    "stop", "cancel", "pause", "skip",
+)
+
+
+def _has_stock_refresh_intent(q: str) -> bool:
+    """库存刷新意图检测（窄口径正则 + 宽口径动作词，任意语序）。"""
+    if _STOCK_REFRESH_INTENT_RE.search(q):
+        return True
+    return "库存" in q and any(v in q for v in _STOCK_REFRESH_WIDE_VERBS)
+
+
+def _stock_refresh_refused(q: str) -> bool:
+    """位置无关的库存刷新拒绝检测：消息任意位置含拒绝标记即视为拒绝。"""
+    return any(m in q for m in _STOCK_REFRESH_REFUSAL_MARKERS)
+
+
+def _stock_refresh_refusal_reply(question: str) -> Optional[str]:
+    """round-15（Luke 指令①）：检出库存刷新意图但用户明确拒绝时，给出确定性回复，
+    绝不路由 wf1_stock_v2（不创建后台任务）。无意图或无拒绝词时返回 None（不接管）。"""
+    q = (question or "").lower()
+    if not _has_stock_refresh_intent(q) or not _stock_refresh_refused(q):
+        return None
+    return (
+        "收到，本轮不执行库存刷新 / 同步（未创建后台任务、未启动后台流程）。"
+        "需要刷新时，直接说「刷库存」或「同步 ERP 6 仓库存」即可。"
+    )
+
+
 def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
     if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新",
                              "不用刷库存", "不要刷库存")):
         return None
-    # T37 否定词前置拦截：库存副作用动作族（刷/刷新/同步/重算）必须先过拒绝表达。
-    _NEG = (r"不用|不要|无需|先别|别|暂时别|不需要|不需|先不|不必|不想|不打算"
-            r"|请勿|勿|停止|取消|暂停|暂缓|中止|终止|禁止|严禁")
-    if _re.search(
-        rf"(?:{_NEG}).{{0,8}}(?:刷|刷新|同步|重算|更新).{{0,15}}库存"
-        rf"|(?:{_NEG}).{{0,8}}库存.{{0,8}}(?:刷|刷新|刷一下|同步|重算|更新)"
-        r"|(?:不刷|不刷新|不同步|不重算|不更新).{0,15}库存"
-        r"|库存.{0,8}(?:不刷新|不同步|不重算|不更新)",
-        q,
-    ):
+    # T37 round-15：库存刷新是副作用动作，已检出意图但用户明确拒绝 → 不路由（任意语序）。
+    if _has_stock_refresh_intent(q) and _stock_refresh_refused(q):
         return None
     # T37: 直接路由库存刷新口语意图（刷/刷新/同步/重算 + 库存）。
-    if _re.search(r"(?:刷|刷新|同步|重算).{0,10}库存|库存.{0,5}(?:刷新|刷一下|同步|重算)", q):
+    if _STOCK_REFRESH_INTENT_RE.search(q):
         return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
     # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
     if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
@@ -2966,6 +3017,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_readonly_router",
+            "hallucination_warnings": None,
+        }
+
+    # T37 round-15（Luke 指令①）：库存刷新副作用动作，用户明确拒绝（任意语序）→
+    # 确定性回复，绝不调 run_workflow，绝不伪造任务号/已启动声明。
+    stock_refusal_reply = _stock_refresh_refusal_reply(question)
+    if stock_refusal_reply:
+        return {
+            "reply": stock_refusal_reply,
+            "clean_reply": stock_refusal_reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "执行",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_stock_refusal_router",
             "hallucination_warnings": None,
         }
 

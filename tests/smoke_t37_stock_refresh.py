@@ -53,6 +53,7 @@ from hipop.server._safety import sanitize_reply
 import hipop.server.agent as agent_module
 from hipop.server.agent import (
     _deterministic_workflow_request,
+    _stock_refresh_refusal_reply,
     _maybe_inject_missing_rates,
     _last_sku_rate_stats,
 )
@@ -363,6 +364,110 @@ def test_route_negation_严禁同步库存():
 def test_route_negation_暂缓同步库存():
     r = _deterministic_workflow_request("暂缓同步库存")
     assert r is None, f"暂缓同步库存 应被否定词拦截，实际: {r}"
+
+
+# ── round-15（Luke 指令①）：位置无关拒绝词否决 ──────────────────────────────────
+# 前 14 轮用「拒绝词必须紧贴在 刷/同步 之前」的位置型正则，运营把「库存」放最前、
+# 拒绝词插在中间（库存 + 拒绝词 + 同步/重算）即可穿透。下列探针在旧位置型正则下
+# 仍返回 wf1_stock_v2（FAIL），改为位置无关扫描后均返回 None（PASS）。
+def test_route_negation_库存先别同步():
+    r = _deterministic_workflow_request("库存先别同步")
+    assert r is None, f"库存先别同步 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_ERP库存不用同步():
+    r = _deterministic_workflow_request("ERP库存不用同步")
+    assert r is None, f"ERP库存不用同步 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_库存暂缓同步():
+    r = _deterministic_workflow_request("库存暂缓同步")
+    assert r is None, f"库存暂缓同步 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_库存同步暂停一下():
+    r = _deterministic_workflow_request("库存同步暂停一下")
+    assert r is None, f"库存同步暂停一下 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_库存同步先暂停():
+    r = _deterministic_workflow_request("库存同步先暂停")
+    assert r is None, f"库存同步先暂停 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_库存请勿重算():
+    r = _deterministic_workflow_request("库存请勿重算")
+    assert r is None, f"库存请勿重算 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_不要扫库存():
+    # 宽口径动作词（扫）也属库存刷新意图，拒绝词同样必须否决。
+    r = _deterministic_workflow_request("不要扫库存")
+    assert r is None, f"不要扫库存 应被拒绝词否决，实际: {r}"
+
+
+def test_route_negation_库存先不要同步():
+    r = _deterministic_workflow_request("库存先不要同步")
+    assert r is None, f"库存先不要同步 应被拒绝词否决，实际: {r}"
+
+
+# ── round-15：拒绝命中时给出确定性「不执行」回复（不调 wf1_stock_v2）──────────────
+def test_stock_refusal_reply_present_for_explicit_refusal():
+    for q in ("库存先别同步", "ERP库存不用同步", "库存请勿重算", "暂停同步库存",
+              "不要扫库存"):
+        reply = _stock_refresh_refusal_reply(q)
+        assert reply and "不执行" in reply and "未创建后台任务" in reply, (
+            f"明确拒绝 {q!r} 应返回确定性不执行回复，实际: {reply!r}"
+        )
+
+
+def test_stock_refusal_reply_none_for_positive_request():
+    for q in ("刷库存", "刷ERP库存", "刷6仓库存", "同步库存", "库存同步",
+              "刷新库存", "重算库存", "请帮我刷库存（ERP 6仓），并说明会更新哪些表。"):
+        assert _stock_refresh_refusal_reply(q) is None, (
+            f"正向刷库存请求 {q!r} 不应触发拒绝回复"
+        )
+
+
+# ── round-15：硬性拒绝词族（甭/莫/休要/拒绝/不准/不许/不让）──────────────────────
+# 这些与 禁止/严禁 同属「明确不许」语义，位置无关扫描必须否决；正向命令不含这些子串，
+# 加入纯增益无误判。
+def test_route_negation_甭刷库存():
+    assert _deterministic_workflow_request("甭刷库存") is None
+
+
+def test_route_negation_拒绝刷库存():
+    assert _deterministic_workflow_request("拒绝刷库存") is None
+
+
+def test_route_negation_不准刷库存():
+    assert _deterministic_workflow_request("不准刷库存") is None
+
+
+def test_route_negation_不许同步库存():
+    assert _deterministic_workflow_request("不许同步库存") is None
+
+
+def test_route_negation_不让刷库存():
+    assert _deterministic_workflow_request("不让刷库存") is None
+
+
+def test_route_negation_休要刷库存():
+    assert _deterministic_workflow_request("休要刷库存") is None
+
+
+def test_route_negation_莫同步库存():
+    assert _deterministic_workflow_request("莫同步库存") is None
+
+
+def test_route_positive_with_免避免_still_wf1():
+    # 「以免/避免」含「免」字，但属正向命令；硬性拒绝词只收 休要（非裸 休/免），
+    # 故下列仍须正向路由，验证未引入「免/休」误判。
+    for q in ("重算库存以免出错", "刷新库存避免漏单"):
+        r = _deterministic_workflow_request(q)
+        assert r is not None and r.get("workflow") == "wf1_stock_v2", (
+            f"正向命令 {q!r} 应路由 wf1_stock_v2，实际: {r}"
+        )
 
 
 def test_route_positive_sync_inventory_still_wf1():
@@ -1016,6 +1121,24 @@ if __name__ == "__main__":
         ("路由-否定词-禁止同步库存",           test_route_negation_禁止同步库存),
         ("路由-否定词-严禁同步库存",           test_route_negation_严禁同步库存),
         ("路由-否定词-暂缓同步库存",           test_route_negation_暂缓同步库存),
+        ("路由-否定词-库存先别同步(R15)",      test_route_negation_库存先别同步),
+        ("路由-否定词-ERP库存不用同步(R15)",   test_route_negation_ERP库存不用同步),
+        ("路由-否定词-库存暂缓同步(R15)",      test_route_negation_库存暂缓同步),
+        ("路由-否定词-库存同步暂停一下(R15)",  test_route_negation_库存同步暂停一下),
+        ("路由-否定词-库存同步先暂停(R15)",    test_route_negation_库存同步先暂停),
+        ("路由-否定词-库存请勿重算(R15)",      test_route_negation_库存请勿重算),
+        ("路由-否定词-不要扫库存(R15)",        test_route_negation_不要扫库存),
+        ("路由-否定词-库存先不要同步(R15)",    test_route_negation_库存先不要同步),
+        ("拒绝回复-明确拒绝有不执行回复(R15)",  test_stock_refusal_reply_present_for_explicit_refusal),
+        ("拒绝回复-正向请求无拒绝回复(R15)",    test_stock_refusal_reply_none_for_positive_request),
+        ("路由-硬拒绝-甭刷库存(R15)",          test_route_negation_甭刷库存),
+        ("路由-硬拒绝-拒绝刷库存(R15)",        test_route_negation_拒绝刷库存),
+        ("路由-硬拒绝-不准刷库存(R15)",        test_route_negation_不准刷库存),
+        ("路由-硬拒绝-不许同步库存(R15)",      test_route_negation_不许同步库存),
+        ("路由-硬拒绝-不让刷库存(R15)",        test_route_negation_不让刷库存),
+        ("路由-硬拒绝-休要刷库存(R15)",        test_route_negation_休要刷库存),
+        ("路由-硬拒绝-莫同步库存(R15)",        test_route_negation_莫同步库存),
+        ("路由-正向-含免避免不误判(R15)",      test_route_positive_with_免避免_still_wf1),
         ("路由-正向-同步库存",                 test_route_positive_sync_inventory_still_wf1),
         ("路由-正向-库存同步",                 test_route_positive_inventory_sync_still_wf1),
         ("路由-正向-刷新库存",                 test_route_positive_refresh_inventory_still_wf1),
