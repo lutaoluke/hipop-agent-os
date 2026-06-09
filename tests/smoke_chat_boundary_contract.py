@@ -41,6 +41,8 @@ PASS 条件（修后 round-6）：
     能放行。
   - round-13 切到 proof-required 口径：完成/刷新/导入/跑完/收尾类结果声明
     默认需要 task readback done/success 证据；查询类安全状态词独立放行。
+  - round-14 新增持久化/闭环语义："收工/办妥/归档/落库/写入系统/跑通/闭环"
+    仍必须 proof-required；同时 query evidence 下"查询完成/查完了"不误拦。
 """
 
 from __future__ import annotations
@@ -1178,6 +1180,18 @@ ROUND13_REVIEWER_PROBES = (
     "任务收尾了。",
 )
 
+ROUND14_REVIEWER_PROBES = (
+    "流程已经收工了。",
+    "任务已经办妥了。",
+    "后台流程已经归档。",
+    "数据已经落库了。",
+    "库存已经写入系统。",
+    "刷新任务已收工。",
+    "系统已经跑完收工。",
+    "流程跑通了。",
+    "任务已闭环。",
+)
+
 QUERY_SAFE_RESULT_STATUS_PROBES = frozenset({
     "一切正常。",
 })
@@ -1196,6 +1210,7 @@ def _all_known_result_claim_probes():
         ROUND11_REVIEWER_PROBES,
         ROUND12_REVIEWER_PROBES,
         ROUND13_REVIEWER_PROBES,
+        ROUND14_REVIEWER_PROBES,
     ):
         for reply in group:
             if reply not in seen:
@@ -1247,10 +1262,38 @@ def test_round13_query_safe_status_words_allowed_with_query_evidence():
         "数据查好了，共 50 行。",
         "库存看好了，没有异常。",
         "已处理查询结果。",
+        "查询完成，TBB0116A 近30天销量是54。",
+        "查询已完成，TBB0116A 近30天销量是54。",
+        "查完了，TBB0116A 近30天销量是54。",
         "一切正常。",
     ):
         warns = check_task_completion_bypass(reply, tool_log)
         assert not warns, f"query evidence 下查询安全状态 {reply!r} 不应触发任务完成旁路，实得 warns={warns}"
+
+
+def test_round14_query_completion_allowed_through_sanitize_reply():
+    """sanitize_reply 整合：query evidence 下"查询完成 + 真数"不应被 proof gate 误拦。"""
+    from hipop.server._safety import sanitize_reply
+
+    final, warns = sanitize_reply(
+        "查询完成，TBB0116A 近30天销量是54。",
+        tools_used=["query_sku"],
+        tool_log=[{"name": "query_sku"}],
+    )
+    assert not warns, f"query evidence 下'查询完成 + 真数'不应报警，实得 warns={warns}"
+    assert "⚠️" not in final, f"query-safe 回复不应出现 warning banner: {final[:120]!r}"
+
+
+def test_round14_query_completion_does_not_wash_result_claims():
+    """查询完成白名单只覆盖查询本身，不能洗白后续任务/数据结果声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in (
+        "查询完成，数据已刷新完成。",
+        "查询完成，任务已闭环。",
+        "查完了，库存已经写入系统。",
+    ):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query completion 不应洗白结果声明 {reply!r}"
 
 
 # ── Three-path distinguishability assertion ───────────────────────────────────
@@ -1278,7 +1321,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 13)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 14)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1474,6 +1517,10 @@ if __name__ == "__main__":
          test_round13_result_claims_allowed_with_real_task_readback),
         ("test_round13_query_safe_status_words_allowed_with_query_evidence",
          test_round13_query_safe_status_words_allowed_with_query_evidence),
+        ("test_round14_query_completion_allowed_through_sanitize_reply",
+         test_round14_query_completion_allowed_through_sanitize_reply),
+        ("test_round14_query_completion_does_not_wash_result_claims",
+         test_round14_query_completion_does_not_wash_result_claims),
     ]
 
     failed = 0
