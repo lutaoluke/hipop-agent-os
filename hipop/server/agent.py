@@ -120,6 +120,22 @@ TOOLS = [
         },
     },
     {
+        "name": "query_replenishment_sku",
+        "description": (
+            "查单个 SKU 的本周补货建议与可追溯证据。用于用户问某 SKU 的补货建议、"
+            "pipeline、风险标签、紧急度。若缓存/聚合证据缺失、全 0、过期或与上架状态矛盾，"
+            "必须使用实时/权威源；实时源失败时返回 blocked，不得把缓存 0 当作结论。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string", "description": "SKU 码，如 TBU0010A"},
+                "store": {"type": "string", "enum": ["KSA", "UAE"], "default": "KSA"},
+            },
+            "required": ["sku"],
+        },
+    },
+    {
         "name": "compute_air_freight_roi",
         "description": "估算单个 SKU 海运 vs 空运的 ROI 决策。假设：海运 0.4 USD/件、空运 2.5 USD/件、海运 25 天、空运 5 天。结合 SKU 销量 + 利润率，估算损失订单数 + 净 ROI 差。",
         "input_schema": {
@@ -722,6 +738,13 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
             {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
         ],
     }
+
+
+def tool_query_replenishment_sku(sku: str, store: str = "KSA") -> Dict:
+    tid = _get_tenant()
+    alias = _resolve_entity_alias(store) or ""
+    from . import replenishment_evidence as _rep
+    return _rep.query_replenishment_sku(sku, store, tid, alias)
 
 
 def tool_compute_air_freight_roi(sku: str, store: str, qty: int = 100) -> Dict:
@@ -1482,6 +1505,7 @@ TOOL_FUNCS = {
     "update_alert_status": tool_update_alert_status,
     "scope_overview": tool_scope_overview,
     "compute_replenishment": tool_compute_replenishment,
+    "query_replenishment_sku": tool_query_replenishment_sku,
     "compute_air_freight_roi": tool_compute_air_freight_roi,
     "data_health_check": tool_data_health_check,
     "list_products": tool_list_products,
@@ -2108,6 +2132,19 @@ def _deterministic_sku_metric_request(question: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
+    q = question or ""
+    q_up = q.upper()
+    if not any(x in q for x in (
+        "补货", "pipeline", "Pipeline", "风险标签", "紧急度", "待发", "在途",
+    )):
+        return None
+    if not any(x in q for x in ("补货", "pipeline", "Pipeline")):
+        return None
+    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up)
+    return m.group(0) if m else None
+
+
 def _format_pct(value) -> str:
     try:
         pct = float(value or 0)
@@ -2123,6 +2160,14 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
     item = next((x for x in items if (x.get("sku") or "").upper() == sku.upper()), None)
     if not item or not item.get("found"):
         return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
+    if item.get("live_sales_failed") or any(
+        item.get(k) is None for k in ("sales_30d", "total_orders_30d", "history_total")
+    ):
+        msg = item.get("live_sales_message") or item.get("live_sales_error") or "实时取数不可用"
+        return (
+            f"{sku} 当前无法实时确认 30 天销量、30 天总单量和历史总销量：{msg}。"
+            "我不会用旧快照数字冒充实时口径；请刷新/恢复 ERP 实时源后再查。"
+        )
     if item.get("data_stale"):
         as_of = item.get("as_of_date") or "未知日期"
         stale_days = item.get("stale_days")
@@ -2337,6 +2382,30 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_data_freshness_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_replenishment_sku = _deterministic_replenishment_sku_request(question)
+    if direct_replenishment_sku:
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool(
+            "query_replenishment_sku",
+            {"sku": direct_replenishment_sku, "store": store},
+            user=scope,
+        )
+        from . import replenishment_evidence as _rep
+        reply = _rep.format_replenishment_sku_reply(tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["query_replenishment_sku"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0 if (tool_result or {}).get("ok") else 0.9,
+            "judge_method": "deterministic_replenishment_sku_router",
             "hallucination_warnings": None,
         }
 

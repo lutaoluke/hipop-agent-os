@@ -488,14 +488,18 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
     item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
     c = _find_case("T04 TBB0116A")
     if c and item.get("found"):
-        c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
-        c.must_contain = [
-            _num_re(item.get("sales_30d")),
-            _num_re(item.get("total_orders_30d")),
-            _rate_re(item.get("cancel_rate_30d"), "取消率"),
-            _rate_re(item.get("return_rate_30d"), "退货率"),
-            _num_re(item.get("history_total")),
-        ]
+        required = ("sales_30d", "total_orders_30d", "history_total")
+        if item.get("live_sales_failed") or any(item.get(k) is None for k in required):
+            c.name = "T04 TBB0116A 30d 口径（live 不可用时必须明确不可得）"
+        else:
+            c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+            c.must_contain = [
+                _num_re(item.get("sales_30d")),
+                _num_re(item.get("total_orders_30d")),
+                _rate_re(item.get("cancel_rate_30d"), "取消率"),
+                _rate_re(item.get("return_rate_30d"), "退货率"),
+                _num_re(item.get("history_total")),
+            ]
 
     stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
     stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})

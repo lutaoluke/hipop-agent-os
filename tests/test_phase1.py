@@ -3,6 +3,7 @@ Phase 1 端到端测试 - 跑过 80%+ 即视为达标
 """
 import os, sys, json, subprocess, time
 from pathlib import Path
+import importlib.util
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +13,25 @@ BASE = "http://127.0.0.1:8765"
 
 
 _client = httpx.Client(trust_env=False, timeout=30)
+
+
+def _load_t27_replenishment_smoke():
+    path = REPO_ROOT / "tests" / "smoke_t27_replenishment_evidence.py"
+    spec = importlib.util.spec_from_file_location("smoke_t27_replenishment_evidence", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_chat_t27_replenishment_live_evidence_contract():
+    """T27 phase-1 contract: cache-zero must answer from live evidence."""
+    _load_t27_replenishment_smoke().test_t27_cache_zero_uses_live_authoritative_evidence()
+
+
+def test_chat_t27_replenishment_live_failure_blocks_cached_zero():
+    """T27 phase-1 contract: live failure must block cached zero conclusions."""
+    _load_t27_replenishment_smoke().test_t27_live_unavailable_blocks_cached_zero_answer()
 
 
 def _get(path: str, timeout: int = 15):
