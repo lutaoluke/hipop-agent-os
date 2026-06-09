@@ -93,6 +93,34 @@ _STALE_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# WS-133 Round-3: 物流编造声明检测器
+# Rule B/D（货单/SKU 未找到——确定性结论）：捡拾在途声明 AND 否定旁路借口
+# "只是延迟/同步慢" 在 not-found 语境下是隐含"货单其实存在"的旁路声明。
+_NOT_FOUND_FABRICATION_RE = re.compile(
+    r"当前.{0,3}在途|已在途|目前在途"    # 正向在途声明
+    r"|在途\s*\d+\s*件?"                # 具体在途数量
+    r"|预计.{0,8}(?:到仓|到货|到达)"    # 预计到货
+    r"|货代.{0,3}为\s*\S+"              # 货代已分配
+    r"|只是.{0,8}(?:延迟|慢|同步)"      # 旁路借口（暗示货单存在只是延迟）
+    r"|当前.{0,5}(?:没有|无).{0,3}在途" # 编造"无在途"结论
+    r"|没有在途库存"
+)
+
+# Rule F2/H/F（查询出错——结果不确定）：同上但不含旁路借口
+# 查询失败时说"只是网络延迟，请重试"是合理的，不应触发警告。
+_ERROR_FABRICATION_RE = re.compile(
+    r"当前.{0,3}在途|已在途|目前在途"
+    r"|在途\s*\d+\s*件?"
+    r"|预计.{0,8}(?:到仓|到货|到达)"
+    r"|货代.{0,3}(?:为|是)\s*\S+"
+    r"|跟踪号.{0,3}(?:是|为)\s*\S+"
+    r"|当前.{0,5}(?:没有|无).{0,3}在途"
+    r"|没有在途库存"
+    r"|没有在途"
+    r"|库存.{0,3}正常"
+    r"|状态.{0,3}正常"
+)
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -815,12 +843,15 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_order_live"
         and t.get("result_error") == "order_not_found_in_erp"
     ]
-    if order_not_found_entries and not re.search(
-        # (?<!不是) 防止"不是不存在"绕过（否定否定 ≠ 未找到）。
-        # 删去原 `该货单.{0,10}(不|无)`：间隔过大会跨越"不是"匹配到下一个"不/无"，
-        # 被否定句绕过；具体场景已由 (?<!不是)不存在 / 无物流 / 无记录 / 找不到 等覆盖。
-        r"(未找到|(?<!不是)不存在|无物流|找不到|无记录|没有.{0,5}找到|ERP.*无记录|核实货单号)",
-        reply,
+    if order_not_found_entries and (
+        # 有正向编造声明（含旁路借口）→ 不论回复是否同时说了"未找到"都要拦截
+        _NOT_FOUND_FABRICATION_RE.search(reply)
+        or not re.search(
+            # (?<!不是) 防止"不是不存在"绕过；其他否定否定模式已由上方
+            # _NOT_FOUND_FABRICATION_RE 中的正向声明检测兜底。
+            r"(未找到|(?<!不是)不存在|无物流|找不到|无记录|没有.{0,5}找到|ERP.*无记录|核实货单号)",
+            reply,
+        )
     ):
         order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
         order_str = "、".join(filter(None, order_nos)) or "该货单"
@@ -870,12 +901,12 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_sku_live"
         and t.get("result_error") == "sku_no_orders_in_erp"
     ]
-    if sku_not_found_entries and not re.search(
-        # (?<!不是) 防止"不是不存在"绕过（否定否定 ≠ 未找到）。
-        # 删去原 `该SKU.{0,10}(不|无)`：间隔过大允许跳过"不是"命中下一个"不/无"；
-        # 具体场景已由 (?<!不是)不存在 / 无货单 / 无记录 / 找不到 / 无在途 等覆盖。
-        r"(未找到|(?<!不是)不存在|无货单|找不到|无记录|没有.{0,5}找到|ERP.*无记录|无在途|核实.*SKU)",
-        reply,
+    if sku_not_found_entries and (
+        _NOT_FOUND_FABRICATION_RE.search(reply)
+        or not re.search(
+            r"(未找到|(?<!不是)不存在|无货单|找不到|无记录|没有.{0,5}找到|ERP.*无记录|无在途|核实.*SKU)",
+            reply,
+        )
     ):
         sku_nos = [_get_tool_arg(t, "sku") for t in sku_not_found_entries]
         sku_str = "、".join(filter(None, sku_nos)) or "该 SKU"
@@ -954,10 +985,14 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_order_live"
         and t.get("result_error") == "order_lookup_unavailable_no_erp_credentials"
     ]
-    if order_no_credentials and not re.search(
-        r"(ERP.{0,10}(未配置|无配置|没配置|账号|凭据|credentials)|配置.{0,5}dbuyerp"
-        r"|无法确认|ERP.{0,5}(失败|不可用)|账号未配|暂无凭据)",
-        reply,
+    if order_no_credentials and (
+        # 即使回复开头已说明 ERP 未配置，后缀出现编造在途声明仍须拦截（洞2 修复）
+        _ERROR_FABRICATION_RE.search(reply)
+        or not re.search(
+            r"(ERP.{0,10}(未配置|无配置|没配置|账号|凭据|credentials)|配置.{0,5}dbuyerp"
+            r"|无法确认|ERP.{0,5}(失败|不可用)|账号未配|暂无凭据)",
+            reply,
+        )
     ):
         order_nos2 = [_get_tool_arg(t, "order_no") for t in order_no_credentials]
         order_str2 = "、".join(filter(None, order_nos2)) or "该货单"
@@ -1002,10 +1037,14 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") in ("query_sku_live", "query_order_live")
         and (t.get("result_error") or "").startswith("erp_fetch_error")
     ]
-    if erp_fetch_errors and not re.search(
-        r"(查询失败|ERP.{0,5}(失败|异常)|实时.{0,5}失败|获取失败|抓取失败|接口.{0,5}失败"
-        r"|网络.{0,5}(错误|异常)|请求失败|暂时无法.{0,5}(查|获取)|无法查询)",
-        reply,
+    if erp_fetch_errors and (
+        # 即使回复已说明查询失败，后缀出现具体库存/在途声明仍须拦截（洞3 修复）
+        _ERROR_FABRICATION_RE.search(reply)
+        or not re.search(
+            r"(查询失败|ERP.{0,5}(失败|异常)|实时.{0,5}失败|获取失败|抓取失败|接口.{0,5}失败"
+            r"|网络.{0,5}(错误|异常)|请求失败|暂时无法.{0,5}(查|获取)|无法查询)",
+            reply,
+        )
     ):
         items = [
             _get_tool_arg(t, "order_no") or _get_tool_arg(t, "sku")

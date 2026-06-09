@@ -458,6 +458,114 @@ def test_rule_i_genuine_failure_acknowledgment_still_passes():
     assert not rule_i_warns, f"明确说失败且无成功声明，不应触发 Rule I: {rule_i_warns}"
 
 
+# ─── 验门人打回 Round 3：洞1/洞2/洞3 ─────────────────────────────────────────────
+
+# 洞1：Rule B/D 仅挡"不是不存在"，其他否定否定模式仍绕过
+
+def test_rule_b_bingnon_bypass_blocked():
+    """洞1-A: order_not_found_in_erp 下，'并非不存在，当前已在途' 绕过 Rule B → 必须拦截。
+
+    FAIL（修前）：'并非不存在' 中 '不存在' 被 (?<!不是) 放行为已说明，门放行。
+    PASS（修后）：检测到 '当前已在途' 正向编造声明，无论有无否定词都触发警告。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_not_found_in_erp",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    bypass_reply = "该货单并非不存在，只是系统延迟；当前已在途"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"'并非不存在，当前已在途' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"未找到|不存在|无记录|核实货单号|无物流", out), \
+        f"应插入未找到前缀: {out[:300]}"
+
+
+def test_rule_b_bushipre_bypass_blocked():
+    """洞1-B: order_not_found_in_erp 下，'不是未找到，只是同步慢；当前在途' → 必须拦截。
+
+    FAIL（修前）：'未找到' 子串被 re.search 命中当作已说明，门放行。
+    PASS（修后）：检测到 '当前在途' 正向声明，触发警告。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_not_found_in_erp",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    bypass_reply = "不是未找到，只是同步慢；当前在途"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"'不是未找到，只是同步慢；当前在途' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"未找到|不存在|无记录|核实货单号|无物流", out), \
+        f"应插入未找到前缀: {out[:300]}"
+
+
+def test_rule_b_binmeiyou_excuse_bypass_blocked():
+    """洞1-C: order_not_found_in_erp 下，'并没有不存在，只是 ERP 延迟' → 必须拦截。
+
+    FAIL（修前）：'不存在' 被 (?<!不是) 放行（前两字 '没有' ≠ '不是'），'只是 ERP 延迟' 逃过。
+    PASS（修后）：检测到 '只是 ERP 延迟' 是旁路借口声明，触发警告。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_not_found_in_erp",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    bypass_reply = "并没有不存在，只是 ERP 延迟"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"'并没有不存在，只是 ERP 延迟' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"未找到|不存在|无记录|核实货单号|无物流", out), \
+        f"应插入未找到前缀: {out[:300]}"
+
+
+# 洞2：Rule F2 豁免过宽——ERP 未配置说明后仍可追加在途编造
+
+def test_rule_f2_suffix_transit_fabrication_blocked():
+    """洞2: ERP 未配置说明 + 后缀编造在途状态 → Rule F2 仍须拦截。
+
+    FAIL（修前）：'ERP 账号未配置，无法确认' 被 re.search 放行整条回复，后缀编造逃过。
+    PASS（修后）：检测到后缀中的 '当前在途，预计明天到仓' 正向声明，仍触发警告。
+    """
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PD-GHOST"},
+        "result_error": "order_lookup_unavailable_no_erp_credentials",
+        "result_keys": ["ok", "error", "order_no", "message"],
+    }]
+    bypass_reply = "ERP 账号未配置，无法确认；不过货单 PD-GHOST 当前在途，预计明天到仓。"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_order_live"], tool_log=tool_log)
+    assert warns, f"F2 后缀编造 '当前在途，预计明天到仓' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"ERP|配置|无法确认|未配置|账号|凭据", out), \
+        f"回复应包含 ERP 未配置说明: {out[:300]}"
+
+
+# 洞3：Rule H 豁免过宽——查询失败说明后仍可追加负向库存编造
+
+def test_rule_h_suffix_negative_inventory_claim_blocked():
+    """洞3: 查询失败说明 + 后缀编造'当前没有在途库存' → Rule H 仍须拦截。
+
+    FAIL（修前）：'ERP 查询失败' 被 re.search 放行整条回复，后缀编造逃过。
+    PASS（修后）：检测到后缀中的 '当前没有在途库存' 具体库存声明，仍触发警告。
+    """
+    tool_log = [{
+        "name": "query_sku_live",
+        "args": {"sku": "SDA1874A"},
+        "result_error": "erp_fetch_error: TimeoutError",
+        "result_keys": ["ok", "error"],
+    }]
+    bypass_reply = "ERP 查询失败，网络超时；该货单当前没有在途库存"
+    out, warns = _safety.sanitize_reply(bypass_reply, tools_used=["query_sku_live"], tool_log=tool_log)
+    assert warns, f"H 后缀编造 '当前没有在途库存' 应被拦截，但 warns={warns}"
+    import re
+    assert re.search(r"查询失败|ERP.*失败|实时.*失败|获取失败|暂时无法", out), \
+        f"回复应包含失败说明: {out[:300]}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -487,6 +595,12 @@ if __name__ == "__main__":
         test_rule_d_legitimate_not_found_still_passes,
         test_rule_i_concede_fail_then_claim_success_still_blocked,
         test_rule_i_genuine_failure_acknowledgment_still_passes,
+        # Round 3 — 验门人打回补洞
+        test_rule_b_bingnon_bypass_blocked,
+        test_rule_b_bushipre_bypass_blocked,
+        test_rule_b_binmeiyou_excuse_bypass_blocked,
+        test_rule_f2_suffix_transit_fabrication_blocked,
+        test_rule_h_suffix_negative_inventory_claim_blocked,
     ]
     failed = 0
     for t in tests:
