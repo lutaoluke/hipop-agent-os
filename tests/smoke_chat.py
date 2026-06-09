@@ -338,6 +338,12 @@ CASES: List[Case] = [
         # product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径，随 live DB 漂移）
         must_contain=[_PRODUCT_TOTAL_RE, _PRODUCT_SPLIT_RE],
     ),
+    Case(
+        name="WS-148 近30天销量 TopN（list_products 确定性路由 + 证据）",
+        question="KSA 近30天销量最高的3个商品",
+        must_use_tools=["list_products"],
+        must_contain=[r"近\s*30\s*天销量", r"来源", r"202\d-\d{2}-\d{2}", r"wf2_sku\.sales_30d"],
+    ),
     # ─── 概览类 ───
     Case(
         name="店铺整体（真实在售 SKU + 红色告警）",
