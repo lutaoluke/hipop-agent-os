@@ -90,26 +90,38 @@ def spawn_task(
             "created_at": time.time(),
         }, f, ensure_ascii=False, indent=2)
 
-    # 2. INSERT tasks 行（state=queued）— RLS 上下文得先 set
+    # 2. INSERT tasks 行 + queued event —— 同一事务原子化（WS-141 Round 4，Option A）
+    #    根因（WS-132 Round 3 红队）：原实现先 commit `tasks` INSERT，再单独开连接写
+    #    queued event；event 写失败时 INSERT 已落库 → 幽灵任务（有行无 lifecycle 事件，
+    #    运营无法回读，重试又造重复孤儿）。这里把 INSERT 与 queued event 写进同一个
+    #    conn() 事务：任一步失败由 context manager 回滚 + 清掉 task 目录，spawn_task 抛
+    #    异常时任务真的没建（DB 无 task row）。queued event 复用同一连接（txn=c），
+    #    不另开连接，保证两步同生共死。
+    #    queued event 子进程启动前同步落库 = durable 任务证据（WS-99 T21-SUB-1）。
     _data.set_current_tenant(tenant_id)
-    with _data.conn() as c:
-        c.execute(
-            "INSERT INTO tasks "
-            "(task_id, tenant_id, workflow, state, spec_path, progress_path, scratch_dir, "
-            " actor_user_id, actor_email, actor_source) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
-            (task_id, tenant_id, workflow,
-             paths["spec"], paths["progress"], paths["scratch"],
-             actor.get("user_id"), actor.get("email"), actor.get("source")),
-        )
-        c.commit()
-
-    # 2b. 写 queued event（子进程启动前同步落库 — durable 任务证据，WS-99 T21-SUB-1）
-    _data.write_event(
-        task_id, 0, "任务排队", "queued",
-        json.dumps({"workflow": workflow, "tenant_id": tenant_id}, ensure_ascii=False),
-        actor=actor,
-    )
+    try:
+        with _data.conn() as c:
+            c.execute(
+                "INSERT INTO tasks "
+                "(task_id, tenant_id, workflow, state, spec_path, progress_path, scratch_dir, "
+                " actor_user_id, actor_email, actor_source) "
+                "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+                (task_id, tenant_id, workflow,
+                 paths["spec"], paths["progress"], paths["scratch"],
+                 actor.get("user_id"), actor.get("email"), actor.get("source")),
+            )
+            _data.write_event(
+                task_id, 0, "任务排队", "queued",
+                json.dumps({"workflow": workflow, "tenant_id": tenant_id}, ensure_ascii=False),
+                actor=actor, txn=c,
+            )
+            c.commit()
+    except Exception:
+        # 事务已回滚（DB 无 task row）。清掉刚建的 task 目录，避免留下无 DB 行的孤儿
+        # spec.json；然后让异常向上传播 —— spawn_task 的「失败」语义此时才真实。
+        import shutil as _shutil
+        _shutil.rmtree(paths["dir"], ignore_errors=True)
+        raise
 
     # 3. 起 subprocess worker（nohup detached，重启 uvicorn 不影响）
     # 用 sys.executable 而非裸 "python3" —— 后者在 PATH 上可能解析到错的 venv（如 homebrew

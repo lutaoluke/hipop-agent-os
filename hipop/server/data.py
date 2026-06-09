@@ -1027,22 +1027,33 @@ def get_today(store: str) -> Dict:
 
 # ── Agent 处理事件流（SSE 数据源）────────────────────────
 def write_event(task_id: str, step_no: int, step_name: str, status: str, message: str = "",
-                actor: Optional[Dict] = None):
+                actor: Optional[Dict] = None, txn=None):
     """写工作流执行事件 + 触发方留痕（actor: {user_id, email, role, source}）。
 
     actor.source ∈ {'chat', 'ui', 'cron', 'upload'}。每个 step 都写一份 actor 列；
     审计时按 task_id 聚合就能看到这个任务由谁、什么 channel 触发。
+
+    txn: 可选已开连接。传入则在该连接/事务内写入（不自开连接、不 commit），让调用方
+         把 event 写入与其它 DML 包进同一原子事务。WS-141：spawn_task 的 `tasks` INSERT
+         与 queued event 必须同生共死——event 写失败必须回滚 INSERT，否则留幽灵任务
+         （有行无 lifecycle 事件，运营无法回读）。不传 txn 时维持原行为（自开连接 + commit）。
     """
     tid = get_current_tenant() or 1
     a = actor or {}
-    with conn() as c:
-        c.execute("""
+    sql = """
             INSERT INTO agent_events
               (tenant_id, task_id, step_no, step_name, status, message,
                actor_user_id, actor_email, actor_role, actor_source)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (tid, task_id, step_no, step_name, status, message,
-              a.get("user_id"), a.get("email"), a.get("role"), a.get("source")))
+        """
+    params = (tid, task_id, step_no, step_name, status, message,
+              a.get("user_id"), a.get("email"), a.get("role"), a.get("source"))
+    if txn is not None:
+        # 调用方持有事务：只 execute，不 commit（由调用方统一 commit/rollback）
+        txn.execute(sql, params)
+        return
+    with conn() as c:
+        c.execute(sql, params)
         c.commit()
 
 

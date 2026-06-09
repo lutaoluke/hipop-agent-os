@@ -306,6 +306,82 @@ def test_exec_tool_run_workflow_event_store_down_preserves_task_id():
     print(f"    task_id={result.get('task_id')!r} lifecycle_error={result.get('lifecycle_error')!r}")
 
 
+# ── Test 10: spawn_task() 内部 queued event 写失败 → 不留幽灵任务（WS-141 根因门）──
+
+def test_spawn_task_queued_event_failure_no_ghost_task():
+    """WS-141 Round 4 根因门：spawn_task() 内部 queued event 写失败时不得留幽灵任务。
+
+    根因（WS-132 Round 3 红队）：spawn_task() 先 commit `tasks` INSERT，再单独开连接
+    写 queued event；若 queued event 写失败，spawn_task 抛异常、tool_run_workflow 返回
+    creation_failed=True 不给 task_id，但 DB 里已残留 state=queued 且 agent_events=[]
+    的幽灵行（运营无法回读，重试又造重复孤儿）。
+
+    本测试直接打 spawn_task() 内部路径（mock event store / write_event 失败），不 mock
+    掉整个 spawn_task。修法 Option A（原子事务）下：
+
+    FAIL（修前 HEAD 5d4c1d6）：INSERT 先 commit → write_event 失败 → spawn_task 抛异常，
+      但 `tasks` 表残留 state=queued、agent_events=[] 的幽灵行（断言 `not rows` 失败）。
+    PASS（修后 Option A）：INSERT + queued event 同事务，event 写失败回滚 INSERT →
+      spawn_task 抛异常且 `tasks` 表无任何 task row（真的没建）。
+    """
+    import tempfile
+    import shutil
+    from pathlib import Path as _Path
+    from hipop.server import data as _data
+
+    # PG 模式下本测试的 sqlite 事务语义不适用，跳过（CI 默认 sqlite）
+    if _data.is_postgres():
+        print("    SKIP (postgres mode — sqlite 事务语义专项)")
+        return
+
+    from hipop.server import runtime as _runtime
+
+    tmpdir = tempfile.mkdtemp(prefix="ws141_ghost_")
+    db_path = os.path.join(tmpdir, "ghost.db")
+    tasks_root = os.path.join(tmpdir, "tasks")
+    raised = None
+    try:
+        with patch.object(_data, "DB_PATH", db_path), \
+             patch.object(_data, "_task_tables_checked", False), \
+             patch.object(_runtime, "TASKS_ROOT", _Path(tasks_root)):
+            _data.set_current_tenant(1)
+            _data._ensure_task_tables()
+
+            def _event_fail(*a, **k):
+                raise sqlite3.OperationalError("event store down")
+
+            # mock 整个 event store 写入（spawn_task 内部 queued event 走 write_event）
+            with patch("hipop.server.data.write_event", side_effect=_event_fail):
+                try:
+                    _runtime.spawn_task(
+                        workflow="wf1_stock_v2", tenant_id=1,
+                        actor={"source": "chat", "email": "t@t.com"},
+                    )
+                except Exception as e:
+                    raised = e
+
+            # Option A：queued event 写失败 → spawn_task 必抛（任务真没建）
+            assert raised is not None, (
+                "queued event 写失败时 spawn_task 应抛异常（Option A：任务未创建）"
+            )
+
+            # 关键断言：DB 里没有任何 task row（无幽灵任务）
+            _data.set_current_tenant(1)
+            rows = _data._fetch("SELECT task_id, state FROM tasks")
+            ghost = [r for r in rows if r.get("state") in ("queued", "running")]
+            assert not ghost, (
+                f"queued event 写失败后残留幽灵任务（有行无事件）: {ghost}\n"
+                "修前 FAIL 预期：INSERT 先 commit → event 失败 → tasks 表残留 state=queued 幽灵行。\n"
+                "修后 Option A：INSERT 与 queued event 同事务，event 失败回滚 INSERT。"
+            )
+            assert not rows, (
+                f"事务回滚后 tasks 表应为空，实际残留: {rows}"
+            )
+            print(f"    spawn raised={type(raised).__name__}; tasks 表为空（无幽灵任务）✓")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -321,6 +397,7 @@ if __name__ == "__main__":
         ("test_scan_complete_claim_blocked", test_scan_complete_claim_blocked),
         ("test_spawn_success_event_write_failure_partial_success", test_spawn_success_event_write_failure_partial_success),
         ("test_exec_tool_run_workflow_event_store_down_preserves_task_id", test_exec_tool_run_workflow_event_store_down_preserves_task_id),
+        ("test_spawn_task_queued_event_failure_no_ghost_task", test_spawn_task_queued_event_failure_no_ghost_task),
     ]
 
     failed = 0
