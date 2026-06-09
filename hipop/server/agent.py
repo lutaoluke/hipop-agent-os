@@ -1725,8 +1725,16 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
                 "拒绝出数。请先刷新物流（wf3_logistics_v2）。"
             )
         else:
-            erp_in_transit = wf3r.get("in_transit_total_qty")
-            erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+            wf3_in_transit = wf3r.get("in_transit_total_qty")
+            if wf3_in_transit is None:
+                erp_in_transit_unavailable = (
+                    "wf3_logistics_hub_v2.in_transit_total_qty 字段缺失/NULL，"
+                    "在途数据不可用。请先刷新物流（wf3_logistics_v2）。"
+                )
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+            else:
+                erp_in_transit = wf3_in_transit
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
     else:
         erp_in_transit_unavailable = "wf3_logistics_hub_v2 无该 SKU 记录（在途数据未拉取）"
 

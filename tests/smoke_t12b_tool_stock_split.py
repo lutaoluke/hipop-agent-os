@@ -6,7 +6,8 @@
   3. erp_in_transit 来自 wf3_logistics_hub_v2，不计入 total_stock（erp_in_transit_not_in_total=True）。
   4. wf3 无记录 → erp_in_transit=None + erp_in_transit_unavailable 有说明，不报错。
   5. wf3 数据超 3 天 → erp_in_transit=None（fail-closed），不静默出旧数。
-  6. T11 键（yiwu/overseas_saudi_1/noon/inbound）保持向后兼容。
+  6. wf3 新鲜记录但 in_transit_total_qty 缺失/NULL → 不静默正常，必须说明原因。
+  7. T11 键（yiwu/overseas_saudi_1/noon/inbound）保持向后兼容。
 
 FAIL（改前）：
   - split 无 dongguan / domestic 键
@@ -123,12 +124,12 @@ def _seed_stock(conn, updated_at: str, dongguan: int = DONGGUAN) -> None:
     conn.commit()
 
 
-def _seed_wf3(conn, updated_at) -> None:
+def _seed_wf3(conn, updated_at, in_transit_qty=WF3_IN_TRANSIT) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO wf3_logistics_hub_v2 "
         "(tenant_id, sku, in_transit_total_qty, has_stuck_batch, needs_ops_input, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (TENANT_ID, SKU, WF3_IN_TRANSIT, 0, 0, updated_at),
+        (TENANT_ID, SKU, in_transit_qty, 0, 0, updated_at),
     )
     conn.commit()
 
@@ -294,6 +295,39 @@ def test_erp_in_transit_stale_wf3_fail_closed() -> None:
           f"got ok={result.get('ok')!r}")
 
 
+def test_erp_in_transit_null_qty_fail_closed() -> None:
+    """wf3 新鲜记录但 in_transit_total_qty=NULL → 不静默正常，必须说明字段缺失。
+
+    FAIL（返工前）：erp_in_transit=None 但 erp_in_transit_unavailable=None。
+    PASS（返工后）：erp_in_transit=None，source=None，unavailable 明确说明字段缺失。
+    """
+    print("\n── test_erp_in_transit_null_qty_fail_closed ────────────────")
+    import hipop.server.data as _data
+    import hipop.server.agent as _agent
+
+    conn = _fresh_db(_data)
+    _seed_entity(conn)
+    _seed_stock(conn, TODAY)
+    _seed_wf3(conn, TODAY + "T09:00:00", in_transit_qty=None)
+    _data.set_current_tenant(TENANT_ID)
+
+    result = _agent.tool_query_stock_split(SKU, "KSA")
+    reason = result.get("erp_in_transit_unavailable") or ""
+
+    check("wf3 新鲜但 in_transit_total_qty=NULL → erp_in_transit=None",
+          result.get("erp_in_transit") is None,
+          f"got erp_in_transit={result.get('erp_in_transit')!r}（不得编 0）")
+    check("wf3 in_transit_total_qty 缺失 → erp_in_transit_source=None",
+          result.get("erp_in_transit_source") is None,
+          f"got erp_in_transit_source={result.get('erp_in_transit_source')!r}")
+    check("wf3 in_transit_total_qty 缺失 → unavailable 明确说明原因",
+          bool(reason),
+          f"got erp_in_transit_unavailable={result.get('erp_in_transit_unavailable')!r}")
+    check("unavailable 说明包含缺失字段名或字段缺失",
+          ("in_transit_total_qty" in reason) or ("字段缺失" in reason),
+          f"got reason={reason!r}")
+
+
 def test_dongguan_zero_still_has_key() -> None:
     """dongguan_qty=0（NULL）时 split 仍含 dongguan 键（值为 0），domestic=yiwu。"""
     print("\n── test_dongguan_zero_still_has_key ────────────────────────")
@@ -340,6 +374,7 @@ def main() -> int:
     test_erp_in_transit_from_wf3_not_in_total()
     test_erp_in_transit_no_wf3_record()
     test_erp_in_transit_stale_wf3_fail_closed()
+    test_erp_in_transit_null_qty_fail_closed()
     test_dongguan_zero_still_has_key()
 
     passed = sum(1 for _, ok in _results if ok)
