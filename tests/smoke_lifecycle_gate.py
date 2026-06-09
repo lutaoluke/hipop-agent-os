@@ -289,18 +289,19 @@ def test_exec_tool_run_workflow_event_store_down_preserves_task_id():
     with patch("hipop.server.runtime.spawn_task", side_effect=_spawn_ok):
         with patch("hipop.server.data.write_event", side_effect=_event_fail):
             with patch("hipop.server.data.get_events_after", return_value=[_queued_event(_fake_task_id)]):
-                with patch("hipop.server.data.set_current_tenant"):
-                    with patch("hipop.server.agent._get_tenant", return_value=1):
-                        with patch("hipop.server.rbac.tool_allowed", return_value=True):
-                            try:
-                                result = _exec_tool(
-                                    "run_workflow",
-                                    {"workflow": "wf1_stock_v2"},
-                                    user={"role": "manager", "id": "u1",
-                                          "email": "t@t.com", "tenant_id": 1},
-                                )
-                            except Exception as e:
-                                raised = e
+                with patch("hipop.server.data._fetch", return_value=[]):
+                    with patch("hipop.server.data.set_current_tenant"):
+                        with patch("hipop.server.agent._get_tenant", return_value=1):
+                            with patch("hipop.server.rbac.tool_allowed", return_value=True):
+                                try:
+                                    result = _exec_tool(
+                                        "run_workflow",
+                                        {"workflow": "wf1_stock_v2"},
+                                        user={"role": "manager", "id": "u1",
+                                              "email": "t@t.com", "tenant_id": 1},
+                                    )
+                                except Exception as e:
+                                    raised = e
 
     assert raised is None, (
         f"_exec_tool 不应抛出异常: {type(raised).__name__}: {raised}"
