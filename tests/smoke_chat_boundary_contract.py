@@ -35,9 +35,10 @@ PASS 条件（修后 round-6）：
     仅真实 task readback done/success 能放行。
   - round-11 新增 process/recompute/import completion synonyms："后台流程已结束/
     数据已重新计算/已导入最新数据"。仅真实 task readback done/success 能放行。
-  - round-12 新增同义完成/导入变体："后台流程已经结束/最新数据已导入"。
-    无工具、run_workflow only、query evidence 都不能洗白；仅真实 task readback
-    done/success 能放行。
+  - round-12 新增同义完成/导入变体："后台流程已经结束/最新数据已导入/
+    数据已经完全重新计算/导入已经成功完成/已成功导入最新数据"。无工具、
+    run_workflow only、query evidence 都不能洗白；仅真实 task readback done/success
+    能放行。
 """
 
 from __future__ import annotations
@@ -1106,6 +1107,9 @@ def test_round11_process_recompute_import_not_washed_by_query_evidence():
 ROUND12_REVIEWER_PROBES = (
     "后台流程已经结束。",
     "最新数据已导入。",
+    "数据已经完全重新计算",
+    "导入已经成功完成",
+    "已成功导入最新数据",
 )
 
 
