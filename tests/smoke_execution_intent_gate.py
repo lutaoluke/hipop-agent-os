@@ -85,6 +85,43 @@ def test_negation_inside_mixed_message():
     assert gate.enters_execution("不用上传 不用刷新 现在就告诉我哪些要补") is False
 
 
+def test_interrogative_with_imperative_not_execute():
+    """红队（验门人 14:42 打回点）:询问句里带「帮我/请/能否」仍是询问，不执行。
+
+    修前 bug:classify_mood 先判祈使（帮我/请）为 EXECUTE，再判疑问 —— 所以这些
+    「能不能帮我刷新库存？」红队句全被误判执行并路由到 wf1_stock_v2。
+    修后:执行动词分句带疑问情态/疑问助词 → INTERROGATIVE，压过祈使。
+    """
+    for q in (
+        "能不能帮我刷新库存？",
+        "可以帮我刷新库存吗？",
+        "能否帮我刷库存？",
+        "帮我刷新库存吗？",
+        "可不可以帮我刷新一下库存？",
+    ):
+        assert gate.classify_mood(q) == IntentMood.INTERROGATIVE, f"{q!r} 应判询问句"
+        assert gate.enters_execution(q) is False, f"{q!r} 不应进执行路由"
+        assert gate.evaluate(q).blocks_llm_execution is True, f"{q!r} 应拦 LLM 偷跑"
+
+
+def test_imperative_with_reporting_subclause_still_executes():
+    """回归护栏:真命令带汇报性从句（…告诉我是否成功）仍是执行，不被疑问词误伤。
+
+    执行动词分句「帮我刷库存」是祈使命令；「是否」在另一汇报分句，不该把整句拉成询问。
+    含末尾问号的变体也必须执行（执行分句是命令，整句问号属汇报语气）。
+    """
+    assert gate.classify_mood("帮我刷库存，并告诉我是否真的创建了任务") == IntentMood.EXECUTE
+    assert gate.enters_execution("帮我刷库存，并告诉我是否真的创建了任务") is True
+    assert gate.classify_mood("帮我刷库存，告诉我是否成功？") == IntentMood.EXECUTE
+    assert gate.enters_execution("帮我刷库存，告诉我是否成功？") is True
+
+
+def test_router_blocks_interrogative_with_imperative():
+    """路由层:「能不能帮我刷新库存？」不进 wf 路由（修前会因含「帮我刷新」误进）。"""
+    for q in ("能不能帮我刷新库存？", "可以帮我刷新库存吗？", "能否帮我刷库存？"):
+        assert _deterministic_workflow_request(q) is None, f"{q!r} 不应路由"
+
+
 # ── 2) 风险分层 + 自动补调策略 ──────────────────────────────────────────────
 
 def test_low_risk_internal_action():
@@ -94,6 +131,31 @@ def test_low_risk_internal_action():
 def test_high_risk_external_and_txn():
     for q in ("帮我下采购单并提交", "发飞书通知群", "帮我取消订单", "全店批量覆盖价格"):
         assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 应判高风险"
+
+
+def test_external_notify_phrasings_confirm_first():
+    """红队（验门人 14:42 覆盖缺口）:notify_via_feishu schema 明写的运营说法
+    「通知刘鹤 / 推到群里 / @同事」必须判外部通知 → 高风险 confirm-first，
+    修前评估为 mood=none / risk=low_auto / confirm=False（外部通知漏网）。
+    """
+    for q in (
+        "帮我通知刘鹤这批货到了",
+        "推到群里",
+        "@同事看一下这个库存",
+        "把补货建议发到飞书群",
+        "通知运营一下",
+    ):
+        assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 外部通知应判高风险"
+        d = gate.evaluate(q)
+        assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
+        assert d.needs_confirm_first is True, f"{q!r} 应 confirm-first 不自动执行"
+        assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
+
+
+def test_plain_notification_query_not_misfired():
+    """护栏:查询型「飞书有没有新通知」不应被误判为外部通知动作而拦 confirm。"""
+    assert gate.classify_mood("查一下飞书有没有新通知") == IntentMood.NONE
+    assert gate.evaluate("查一下飞书有没有新通知").needs_confirm_first is False
 
 
 def test_recovery_low_risk_first_attempt_retries_once():
@@ -245,6 +307,28 @@ def test_chat_interrogative_creates_no_task():
     assert "run_workflow" not in (result.get("tools_used") or []), result
 
 
+def test_chat_low_risk_failure_routes_to_plan_confirm():
+    """chat()「帮我刷库存」低风险触发失败（自动补调一次后仍失败）→ 接线必须转 plan→confirm:
+    追加「下一步…不再自动重复触发…回确认/取消」，绝不返回「已触发/已完成」假证据，也不无限重试。
+
+    验门人 14:42 指出此接线没有 smoke 钉住 —— 这里 fail-then-pass 钉死它。
+    """
+    fail_result = {"ok": False, "error": "trigger_failed", "message": None}
+    with patch.object(_agent, "_exec_tool", return_value=fail_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat([{"role": "user", "content": "帮我刷库存，ERP 6 仓"}], _SCOPE)
+    reply = result.get("reply") or ""
+    # 没有创建成功的任务
+    wt = result.get("workflow_tasks") or []
+    assert not any(t.get("ok") for t in wt), result
+    # 转 plan→confirm:展示下一步 + 需确认，且不重试承诺
+    assert "下一步" in reply and "不再自动重复触发" in reply, reply
+    assert ("确认" in reply and "取消" in reply), reply
+    # 绝不假证据
+    for bad in ("已触发", "已启动", "已完成", "已刷新"):
+        assert bad not in reply, reply
+
+
 if __name__ == "__main__":
     tests = [
         test_negation_not_execute,
@@ -254,8 +338,13 @@ if __name__ == "__main__":
         test_affirmative_executes,
         test_plain_query_is_none,
         test_negation_inside_mixed_message,
+        test_interrogative_with_imperative_not_execute,
+        test_imperative_with_reporting_subclause_still_executes,
+        test_router_blocks_interrogative_with_imperative,
         test_low_risk_internal_action,
         test_high_risk_external_and_txn,
+        test_external_notify_phrasings_confirm_first,
+        test_plain_notification_query_not_misfired,
         test_recovery_low_risk_first_attempt_retries_once,
         test_recovery_low_risk_second_attempt_plan_confirm,
         test_recovery_high_risk_always_confirm_first,
@@ -272,6 +361,7 @@ if __name__ == "__main__":
         test_chat_high_risk_confirm_first_no_task,
         test_chat_affirmative_stock_creates_real_task,
         test_chat_interrogative_creates_no_task,
+        test_chat_low_risk_failure_routes_to_plan_confirm,
     ]
     failed = 0
     for t in tests:

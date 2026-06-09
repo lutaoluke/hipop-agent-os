@@ -60,11 +60,23 @@ _REFRESH_TRIGGER_RE = re.compile(
     r"刷新|刷库存?|刷一下|同步|重算|重新计算|重跑|跑一下|拉一下|扫"
 )
 
+# 外部通知动作词法（发飞书 / 通知某人 / 推到群 / @某人 …）—— 与 notify_via_feishu
+# 工具 schema 声明的运营说法对齐（agent.py: "发到飞书 / 通知刘鹤 / 推到群里 / @同事"）。
+# 在 _EXEC_VERB_RE（让 mood 识别为动作）和 _HIGH_RISK_RE（外部通知必 confirm-first）
+# 两处共用，避免「通知刘鹤 / 推到群里 / @同事」被漏判成 mood=none / risk=low_auto。
+_EXTERNAL_NOTIFY = (
+    r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|"
+    r"通知群|群通知|发通知|推送(?:通知|消息|到群|给|到飞书)|推到.{0,4}群|推进.{0,3}群|发到群|"
+    r"发邮件|发短信|发消息给|@[一-鿿A-Za-z]|"
+    r"通知(?:一下|下)?(?:刘鹤|老板|大家|对方|同事|运营|相关人?|群|"
+    r"[一-鿿]{2,3}(?:同事|经理|总监?|老板))"
+)
+
 # 执行动词（mood 判别用，比路由触发集略宽，覆盖外部副作用动词）。
 _EXEC_VERB_RE = re.compile(
     r"刷新|刷库存?|刷一下|同步|重算|重新计算|重跑|跑一下|拉一下|扫|"
     r"更新|生成|创建|启动|触发|执行|跑一遍|重新跑|"
-    r"下单|下采购|提交|发飞书|发通知|发邮件|发短信|推送|通知群|取消订单|撤单|退款"
+    r"下单|下采购|提交|取消订单|撤单|退款|" + _EXTERNAL_NOTIFY
 )
 
 # 否定语素（封闭集）—— 出现在执行动词「之前、同一分句内」才算否定该动作。
@@ -95,11 +107,12 @@ _IMPERATIVE_RE = re.compile(
 )
 
 # 高风险动作标记：外部通知 / 交易·采购·订单 / 不可回滚 / 跨店批量覆盖。
+# 外部通知段复用 _EXTERNAL_NOTIFY（与 notify_via_feishu schema 对齐），其余为交易/不可回滚/批量。
 _HIGH_RISK_RE = re.compile(
     r"采购单|采购订单|下采购|下单|报采购|发起采购|提交订单|提交采购|"
-    r"发飞书|飞书.{0,4}通知|通知群|群通知|发通知|推送通知|发邮件|发短信|发消息给|"
     r"取消订单|撤单|退款|退货|"
-    r"删除|清空|批量(?:覆盖|修改|删除|更新)|全店(?:覆盖|修改|刷|铺)|跨店(?:批量|覆盖|铺)"
+    r"删除|清空|批量(?:覆盖|修改|删除|更新)|全店(?:覆盖|修改|刷|铺)|跨店(?:批量|覆盖|铺)|"
+    + _EXTERNAL_NOTIFY
 )
 
 _CLAUSE_SEP_RE = re.compile(r"[，。！？!?；;、,\n\r\t ]+")
@@ -141,6 +154,7 @@ def classify_mood(question: str) -> IntentMood:
         return IntentMood.NONE
 
     clause = _exec_clause(q)
+    clause_is_imperative = bool(_IMPERATIVE_RE.search(clause))
 
     # 1) 否定（动词前否定语素）—— 最高优先：明确说「不要执行」。
     if _clause_negated(clause):
@@ -151,15 +165,18 @@ def classify_mood(question: str) -> IntentMood:
     # 3) 只问影响面 —— 同分句内问影响/后果/风险，只解释不执行。
     if _IMPACT_RE.search(clause):
         return IntentMood.IMPACT_QUERY
-    # 4) 祈使请求（帮我/请/现在就…）锚定到执行动词分句 → 肯定执行，
-    #    压过句中其它从句里的疑问/汇报语气。
-    if _IMPERATIVE_RE.search(clause):
-        return IntentMood.EXECUTE
-    # 5) 疑问句 —— 执行动词分句里问「能不能/会不会…」，或全句以疑问助词收尾，
-    #    解释能力/条件，不执行。
-    if _QUESTION_MODAL_RE.search(clause) or _QUESTION_TAIL_RE.search(q):
+    # 4) 疑问句 —— 必须压过祈使请求：用户问「能不能帮我刷新库存？」里虽含「帮我」，
+    #    但整体是询问而非执行命令，绝不能因为有「帮我」就误进执行路由（验门人红队洞）。
+    #    判据（锚定执行动词分句，避免汇报性从句误伤）：
+    #      a) 执行动词分句本身带疑问情态（能不能/可不可以/能否…）或以疑问助词收尾（…吗？）；
+    #      b) 或整条消息以疑问收尾，且执行动词分句不是祈使命令分句
+    #         （「帮我刷库存，告诉我是否成功？」执行分句「帮我刷库存」是命令 → 仍执行）。
+    clause_is_question = bool(
+        _QUESTION_MODAL_RE.search(clause) or _QUESTION_TAIL_RE.search(clause)
+    )
+    if clause_is_question or (_QUESTION_TAIL_RE.search(q) and not clause_is_imperative):
         return IntentMood.INTERROGATIVE
-    # 6) 其余 = 肯定祈使执行。
+    # 5) 其余（含祈使请求与无修饰的祈使动词）= 肯定祈使执行。
     return IntentMood.EXECUTE
 
 
