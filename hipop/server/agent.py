@@ -413,16 +413,129 @@ TOOLS = [
 
 
 # ── 工具实现（v2 列存：按 tenant_id + entity_alias 过滤）──
+
+# T03 门：SKU 销量问答必须走实时取数路径，不能以 wf2_sku 快照 as_of_date 是否新鲜为由绕过。
+# injectable：测试注入 mock fn；生产使用 _erp_sku_stats_live 默认实现。
+# 签名：(sku: str, nation_id: int, token: str | None) -> dict
+#   ok=True:  {"sales_30d": int|None, "history_total": int|None, "fetched_at": str, "source": str}
+#   ok=False: {"error": str, "message": str}
+_sku_sales_live_fn: Optional[Any] = None
+
+
+def _erp_sku_stats_live(sku: str, nation_id: int, token) -> dict:
+    """ERP /product-order-statistics 实时拉单 SKU 30d 销量。token=None 时直接返回不可用。"""
+    if token is None:
+        return {"ok": False, "error": "no_erp_token",
+                "message": "ERP 凭据不可用（未配置或登录失败），无法实时确认 SKU 销量"}
+    import datetime as _dt
+    import re as _re
+    try:
+        from workflows.wf0_logistics import erp_get as _erp_get
+    except ImportError:
+        return {"ok": False, "error": "erp_import_error",
+                "message": "无法加载 ERP 模块"}
+    today = _dt.date.today()
+    start = today - _dt.timedelta(days=30)
+
+    def _fmt(d):
+        return f"{d.year}-{d.month}-{d.day}"
+
+    params = {
+        "nation_id": nation_id,
+        "platform_id": 2,
+        "keyword": sku,
+        "keyword_type": 1,
+        "ordered_time_section[]": [_fmt(start), _fmt(today)],
+        "page": 1,
+        "limit": 50,
+    }
+    try:
+        resp = _erp_get("/product-order-statistics", params, token)
+    except Exception as e:
+        return {"ok": False, "error": f"erp_fetch: {type(e).__name__}",
+                "message": str(e)[:200]}
+    if resp.get("code") != 200:
+        return {"ok": False, "error": "erp_api_error",
+                "message": str(resp.get("msg") or "")[:200]}
+    items = resp.get("data") or []
+    sku_up = sku.upper()
+    match = None
+    for it in items:
+        sku_obj = it.get("sku") or {}
+        for psk in (sku_obj.get("platform_sku_ids") or []):
+            if (psk.get("platform_sku_id") or "").upper() == sku_up:
+                match = it
+                break
+        if not match and (it.get("sku_id") or "").upper() == sku_up:
+            match = it
+        if match:
+            break
+    if not match:
+        return {"ok": False, "error": "sku_not_found_in_erp",
+                "message": f"SKU {sku} 在 ERP 30d 窗口内无记录（API 可能不支持 keyword 过滤或该 SKU 无近期订单）"}
+
+    _NATION_TO_COUNTRY = {1: "SA", 2: "AE"}
+    country_code = _NATION_TO_COUNTRY.get(nation_id)
+    if not country_code:
+        return {"ok": False, "error": f"unknown_nation_id_{nation_id}",
+                "message": f"nation_id={nation_id} 未知，无法确定目标国家前缀，拒绝返回其他国家数字"}
+
+    def _parse_country(val, country):
+        pat = _re.compile(rf"{country}\s*[:：]\s*(\d+)")
+        for s in (val if isinstance(val, list) else [str(val or "")]):
+            m = pat.match(str(s).strip())
+            if m:
+                return int(m.group(1))
+        return None
+
+    sales_30d = _parse_country(match.get("sales_count"), country_code)
+    fetched_at = _dt.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "sku": sku,
+        "sales_30d": sales_30d,
+        "history_total": None,
+        "fetched_at": fetched_at,
+        "source": "ERP /product-order-statistics (realtime)",
+        "window_days": 30,
+    }
+
+
 def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
+
+    # 国别 ID（ERP 实时取数用）
+    _country = {"KSA": "SA", "UAE": "AE", "SA": "SA", "AE": "AE"}.get(store.upper(), "SA")
+    _nation_id = {"SA": 1, "AE": 2}.get(_country, 1)
+
+    # ERP token（best-effort；失败时销量字段降级，不阻断整个工具执行）
+    _erp_token = None
+    try:
+        _tok, _err = _erp_token_or_error(tid)
+        if not _err:
+            _erp_token = _tok
+    except Exception:
+        pass
+
     out = []
     refs = []
     for sku in skus[:3]:
+        # ── T03 门：强制走实时取数路径拿销量数字 ──────────────────────
+        live_fn = _sku_sales_live_fn if _sku_sales_live_fn is not None else _erp_sku_stats_live
+        try:
+            live_result = live_fn(sku, _nation_id, _erp_token)
+        except Exception as _e:
+            live_result = {"ok": False, "error": f"live_fn_exception: {type(_e).__name__}",
+                           "message": str(_e)[:200]}
+        live_ok = bool(live_result and live_result.get("ok"))
+        # Round-4: ok=True alone is not enough; require sales_30d to be present
+        live_has_sales = live_ok and live_result.get("sales_30d") is not None
+
         rows = _data._fetch("""
             SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
                    w2.sales_30d, w2.sales_10d, w2.latest_price,
-                   w2.total_orders, w2.as_of_date,
+                   w2.total_orders, w2.as_of_date, w2.imported_at,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
                    h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
@@ -438,8 +551,6 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             out.append({"sku": sku, "found": False})
             continue
         r = rows[0]
-        # 用 wf2_sku.as_of_date 作为 30d 窗口截止日计算 30d 口径取消/退货率。
-        # 确定性规则在 data.sku_30d_stats 中，不在此处重写（口径唯一源）。
         as_of = r.get("as_of_date")
         stats_30d: dict = {}
         if as_of:
@@ -447,8 +558,7 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                 stats_30d = _data.sku_30d_stats(tid, alias, sku, as_of)
             except Exception:
                 stats_30d = {}
-        # 快照时效门：as_of_date 超 3 天或缺失 → data_stale=True，数值 REDACT 为 null。
-        # 目的：防止过期快照被 LLM 当成新鲜数据呈现；LLM 必须告知数据过期。
+        # 快照时效门：非销量字段超 3 天 → REDACT。
         import datetime as _dt
         stale_days_val: int = 0
         data_stale_val: bool = not as_of
@@ -462,33 +572,62 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
         def _r(val):
             return None if data_stale_val else val
 
+        def _live_guarded_snapshot(val):
+            return _r(val) if live_has_sales else None
+
+        # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
+        sales_30d_out = live_result.get("sales_30d") if live_ok else None
+        history_total_out = live_result.get("history_total") if live_ok else None
+
         item = {
             "sku": sku,
             "found": True,
             "title": r["title"],
-            "trend": _r(r["trend"]),
-            "profit_rate_pct": _r(round((r["latest_profit_rate"] or 0) * 100, 1)),
-            "sales_30d": _r(r["sales_30d"]),
-            "sales_10d": _r(r["sales_10d"]),
-            "daily_rate": _r(r["daily_rate"]),
-            "urgency": r["urgency"],
-            "ops_advice": r["ops_advice"],
+            "trend": _live_guarded_snapshot(r["trend"]),
+            "profit_rate_pct": _live_guarded_snapshot(round((r["latest_profit_rate"] or 0) * 100, 1)),
+            "sales_30d": sales_30d_out,
+            "sales_10d": _live_guarded_snapshot(r["sales_10d"]),
+            "daily_rate": _live_guarded_snapshot(r["daily_rate"]),
+            "urgency": _live_guarded_snapshot(r["urgency"]),
+            "ops_advice": _live_guarded_snapshot(r["ops_advice"]),
             "in_transit": r["in_transit_total_qty"],
             "has_stuck_batch": bool(r["has_stuck_batch"]),
-            "weekly_replenish": r["weekly_total_replenish"],
-            # 30d 口径取消/退货率（口径：以 as_of_date 为截止的 30d 窗口）。
-            # 与 sales_30d 同窗口，不与全历史 cancel_rate/return_rate 混用。
-            "total_orders_30d": _r(stats_30d.get("total_30d")),
-            "cancel_rate_30d": _r(stats_30d.get("cancel_rate_30d")),
-            "return_rate_30d": _r(stats_30d.get("return_rate_30d")),
-            # 历史总销量：来自 wf2_sku.total_orders（noon 全历史聚合），口径与 30d 不同。
-            "history_total": _r(r.get("total_orders")),
+            "weekly_replenish": _live_guarded_snapshot(r["weekly_total_replenish"]),
+            "total_orders_30d": _live_guarded_snapshot(stats_30d.get("total_30d")),
+            "cancel_rate_30d": _live_guarded_snapshot(stats_30d.get("cancel_rate_30d")),
+            "return_rate_30d": _live_guarded_snapshot(stats_30d.get("return_rate_30d")),
+            "history_total": history_total_out,
             "as_of_date": as_of,
             "data_stale": data_stale_val,
             "stale_days": stale_days_val,
         }
+
+        if live_has_sales:
+            item["live_evidence"] = {
+                "fetched_at": live_result.get("fetched_at"),
+                "source": live_result.get("source", "live"),
+            }
+        else:
+            item["live_sales_failed"] = True
+            if live_ok:
+                item["live_sales_error"] = "live_ok_but_missing_sales_30d"
+                item["live_sales_message"] = (
+                    "当前无法实时确认 SKU 销量（实时接口返回但关键指标缺失），已降级（不输出旧缓存确定数）"
+                )
+            else:
+                item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
+                item["live_sales_message"] = (
+                    (live_result or {}).get("message")
+                    or "当前无法实时确认 SKU 销量，已降级（不输出旧缓存确定数）"
+                )
+
+        imported_at_val = (r.get("imported_at") or "")[:10] or None
         out.append(item)
-        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
+        refs.append({"table": "wf2_sku", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'", "imported_at": imported_at_val, "as_of_date": as_of})
+        if live_has_sales:
+            refs.append({"table": live_result.get("source", "live (realtime)"),
+                         "where": f"partner_sku='{sku}'",
+                         "fetched_at": live_result.get("fetched_at")})
         refs.append({"table": "wf2_orders", "where": f"30d window ending {as_of or 'N/A'}"})
         refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
         refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'"})
@@ -1114,6 +1253,13 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     finally:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
+    if not in_transit and not completed:
+        return {
+            "ok": False,
+            "error": "sku_no_orders_in_erp",
+            "sku": sku,
+            "message": f"SKU {sku} 在 ERP 中无在途或近期完成货单记录，请核实 SKU 是否正确。",
+        }
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
     in_transit_out = []
     for o in in_transit[:15]:
@@ -1180,7 +1326,12 @@ def tool_query_order_live(order_no: str) -> Dict:
     # 找精确匹配
     match = [o for o in items if (o.get("delivery_order_no") or "").upper() == order_no.upper()]
     if not match:
-        return {"ok": False, "error": "order_not_found_in_erp", "order_no": order_no}
+        return {
+            "ok": False,
+            "error": "order_not_found_in_erp",
+            "order_no": order_no,
+            "message": f"货单号 {order_no} 在 ERP 中无记录，请核实货单号是否正确。",
+        }
     o = match[0]
     forwarder = (o.get("logistics") or {}).get("logistics_name", "")
     tracking = o.get("logistics_bill_no", "")

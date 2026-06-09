@@ -25,13 +25,10 @@ import time
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Optional
 import datetime as _dt
-
-# macOS Python can inherit system proxies even when the shell env is clean.
-# Chat smoke must hit the local uvicorn server directly.
-urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
 
 # ── case 定义 ────────────────────────────────────────────
@@ -59,6 +56,18 @@ GLOBAL_BLACKLIST = [
 ]
 
 
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req, timeout: int):
+    """macOS urllib reads system proxies; localhost smokes must not go through them."""
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return _NO_PROXY_OPENER.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _num_re(n: Optional[int]) -> str:
     if n is None:
         return r"\d+"
@@ -77,6 +86,16 @@ def _rate_re(rate: Optional[float]) -> str:
     one_decimal = f"{pct:.1f}".rstrip("0").rstrip(".")
     two_decimal = f"{pct:.2f}".rstrip("0").rstrip(".")
     return rf"{re.escape(one_decimal)}|{re.escape(two_decimal)}"
+
+
+_UNAVAILABLE_RE = (
+    r"无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|"
+    r"ERP.*(?:凭据|登录)|同上"
+)
+
+
+def _or_unavailable(pattern: str) -> str:
+    return rf"{pattern}|{_UNAVAILABLE_RE}"
 
 
 def _live_expectations() -> dict:
@@ -179,11 +198,11 @@ _PRODUCT_SPLIT_RE = "|".join(
     _num_re(_LIVE[k]) for k in ("sku_listed", "sku_unlisted", "product_listed", "product_unlisted")
 )
 _SKU_LISTED_RE = _num_re(_LIVE["sku_listed"])
-_TBB_SALES_RE = _num_re(_LIVE["tbb_sales_30d"])
-_TBB_TOTAL_RE = _num_re(_LIVE["tbb_total_30d"])
-_TBB_CANCEL_RE = _rate_re(_LIVE["tbb_cancel_rate_30d"])
-_TBB_RETURN_RE = _rate_re(_LIVE["tbb_return_rate_30d"])
-_TBB_HISTORY_RE = _num_re(_LIVE["tbb_history_total"])
+_TBB_SALES_RE = _or_unavailable(_num_re(_LIVE["tbb_sales_30d"]))
+_TBB_TOTAL_RE = _or_unavailable(_num_re(_LIVE["tbb_total_30d"]))
+_TBB_CANCEL_RE = _or_unavailable(_rate_re(_LIVE["tbb_cancel_rate_30d"]))
+_TBB_RETURN_RE = _or_unavailable(_rate_re(_LIVE["tbb_return_rate_30d"]))
+_TBB_HISTORY_RE = _or_unavailable(_num_re(_LIVE["tbb_history_total"]))
 _STALE_TST001_RE = (
     r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认"
     if _LIVE["stale_tst001"] == "stale"
@@ -233,11 +252,7 @@ CASES: List[Case] = [
     # 数字 = tenant=1 / hipop_ksa 当前 wf2_sku 实数（ERP ingest 后会漂移）。
     # source of truth（PG，与 list_products 同口径）：
     #   COUNT(DISTINCT product_id)=product 维度 total，COUNT(*)=SKU 维度 total，
-    #   SUM(is_listed=1)=listed。2026-06-03 复核：product 1424 / SKU 1799 /
-    #   listed_sku 1046 / unlisted_sku 753 / listed_prod 950 / unlisted_prod 474，
-    #   零重复 partner_sku/product_id（漂移自 ERP 新增品，非 double-count）。
-    #   原 1418/1788/742/488 是更早 ingest 快照，已随真实数据漂移更新。
-    #   +1 SKU: STALE_TST001（is_listed=0, product_id=NULL）测试夹具已入库。
+    #   SUM(is_listed=1)=listed。真实数据会随 ingest 漂移，下面从 DB 动态生成断言。
     Case(
         name="商品总数（要真实 product 总数）",
         question="店铺总共多少商品",
@@ -285,7 +300,8 @@ CASES: List[Case] = [
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
     # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%；改后必须报 5.88%（3/51）+ history=1967。
+    # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%。WS-122 后，live 成功时可报实时数；
+    # live/ERP 凭据不可用时必须明确不可得，不能用旧快照 48/51/1967 冒充实时。
     Case(
         name="T04 TBB0116A 30d 口径（sales / total / cancel / history 同 DB）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
@@ -435,6 +451,15 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T26 货单负控（WS-106）────────────────────────────────────────────────────
+    Case(
+        name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
+        question="请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
+        must_use_tools=["query_order_live"],
+        must_contain=[r"未找到|不存在|无物流|无记录|找不到|核实货单号"],
+        must_not_contain=["我来查这个货单号的实时状态", r"正在查.*货单.*实时"],
+        timeout=120,
+    ),
 ]
 
 
@@ -458,7 +483,7 @@ def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"_http_error": e.code, "_body": e.read().decode("utf-8", "ignore")[:500]}
@@ -521,7 +546,7 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
             headers=_auth_headers(),
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with _urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
