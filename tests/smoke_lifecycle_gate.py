@@ -181,6 +181,62 @@ def test_scan_complete_claim_blocked():
     print(f"    warns={warns[0]!r}")
 
 
+# ── Test 8: spawn 成功 + init event 写失败 → task_id 存在 + lifecycle_error ──────
+
+def test_spawn_success_event_write_failure_partial_success():
+    """spawn_task 成功但 init event 写失败时，必须返回 task_id + lifecycle_error。
+
+    这是"部分成功"路径：task 已在 DB 中创建，但 init event 未写入。
+    运营必须能拿到 task_id 去查询，而不是以为任务从未创建。
+
+    FAIL（修前）：spawn_task 和 write_event 在同一个 try/except；
+                  event 写失败 → 返回 creation_failed=True（无 task_id）。
+    PASS（修后）：两个独立 try/except；event 写失败 → ok=True + task_id + lifecycle_error。
+    """
+    try:
+        from hipop.server.agent import tool_run_workflow
+    except ImportError as e:
+        print(f"    SKIP (missing dep: {e})")
+        return
+
+    _fake_task_id = "test_tid_abc123"
+
+    def _spawn_ok(*args, **kwargs):
+        return _fake_task_id
+
+    def _event_fail(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    raised = None
+    result = None
+    with patch("hipop.server.runtime.spawn_task", side_effect=_spawn_ok):
+        with patch("hipop.server.agent._data") as mock_data:
+            mock_data.set_current_tenant.return_value = None
+            mock_data.write_event.side_effect = _event_fail
+            with patch("hipop.server.agent._get_tenant", return_value=1):
+                try:
+                    result = tool_run_workflow("wf1_stock_v2")
+                except Exception as e:
+                    raised = e
+
+    assert raised is None, (
+        f"tool_run_workflow 不应抛出异常: {type(raised).__name__}: {raised}"
+    )
+    assert result is not None, "应返回 dict，但返回了 None"
+    assert result.get("task_id") == _fake_task_id, (
+        f"部分成功路径：应返回已创建的 task_id={_fake_task_id!r}，"
+        f"实际: {result}\n"
+        "修前 FAIL 预期：spawn+event 同 try/except，event 失败 → creation_failed=True 无 task_id"
+    )
+    assert result.get("lifecycle_error"), (
+        f"event 写失败时应有 lifecycle_error 字段说明原因: {result}"
+    )
+    assert result.get("creation_failed") is not True, (
+        f"spawn 成功后 event 写失败不应标 creation_failed=True（任务已创建）: {result}"
+    )
+    print(f"    task_id={result.get('task_id')!r} lifecycle_error={result.get('lifecycle_error')!r}")
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -194,6 +250,7 @@ if __name__ == "__main__":
         ("test_refresh_done_with_run_workflow_still_warned", test_refresh_done_with_run_workflow_still_warned),
         ("test_task_created_wording_no_false_positive", test_task_created_wording_no_false_positive),
         ("test_scan_complete_claim_blocked", test_scan_complete_claim_blocked),
+        ("test_spawn_success_event_write_failure_partial_success", test_spawn_success_event_write_failure_partial_success),
     ]
 
     failed = 0

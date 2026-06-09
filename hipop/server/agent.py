@@ -1178,20 +1178,12 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     from . import runtime as _runtime
     if workflow in _runners.list_runners():
         # Managed Agents path: durable tasks row + events (same contract as /api/run-workflow)
-        # WS-132: try/except so DB/filesystem failures return ok=False + creation_failed=True,
-        # distinguishing "not created" from "created but execution failed" (acceptance criterion 2).
+        # WS-132: two separate try/except blocks to distinguish (acceptance criterion 2):
+        #   - spawn_task failure (task never created) → creation_failed=True, no task_id
+        #   - spawn_task success but init event write failure → task_id present + lifecycle_error
         try:
             task_id = _runtime.spawn_task(
                 workflow=workflow, tenant_id=tid, actor=actor,
-            )
-            _data.set_current_tenant(tid)
-            _data.write_event(
-                task_id, 1, "初始化", "done",
-                _json.dumps({"workflow": workflow, "label": label,
-                             "affected_modules": affected, "total_steps": len(steps),
-                             "tenant_id": tid,
-                             "runtime": "managed_agents"}, ensure_ascii=False),
-                actor=actor,
             )
         except Exception as _spawn_err:
             return {
@@ -1201,7 +1193,21 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
                 "workflow": workflow,
                 "label": label,
             }
+        _lifecycle_error = None
+        try:
+            _data.set_current_tenant(tid)
+            _data.write_event(
+                task_id, 1, "初始化", "done",
+                _json.dumps({"workflow": workflow, "label": label,
+                             "affected_modules": affected, "total_steps": len(steps),
+                             "tenant_id": tid,
+                             "runtime": "managed_agents"}, ensure_ascii=False),
+                actor=actor,
+            )
+        except Exception as _event_err:
+            _lifecycle_error = f"事件写入失败，任务已创建但状态未能初始化: {type(_event_err).__name__}: {_event_err}"
     else:
+        _lifecycle_error = None
         from uuid import uuid4
         import threading
         task_id = uuid4().hex[:8]
@@ -1265,6 +1271,8 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
     }
     if exec_failed:
         result["error"] = execution_record.get("reason") or "工作流任务未确认创建成功"
+    if _lifecycle_error:
+        result["lifecycle_error"] = _lifecycle_error
     return result
 
 
