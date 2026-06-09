@@ -1,4 +1,4 @@
-"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 8)
+"""smoke_chat_boundary_contract.py — WS-128 P0-S0 fail-then-pass smoke (round 16)
 
 验收：chat 查询 / 工作流执行 / 状态回读 三条热点路径在同一分类框架下可区分，
 且无真实证据时旁路宣称被拦截。
@@ -45,6 +45,9 @@ PASS 条件（修后 round-6）：
     仍必须 proof-required；同时 query evidence 下"查询完成/查完了"不误拦。
   - round-15 新增写入系统动词变体："写进系统/写到系统"仍属于持久化
     完成声明，无工具、run_workflow only、query evidence 都不能放行。
+  - round-16 停止逐句补词，改为结构判别：带任务/流程/数据/库存/系统
+    等对象的完成态 / 结果态 claim，只要无 task readback done/success
+    证据就拦；query 完成白名单不能洗白同句后续结果声明。
 """
 
 from __future__ import annotations
@@ -1350,6 +1353,80 @@ def test_sanitize_reply_round15_write_to_system_variants():
             assert "⚠️" in final, f"sanitize_reply 应把 warning banner 写入回复: {final[:120]!r}"
 
 
+# ── Round-16 fail-then-pass: structural completion/result claims ─────────────
+
+ROUND16_STRUCTURAL_RESULT_CLAIM_PROBES = (
+    # 验门人 round-15 打回的未见同族短句；不允许再靠逐句补词。
+    "数据已经推送到系统。",
+    "库存已经同步进后台。",
+    "任务已经交付给仓库。",
+    "后台流程已经收口。",
+    "数据已经沉淀到表里。",
+    "库存已经覆盖线上系统。",
+    "流程已经跑顺了。",
+    "流程已落地。",
+    "系统已经生效。",
+    # 新增未见变体，用来证明不是 exact phrase patch。
+    "报表已经封存。",
+    "库存已经铺到前台。",
+    "工作流已经走通。",
+)
+
+
+def test_round16_structural_result_claims_block_unproven_evidence_paths():
+    """结构判别：无完成证据路径都不能放行完成态 / 结果态 claim。"""
+    evidence_paths = (
+        ("no_tool", []),
+        ("run_workflow_only", [{"name": "run_workflow", "task_id": "aabb1234"}]),
+        ("query_only", [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]),
+    )
+    for path_name, tool_log in evidence_paths:
+        for reply in ROUND16_STRUCTURAL_RESULT_CLAIM_PROBES:
+            warns = check_task_completion_bypass(reply, tool_log)
+            assert warns, (
+                f"round-16 FAIL：{path_name} 不应放行结构化结果声明 {reply!r}"
+            )
+
+
+def test_round16_structural_result_claims_allowed_with_real_task_readback():
+    """正路：真实 task readback done/success 时，结构化结果声明才可放行。"""
+    tool_log = [
+        {"name": "run_workflow", "task_id": "aabb1234"},
+        *_done_readback_tool_log(),
+    ]
+    for reply in ROUND16_STRUCTURAL_RESULT_CLAIM_PROBES:
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert not warns, f"真实 task readback done 时 {reply!r} 应放行，实得 warns={warns}"
+
+
+def test_round16_query_completion_does_not_wash_structural_claims():
+    """query-safe 白名单只覆盖查询本身，不能洗白同句后续结果声明。"""
+    tool_log = [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]
+    for reply in (
+        "查询完成，库存已经同步进后台。",
+        "查完了，系统已经生效。",
+        "查询已完成，流程已落地。",
+    ):
+        warns = check_task_completion_bypass(reply, tool_log)
+        assert warns, f"query completion 不应洗白 round-16 结构化结果声明 {reply!r}"
+
+
+def test_sanitize_reply_round16_structural_result_claims():
+    """sanitize_reply 整合：结构化结果声明无完成证据时必须带 warning。"""
+    from hipop.server._safety import sanitize_reply
+
+    evidence_paths = (
+        ([], []),
+        (["run_workflow"], [{"name": "run_workflow", "task_id": "aabb1234"}]),
+        (["query_sku"], [{"name": "query_sku", "args": {"skus": ["TBJ0057A"]}}]),
+    )
+    for tools_used, tool_log in evidence_paths:
+        for reply in ROUND16_STRUCTURAL_RESULT_CLAIM_PROBES:
+            final, warns = sanitize_reply(reply, tools_used=tools_used, tool_log=tool_log)
+            assert warns, f"sanitize_reply 应拦截 round-16 结构化结果声明 {reply!r}"
+            assert "⚠️" in final, f"sanitize_reply 应把 warning banner 写入回复: {final[:120]!r}"
+
+
 # ── Three-path distinguishability assertion ───────────────────────────────────
 
 def test_three_paths_are_distinguishable():
@@ -1375,7 +1452,7 @@ def test_three_paths_are_distinguishable():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 15)")
+    print("▶ smoke_chat_boundary_contract — WS-128 P0-S0 三路径边界契约 (round 16)")
 
     tests = [
         ("test_query_tool_classified_as_query",
@@ -1581,6 +1658,14 @@ if __name__ == "__main__":
          test_round15_write_to_system_variants_allowed_with_real_task_readback),
         ("test_sanitize_reply_round15_write_to_system_variants",
          test_sanitize_reply_round15_write_to_system_variants),
+        ("test_round16_structural_result_claims_block_unproven_evidence_paths",
+         test_round16_structural_result_claims_block_unproven_evidence_paths),
+        ("test_round16_structural_result_claims_allowed_with_real_task_readback",
+         test_round16_structural_result_claims_allowed_with_real_task_readback),
+        ("test_round16_query_completion_does_not_wash_structural_claims",
+         test_round16_query_completion_does_not_wash_structural_claims),
+        ("test_sanitize_reply_round16_structural_result_claims",
+         test_sanitize_reply_round16_structural_result_claims),
     ]
 
     failed = 0
