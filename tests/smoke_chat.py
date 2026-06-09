@@ -268,10 +268,15 @@ _TBB_TOTAL_RE = _or_unavailable(_num_re(_LIVE["tbb_total_30d"]))
 _TBB_CANCEL_RE = _or_unavailable(_rate_re(_LIVE["tbb_cancel_rate_30d"]))
 _TBB_RETURN_RE = _or_unavailable(_rate_re(_LIVE["tbb_return_rate_30d"]))
 _TBB_HISTORY_RE = _or_unavailable(_num_re(_LIVE["tbb_history_total"]))
+_STALE_TST001_STALE_RE = (
+    r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|"
+    r"不确定|无法确认|不可确认|无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)"
+)
+_STALE_TST001_MISSING_RE = r"未找到|查不到|不存在|不在.*店铺|SKU.{0,6}有误|编码.{0,6}有误"
 _STALE_TST001_RE = (
-    r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认"
+    _STALE_TST001_STALE_RE
     if _LIVE["stale_tst001"] == "stale"
-    else r"未找到|查不到|不存在|不在.*店铺|SKU.{0,6}有误|编码.{0,6}有误"
+    else _STALE_TST001_MISSING_RE
 )
 
 
@@ -642,9 +647,11 @@ def check_chat_history_endpoint(opener: urllib.request.OpenerDirector, base_url:
     return None
 
 
-def _http_json(base_url: str, path: str, timeout: int = 20):
+def _http_json(base_url: str, path: str, timeout: int = 20,
+               opener: Optional[urllib.request.OpenerDirector] = None):
     req = urllib.request.Request(f"{base_url}{path}", headers=_auth_headers())
-    with _urlopen(req, timeout=timeout) as r:
+    open_fn = opener.open if opener is not None else _urlopen
+    with open_fn(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
@@ -711,9 +718,10 @@ def _find_case(name_part: str) -> Optional[Case]:
     return next((c for c in CASES if name_part in c.name), None)
 
 
-def _prepare_dynamic_expectations(base_url: str) -> None:
-    rows = _http_json(base_url, "/api/sku-health/KSA?listing=all&limit=10000", timeout=30)
-    today = _http_json(base_url, "/api/today/KSA", timeout=10)
+def _prepare_dynamic_expectations(base_url: str,
+                                  opener: Optional[urllib.request.OpenerDirector] = None) -> None:
+    rows = _http_json(base_url, "/api/sku-health/KSA?listing=all&limit=10000", timeout=30, opener=opener)
+    today = _http_json(base_url, "/api/today/KSA", timeout=10, opener=opener)
     product_ids = {r.get("product_id") for r in rows if r.get("product_id")}
     listed_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and r.get("is_listed")}
     unlisted_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and not r.get("is_listed")}
@@ -742,7 +750,7 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         c.must_contain = [_num_re(sku_count)]
 
     try:
-        metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20)
+        metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20, opener=opener)
         item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
         c = _find_case("T04 TBB0116A")
         if c and item.get("found"):
@@ -752,12 +760,15 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         pass  # endpoint unavailable — T04 uses static DB expectations
 
     try:
-        stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
+        stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20, opener=opener)
         stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})
-        c = _find_case("T04 快照过期边界")
+        c = _find_case("T04 快照过期")
         if c and not stale_item.get("found"):
-            c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
-            c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
+            c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前不存在时必须诚实未找到）"
+            c.must_contain = [_STALE_TST001_MISSING_RE]
+        elif c and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
+            c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前 fail-closed，不得给旧值）"
+            c.must_contain = [_STALE_TST001_STALE_RE]
     except Exception:
         pass  # endpoint unavailable — T04 stale case uses static expectations
 
@@ -791,7 +802,7 @@ def main():
         sys.exit(1)
     print(f"chat-history endpoint: ✓")
     try:
-        _prepare_dynamic_expectations(args.url)
+        _prepare_dynamic_expectations(args.url, opener)
     except Exception as e:
         print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
         sys.exit(1)

@@ -24,6 +24,23 @@ def _load_t27_replenishment_smoke():
     return mod
 
 
+def _load_chat_dynamic_expectations_smoke():
+    path = REPO_ROOT / "tests" / "smoke_chat_dynamic_expectations_auth.py"
+    spec = importlib.util.spec_from_file_location("smoke_chat_dynamic_expectations_auth", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_chat_stale_tst001_dynamic_expectations_auth_boundary():
+    """WS-143: chat dynamic prep reuses auth and keeps stale/missing fail-closed."""
+    smoke = _load_chat_dynamic_expectations_smoke()
+    smoke.test_dynamic_prep_uses_authenticated_opener()
+    smoke.test_stale_tst001_found_fail_closed_is_not_classified_as_missing()
+    smoke.test_stale_tst001_missing_still_requires_not_found_reply()
+
+
 def test_chat_t27_replenishment_live_evidence_contract():
     """T27 phase-1 contract: cache-zero must answer from live evidence."""
     _load_t27_replenishment_smoke().test_t27_cache_zero_uses_live_authoritative_evidence()
