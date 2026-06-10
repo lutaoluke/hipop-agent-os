@@ -15,6 +15,8 @@ name: gate-chat-coverage
 on:
   pull_request:
     branches: [main]
+    # edited:作者补 `chat smoke:` 声明行后,改 PR 正文也要重跑这道门(否则改了 body 不重判,门一直红)。
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   chat-smoke-declared:
