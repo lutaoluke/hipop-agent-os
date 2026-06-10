@@ -133,10 +133,17 @@ def test_high_risk_external_and_txn():
         assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 应判高风险"
 
 
-def test_external_notify_phrasings_confirm_first():
-    """红队（验门人 14:42 覆盖缺口）:notify_via_feishu schema 明写的运营说法
-    「通知刘鹤 / 推到群里 / @同事」必须判外部通知 → 高风险 confirm-first，
-    修前评估为 mood=none / risk=low_auto / confirm=False（外部通知漏网）。
+def test_external_notify_phrasings_unsupported_feishu():
+    """WS-150 收敛（取代 WS-145 的「外部通知 → confirm-first」契约）。
+
+    工作台对外主动通知只有飞书一条通道，且 notify_via_feishu 是只读 stub
+    （supported=False）。notify_via_feishu schema 明写的运营说法
+    「发飞书 / 通知刘鹤 / 推到群里 / @同事 / 通知运营」本质都是做不到的主动飞书推送，
+    应走**确定性「只读/暂不支持」拒绝**，而非让用户去 confirm 一个物理上做不到的动作
+    （confirm 后仍落到 stub，反而诱发「已发飞书」幻觉 —— 正是 WS-150 要消除的死法）。
+
+    WS-145 的安全内核仍保留：这些请求 has_exec_verb=True、绝不直接进执行路由
+    （enters_execution=False）；只是补救手段从 confirm-first 升级为确定性拒绝（更强）。
     """
     for q in (
         "帮我通知刘鹤这批货到了",
@@ -145,11 +152,27 @@ def test_external_notify_phrasings_confirm_first():
         "把补货建议发到飞书群",
         "通知运营一下",
     ):
-        assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 外部通知应判高风险"
         d = gate.evaluate(q)
         assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
-        assert d.needs_confirm_first is True, f"{q!r} 应 confirm-first 不自动执行"
+        assert d.unsupported_feishu_notify is True, f"{q!r} 应判主动飞书通知不支持 → 确定性拒绝"
+        assert d.needs_confirm_first is False, f"{q!r} 不再走通用 confirm-first（已被确定性拒绝取代）"
         assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
+
+
+def test_notify_plus_transaction_still_confirm_first():
+    """WS-150 边界护栏：主动飞书通知与真高风险交易/采购/批量同句出现时，
+    交易不能被「通知不支持」顺带放过 —— 飞书拒绝让位，交易仍 confirm-first。
+    """
+    for q in (
+        "帮我下采购单并通知刘鹤",
+        "下采购单并推到群里",
+        "全店批量覆盖价格再发飞书通知大家",
+    ):
+        d = gate.evaluate(q)
+        assert d.risk == RiskTier.HIGH_CONFIRM, f"{q!r} 含交易/批量应判高风险"
+        assert d.unsupported_feishu_notify is False, f"{q!r} 夹带交易 → 飞书拒绝让位"
+        assert d.needs_confirm_first is True, f"{q!r} 交易仍须 confirm-first，不被通知不支持放过"
+        assert d.enters_execution is False, f"{q!r} 高风险不直接执行"
 
 
 def test_plain_notification_query_not_misfired():
@@ -343,7 +366,8 @@ if __name__ == "__main__":
         test_router_blocks_interrogative_with_imperative,
         test_low_risk_internal_action,
         test_high_risk_external_and_txn,
-        test_external_notify_phrasings_confirm_first,
+        test_external_notify_phrasings_unsupported_feishu,
+        test_notify_plus_transaction_still_confirm_first,
         test_plain_notification_query_not_misfired,
         test_recovery_low_risk_first_attempt_retries_once,
         test_recovery_low_risk_second_attempt_plan_confirm,

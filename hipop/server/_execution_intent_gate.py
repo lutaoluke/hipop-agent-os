@@ -106,14 +106,20 @@ _IMPERATIVE_RE = re.compile(
     r"帮我|帮忙|给我|请(?!问)|麻烦|现在就|马上|立刻|立即|赶紧|快.{0,2}把|去把|来把"
 )
 
-# 高风险动作标记：外部通知 / 交易·采购·订单 / 不可回滚 / 跨店批量覆盖。
-# 外部通知段复用 _EXTERNAL_NOTIFY（与 notify_via_feishu schema 对齐），其余为交易/不可回滚/批量。
-_HIGH_RISK_RE = re.compile(
+# 交易 / 采购 / 订单 / 不可回滚 / 跨店批量覆盖（外部通知之外的高风险动作）。
+_TXN_BATCH_RISK = (
     r"采购单|采购订单|下采购|下单|报采购|发起采购|提交订单|提交采购|"
     r"取消订单|撤单|退款|退货|"
-    r"删除|清空|批量(?:覆盖|修改|删除|更新)|全店(?:覆盖|修改|刷|铺)|跨店(?:批量|覆盖|铺)|"
-    + _EXTERNAL_NOTIFY
+    r"删除|清空|批量(?:覆盖|修改|删除|更新)|全店(?:覆盖|修改|刷|铺)|跨店(?:批量|覆盖|铺)"
 )
+_TXN_BATCH_RISK_RE = re.compile(_TXN_BATCH_RISK)
+
+# 高风险动作标记：交易/采购/不可回滚/跨店批量 + 外部通知。
+# 外部通知段复用 _EXTERNAL_NOTIFY（与 notify_via_feishu schema 对齐），单一来源。
+_HIGH_RISK_RE = re.compile(_TXN_BATCH_RISK + "|" + _EXTERNAL_NOTIFY)
+
+# 飞书/外部主动通知动作（与 _EXTERNAL_NOTIFY 同源，单独编译供 WS-150 确定性拒绝判定）。
+_FEISHU_NOTIFY_RE = re.compile(_EXTERNAL_NOTIFY)
 
 _CLAUSE_SEP_RE = re.compile(r"[，。！？!?；;、,\n\r\t ]+")
 
@@ -188,22 +194,20 @@ def classify_risk(question: str) -> RiskTier:
 
 
 def is_unsupported_feishu_notify(question: str) -> bool:
-    """WS-150: 工作台飞书集成当前为只读，检测主动发飞书/通知群的请求。
+    """WS-150: 工作台对外主动通知只有飞书一条通道，且当前为只读集成
+    （notify_via_feishu 是 stub，永远返回 supported=False）。
 
-    这些请求虽然会被 _HIGH_RISK_RE 捕获，但应该返回确定性拒绝（unsupported），
-    而非让用户看到通用的高风险确认文案。
+    凡是「发飞书 / 通知群 / 推送 / 通知某人 / @同事」这类主动外发请求，本质都是
+    workbench 物理上做不到的主动飞书推送 —— 应返回确定性「只读/暂不支持」拒绝，
+    而不是让用户去 confirm 一个做不到的动作（confirm 后仍会落到 stub，反而诱发
+    「已发飞书」幻觉，正是本条要消除的死法）。判定复用 _EXTERNAL_NOTIFY 词法
+    （_FEISHU_NOTIFY_RE），与 notify_via_feishu schema / _HIGH_RISK_RE 外部通知段
+    保持单一来源，避免词表分叉。
+
+    注意：本函数只回答「这是不是一条主动飞书通知请求」。当同一句还夹带交易/采购/
+    批量等**真高风险**动作时，是否让位给 confirm-first 由 evaluate() 决定，不在此处。
     """
-    if not has_execution_verb(question or ""):
-        return False
-
-    feishu_notify_pattern = re.compile(
-        r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|"
-        r"通知群|群通知|发通知|推送(?:通知|消息|到群|给|到飞书)|推到.{0,4}群|推进.{0,3}群|发到群|"
-        r"发邮件|发短信|发消息给|@[一-鿿A-Za-z]|"
-        r"通知(?:一下|下)?(?:刘鹤|老板|大家|对方|同事|运营|相关人?|群|"
-        r"[一-鿿]{2,3}(?:同事|经理|总监?|老板))"
-    )
-    return bool(feishu_notify_pattern.search(question or ""))
+    return bool(_FEISHU_NOTIFY_RE.search(question or ""))
 
 
 class GateDecision(NamedTuple):
@@ -222,8 +226,11 @@ def evaluate(question: str) -> GateDecision:
     risk = classify_risk(question)
     has_exec = has_execution_verb(question)
     enters = (mood == IntentMood.EXECUTE) and (risk == RiskTier.LOW_AUTO) and has_exec
-    # WS-150: 工作台不支持主动发飞书 → 跳过通用 confirm-first，返回确定性拒绝
-    unsupported_notify = is_unsupported_feishu_notify(question)
+    # WS-150: 主动飞书通知工作台不支持 → 跳过通用 confirm-first，返回确定性拒绝。
+    # 但若同一句还夹带交易/采购/批量这类**真高风险**动作（如「下采购单并通知刘鹤」），
+    # 不能因为「通知不支持」就把采购也一并放过 —— 此时交易仍走 confirm-first，飞书拒绝让位。
+    txn_risk = bool(_TXN_BATCH_RISK_RE.search(question or ""))
+    unsupported_notify = is_unsupported_feishu_notify(question) and not txn_risk
     needs_confirm = (mood == IntentMood.EXECUTE) and (risk == RiskTier.HIGH_CONFIRM) and not unsupported_notify
     blocks = has_exec and mood in (
         IntentMood.NEGATED,
