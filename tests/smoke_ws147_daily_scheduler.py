@@ -130,7 +130,7 @@ def test_refresh_all_runs_snapshot_for_business_date_and_blocks_today() -> None:
     assert "wf1_stock_snapshot_v2" in saved["steps_done"], saved
     assert out["business_date"] == "2026-06-09", out
 
-    today = daily_refresh.today_date(now=FIXED_NOW)
+    today = daily_refresh.today_date()
     try:
         wr._run_refresh_all("tid", 1, None, {"business_date": today}, {}, lambda: None, lambda p: None)
     except ValueError as exc:
