@@ -3883,6 +3883,299 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
     }
 
 
+def _execute_workflow_route(
+    direct_workflow: Dict[str, str],
+    question: str,
+    scope: Dict,
+    judge_method: str = "deterministic_workflow_router",
+) -> Dict:
+    """真实工作流执行路由（确定性）：调 run_workflow、构造 workflow_tasks + 三态受理回执。
+
+    WS-145 肯定执行 + WS-159 库存刷新确认门共用此路由 —— 一处真实触发逻辑，避免确认轮另写
+    一份「执行」分支导致接线/回执口径漂移。绝不返回「已触发/已完成」假证据，task_id 来自真实
+    tool_result / 既有运行实例。
+    """
+    tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
+    tool_result = _exec_tool("run_workflow", tool_args, user=scope)
+    workflow_tasks = []
+    if isinstance(tool_result, dict) and tool_result.get("ok"):
+        task_id = tool_result["task_id"]
+        workflow_tasks.append({
+            "ok": True,
+            "task_id": task_id,
+            "workflow": tool_result.get("workflow", direct_workflow["workflow"]),
+            "label": tool_result.get("label", direct_workflow.get("label", direct_workflow["workflow"])),
+            "total_steps": tool_result.get("total_steps", 0),
+            "affected_modules": tool_result.get("affected_modules", []),
+            "followup_prompt": tool_result.get("followup_prompt"),
+        })
+        # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
+        # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
+        reply = _workflow_receipt_reply(
+            task_id, tool_result["workflow"], direct_workflow["label"]
+        )
+        impact = _workflow_business_impact_reply(tool_result["workflow"], question)
+        if impact:
+            reply = f"{reply}\n\n{impact}"
+        # T21-SUB-3 物流入口专项降级：用回读接口验证 durable 任务证据；
+        # 任务表报错或事件缺失时降级回复，不返回假成功。
+        if direct_workflow.get("workflow") == "wf3_logistics_v2":
+            degrade_msg = _logistics_task_evidence_check(task_id)
+            if degrade_msg:
+                reply = degrade_msg
+    elif (
+        isinstance(tool_result, dict)
+        and tool_result.get("action_type") == "denied"
+        and "已有运行中实例" in (tool_result.get("reason") or "")
+    ):
+        existing = _current_workflow_task(direct_workflow["workflow"])
+        if existing:
+            workflow_tasks.append({
+                "ok": True,
+                "task_id": existing["task_id"],
+                "workflow": existing["workflow"],
+                "label": direct_workflow["label"],
+                "total_steps": None,
+                "affected_modules": [],
+                "followup_prompt": question,
+                "state": existing.get("state"),
+                "already_running": True,
+            })
+            reply = (
+                f"{direct_workflow['label']}已有运行中的后台任务 "
+                f"`{existing['task_id']}`，我不重复触发。"
+            )
+        else:
+            # DB not yet updated; parse ID from denial reason string
+            extracted_id = _existing_workflow_task_id(tool_result)
+            if extracted_id:
+                workflow = direct_workflow["workflow"]
+                label, total_steps, affected = _workflow_registry_summary(
+                    workflow, direct_workflow["label"]
+                )
+                workflow_tasks.append({
+                    "ok": True,
+                    "task_id": extracted_id,
+                    "workflow": workflow,
+                    "label": label,
+                    "total_steps": total_steps,
+                    "affected_modules": affected,
+                    "followup_prompt": question,
+                })
+                reply = (
+                    f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
+                    f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
+                    "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                )
+            else:
+                reply = tool_result.get("reason") or "工作流触发失败。"
+    else:
+        existing_task_id = _existing_workflow_task_id(tool_result or {})
+        if existing_task_id:
+            workflow = direct_workflow["workflow"]
+            label, total_steps, affected = _workflow_registry_summary(
+                workflow, direct_workflow["label"]
+            )
+            workflow_tasks.append({
+                "ok": True,
+                "task_id": existing_task_id,
+                "workflow": workflow,
+                "label": label,
+                "total_steps": total_steps,
+                "affected_modules": affected,
+                "followup_prompt": question,
+            })
+            reply = (
+                f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
+                f"任务 ID：{existing_task_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
+                "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+            )
+        else:
+            workflow_tasks.append({
+                "ok": False,
+                "workflow": direct_workflow["workflow"],
+                "label": direct_workflow.get("label", direct_workflow["workflow"]),
+                "error": (tool_result or {}).get("error") or "触发失败",
+                "task_id": None,
+            })
+            reason = (
+                (tool_result or {}).get("message")
+                or (tool_result or {}).get("error")
+                or (tool_result or {}).get("reason")
+            )
+            if reason:
+                reply = reason
+            elif direct_workflow.get("workflow") == "wf3_logistics_v2":
+                reply = ("物流后台任务**未确认创建成功**（工作流触发失败）。"
+                         "请稍后在工作台任务面板确认任务状态，或重试。")
+            else:
+                reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
+            # WS-145 自动补调策略:确定性路由这一次触发即「自动补调一次」。
+            # 失败后 policy 判定转 plan→confirm（不无限重试），追加下一步 + 需确认，
+            # 绝不返回「已触发/已完成」假证据。
+            from . import _execution_intent_gate as _intent_gate
+            if (
+                _intent_gate.decide_recovery(_intent_gate.RiskTier.LOW_AUTO, 1)
+                == _intent_gate.RecoveryAction.PLAN_CONFIRM
+            ):
+                reply = reply.rstrip() + (
+                    "\n\n下一步:这步自动补调一次仍未成功，我不再自动重复触发——"
+                    "回「确认」我再试一次，或回「取消」改用上传/手动核对。"
+                )
+    from . import _provider
+    return {
+        "reply": reply,
+        "clean_reply": reply,
+        "references": _dedup_refs((tool_result or {}).get("references", [])),
+        "action_id": None,
+        "tools_used": ["run_workflow"],
+        "tag": "执行",
+        "workflow_tasks": workflow_tasks,
+        "provider": _provider.get_provider(),
+        "confidence": 1.0,
+        "judge_method": judge_method,
+        "hallucination_warnings": None,
+    }
+
+
+def _msg_text(m) -> str:
+    """从一条 message 取纯文本（content 可能是 blocks 列表）。"""
+    if not isinstance(m, dict):
+        return ""
+    c = m.get("content")
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return c or ""
+
+
+def _inventory_refresh_feasibility(scope: Dict):
+    """库存刷新「可执行性」稳口径判断（WS-159）。
+
+    不仅判低风险，还要能锁定范围 + 无明显执行前阻断：
+      - 缺店铺范围（不知道刷哪个店铺）→ 不可执行；
+      - 已有正在运行的库存刷新任务（冲突）→ 不可执行（不重复触发）。
+    其余视为可执行。返回 (ok: bool, reason: str, next_step: str)。
+    """
+    store = (scope or {}).get("store")
+    if not store:
+        return (
+            False,
+            "缺少店铺范围（不知道要刷哪个店铺的库存）",
+            "请先在工作台选好店铺（如 KSA），再让我刷新",
+        )
+    existing = _current_workflow_task("wf1_stock_v2")
+    if existing:
+        return (
+            False,
+            f"{store} 已有一个正在运行的库存刷新任务（task `{existing['task_id']}`）",
+            "等当前任务跑完再刷，或在任务面板查看进度",
+        )
+    return (True, "", "")
+
+
+def _pending_inventory_refresh_inquiry(messages: List[Dict]) -> Optional[str]:
+    """从消息历史结构性推出「上一轮存在可执行库存刷新提议」(pending)。
+
+    判据（只看紧接上一轮，pending 只对下一轮有效）：
+      messages[-3] 是 user 且为询问式库存刷新请求，
+      messages[-2] 是 assistant 且含本门的 PROPOSAL_MARKER（=确实提过可执行刷新）。
+    满足则返回那条询问文本（用作 followup_prompt）；否则 None。
+    换题后 messages[-3] 不再是询问句 → 自然返回 None（pending 失效）。
+    """
+    from . import _inventory_refresh_gate as _inv_gate
+    if not messages or len(messages) < 3:
+        return None
+    prev_assistant = messages[-2]
+    prev_user = messages[-3]
+    if not isinstance(prev_assistant, dict) or prev_assistant.get("role") != "assistant":
+        return None
+    if not isinstance(prev_user, dict) or prev_user.get("role") != "user":
+        return None
+    inquiry = _msg_text(prev_user)
+    if not _inv_gate.is_inventory_refresh_inquiry(inquiry):
+        return None
+    if _inv_gate.PROPOSAL_MARKER not in _msg_text(prev_assistant):
+        return None
+    return inquiry
+
+
+def _inventory_refresh_no_task_result(reply: str, judge_method: str) -> Dict:
+    from . import _provider
+    return {
+        "reply": reply,
+        "clean_reply": reply,
+        "references": [],
+        "action_id": None,
+        "tools_used": [],
+        "tag": "确认",
+        "workflow_task": None,
+        "workflow_tasks": [],
+        "provider": _provider.get_provider(),
+        "confidence": 1.0,
+        "judge_method": judge_method,
+        "hallucination_warnings": None,
+    }
+
+
+def _inventory_refresh_confirm_gate(
+    messages: List[Dict], question: str, scope: Dict
+) -> Optional[Dict]:
+    """WS-159 库存刷新询问式确认门。返回 chat 结果 dict 即短路；返回 None 表示不介入。
+
+    三类轮次：
+      1) 裸确认轮：有 pending → 执行一次真实 wf1_stock_v2；无 pending → 要求说明要执行什么。
+      2) 取消轮：有 pending → 作废、不执行；无 pending → 交既有流程（普通否定句）。
+      3) 询问轮：可执行 → 提议 + 反问确认（挂 pending）；不可/缺信息 → 说明缺口（不挂 pending）。
+    """
+    from . import _inventory_refresh_gate as _inv_gate
+    q = question or ""
+
+    # 1) 裸确认轮
+    if _inv_gate.is_confirmation(q):
+        inquiry = _pending_inventory_refresh_inquiry(messages)
+        if inquiry is not None:
+            ok, reason, next_step = _inventory_refresh_feasibility(scope)
+            if not ok:
+                return _inventory_refresh_no_task_result(
+                    _inv_gate.pending_now_infeasible_reply(reason, next_step),
+                    "inventory_refresh_confirm_now_infeasible",
+                )
+            # 消费 pending：执行一次真实库存刷新（复用统一执行路由）。
+            return _execute_workflow_route(
+                {"workflow": "wf1_stock_v2", "label": "库存刷新"},
+                inquiry,
+                scope,
+                judge_method="inventory_refresh_confirm_consumed",
+            )
+        return _inventory_refresh_no_task_result(
+            _inv_gate.bare_confirm_no_pending_reply(),
+            "inventory_refresh_no_pending",
+        )
+
+    # 2) 取消轮
+    if _inv_gate.is_cancellation(q):
+        if _pending_inventory_refresh_inquiry(messages) is not None:
+            return _inventory_refresh_no_task_result(
+                _inv_gate.cancelled_reply(), "inventory_refresh_cancelled"
+            )
+        return None  # 无 pending 的否定句 → 交既有 WS-145 流程
+
+    # 3) 询问轮（turn 1）
+    if _inv_gate.is_inventory_refresh_inquiry(q):
+        ok, reason, next_step = _inventory_refresh_feasibility(scope)
+        if ok:
+            store = (scope or {}).get("store")
+            return _inventory_refresh_no_task_result(
+                _inv_gate.proposal_reply(store), "inventory_refresh_proposed"
+            )
+        return _inventory_refresh_no_task_result(
+            _inv_gate.infeasible_reply(reason, next_step),
+            "inventory_refresh_infeasible",
+        )
+
+    return None
+
+
 def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
@@ -3948,6 +4241,15 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "judge_method": "execution_intent_gate_confirm_first",
             "hallucination_warnings": None,
         }
+
+    # WS-159 库存刷新询问式确认门:跨轮 pending 解锁。
+    #   询问轮（能不能帮我刷新库存?）→ 提议 + 反问，不落任务;
+    #   裸确认轮（好/可以/确认）且上一轮有提议 → 只执行一次真实 wf1_stock_v2;
+    #   取消/换题/模糊/无 pending 裸确认 → 不执行。
+    # 高风险询问不入此门（由上方 confirm-first / _exec_tool 兜），一句「好」不解锁高风险。
+    inv_refresh = _inventory_refresh_confirm_gate(messages, question, scope)
+    if inv_refresh is not None:
+        return inv_refresh
 
     direct_export = _deterministic_export_request(question)
     if direct_export:
@@ -4022,146 +4324,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
 
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
-        tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
-        tool_result = _exec_tool("run_workflow", tool_args, user=scope)
-        workflow_tasks = []
-        if isinstance(tool_result, dict) and tool_result.get("ok"):
-            task_id = tool_result["task_id"]
-            workflow_tasks.append({
-                "ok": True,
-                "task_id": task_id,
-                "workflow": tool_result.get("workflow", direct_workflow["workflow"]),
-                "label": tool_result.get("label", direct_workflow.get("label", direct_workflow["workflow"])),
-                "total_steps": tool_result.get("total_steps", 0),
-                "affected_modules": tool_result.get("affected_modules", []),
-                "followup_prompt": tool_result.get("followup_prompt"),
-            })
-            # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
-            # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
-            reply = _workflow_receipt_reply(
-                task_id, tool_result["workflow"], direct_workflow["label"]
-            )
-            impact = _workflow_business_impact_reply(tool_result["workflow"], question)
-            if impact:
-                reply = f"{reply}\n\n{impact}"
-            # T21-SUB-3 物流入口专项降级：用回读接口验证 durable 任务证据；
-            # 任务表报错或事件缺失时降级回复，不返回假成功。
-            if direct_workflow.get("workflow") == "wf3_logistics_v2":
-                degrade_msg = _logistics_task_evidence_check(task_id)
-                if degrade_msg:
-                    reply = degrade_msg
-        elif (
-            isinstance(tool_result, dict)
-            and tool_result.get("action_type") == "denied"
-            and "已有运行中实例" in (tool_result.get("reason") or "")
-        ):
-            existing = _current_workflow_task(direct_workflow["workflow"])
-            if existing:
-                workflow_tasks.append({
-                    "ok": True,
-                    "task_id": existing["task_id"],
-                    "workflow": existing["workflow"],
-                    "label": direct_workflow["label"],
-                    "total_steps": None,
-                    "affected_modules": [],
-                    "followup_prompt": question,
-                    "state": existing.get("state"),
-                    "already_running": True,
-                })
-                reply = (
-                    f"{direct_workflow['label']}已有运行中的后台任务 "
-                    f"`{existing['task_id']}`，我不重复触发。"
-                )
-            else:
-                # DB not yet updated; parse ID from denial reason string
-                extracted_id = _existing_workflow_task_id(tool_result)
-                if extracted_id:
-                    workflow = direct_workflow["workflow"]
-                    label, total_steps, affected = _workflow_registry_summary(
-                        workflow, direct_workflow["label"]
-                    )
-                    workflow_tasks.append({
-                        "ok": True,
-                        "task_id": extracted_id,
-                        "workflow": workflow,
-                        "label": label,
-                        "total_steps": total_steps,
-                        "affected_modules": affected,
-                        "followup_prompt": question,
-                    })
-                    reply = (
-                        f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
-                        f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
-                        "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
-                    )
-                else:
-                    reply = tool_result.get("reason") or "工作流触发失败。"
-        else:
-            existing_task_id = _existing_workflow_task_id(tool_result or {})
-            if existing_task_id:
-                workflow = direct_workflow["workflow"]
-                label, total_steps, affected = _workflow_registry_summary(
-                    workflow, direct_workflow["label"]
-                )
-                workflow_tasks.append({
-                    "ok": True,
-                    "task_id": existing_task_id,
-                    "workflow": workflow,
-                    "label": label,
-                    "total_steps": total_steps,
-                    "affected_modules": affected,
-                    "followup_prompt": question,
-                })
-                reply = (
-                    f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
-                    f"任务 ID：{existing_task_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
-                    "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
-                )
-            else:
-                workflow_tasks.append({
-                    "ok": False,
-                    "workflow": direct_workflow["workflow"],
-                    "label": direct_workflow.get("label", direct_workflow["workflow"]),
-                    "error": (tool_result or {}).get("error") or "触发失败",
-                    "task_id": None,
-                })
-                reason = (
-                    (tool_result or {}).get("message")
-                    or (tool_result or {}).get("error")
-                    or (tool_result or {}).get("reason")
-                )
-                if reason:
-                    reply = reason
-                elif direct_workflow.get("workflow") == "wf3_logistics_v2":
-                    reply = ("物流后台任务**未确认创建成功**（工作流触发失败）。"
-                             "请稍后在工作台任务面板确认任务状态，或重试。")
-                else:
-                    reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
-                # WS-145 自动补调策略:确定性路由这一次触发即「自动补调一次」。
-                # 失败后 policy 判定转 plan→confirm（不无限重试），追加下一步 + 需确认，
-                # 绝不返回「已触发/已完成」假证据。
-                from . import _execution_intent_gate as _intent_gate
-                if (
-                    _intent_gate.decide_recovery(_intent_gate.RiskTier.LOW_AUTO, 1)
-                    == _intent_gate.RecoveryAction.PLAN_CONFIRM
-                ):
-                    reply = reply.rstrip() + (
-                        "\n\n下一步:这步自动补调一次仍未成功，我不再自动重复触发——"
-                        "回「确认」我再试一次，或回「取消」改用上传/手动核对。"
-                    )
-        return {
-            "reply": reply,
-            "clean_reply": reply,
-            "references": _dedup_refs((tool_result or {}).get("references", [])),
-            "action_id": None,
-            "tools_used": ["run_workflow"],
-            "tag": "执行",
-            "workflow_tasks": workflow_tasks,
-            "provider": _provider.get_provider(),
-            "confidence": 1.0,
-            "judge_method": "deterministic_workflow_router",
-            "hallucination_warnings": None,
-        }
+        return _execute_workflow_route(direct_workflow, question, scope)
 
     direct_sales_topn_n = _deterministic_product_sales_topn_request(question)
     if direct_sales_topn_n is not None:
