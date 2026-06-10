@@ -927,6 +927,9 @@ def get_data_health(store: str) -> Dict:
     tid_h, alias_h = _resolve_entity_for_store(store)
     latest_w1_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_w2_imported = _date10(_scalar("SELECT MAX(imported_at) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
+    # 业务日：wf2_sku.as_of_date（ERP 实际覆盖的最新订单日，区别于 imported_at 导入时间）
+    # imported_at 可能今天刚跑但订单窗口仍是上周——暴露给 LLM 会造成"假新鲜"声明
+    erp_sales_biz_date = _date10(_scalar("SELECT MAX(as_of_date) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_w5_updated  = _date10(_scalar("SELECT MAX(updated_at) FROM wf5_sales_cycle WHERE tenant_id=? AND entity_alias=?", (tid_h, alias_h)))
     latest_hub_updated = _date10(_scalar("SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?", (tid_h,)))
     latest_alerts      = _date10(_scalar("SELECT MAX(created_at) FROM wf6_logistics_alerts_v2 WHERE tenant_id=?", (tid_h,)))
@@ -950,7 +953,8 @@ def get_data_health(store: str) -> Dict:
 
     sources = {
         "erp_products":  {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
-        "erp_sales":     {"latest": latest_w2_imported, "stale_days": _stale_days(latest_w2_imported), "automation": "auto",      "workflow": "wf2_sales"},
+        # erp_sales.latest = 业务日（as_of_date），不用 imported_at，防止 LLM 误读导入时间为业务新鲜度
+        "erp_sales":     {"latest": erp_sales_biz_date, "import_time": latest_w2_imported, "stale_days": _stale_days(erp_sales_biz_date), "automation": "auto", "workflow": "wf2_sales"},
         "erp_stock":     {"latest": latest_w1_imported, "stale_days": _stale_days(latest_w1_imported), "automation": "auto",      "workflow": "wf1_stock"},
         "noon_orders":   {"latest": latest_noon_order,  "stale_days": _stale_days(latest_noon_order),  "automation": "needs_csv", "workflow": "wf2_sales", "csv_pattern": f"sales_noon_*_{s.upper()}_*.csv", "where": "紫鸟 noon 后台 → sales 页面 → export 最近 180 天 CSV"},
         "noon_stock":    {"latest": latest_noon_stock,  "stale_days": _stale_days(latest_noon_stock),  "automation": "needs_csv", "workflow": "wf1_stock", "csv_pattern": f"Inventory*{s.upper()}*.csv",   "where": "紫鸟 noon 后台 → my inventory → export"},
@@ -993,6 +997,105 @@ def get_data_health(store: str) -> Dict:
         "sources": sources,  # Agent data_health_check tool 用这个
         "dependency_groups": dependency_groups,  # 用户意图 → 该看哪些源
         "stale_threshold_days": stale_threshold_days,
+    }
+
+
+# ── T07 freshness gate（确定性业务日覆盖检查）────────────────────────────────
+def check_freshness_coverage(store: str, domain: str, target_date: Optional[str] = None) -> Dict:
+    """T07: 按 store + domain + 目标业务日判断数据是否覆盖（确定性，非 prompt 规则）。
+
+    在 chat() 调 LLM 之前调用。直接读 DB，不走 LLM。
+
+    domain: "sales" | "stock" | "logistics"
+    target_date: YYYY-MM-DD（默认今天）
+
+    返回 dict:
+      covered     : bool — 目标日期已有数据
+      domain      : str
+      latest_date : str — DB 里最新的业务日（YYYY-MM-DD 或 ""）
+      target_date : str — 被检查的目标日期
+      stale_days  : int | None — (today - latest_date).days；None 表示无数据
+      action      : "use_cache" | "run_workflow" | "upload_csv"
+      workflow    : str | None — action=run_workflow 时触发哪个 workflow
+      csv_hint    : dict | None — action=upload_csv 时的上传指引
+    """
+    tid, alias = _resolve_entity_for_store(store)
+    today = datetime.date.today().isoformat()
+    target = target_date or today
+
+    def _date10(v):
+        if v is None: return ""
+        if hasattr(v, "isoformat"): return v.isoformat()[:10]
+        return str(v)[:10]
+
+    def _stale(d_str):
+        if not d_str: return None
+        try:
+            return (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(d_str[:10])).days
+        except Exception:
+            return None
+
+    if domain == "sales":
+        # 业务日：wf2_sku.as_of_date（ERP 数据覆盖到的最新订单日）
+        # 不用 imported_at：导入时间可能今天刚跑但订单窗口仍是上周——会误判为覆盖（假新鲜）
+        latest = _date10(_scalar(
+            "SELECT MAX(as_of_date) FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
+            (tid, alias),
+        ))
+        stale_days = _stale(latest)
+        covered = bool(latest and latest >= target)
+        if not covered:
+            return {
+                "covered": False, "domain": domain,
+                "latest_date": latest or "", "target_date": target,
+                "stale_days": stale_days,
+                "action": "run_workflow", "workflow": "wf2_sales_v2", "csv_hint": None,
+            }
+        return {
+            "covered": True, "domain": domain,
+            "latest_date": latest, "target_date": target,
+            "stale_days": stale_days,
+            "action": "use_cache", "workflow": None, "csv_hint": None,
+        }
+
+    elif domain == "stock":
+        latest = _date10(_scalar(
+            "SELECT MAX(imported_at) FROM wf1_stock WHERE tenant_id=? AND entity_alias=?",
+            (tid, alias),
+        ))
+        stale_days = _stale(latest)
+        covered = bool(latest and latest >= target)
+        return {
+            "covered": covered, "domain": domain,
+            "latest_date": latest or "", "target_date": target,
+            "stale_days": stale_days,
+            "action": "use_cache" if covered else "run_workflow",
+            "workflow": None if covered else "wf1_stock_v2",
+            "csv_hint": None,
+        }
+
+    elif domain == "logistics":
+        latest = _date10(_scalar(
+            "SELECT MAX(updated_at) FROM wf3_logistics_hub_v2 WHERE tenant_id=?",
+            (tid,),
+        ))
+        stale_days = _stale(latest)
+        covered = bool(latest and latest >= target)
+        return {
+            "covered": covered, "domain": domain,
+            "latest_date": latest or "", "target_date": target,
+            "stale_days": stale_days,
+            "action": "use_cache" if covered else "run_workflow",
+            "workflow": None if covered else "wf3_logistics_v2",
+            "csv_hint": None,
+        }
+
+    # 未知 domain — fail-open，不拦 LLM
+    return {
+        "covered": True, "domain": domain,
+        "latest_date": "", "target_date": target,
+        "stale_days": None,
+        "action": "use_cache", "workflow": None, "csv_hint": None,
     }
 
 

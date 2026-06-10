@@ -24,6 +24,7 @@ import re
 import time
 import argparse
 import http.cookiejar
+import sqlite3
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -36,10 +37,13 @@ import datetime as _dt
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
 _URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_AUTH_OPENER: Optional[urllib.request.OpenerDirector] = None
+_AUTH_TOKEN = ""
 
 
 def _urlopen(req, timeout: int):
-    return _URL_OPENER.open(req, timeout=timeout)
+    opener = _AUTH_OPENER or _URL_OPENER
+    return opener.open(req, timeout=timeout)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
@@ -58,6 +62,7 @@ class Case:
     must_warn: bool = False                                       # _safety 应该报警告
     expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
     allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
+    t07_guard: bool = False                                       # T07 freshness 结构不变量检查
     timeout: int = 60
 
 
@@ -104,6 +109,7 @@ def ensure_smoke_user_tenant1() -> None:
 
 
 def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
+    global _AUTH_TOKEN
     ensure_smoke_user_tenant1()
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
@@ -118,6 +124,7 @@ def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
         payload = json.loads(r.read())
     if not payload.get("ok"):
         raise RuntimeError(f"smoke login failed: {payload}")
+    _AUTH_TOKEN = (payload.get("token") or "").strip()
     return opener
 
 
@@ -302,6 +309,12 @@ _STALE_RE = (
     rf"|(?:{_STALE_DATA})(?:(?!{_STALE_OBJ}|旧).){{0,15}}?(?:{_STALE_DEG})?旧(?![的\s、]*(?:{_STALE_OBJ}))"
     # ③ 非"旧"族的陈旧 / 保守说法。
     r"|偏保守|过期|不新鲜|滞后|未更新"
+    # ④ 时效表达绑定数据名词：数据名词在前，时效词在后（中间 ≤12 字符，不允许换行）。
+    #    三种等价表达均覆盖（LLM wording variation，T07-2 flaky 根因）：
+    #      - "N 天前"  = 自然语言"几天前"
+    #      - "昨天/昨日" = 1天前的口语
+    #      - "差N天"   = 技术格式"差N天未更新"（data health 表格常见）
+    rf"|(?:noon|{_STALE_DATA})[^\n，。]{{0,12}}(?:\d+\s*天前|昨天|昨日|差\d+天)"
 )
 
 
@@ -377,11 +390,11 @@ CASES: List[Case] = [
         ],
     ),
     # ─── T04 TBB0116A 30d 口径验收（WS-113）───
-    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total 字段，
-     # Agent 只能引用全历史 cancel_rate（1.1%）或答 0%。WS-122 后，live 成功时可报实时数；
-     # live/ERP 凭据不可用时必须明确不可得，不能用旧快照 48/51/1967 冒充实时。
-     Case(
-        name="T04 TBB0116A 30d 口径（sales / total / cancel / history 同 DB）",
+    # fail-then-pass：改前 tool_query_sku 不含 cancel_rate_30d/return_rate_30d/history_total
+    # 字段，Agent 只能引用全历史 cancel_rate 或答 0%；改后必须报 30d cancel_rate。
+    # 具体数字在 main() 中从本次 server 使用的 SQLite DB 动态绑定，避免 live fixture 前进导致漂移。
+    Case(
+        name="T04 TBB0116A 30d 口径（runtime DB 绑定）",
         question="TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
         must_use_tools=["query_sku"],
         must_contain=[
@@ -532,6 +545,29 @@ CASES: List[Case] = [
         # 必须含"待确认 / 是否同意 / OK"等指引（plan_text 特征）
         must_contain=[r"OK|确认|同意|预期影响|plan_text|状态.{0,5}转移"],
     ),
+    # ─── T07 freshness gate（WS-118） ───
+    # 验收③：workflow_task=null + 模拟数的旧失败形态被拦住。
+    # 两种合法路径：
+    #   数据新鲜 → LLM 调查询工具直接答（tools_used 含查询工具，workflow_task=null）
+    #   数据陈旧 → freshness gate 触发 → workflow 被创建（workflow_task 非空）
+    #              OR 返回明确的"最新到X/数据不足"说明
+    # 严禁：workflow_task=null + 无查询工具 + 含模拟数字（T07 regression guard 见 check()）
+    Case(
+        name="T07-1 销量 TopN freshness gate（不能模拟数 + workflow_task=null）",
+        question="今天 KSA 销量最好的前5个 SKU 是哪些",
+        t07_guard=True,
+        must_not_contain=[
+            "已为你生成",
+            r"已触发.{0,10}但没有",
+        ],
+    ),
+    Case(
+        name="T07-2 最畅销商品查询（freshness gate 不误拦否定场景）",
+        question="不用刷新，就用现在的告诉我哪些 SKU 最畅销",
+        # 明确说"不用刷新"→ gate 应跳过 → LLM 答（用现有数据 + 必须给陈旧警示）
+        must_contain=[_STALE_RE],   # 陈旧警示（复用 case 11 的结构判别）
+        must_not_contain=["数据不足：sales", "目标日期.*暂未覆盖"],  # gate 不应触发
+    ),
     # ─── T26 货单负控（WS-106）────────────────────────────────────────────────────
     Case(
         name="T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
@@ -544,9 +580,112 @@ CASES: List[Case] = [
 ]
 
 
+# ── runtime fixture expectations ──────────────────────────
+def _is_t04_tbb0116a_case(c: Case) -> bool:
+    return c.question.startswith("TBB0116A 近 30 天销量")
+
+
+def _int_re(n: int) -> str:
+    raw = str(int(n))
+    comma = f"{int(n):,}"
+    if comma == raw:
+        return rf"\b{re.escape(raw)}\b"
+    loose_comma = re.escape(comma).replace(",", r"[,，]?")
+    return rf"\b(?:{re.escape(raw)}|{loose_comma})\b"
+
+
+def _pct_re(rate: Optional[float]) -> str:
+    if rate is None:
+        return r"暂无|未知|N/A|无"
+    pct = rate * 100.0
+    vals = {f"{pct:.2f}", f"{pct:.1f}"}
+    body = "|".join(re.escape(v) for v in sorted(vals, key=len, reverse=True))
+    return rf"(?:{body})\s*%"
+
+
+def _t04_tbb0116a_expected_from_db() -> dict:
+    db_path = os.environ.get("HIPOP_DB", "/Users/luke/code/hipop/hipop.db")
+    with sqlite3.connect(db_path) as c:
+        c.row_factory = sqlite3.Row
+        sku = c.execute(
+            """
+            SELECT tenant_id, entity_alias, partner_sku, as_of_date, latest_order_date,
+                   sales_30d, total_orders, cancel_count
+            FROM wf2_sku
+            WHERE tenant_id = 1 AND entity_alias = 'hipop_ksa' AND partner_sku = 'TBB0116A'
+            """,
+        ).fetchone()
+        if not sku:
+            raise RuntimeError(f"T04 fixture missing in {db_path}: wf2_sku hipop_ksa/TBB0116A")
+        as_of = sku["as_of_date"] or sku["latest_order_date"]
+        if not as_of:
+            raise RuntimeError(f"T04 fixture missing as_of_date in {db_path}: hipop_ksa/TBB0116A")
+        stats = c.execute(
+            """
+            SELECT COUNT(*) AS total_30d,
+                   SUM(CASE WHEN is_cancelled = 1 THEN 1 ELSE 0 END) AS cancel_30d,
+                   SUM(CASE WHEN is_return = 1 THEN 1 ELSE 0 END) AS return_30d
+            FROM wf2_orders
+            WHERE tenant_id = ? AND entity_alias = ? AND partner_sku = ?
+              AND order_date >= date(?, '-30 days') AND order_date <= ?
+            """,
+            (sku["tenant_id"], sku["entity_alias"], sku["partner_sku"], as_of, as_of),
+        ).fetchone()
+
+    total_30d = int(stats["total_30d"] or 0)
+    cancel_30d = int(stats["cancel_30d"] or 0)
+    return_30d = int(stats["return_30d"] or 0)
+    valid_30d = total_30d - cancel_30d
+    cancel_rate_30d = (cancel_30d / total_30d) if total_30d else None
+    return_rate_30d = (return_30d / valid_30d) if valid_30d else None
+    history_total = int(sku["total_orders"] or 0)
+    history_cancel_rate = (int(sku["cancel_count"] or 0) / history_total) if history_total else None
+    return {
+        "as_of": as_of,
+        "sales_30d": int(sku["sales_30d"] or 0),
+        "total_30d": total_30d,
+        "cancel_rate_30d": cancel_rate_30d,
+        "return_rate_30d": return_rate_30d,
+        "history_total": history_total,
+        "history_cancel_rate": history_cancel_rate,
+    }
+
+
+def _bind_runtime_expectations(cases: List[Case]) -> Optional[dict]:
+    if not any(_is_t04_tbb0116a_case(c) for c in cases):
+        return None
+    exp = _t04_tbb0116a_expected_from_db()
+    for c in cases:
+        if not _is_t04_tbb0116a_case(c):
+            continue
+        c.name = (
+            "T04 TBB0116A 30d 口径"
+            f"（sales={exp['sales_30d']} / total={exp['total_30d']} / "
+            f"cancel≈{exp['cancel_rate_30d'] * 100:.2f}% / history={exp['history_total']}）"
+        )
+        c.must_contain = [
+            _int_re(exp["sales_30d"]),
+            _int_re(exp["total_30d"]),
+            _pct_re(exp["cancel_rate_30d"]),
+            r"退货.*0[%.]|0\.0{1,2}%|0\.00|0%.*退货|无退货",
+            _int_re(exp["history_total"]),
+        ]
+        c.must_not_contain = [
+            r"10\.0%|10%",
+            r"取消率.*0\.0%",
+        ]
+        if (
+            exp["history_cancel_rate"] is not None
+            and exp["cancel_rate_30d"] is not None
+            and abs(exp["history_cancel_rate"] - exp["cancel_rate_30d"]) > 0.0005
+        ):
+            c.must_not_contain.append(_pct_re(exp["history_cancel_rate"]))
+    return exp
+
+
 # ── runner ────────────────────────────────────────────────
 def _auth_headers() -> dict:
-    token = os.environ.get("HIPOP_AUTH_TOKEN", "").strip()
+    token = os.environ.get("HIPOP_AUTH_TOKEN", "").strip() or _AUTH_TOKEN
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -623,6 +762,35 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
 
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
+
+    if c.t07_guard:
+        # T07 结构不变量：对运营销量查询，回复必须由真实数据支撑，禁模拟数。
+        # 合法路径 A: workflow_task 非空（gate 触发了真实 workflow）
+        # 合法路径 B: query 工具被调用（LLM 用真实查询数据回答）
+        # 合法路径 C: reply 含结构化缺数说明（"最新到X"/"数据不足"）
+        # 违规路径: 上面三者均无 + reply 含类似"xx SKU 销量 nn 件"等具体数字组合
+        wt = resp.get("workflow_task")
+        query_tools = {"query_sku", "list_products", "scope_overview", "data_health_check",
+                       "compute_replenishment", "query_sku_live"}
+        has_workflow = bool(wt)
+        has_query_tool = bool(set(tools) & query_tools)
+        has_stale_indicator = bool(re.search(
+            r"最新到|数据不足|暂未覆盖|暂无数据|缺数|数据.{0,8}(最新|只到|截止到)",
+            reply,
+        ))
+        anchored = has_workflow or has_query_tool or has_stale_indicator
+        if not anchored:
+            # 进一步检查是否有"模拟数"特征：具体数字+SKU+单位组合
+            fake_num_re = re.compile(
+                r"(?:[A-Z]{2,}[0-9]{4,}[A-Z]?).{0,20}?(?:销量|卖了|共?\s*[0-9]+\s*(?:件|单|个|次))",
+            )
+            if fake_num_re.search(reply):
+                reasons.append(
+                    "T07 guard: workflow_task=null + 无查询工具 + 含模拟数字组合（旧 T07 失败形态）"
+                )
+            else:
+                # 没有模拟数字，但也没有任何数据支撑 — 空答/不知
+                pass  # 允许 Agent 给空/不确定答案
 
     return (len(reasons) == 0), reasons
 
@@ -772,7 +940,7 @@ def _prepare_dynamic_expectations(base_url: str,
         if c and not stale_item.get("found"):
             c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前不存在时必须诚实未找到）"
             c.must_contain = [_STALE_TST001_MISSING_RE]
-        elif c and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
+        elif c and stale_item.get("found") and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
             c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前 fail-closed，不得给旧值）"
             c.must_contain = [_STALE_TST001_STALE_RE]
     except Exception:
@@ -801,20 +969,37 @@ def main():
     except Exception as e:
         print(f"\n✗ smoke 登录失败：{type(e).__name__}: {e}")
         sys.exit(1)
+    global _AUTH_OPENER
+    _AUTH_OPENER = opener
     err = check_chat_history_endpoint(opener, args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
         sys.exit(1)
     print(f"chat-history endpoint: ✓")
+    # 顺序关键：先 SQLite 静态绑定（兜底），再动态覆盖（动态优先）。
+    # _bind_runtime_expectations 先写 must_contain；
+    # _prepare_dynamic_expectations 随后用服务端 /api/sku-metrics 真实值覆盖，让动态值赢。
+    cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
+    try:
+        t04_exp = _bind_runtime_expectations(cases)
+    except Exception as e:
+        print(f"\n✗ T04 runtime fixture 检查失败：{e}")
+        sys.exit(1)
     try:
         _prepare_dynamic_expectations(args.url, opener)
     except Exception as e:
         print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
         sys.exit(1)
     print(f"Cases: {len(CASES)}\n")
+    if args.verbose and t04_exp:
+        print(
+            "T04 runtime fixture: "
+            f"as_of={t04_exp['as_of']}, sales={t04_exp['sales_30d']}, "
+            f"total={t04_exp['total_30d']}, cancel={t04_exp['cancel_rate_30d'] * 100:.2f}%, "
+            f"history={t04_exp['history_total']}"
+        )
 
-    cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
     passed, failed = 0, 0
     failures = []
 
