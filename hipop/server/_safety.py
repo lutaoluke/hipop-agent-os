@@ -621,8 +621,8 @@ def _check_blocked_replenishment_claim(reply: str, tool_log: list) -> List[str]:
 _PURE_NUM_RE = re.compile(r'分别是多少|各.*是多少|是多少\s*$|是多少[？?。，,]')
 # 质量/表现评价词（行级匹配，不用 DOTALL 以免吃掉整表）
 _QUALITY_JUDGMENT_RE = re.compile(
-    r'表现.{0,10}不错|毛利.{0,10}不错|健康.{0,10}不错|正常范围|质量.{0,10}稳定'
-    r'|利润.{0,10}不错|表现良好|不错.{0,10}表现|整体.{0,20}表现|非常健康|很健康'
+    r'表现.{0,30}不错|毛利.{0,30}不错|健康.{0,30}不错|正常范围|质量.{0,30}稳定'
+    r'|利润.{0,30}不错|表现良好|不错.{0,30}表现|整体.{0,30}表现|非常健康|很健康'
     r'|整体.*表现|表现良好'
 )
 
@@ -686,6 +686,17 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "这是 hallucinate（实际没创建后台任务，请重发"
             "『帮我扫一下 ERP 物流』之类更明确的指令）"
         )
+        # 结构性清除：假任务号 / 假成功段 / 假前端进度 → 替换为真相标注
+        _pw_sentence_pat = re.compile(
+            r'[^。\n!？]*(?:'
+            r'[0-9a-f]{8}|前端会推送进度|'
+            r'(?:已触发|已启动|已开始|再次触发).{0,30}(?:工作流|库存|物流|刷新|任务|后台)|'
+            r'任务.{0,10}(?:提交|启动|在后台)'
+            r')[^。\n!？]*[。!？]?'
+        )
+        reply = _pw_sentence_pat.sub("[本轮未创建刷新任务 / 未启动后台流程] ", reply)
+        if "本轮未创建刷新任务" not in reply and "未启动后台流程" not in reply:
+            reply += "\n[本轮未创建刷新任务 / 未启动后台流程]"
 
     # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
     # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词

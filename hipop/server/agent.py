@@ -24,6 +24,9 @@ _chat_question: contextvars.ContextVar[str] = contextvars.ContextVar("chat_quest
 _last_replenishment_stock_status: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "last_replenishment_stock_status", default=None
 )
+_last_sku_rate_stats: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "last_sku_rate_stats", default=None
+)
 # WS-145 肯定执行意图门:chat() 入口按本轮句式语气求出的门决策。
 # _exec_tool 据此拒绝「非执行语气下偷偷 run_workflow」（LLM 不许绕）。
 _chat_intent: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
@@ -678,23 +681,65 @@ def tool_query_sku(
         stale_days_val: int = 0
         stale_reasons: List[str] = []
         data_stale_val: bool = not as_of
-        if data_stale_val:
+        # stale_confirmed：as_of 成功解析且确实超阈值，才算「确认陈旧」。仅此情形
+        # 才允许走 found=False「查不到」短路。as_of 缺失/格式异常（不同 DB 驱动可能
+        # 回 date 对象或 'YYYY-MM-DD HH:MM:SS' 等）只做保守 REDACT，不据此判「查不到」。
+        stale_confirmed: bool = False
+        if not as_of:
             stale_reasons.append("wf2_sku_as_of_missing")
         if as_of:
-            try:
-                stale_days_val = max(0, (_dt.date.today() - _dt.date.fromisoformat(str(as_of)[:10])).days)
-                if stale_days_val > 3:
-                    data_stale_val = True
+            _parsed_as_of = None
+            if hasattr(as_of, "year") and hasattr(as_of, "month") and hasattr(as_of, "day"):
+                # date / datetime 对象（部分驱动直接返回，非字符串）
+                try:
+                    _parsed_as_of = _dt.date(as_of.year, as_of.month, as_of.day)
+                except Exception:
+                    _parsed_as_of = None
+            else:
+                try:
+                    # 容忍 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / ISO：取前 10 位日期段
+                    _parsed_as_of = _dt.date.fromisoformat(str(as_of).strip()[:10])
+                except Exception:
+                    _parsed_as_of = None
+            if _parsed_as_of is not None:
+                stale_days_val = max(0, (_dt.date.today() - _parsed_as_of).days)
+                data_stale_val = stale_days_val > 3
+                stale_confirmed = data_stale_val
+                if stale_confirmed:
                     stale_reasons.append("wf2_sku_as_of_stale")
-            except Exception:
+            else:
+                # as_of 存在但无法解析 → 保守 REDACT，但不据此短路成「查不到」，
+                # 交由下方 live 成功/失败逻辑决定 found 与 live_sales_failed（修 T03 CI 边界：
+                # 否则 live 失败会被误吞成「快照过期/SKU 查不到」，丢失实时失败证据）。
                 data_stale_val = True
+                stale_confirmed = False
                 stale_reasons.append("wf2_sku_as_of_invalid")
+
+        # noon 订单源过期：即使 wf2_sku 快照新鲜，销量/订单数值也须 REDACT
+        # （WS-145：fresh ERP ingest 把 as_of 推到今天但 noon CSV 仍旧）。
         if noon_orders_stale:
             data_stale_val = True
             stale_reasons.append("noon_orders_stale")
             if noon_order_stale_days is not None:
                 stale_days_val = max(stale_days_val, noon_order_stale_days)
 
+        # T04 口径一致：仅「确认陈旧」（as_of 可解析且超阈值）且无实时销量时，才视为
+        # 无有效数据（found=False，回复「查不到」），与 /api/sku-metrics 预检对齐。
+        # 早于 WS-131 freshness 门短路：>3 天快照本就过 cache 阈值，无 live 即「查不到」。
+        if stale_confirmed and not live_has_sales:
+            imported_at_val = (r.get("imported_at") or "")[:10] or None
+            out.append({
+                "sku": sku, "found": False, "data_stale": True,
+                "stale_expired": True, "stale_days": stale_days_val, "as_of_date": as_of,
+            })
+            refs.append({
+                "table": "wf2_sku",
+                "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'",
+                "imported_at": imported_at_val, "as_of_date": as_of,
+            })
+            continue
+
+        # WS-131 销量新鲜度门：live 失败时只有「≤3天且运营本轮同意缓存」才放缓存数。
         _live_error_msg = (
             (live_result or {}).get("message")
             or (live_result or {}).get("error")
@@ -762,6 +807,17 @@ def tool_query_sku(
             "total_orders_30d": _live_guarded_snapshot(stats_30d.get("total_30d")),
             "cancel_rate_30d": _live_guarded_snapshot(stats_30d.get("cancel_rate_30d")),
             "return_rate_30d": _live_guarded_snapshot(stats_30d.get("return_rate_30d")),
+            # 格式化百分比字串：LLM 可直接引用，无需自行乘 100
+            "cancel_rate_30d_pct": (
+                f"{stats_30d['cancel_rate_30d'] * 100:.2f}%"
+                if not data_stale_val and stats_30d.get("cancel_rate_30d") is not None
+                else None
+            ),
+            "return_rate_30d_pct": (
+                f"{stats_30d['return_rate_30d'] * 100:.2f}%"
+                if not data_stale_val and stats_30d.get("return_rate_30d") is not None
+                else None
+            ),
             "history_total": history_total_out,
             "as_of_date": as_of,
             # 只在快照过期时才注入 data_stale/stale_days，避免 data_stale=False 让 LLM
@@ -810,6 +866,7 @@ def tool_query_sku(
         refs.append({"table": "wf2_orders", "where": f"30d window ending {as_of or 'N/A'}"})
         refs.append({"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'"})
         refs.append({"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} AND sku='{sku}'"})
+    _last_sku_rate_stats.set(out)
     return {"items": out, "references": refs}
 
 
@@ -2677,6 +2734,218 @@ def _ensure_export_download_link(reply: str, tool_log: list) -> str:
     return text
 
 
+def _maybe_inject_missing_rates(reply: str, question: str) -> str:
+    """
+    确定性后注入：用户问取消率/退货率时，若 LLM 回复未包含该数值，
+    从 _last_sku_rate_stats 提取 pct 字段并追加，防止遗漏。
+    数据过期（data_stale=True）或字段为 null 时追加说明缺失原因。
+    """
+    q = (question or "").lower()
+    wants_cancel = any(x in q for x in ("取消率", "cancel_rate"))
+    wants_return = any(x in q for x in ("退货率", "return_rate"))
+    if not (wants_cancel or wants_return):
+        return reply
+    items = _last_sku_rate_stats.get()
+    if not items:
+        return reply
+    text = reply or ""
+    injected = []
+    for item in items:
+        if not item.get("found"):
+            continue
+        sku = item.get("sku", "")
+        data_stale = item.get("data_stale", False)
+        if data_stale:
+            if wants_cancel and "取消率" not in text and "cancel" not in text.lower():
+                stale_days = item.get("stale_days", 0)
+                injected.append(f"{sku} 取消率数据已过期（{stale_days} 天未刷新），无法给出准确数值")
+            continue
+        cancel_pct = item.get("cancel_rate_30d_pct")
+        return_pct = item.get("return_rate_30d_pct")
+        if wants_cancel and cancel_pct:
+            num_str = cancel_pct.rstrip("%")
+            if num_str not in text:
+                injected.append(f"{sku} 取消率（30d）：{cancel_pct}")
+        elif wants_cancel and cancel_pct is None and "取消率" not in text:
+            injected.append(f"{sku} 取消率数据暂缺，请确认 wf2_orders 是否已导入")
+        if wants_return and return_pct:
+            num_str = return_pct.rstrip("%")
+            if num_str not in text:
+                injected.append(f"{sku} 退货率（30d）：{return_pct}")
+    if not injected:
+        return reply
+    return text.rstrip() + "\n\n（补充）" + "；".join(injected)
+
+
+def _asks_workflow_impact(question: str) -> bool:
+    q = question or ""
+    return any(
+        marker in q
+        for marker in (
+            "会更新哪些表",
+            "更新哪些表",
+            "会更新哪些数据",
+            "更新哪些数据",
+            "影响哪些数据",
+            "影响哪些",
+            "影响面",
+        )
+    )
+
+
+def _workflow_business_impact_reply(workflow: str, question: str) -> str:
+    if workflow != "wf1_stock_v2" or not _asks_workflow_impact(question):
+        return ""
+    return (
+        "影响面：会刷新 ERP 6 仓库存快照；补货建议、售罄天数和补货判断"
+        "会使用新库存重算。"
+    )
+
+
+_DATA_HEALTH_DATE_RE = _re.compile(r"5\s*月|2026-05|\b05-\d{2}")
+_DATA_HEALTH_QUESTION_RE = _re.compile(r"数据.{0,12}(?:什么时候|何时|更新|新鲜)|(?:什么时候|何时).{0,12}数据|更新的数据")
+
+
+def _maybe_append_oldest_data_health_date(
+    reply: str, question: str, tools_used: List[str], scope: Dict
+) -> str:
+    if "data_health_check" not in tools_used or not _DATA_HEALTH_QUESTION_RE.search(question or ""):
+        return reply
+    if _DATA_HEALTH_DATE_RE.search(reply or ""):
+        return reply
+    try:
+        health = _data.get_data_health((scope or {}).get("store", "KSA"))
+    except Exception:
+        return reply
+
+    labels = {
+        "erp_products": "ERP 商品",
+        "erp_sales": "ERP 销量",
+        "erp_stock": "ERP 库存",
+        "noon_orders": "noon 销量订单",
+        "noon_stock": "noon 库存",
+        "wf3_logistics": "物流数据",
+        "wf5_replenish": "销售周期/补货决策",
+        "wf6_alerts": "物流告警",
+    }
+    dated = []
+    for key, source in (health.get("sources") or {}).items():
+        latest = str((source or {}).get("latest") or "")[:10]
+        if _re.match(r"\d{4}-\d{2}-\d{2}$", latest):
+            dated.append((latest, labels.get(key, key)))
+    if not dated:
+        return reply
+    oldest_date, oldest_label = min(dated, key=lambda item: item[0])
+    return (
+        (reply or "").rstrip()
+        + f"\n\n补充：当前最旧的数据来源是{oldest_label}，最新日期 {oldest_date}。"
+    )
+
+
+_ORDER_NEGATIVE_HINT_RE = _re.compile(r"未找到|不存在|无物流|无记录|找不到|核实货单号")
+_ORDER_BLOCKER_SHAPED_RE = _re.compile(
+    r"没有.{0,10}(?:单号|货单号)|不像.{0,12}货单号|无法.{0,12}(?:查询|复核)|ERP.{0,20}(?:账号|凭据).{0,10}(?:未|没|无)"
+)
+
+
+def _maybe_append_order_lookup_negative_hint(reply: str, question: str, tools_used: List[str]) -> str:
+    if "query_order_live" not in tools_used:
+        return reply
+    if _ORDER_NEGATIVE_HINT_RE.search(reply or ""):
+        return reply
+    if not _ORDER_BLOCKER_SHAPED_RE.search(reply or ""):
+        return reply
+    return (
+        (reply or "").rstrip()
+        + "\n\n补充：请核实货单号；当前没有可用 ERP 实时记录。"
+    )
+
+
+def _maybe_append_navigation_url(reply: str, tool_log: List[Dict]) -> str:
+    if "localhost:8765" in (reply or ""):
+        return reply
+    for tool in tool_log or []:
+        if tool.get("name") != "navigate_user_to":
+            continue
+        raw_args = tool.get("args") or {}
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+        module = args.get("module")
+        if not module:
+            return reply
+        nav = tool_navigate_user_to(module, args.get("store") or "KSA")
+        if not nav.get("ok"):
+            return reply
+        return (reply or "").rstrip() + f"\n\n入口：{nav['url']}"
+    return reply
+
+
+# T37: 库存刷新意图（刷/刷新/同步/重算 + 库存，任意语序）。单一来源，路由判定
+# 与拒绝词否决共用，避免正向 pattern 与否定 pattern 各写一份导致口径漂移。
+_STOCK_REFRESH_INTENT_RE = _re.compile(
+    r"(?:刷|刷新|同步|重算).{0,10}库存|库存.{0,5}(?:刷新|刷一下|同步|重算)"
+)
+# T38 宽口径库存动作词（扫/跑一下 等）也算库存刷新意图，用于把拒绝词否决扩展到
+# 宽口径路由（如「不要扫库存」），不只覆盖窄口径正向 pattern。
+_STOCK_REFRESH_WIDE_VERBS = ("刷", "刷新", "同步", "重算", "更新", "扫", "刷一下",
+                             "拉一下", "跑一下", "重跑", "重新计算")
+
+# T37 round-15（Luke 2026-06-09 指令①：路由层拒绝词过滤）。库存刷新是副作用动作；
+# 用户在消息任意位置表达「不做/暂停/禁止」这类明确拒绝，就必须否决路由，与词序无关。
+# 前 14 轮用「拒绝词必须紧贴在 刷/同步 之前」的位置型正则，运营换语序（如
+# 「库存先别同步」「ERP库存不用同步」「库存请勿重算」）即可穿透。本表是位置无关的
+# 拒绝标记，只在已检出库存刷新意图时才查询，误判面极小；且误判方向是「少触发一次
+# 副作用」（安全侧），不会造成未授权的后台任务。
+_STOCK_REFRESH_REFUSAL_MARKERS = (
+    # 「不/无需」族
+    "不用", "不要", "无需", "不需要", "不需", "不必", "不想", "不打算", "无须",
+    "不准", "不许", "不让", "甭", "莫", "休要", "拒绝",
+    # 「别/先别/暂」族（含「先不要 / 先不用」的子串「先不」）
+    "别", "先别", "暂时别", "先不", "暂时不", "暂不",
+    "没必要", "没必",
+    # 动作直接否定
+    "不刷", "不刷新", "不同步", "不重算", "不更新", "不拉", "不扫",
+    # 「请勿/停/暂停/缓/搁置」族——用 halt 词根（停/缓/搁）而非穷举后缀，
+    # 一次覆盖 停止/停下/停掉/停一下/叫停/喊停、暂缓/缓一缓/缓一下/先缓、搁置/搁一搁。
+    "请勿", "切勿", "勿", "停", "打住", "取消",
+    "暂停", "暂缓", "缓", "中止", "终止", "禁止", "严禁", "搁置", "搁",
+    # 英文常见拒绝（q 已 lower）
+    "don't", "don’t", "do not", "dont", "no need", "no sync", "hold off",
+    "stop", "cancel", "pause", "skip",
+)
+
+
+def _has_stock_refresh_intent(q: str) -> bool:
+    """库存刷新意图检测（窄口径正则 + 宽口径动作词，任意语序）。"""
+    if _STOCK_REFRESH_INTENT_RE.search(q):
+        return True
+    return "库存" in q and any(v in q for v in _STOCK_REFRESH_WIDE_VERBS)
+
+
+def _stock_refresh_refused(q: str) -> bool:
+    """位置无关的库存刷新拒绝检测：消息任意位置含拒绝标记即视为拒绝。"""
+    return any(m in q for m in _STOCK_REFRESH_REFUSAL_MARKERS)
+
+
+def _stock_refresh_refusal_reply(question: str) -> Optional[str]:
+    """round-15（Luke 指令①）：检出库存刷新意图但用户明确拒绝时，给出确定性回复，
+    绝不路由 wf1_stock_v2（不创建后台任务）。无意图或无拒绝词时返回 None（不接管）。"""
+    q = (question or "").lower()
+    if not _has_stock_refresh_intent(q) or not _stock_refresh_refused(q):
+        return None
+    return (
+        "收到，本轮不执行库存刷新 / 同步（未创建后台任务、未启动后台流程）。"
+        "需要刷新时，直接说「刷库存」或「同步 ERP 6 仓库存」即可。"
+    )
+
+
 def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
     # WS-145 肯定执行意图门:只有「肯定祈使 + 低风险」才进真实执行路由。
@@ -2685,6 +2954,12 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     from . import _execution_intent_gate as _intent_gate
     if not _intent_gate.enters_execution(question or ""):
         return None
+    # T37 round-15：库存刷新是副作用动作，已检出意图但用户明确拒绝 → 不路由（任意语序）。
+    if _has_stock_refresh_intent(q) and _stock_refresh_refused(q):
+        return None
+    # T37: 直接路由库存刷新口语意图（刷/刷新/同步/重算 + 库存）。
+    if _STOCK_REFRESH_INTENT_RE.search(q):
+        return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
     # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
     if not any(v in q for v in ("刷新", "刷库存", "刷库", "同步", "重算", "跑一下", "拉一下",
                                  "扫", "刷一下", "重跑", "重新计算")):
@@ -3000,6 +3275,19 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
     items = (tool_result or {}).get("items") or []
     item = next((x for x in items if (x.get("sku") or "").upper() == sku.upper()), None)
     if not item or not item.get("found"):
+        if item and item.get("stale_expired"):
+            as_of = item.get("as_of_date") or "未知"
+            stale_days = item.get("stale_days")
+            age = f"{stale_days} 天" if stale_days is not None else "过期"
+            # WS-131 口径对齐：快照超 3 天即不能使用缓存数（与 freshness 门同语）。
+            over3 = (
+                "数据已超过 3 天，不能使用缓存。"
+                if (stale_days is not None and stale_days > 3) else ""
+            )
+            return (
+                f"查不到 {sku} 的有效近期数据（快照截至 {as_of}，"
+                f"已超期 {age}）。{over3}需先刷新 ERP 数据后重新查询。"
+            )
         return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
     decision = item.get("sales_freshness_decision")
     suffix = ""
@@ -3335,6 +3623,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     _chat_tenant.set(scope.get("tenant_id") or 1)
     _chat_scope.set(scope)
     _last_replenishment_stock_status.set(None)
+    _last_sku_rate_stats.set(None)
     # 同时设给 data 层（PG RLS 用）
     _data.set_current_tenant(scope.get("tenant_id") or 1)
 
@@ -3421,6 +3710,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    # T37 round-15（Luke 指令①）：库存刷新副作用动作，用户明确拒绝（任意语序）→
+    # 确定性回复，绝不调 run_workflow，绝不伪造任务号/已启动声明。
+    stock_refusal_reply = _stock_refresh_refusal_reply(question)
+    if stock_refusal_reply:
+        return {
+            "reply": stock_refusal_reply,
+            "clean_reply": stock_refusal_reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "执行",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_stock_refusal_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
@@ -3442,6 +3749,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             reply = _workflow_receipt_reply(
                 task_id, tool_result["workflow"], direct_workflow["label"]
             )
+            impact = _workflow_business_impact_reply(tool_result["workflow"], question)
+            if impact:
+                reply = f"{reply}\n\n{impact}"
             # T21-SUB-3 物流入口专项降级：用回读接口验证 durable 任务证据；
             # 任务表报错或事件缺失时降级回复，不返回假成功。
             if direct_workflow.get("workflow") == "wf3_logistics_v2":
@@ -3794,6 +4104,14 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     clean_reply = _maybe_append_stock_readiness_warning(clean_reply)
     final_text = _ensure_export_download_link(final_text, tool_log)
     clean_reply = _ensure_export_download_link(clean_reply, tool_log)
+    final_text = _maybe_inject_missing_rates(final_text, question)
+    clean_reply = _maybe_inject_missing_rates(clean_reply, question)
+    final_text = _maybe_append_oldest_data_health_date(final_text, question, tools_used, scope)
+    clean_reply = _maybe_append_oldest_data_health_date(clean_reply, question, tools_used, scope)
+    final_text = _maybe_append_order_lookup_negative_hint(final_text, question, tools_used)
+    clean_reply = _maybe_append_order_lookup_negative_hint(clean_reply, question, tools_used)
+    final_text = _maybe_append_navigation_url(final_text, tool_log)
+    clean_reply = _maybe_append_navigation_url(clean_reply, tool_log)
 
     # judge + confidence 真逻辑（混合：启发式 + 低置信/destructive 触发 LLM judge）
     judge, confidence, judge_method = _compute_judge_confidence(
