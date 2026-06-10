@@ -200,6 +200,11 @@ def run(messages: List[Dict], system: str, tools: List[Dict],
                 entry["ok"] = ok_val if ok_val is not None else ("error" not in result)
                 entry["task_id"] = result.get("task_id")
                 entry["error"] = result.get("error")
+            # WS-161 B-2: capture fact-slot evidence (失败/空 → 结果槽留空) for 承重墙
+            from ._factslot_contract import factslot_evidence_from_result
+            fse = factslot_evidence_from_result(tool_name, result)
+            if fse:
+                entry["factslot_evidence"] = fse
             tool_log.append(entry)
             msgs.append({
                 "role": "tool",

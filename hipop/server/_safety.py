@@ -1170,6 +1170,14 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "但回复宣称已触发/已启动 — 这是假成功声明（WS-133 Rule I）"
         )
 
+    # WS-161 B-2 禁编承重墙（结构判别，承重墙层）：放在所有 B-1 规则之后，
+    # 让上面各规则先按既有口径告警/补前缀（不破坏 WS-133 等回归），再由本层做 B-1 做不到的事——
+    # 把答案正文里"工具没返回过"的承运商/运单号/库存数量/状态（包含关系判别）就地删掉，
+    # 并对 B-1 未覆盖的失败模式（库存 fail_closed / 空返回）补确定性错误模板。
+    from . import _factslot_contract
+    reply, factslot_warnings = _factslot_contract.apply(reply, tool_log or [], question)
+    warnings.extend(factslot_warnings)
+
     if warnings:
         banner = (
             "⚠️ **系统检测到 Agent 回复中可能存在不准确之处**：\n"
