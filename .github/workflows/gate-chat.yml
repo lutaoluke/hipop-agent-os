@@ -1,0 +1,102 @@
+name: gate-chat
+# harness 门2(交付门)的机械化 · 第二道:全量 live chat 端到端回归。
+#
+# 为什么单独一个 workflow(不并进 gate.yml):
+#   gate.yml 跑 `make test`(governance + judge + 确定性 chat 行为门),全是不烧钱、headless 可跑的。
+#   本 gate 跑 tests/smoke_chat.py 的 ~25 个「真问真答」case —— 每个 case 真起一次 LLM 调用(DeepSeek),
+#   需要一个带 live 数据 + LLM 凭据的环境。两者成本/前置完全不同,拆开避免互相拖累 + 减少 gate.yml 合并冲突。
+#
+# 为什么 self-hosted runner(而非 GitHub-hosted):
+#   live chat e2e 需要 ① chat 用的真实 DB(wf2_sku/wf2_orders/告警...) ② live LLM 凭据 ③(部分 case)ERP 登录态。
+#   这套环境已经存在于运营机器上(dev server 就跑在那)。在 GitHub 云上重建 = 要把真实业务数据塞进 git
+#   + 把 LLM key 放进云 secrets(占位假数据/凭据外泄两个死法)。self-hosted runner 直接复用既有 live 环境,
+#   零数据外泄、零云端密钥。代价:owner 需在该机器注册一个带 `hipop-live` label 的 self-hosted runner。
+#
+# 已验证(本地、2026-06-10,Coder-Opus):
+#   sqlite 模式起 server + DeepSeek 跑全量 smoke_chat.py → 24~25/25 通过(headless 可跑已证实)。
+#   观察到 LLM 非确定性:个别 case(WS-148 TopN 路由)会因模型随机性偶发红 → 故下方加「有界重试」吸收瞬时抖动,
+#   但真实回归(每次都红)依然冒泡成 job 红,挡住合并。
+#
+# 收尾(交 owner,见 PR 正文):
+#   1) 在 live 机器注册 self-hosted runner,label = [self-hosted, hipop-live];确保 HIPOP_ENV_FILE 指向带
+#      DEEPSEEK_API_KEY / DB_URL / JWT_SECRET 的 env 文件(默认 ~/code/hipop/.env.local)。
+#   2) branch protection 把本 check(gate-chat)设成 required → chat 回归红了就拦合并。
+
+on:
+  pull_request:
+    branches: [main]
+
+# 同一 PR 连续推送时,取消上一次还在跑的 chat gate(省 LLM 调用成本)
+concurrency:
+  group: gate-chat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chat-e2e:
+    name: chat e2e (live, ~25 cases, 失败即阻断)
+    runs-on: [self-hosted, hipop-live]
+    timeout-minutes: 20
+    env:
+      # 指向 live 机器上带 DEEPSEEK_API_KEY / DB_URL / JWT_SECRET 的 env 文件。
+      # 用 repo/runner variable 覆盖默认值即可,不把任何密钥写进本文件。
+      HIPOP_ENV_FILE: ${{ vars.HIPOP_ENV_FILE || '/Users/luke/code/hipop/.env.local' }}
+      HIPOP_URL: http://127.0.0.1:8765
+      PYTHON: python3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight — 确认 live 凭据可用(缺则红,绝不空跑)
+        run: |
+          set -euo pipefail
+          if [ ! -f "$HIPOP_ENV_FILE" ]; then
+            echo "::error::HIPOP_ENV_FILE ($HIPOP_ENV_FILE) 不存在 —— 没有 live LLM 凭据,拒绝空跑。请在 runner 上提供。"
+            exit 1
+          fi
+          set -a; . "$HIPOP_ENV_FILE"; set +a
+          if [ -z "${DEEPSEEK_API_KEY:-}${ANTHROPIC_API_KEY:-}${QWEN_API_KEY:-}" ]; then
+            echo "::error::env 文件里没有任何 LLM 凭据(DEEPSEEK_API_KEY 等) —— 拒绝空跑。"
+            exit 1
+          fi
+          echo "live LLM 凭据就绪(provider=${LLM_PROVIDER:-deepseek})"
+
+      - name: Start hipop server (:8765)
+        run: |
+          set -euo pipefail
+          set -a; . "$HIPOP_ENV_FILE"; set +a
+          PYTHONPATH="$PWD" "$PYTHON" -m uvicorn hipop.server.main:app \
+            --host 127.0.0.1 --port 8765 > /tmp/gate_chat_server.log 2>&1 &
+          echo $! > /tmp/gate_chat_server.pid
+          for i in $(seq 1 30); do
+            if curl -sS -m 3 "$HIPOP_URL/health" >/dev/null 2>&1; then
+              echo "server up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::server 30s 内没起来"; tail -40 /tmp/gate_chat_server.log; exit 1
+
+      - name: Gate — chat e2e 回归(有界重试吸收 LLM 抖动;真实回归仍冒泡成红)
+        run: |
+          set -uo pipefail
+          set -a; . "$HIPOP_ENV_FILE"; set +a
+          attempts=2
+          n=0
+          while [ "$n" -lt "$attempts" ]; do
+            n=$((n+1))
+            echo "──── chat e2e 第 $n/$attempts 次 ────"
+            # 直接跑 smoke_chat.py(逐 case 打印 ✓/✗,失败 sys.exit(1));不加 `|| true`,退出码必须冒泡。
+            if PYTHONPATH="$PWD" "$PYTHON" tests/smoke_chat.py --url "$HIPOP_URL"; then
+              echo "chat e2e 第 $n 次通过 ✓"
+              exit 0
+            fi
+            if [ "$n" -lt "$attempts" ]; then
+              echo "::warning::chat e2e 第 $n 次失败,重试一次(吸收 LLM 随机抖动)"
+            fi
+          done
+          echo "::error::chat e2e 连续 $attempts 次失败 —— 判定为真实 chat 回归,阻断合并(见上方逐 case 失败详情)"
+          exit 1
+
+      - name: Stop server
+        if: always()
+        run: |
+          [ -f /tmp/gate_chat_server.pid ] && kill "$(cat /tmp/gate_chat_server.pid)" 2>/dev/null || true
