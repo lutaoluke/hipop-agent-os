@@ -343,6 +343,72 @@ def test_deterministic_orders_block_renders_bound_logistics():
     assert "PD2026001" in body and "承运商：Aramex" in body and "运单号：AB123456789012" in body, f"物流绑定渲染: {body}"
 
 
+# ── 路线 b Round-1 打回补强：自然语言绑定句 + 物流按行绑定 ─────────────────────────
+
+def test_natural_language_stock_misbinding_scrubbed():
+    """打回点 1：工具 总库存=509/义乌=200，模型写"总库存是 200 件，义乌为 509 件"
+    （自然语言绑定句、值真关系假）→ 错配句的值必须删，不能"正确块+错误正文同屏"。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 当前总库存是 200 件，义乌为 509 件。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "总库存是 200" not in body, f"自然语言错配'总库存是 200'必须删: {body}"
+    assert "义乌为 509" not in body, f"自然语言错配'义乌为 509'必须删: {body}"
+    assert "总库存：509" in body and "义乌：200" in body, f"权威块应给正确绑定: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_natural_language_stock_correct_binding_not_scrubbed():
+    """工具 总库存=509/义乌=200，模型写"总库存是 509 件，义乌为 200 件"（绑定正确）→ 不删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 当前总库存是 509 件，义乌为 200 件。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "总库存是 509" in body and "义乌为 200" in body, f"正确自然绑定句不应删: {body}"
+    assert not [w for w in warns if "禁编承重墙" in w], warns
+
+
+def _sku_live_two_orders():
+    from hipop.server._factslot_contract import factslot_evidence_from_result
+    result = {"ok": True, "sku": "TBC0168A", "in_transit_orders": [
+        {"order_no": "PD2026001", "forwarder": "Aramex", "tracking_no": "AB123456789012", "qty": 30},
+        {"order_no": "PD2026002", "forwarder": "SMSA", "tracking_no": "CD987654321098", "qty": 20},
+    ]}
+    return [{"name": "query_sku_live", "args": {"sku": "TBC0168A"}, "result_error": None,
+             "factslot_evidence": factslot_evidence_from_result("query_sku_live", result)}]
+
+
+def test_logistics_carrier_row_swap_scrubbed():
+    """打回点 2：PD2026001 真实承运商=Aramex、PD2026002=SMSA，回复把承运商对调 → 错配行删。"""
+    tl = _sku_live_two_orders()
+    reply = "货单 PD2026001 由 SMSA 承运，货单 PD2026002 由 Aramex 承运。"
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "PD2026001 由 SMSA" not in body, f"PD2026001 挂错承运商 SMSA 必须删: {body}"
+    assert "PD2026002 由 Aramex" not in body, f"PD2026002 挂错承运商 Aramex 必须删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_logistics_tracking_row_swap_scrubbed():
+    """运单号交叉搬运：把 CD...（PD2026002 的）挂到 PD2026001 → 该错配句的运单号删。"""
+    tl = _sku_live_two_orders()
+    reply = "货单 PD2026001 的运单号是 CD987654321098。"
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "PD2026001 的运单号是 CD987654321098" not in body, f"运单交叉搬运应删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_logistics_correct_row_binding_not_scrubbed():
+    """承运商与货单绑定正确 → 不删（避免误拦）。"""
+    tl = _sku_live_two_orders()
+    reply = "货单 PD2026001 由 Aramex 承运，货单 PD2026002 由 SMSA 承运。"
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "PD2026001 由 Aramex" in body and "PD2026002 由 SMSA" in body, f"正确按行绑定不应删: {body}"
+    assert not [w for w in warns if "禁编承重墙" in w], warns
+
+
 # ── 接线：两个 provider 都在 tool_log 写入 factslot_evidence ──────────────────────
 
 def test_both_providers_wire_factslot_evidence():
@@ -375,6 +441,11 @@ TESTS = [
     test_deterministic_stock_block_renders_bound_values,
     test_stock_fail_closed_renders_no_block_uses_error_template,
     test_deterministic_orders_block_renders_bound_logistics,
+    test_natural_language_stock_misbinding_scrubbed,
+    test_natural_language_stock_correct_binding_not_scrubbed,
+    test_logistics_carrier_row_swap_scrubbed,
+    test_logistics_tracking_row_swap_scrubbed,
+    test_logistics_correct_row_binding_not_scrubbed,
     test_both_providers_wire_factslot_evidence,
 ]
 

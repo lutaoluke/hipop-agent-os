@@ -99,9 +99,13 @@ _STOCK_LABELS = [
     "总仓", "noon", "总库存", "总量", "总计", "库存", "在库", "在途", "现货",
     "待发货", "待发", "待发出", "待出库", "可售", "可用",
 ]
+# 标签后的连接词：冒号 / 是 / 为 / 有 / 共 / 计 / 达 / 等号 —— 覆盖"总库存是 200""义乌为 509"
+# 这类自然语言绑定句（Round-1 打回点 1：之前只覆盖"标签+冒号+数字"，自然句被绕过）。
+# 标签 alt 放在裸"数字+单位" alt 之前，保证"总库存是 200 件"在 总 处先整段命中带标签的片段，
+# slot-aware 才能看到标签做绑定校验（否则只命中"200 件"、无标签、退化成 flat 放行）。
 _STOCK_QTY_RE = re.compile(
-    r"\d+\s*(?:件|个|箱|pcs|现货|套|双)"
-    r"|(?:" + "|".join(re.escape(w) for w in _STOCK_LABELS) + r")\s*仓?\s*[:：]?\s*\d+"
+    r"(?:" + "|".join(re.escape(w) for w in _STOCK_LABELS) + r")\s*仓?\s*(?:[:：]|是|为|有|共|计|达|＝|=)?\s*\d+"
+    r"|\d+\s*(?:件|个|箱|pcs|现货|套|双)"
 )
 
 
@@ -325,16 +329,18 @@ def scrub_fabricated_slots(
 ) -> Tuple[str, List[str]]:
     """把 reply 正文里"工具没返回过"的承运商/运单号/数量/状态就地删掉。
 
-    包含关系（结构判别，非穷举词表）——四类事实槽都按"reply 值 ∈ 工具返回集合"判，
-    失败/空分支 allow-set 为空 → 全删，成功分支只删工具没给出的多编值（验收 2 对称面墙）：
-      - 承运商：闭集实体命中，但不在工具返回的 forwarders allow-set → 编造 → 删值。
-      - 运单号：id 形 token，但不在 tracking_nos/order_nos allow-set、也不是被查实体 id /
-        用户问句里的 token → 编造 → 删值。
-      - 库存数量：成功 → 数值必须 ∈ 工具返回的 stock_values；纯失败/空 → 全删。
-        （仅在本轮无成功物流查询时启用，成功物流会合法产出"在途 N"计数，避免误删。）
-      - 状态：成功 → reply 状态桶必须 ∈ 工具返回状态的桶集合（同桶同义放行、跨桶编造删，
-        工具状态无法识别成桶时 fail-open 防误拦）；纯失败/空 → 删全部状态断言。
-    allow-set 取所有"成功且有槽值"调用的并集，天然处理混合（A 成功 B 失败）场景。
+    结构判别（非穷举词表）——四类事实槽都校验"值 + 绑定关系"，不只是"值出现过"：
+      - 物流按行绑定（路线 b Round-1）：把回复切子句，子句里恰好 1 个货单号时，其承运商/
+        运单号必须绑定到该货单；出现"别的单的真承运商/运单号"（全局 allow 命中但绑错单）
+        → 删。多货单子句歧义跳过。
+      - 承运商：闭集实体命中但不在任何 forwarders allow-set → 完全编造 → 删。
+      - 运单号：id 形 token，不在 tracking_nos/order_nos allow-set、也非被查 id / 问句 token → 删。
+      - 库存数量：slot-aware 值-槽绑定——"总库存 N"的 N 必须 == 工具 total、"义乌 N" == yiwu …
+        （含"总库存是/为 N"自然语言绑定句，Round-1 打回点 1）；无标签裸数字退化为值 ∈ 全集；
+        纯失败/空 → 全删。仅在无成功物流查询时启用（避免误删物流"在途 N"计数）。
+      - 状态：成功 → reply 状态桶必须 ∈ 工具状态桶（同桶同义放行、跨桶编造删，无法识别桶
+        时 fail-open）；纯失败/空 → 删全部状态断言。
+    allow-set / 绑定映射取所有"成功且有槽值"调用的并集，天然处理混合（A 成功 B 失败）场景。
     """
     evs = _all_evidence(tool_log)
     if not evs:
@@ -363,6 +369,27 @@ def scrub_fabricated_slots(
         for o in (e.get("order_nos") or []):
             id_allow.add(_norm(o))
 
+    # 路线 b · 物流按行绑定（Round-1 打回点 2）：建 货单号 → 该单实际承运商/运单号 映射，
+    # 用于"承运商对调/运单交叉搬运"的按行校验（全局 allow-set 拦不住"真承运商挂错单"）。
+    order_forwarders: Dict[str, set] = {}   # order_no_norm -> {合法承运商 norm + 闭集 token}
+    order_tracking: Dict[str, str] = {}     # order_no_norm -> tracking_norm
+    for e in proven:
+        for o in (e.get("orders") or []):
+            if not isinstance(o, dict):
+                continue
+            on = _norm(o.get("order_no"))
+            if not on:
+                continue
+            if o.get("forwarder"):
+                s = order_forwarders.setdefault(on, set())
+                s.add(_norm(o["forwarder"]))
+                for m in carrier_re.findall(str(o["forwarder"])):
+                    tok = m if isinstance(m, str) else (m[0] if m else "")
+                    if tok:
+                        s.add(_norm(tok))
+            if o.get("tracking_no"):
+                order_tracking[on] = _norm(o["tracking_no"])
+
     # 被查实体 id + 用户问句 token（合法复述，放行）
     qids = set()
     for entry in (tool_log or []):
@@ -380,8 +407,49 @@ def scrub_fabricated_slots(
     warns: List[str] = []
     redacted = {"carrier": [], "id": [], "qty": 0, "status": 0}
 
-    # 承运商：命中闭集但不在 allow-set → 删
     if logistics_called:
+        # ① 按行绑定校验（Round-1 打回点 2）：把回复切成子句，子句里若**恰好 1 个货单号**，
+        #    则该子句出现的承运商/运单号必须绑定到这个货单；出现的是"别的单的真承运商/运单号"
+        #    （全局 allow-set 命中但绑错单）→ 就地删该错配 token。多货单子句（歧义）跳过。
+        if order_forwarders or order_tracking:
+            def _row_bind_clause(clause: str) -> str:
+                orders_in = [on for on in (order_forwarders.keys() | order_tracking.keys())
+                             if on and on in _norm(clause)]
+                if len(orders_in) != 1:
+                    return clause  # 0 或多货单 → 歧义，交全局/其它层
+                on = orders_in[0]
+                allowed_carriers = order_forwarders.get(on, set())
+                allowed_track = order_tracking.get(on)
+
+                def _c_sub(m: re.Match) -> str:
+                    val = m.group(0)
+                    nv = _norm(val)
+                    if nv in allowed_carriers:
+                        return val                       # 绑定正确
+                    if nv in carrier_allow:              # 真承运商但绑错单 → 删
+                        redacted["carrier"].append(val)
+                        return _REDACT_CARRIER
+                    return val                           # 非工具承运商 → 交全局 scrub
+                clause = carrier_re.sub(_c_sub, clause)
+
+                def _t_sub(m: re.Match) -> str:
+                    tok = m.group(0)
+                    up = _norm(tok)
+                    if up == on or up == (allowed_track or "__none__"):
+                        return tok                        # 本单号 / 本单运单号
+                    if up in tracking_allow:              # 真运单号但绑错单 → 删
+                        redacted["id"].append(tok)
+                        return _REDACT_ID
+                    return tok                            # 交全局 scrub
+                return id_re.sub(_t_sub, clause)
+
+            parts = re.split(r"([。！？\n；;，,、])", reply)
+            reply = "".join(
+                _row_bind_clause(seg) if i % 2 == 0 else seg
+                for i, seg in enumerate(parts)
+            )
+
+        # ② 承运商：命中闭集但不在任何 allow-set → 完全编造 → 删
         def _carrier_sub(m: re.Match) -> str:
             val = m.group(0)
             if _norm(val) in carrier_allow:
