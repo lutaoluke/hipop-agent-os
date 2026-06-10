@@ -3165,15 +3165,20 @@ def _deterministic_erp_refresh_time_request(question: str) -> bool:
     q = (question or "").lower()
     from . import _execution_intent_gate as _intent_gate
     gate_decision = _intent_gate.evaluate(question or "")
+    is_time_query = _intent_gate.is_refresh_time_query(question or "")
     if gate_decision.enters_execution:
         return False
     if "erp" not in q:
         return False
-    if not (gate_decision.has_refresh_trigger or any(v in q for v in ("更新", "刷新过", "更新过", "同步过"))):
+    if not (
+        gate_decision.has_refresh_trigger
+        or is_time_query
+        or any(v in q for v in ("更新", "刷新过", "更新过", "同步过", "刷过", "刷的"))
+    ):
         return False
-    has_time_question = any(x in q for x in (
+    has_time_question = is_time_query or any(x in q for x in (
         "上次", "什么时候", "多久前", "几天前", "哪天", "何时", "最近一次",
-        "刷新时间", "更新时间", "刷新过", "更新过",
+        "刷新时间", "刷新日期", "更新时间", "更新日期", "刷新过", "更新过", "刷过", "刷的",
     ))
     if not has_time_question:
         return False
@@ -4402,6 +4407,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    if _deterministic_data_freshness_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("data_health_check", {"store": store}, user=scope)
+        reply = _format_data_freshness_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["data_health_check"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_data_freshness_router",
+            "hallucination_warnings": None,
+        }
+
     # WS-98 Round-2：非执行语气的刷新/重算意图（询问/假设/只问影响面）确定性短路，
     # 交回 WS-145 结构门的干净解释，绝不落 LLM。否则 LLM 会去试 run_workflow——
     # 虽被 _exec_tool 拦下不落任务，却会污染 tools_used 且触发 _safety 假活 banner，
@@ -4592,24 +4615,6 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_scope_overview_router",
-            "hallucination_warnings": None,
-        }
-
-    if _deterministic_data_freshness_request(question):
-        store = scope.get("store") or "KSA"
-        tool_result = _exec_tool("data_health_check", {"store": store}, user=scope)
-        reply = _format_data_freshness_reply(store, tool_result)
-        return {
-            "reply": reply,
-            "clean_reply": reply,
-            "references": _dedup_refs((tool_result or {}).get("references", [])),
-            "action_id": None,
-            "tools_used": ["data_health_check"],
-            "tag": "查询",
-            "workflow_task": None,
-            "provider": _provider.get_provider(),
-            "confidence": 1.0,
-            "judge_method": "deterministic_data_freshness_router",
             "hallucination_warnings": None,
         }
 

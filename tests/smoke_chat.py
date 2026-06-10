@@ -536,6 +536,38 @@ CASES: List[Case] = [
         ],
         must_not_warn=True,
     ),
+    # T36 Round-3 负控（Luke 决策 a）：用户问「上次什么时候刷的 / 多久前刷的」
+    # 即使不带问号，也是在读刷新时间，不能被结构门当成肯定执行、不能创建 wf2 任务。
+    Case(
+        name="T36 负控4：无问号『上次什么时候刷新过』只读时间（不得创建 wf2 任务）",
+        question="ERP 商品库和销量价格上次什么时候刷新过",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|今天|\d+\s*天前|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"启动失败|已触发|已创建|后台任务号|任务\s*ID|run_workflow",
+        ],
+        must_not_warn=True,
+    ),
+    Case(
+        name="T36 负控5：无问号『多久前刷的』只读时间（不得创建 wf2 任务）",
+        question="ERP 商品库和销量价格多久前刷的",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|今天|\d+\s*天前|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"启动失败|已触发|已创建|后台任务号|任务\s*ID|run_workflow|销量排行|销量榜|Top",
+        ],
+        must_not_warn=True,
+    ),
     # T36 Round-2 负控（验门人红队洞）：非执行语气的「刷新 ERP 商品库和销量价格」必须
     # 由 WS-145 结构门确定性短路给干净解释——tools_used=[]、不试 run_workflow、不渲染
     # 「启动失败」、不被 _safety 标假活 banner。旧 PR(c5bad07) 关键词路由会渲染「启动
