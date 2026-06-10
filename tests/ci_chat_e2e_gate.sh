@@ -73,6 +73,17 @@ while [ "$n" -lt "$attempts" ]; do
   echo "──── chat e2e 第 $n/$attempts 次(逐 case ✓/✗ 见下)────"
   if $SMOKE_CMD; then
     echo "[gate] chat e2e 第 $n 次通过 ✓"
+    # WS-163: chat smoke 过了 → 在同一台 live server 上再跑 graded 回归门(分数不只 pass/fail)。
+    # 自测模式(WS154_SELFTEST)无真 server,跳过——self-test 只验 preflight/retry 行为。
+    if [ -z "${WS154_SELFTEST:-}" ]; then
+      echo "──── WS-163 graded 回归门(live, fail-closed: 缺 server 即红)────"
+      if HIPOP_GRADED_REQUIRE_SERVER=1 HIPOP_URL="$URL" "$PY" "$REPO/tests/smoke_graded_threshold.py" --url "$URL"; then
+        echo "[gate] WS-163 graded 回归门通过 ✓"
+      else
+        echo "::error::[gate] WS-163 graded 回归门红:live 分数回归到 baseline−tol 以下,阻断合并。"
+        exit 1
+      fi
+    fi
     exit 0
   fi
   if [ "$n" -lt "$attempts" ]; then

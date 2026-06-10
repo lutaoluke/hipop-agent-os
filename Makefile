@@ -11,8 +11,8 @@
 PYTHON ?= /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
 REPO   := $(shell pwd)
 
-# 自动发现所有 smoke，排除 chat（需 uvicorn 起着，单独 make test-chat）
-SMOKE_FILES := $(filter-out tests/smoke_chat.py,$(sort $(wildcard tests/smoke_*.py)))
+# 自动发现所有 smoke，排除需 uvicorn 的 gate（单独跑 make test-chat）
+SMOKE_FILES := $(filter-out tests/smoke_chat.py tests/smoke_graded_threshold.py,$(sort $(wildcard tests/smoke_*.py)))
 
 .PHONY: test test-chat test-one test-all
 

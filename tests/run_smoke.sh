@@ -59,3 +59,14 @@ PY
 fi
 
 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" tests/smoke_chat.py --url "$URL" "$@"
+
+# WS-163: after the chat smoke passes, enforce the live graded regression gate on the SAME
+# server — make test-chat parity with the CI live lane (tests/ci_chat_e2e_gate.sh). Only in
+# the plain run (no passthrough args like --json-output baseline generation). set -e + the
+# REQUIRE flag mean a graded regression or a missing server here is RED, never a silent green.
+if [ $# -eq 0 ]; then
+  echo ""
+  echo "→ WS-163 graded 回归门 (live, fail-closed: graded 回归或缺 server 即红)"
+  HIPOP_GRADED_REQUIRE_SERVER=1 HIPOP_URL="$URL" \
+    PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" tests/smoke_graded_threshold.py --url "$URL"
+fi

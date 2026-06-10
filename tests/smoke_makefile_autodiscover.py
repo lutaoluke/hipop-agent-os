@@ -26,12 +26,13 @@ REPO = os.path.dirname(HERE)
 
 
 def run():
-    # 期望被 make test 覆盖的 smoke = 所有 tests/smoke_*.py，除 chat（需 server）
+    # 期望被 make test 覆盖的 smoke = 所有 tests/smoke_*.py，除需 server 的 gate
     expected = {
         os.path.basename(p)
         for p in glob.glob(os.path.join(REPO, "tests", "smoke_*.py"))
     }
-    expected.discard("smoke_chat.py")
+    expected.discard("smoke_chat.py")  # needs uvicorn, runs in make test-chat
+    expected.discard("smoke_graded_threshold.py")  # WS-163 graded eval gate, runs in live lane
 
     # make -n test：dry-run 打印将执行的命令（make 会展开 $(SMOKE_FILES)），不真跑
     proc = subprocess.run(
@@ -48,9 +49,11 @@ def run():
     if missing:
         failures.append(f"make test 未自动覆盖这些 smoke: {missing}")
 
-    # 反向：chat 不应被 make test 自动跑（它需要 server）
+    # 反向：需 server 的 gate 不应被 make test 自动跑
     if "smoke_chat.py" in out:
         failures.append("make test 不应自动跑 smoke_chat.py（需 server，应只在 make test-chat）")
+    if "smoke_graded_threshold.py" in out:
+        failures.append("make test 不应自动跑 smoke_graded_threshold.py（需 server，应只在 live lane）")
 
     if failures:
         for f in failures:

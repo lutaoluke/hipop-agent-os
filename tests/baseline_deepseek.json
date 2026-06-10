@@ -1,0 +1,386 @@
+{
+  "model": "deepseek-chat",
+  "timestamp": "2026-06-10T22:27:13Z",
+  "case_count": 31,
+  "cases": [
+    {
+      "name": "数据更新时间问答（不能假说今天）",
+      "question": "KSA 店铺什么时候更新的数据",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "商品总数（动态 product 2884 / SKU 3662）",
+      "question": "店铺总共多少商品",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "商品总数 + 上架未上架细分（动态 product/SKU 维度）",
+      "question": "店铺总共多少商品 包含未上架的",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "WS-148 近30天销量 TopN（list_products 确定性路由 + 证据）",
+      "question": "KSA 近30天销量最高的3个商品",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "店铺整体（动态在售 SKU 2092 + 红色告警）",
+      "question": "我的店里有多少货 哪些需要我关注",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "红色告警（要真数 2）",
+      "question": "红色告警有几个",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "补货建议（数据新鲜走 compute_replenishment；陈旧走上传引导）",
+      "question": "我该补货吗？哪些 SKU",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "单 SKU 查询 TBJ0059A（必含 SKU 名 + 不能编不存在字段）",
+      "question": "TBJ0059A 卖得怎么样",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.5,
+        "correct_time_window": 1.0,
+        "real_task": 0.5,
+        "fail_closed": 1.0,
+        "overall": 0.75
+      }
+    },
+    {
+      "name": "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）",
+      "question": "TBB0116A 近 30 天销量、30 天总单量、历史总销量、退货率和取消率分别是多少",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "T04 快照过期/缺失边界（动态：STALE_TST001 当前不存在时必须诚实未找到）",
+      "question": "STALE_TST001 近 30 天销量、退货率和取消率分别是多少",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "导出表格（必走 export_table，必含真实 /api/download xlsx 链接）",
+      "question": "给我个补货表格 Excel 下载",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "打开页面（必走 navigate_user_to，不能编虚构域名）",
+      "question": "打开补货页面",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "发飞书（必须诚实告知不能主动推）",
+      "question": "把补货建议发到飞书群",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "用户拒绝刷新（要警示陈旧 + 给答案）",
+      "question": "不用上传 不用刷新 现在就告诉我哪些要补",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.5,
+        "correct_time_window": 1.0,
+        "real_task": 0.5,
+        "fail_closed": 1.0,
+        "overall": 0.75
+      }
+    },
+    {
+      "name": "数据新鲜度精确度（不能编精确时间戳）",
+      "question": "数据具体到几点更新的",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "刷新库存（必走 run_workflow，禁编侧边栏路径）",
+      "question": "帮我把库存刷新一下",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "刷新物流（必走 v2，禁老 wf3 全局 env）",
+      "question": "帮我刷一下物流数据",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "扫 ERP 物流（用户口语，必走 run_workflow）",
+      "question": "你扫下 erp 物流信息",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "只查不触发（必不出现已触发字样）",
+      "question": "今天是几号",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.5,
+        "correct_time_window": 1.0,
+        "real_task": 0.5,
+        "fail_closed": 1.0,
+        "overall": 0.75
+      }
+    },
+    {
+      "name": "改告警状态必须走 Plan（不能一步直接 update_alert_status）",
+      "question": "把 PDZ0027158 标已确认丢货",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.5,
+        "correct_time_window": 1.0,
+        "real_task": 0.5,
+        "fail_closed": 1.0,
+        "overall": 0.75
+      }
+    },
+    {
+      "name": "T07-1 销量 TopN freshness gate（不能模拟数 + workflow_task=null）",
+      "question": "今天 KSA 销量最好的前5个 SKU 是哪些",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T07-2 最畅销商品查询（freshness gate 不误拦否定场景）",
+      "question": "不用刷新，就用现在的告诉我哪些 SKU 最畅销",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T26: 不存在货单号（必调 query_order_live，含未找到，禁假称正在查）",
+      "question": "请查询货单 DGORDER-NOT-EXIST-0001 当前物流状态，不存在就说不存在",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 1.0
+      }
+    },
+    {
+      "name": "WS-150: 飞书确定性拒绝（不能主动发飞书/通知群）",
+      "question": "帮我发飞书通知大家",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "WS-150: 飞书拒绝 - 推到群变体",
+      "question": "把现在的库存情况推到群里",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36: 刷新 ERP 商品库和销量价格（task_id 必须可回读）",
+      "question": "run_id=HIPOP-DG-50-20260605-230000; case=T36. 请帮我刷新 ERP 商品库和销量价格，并返回后台任务号。",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 0.5,
+        "overall": 0.875
+      }
+    },
+    {
+      "name": "T36 负控：询问 ERP 商品库和销量价格上次刷新时间（不得创建 wf2 任务）",
+      "question": "请问 ERP 商品库和销量价格上次是什么时候刷新过？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控4：无问号『上次什么时候刷新过』只读时间（不得创建 wf2 任务）",
+      "question": "ERP 商品库和销量价格上次什么时候刷新过",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控5：无问号『多久前刷的』只读时间（不得创建 wf2 任务）",
+      "question": "ERP 商品库和销量价格多久前刷的",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控2：询问句『能不能帮我刷新 ERP 商品库和销量价格?』（结构门干净回复，零工具）",
+      "question": "能不能帮我刷新 ERP 商品库和销量价格？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控3：假设句『如果刷新 ERP 商品库和销量价格会怎样?』（只说明影响，零工具）",
+      "question": "如果刷新 ERP 商品库和销量价格会怎样？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    }
+  ],
+  "averages": {
+    "correct_source": 0.897,
+    "correct_time_window": 1.0,
+    "real_task": 0.935,
+    "fail_closed": 0.984,
+    "overall": 0.954
+  }
+}

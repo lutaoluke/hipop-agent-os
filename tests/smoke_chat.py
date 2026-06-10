@@ -1,4 +1,4 @@
-"""hipop-agent-os smoke test — chat 端到端真实场景
+"""hipop-agent-os smoke test — chat 端到端真实场景 + graded eval (WS-163)
 
 跑法：
   bash tests/run_smoke.sh
@@ -14,6 +14,26 @@
 4. reply 必须不含禁忌词（虚构字段、虚构域名、假宣称）
 
 加新 bug 修完后必须加一个 case 永不重现。
+
+WS-163 扩展：50-case graded eval matrix
+====================================
+本测试产生 pass/fail + 0-1 graded 分数（4维 rubric）：
+  - correct_source（数据源真实）
+  - correct_time_window（时间窗口正确）
+  - real_task（非虚构 task_id / 幻觉实体）
+  - fail_closed（缺数报缺，不编造）
+
+Grading 是确定性规则，基于 response 结构（工具调用、回复正则、hallucination_warnings）
+而非 LLM 自述评价。见 grade_case() 函数实现。
+
+产出：
+  - 渐进打分矩阵（50 case × 4 维 + overall）
+  - 平均分（baseline model vs DeepSeek 对照，留待 Phase4 E9.2 浏览器自动化后补）
+  - 「确定性化收益矩阵」：哪些 case 由路由/数据门已解决（留 DeepSeek） vs 仍需模型升级
+
+Integration with Phase4：
+  - 现有 smoke 结果 → grade_case() → 矩阵导出
+  - 后续 E9.2 完成后，浏览器回放 + graded 评分 → 喂 Phase4 回归网（E8.2）阈值判定
 """
 from __future__ import annotations
 
@@ -69,6 +89,14 @@ class Case:
     allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
     t07_guard: bool = False                                       # T07 freshness 结构不变量检查
     timeout: int = 60
+    # Grading dimensions (WS-163: 4-dim rubric for graded eval)
+    # Each dimension 0-1, aggregated for final case score
+    rubric_weights: dict = field(default_factory=lambda: {
+        "correct_source": 0.25,      # Data from correct tool/API
+        "correct_time_window": 0.25, # Time window constraint met (30d, historical, etc)
+        "real_task": 0.25,           # No fake task_id or hallucinated entities
+        "fail_closed": 0.25,         # Reports missing data, doesn't fabricate when unavailable
+    })
 
 
 # 禁忌词集中：所有 case 共享（hallucinate 黑名单）
@@ -867,6 +895,106 @@ def check_task_evidence(opener: urllib.request.OpenerDirector, base_url: str,
     return None
 
 
+def grade_case(c: Case, resp: dict) -> dict:
+    """WS-163: Graded evaluation — 4-dim rubric (0-1 per dimension).
+
+    Returns {
+        "correct_source": 0-1,
+        "correct_time_window": 0-1,
+        "real_task": 0-1,
+        "fail_closed": 0-1,
+        "overall": weighted avg,
+    }
+
+    Deterministic rules based on response structure, not LLM self-rating.
+    """
+    grades = {}
+
+    reply = resp.get("reply") or ""
+    clean_reply = resp.get("clean_reply") or reply
+    tools = resp.get("tools_used") or []
+    warns = resp.get("hallucination_warnings") or []
+
+    # Dimension 1: correct_source (data came from real tool/API, not fabricated)
+    # For cases with must_use_tools: 1.0 if all called + no warns; 0.5 if partial; 0.0 if none/error
+    # For cases WITHOUT must_use_tools: depends on check() pass + no hallucination warns
+    #   (these cases rely on must_contain/must_not_contain for validation, so grader can't
+    #    assume "no tools = fabricated" — but CAN penalize hallucination_warnings as signal)
+    if resp.get("_error") or resp.get("_http_error"):
+        grades["correct_source"] = 0.0
+    elif c.must_use_tools:
+        # Tool-required cases: strict tool checking
+        if all(t in tools for t in c.must_use_tools):
+            grades["correct_source"] = 0.0 if warns else 1.0
+        elif any(t in tools for t in c.must_use_tools):
+            grades["correct_source"] = 0.5
+        else:
+            grades["correct_source"] = 0.0
+    else:
+        # Non-tool-required cases: penalize warnings, but allow partial credit if check passes
+        ok, _ = check(c, resp)
+        if warns:
+            grades["correct_source"] = 0.5  # Warnings reduce confidence even if check passes
+        elif ok:
+            grades["correct_source"] = 0.9  # Slightly lower than perfect 1.0 for cases without tool evidence
+        else:
+            grades["correct_source"] = 0.3  # Fails check but without tool evidence to fail on
+
+    # Dimension 2: correct_time_window (query scoped to right time frame)
+    # Examples: 30d queries respect 30d window, historical queries don't fake "today"
+    # 1.0 if: time-scoped must_contain patterns all matched
+    # 0.5 if: time window partially correct
+    # 0.0 if: wrong time window or fabricated dates
+    has_stale_warn = any("陈旧" in w or "旧" in w or "过期" in w for w in warns)
+    time_specific_patterns = [kw for kw in c.must_contain
+                              if any(x in kw for x in ["天前", "月", "年", "30", "10"])]
+    if time_specific_patterns:
+        matched_time = sum(1 for kw in time_specific_patterns if re.search(kw, reply))
+        if matched_time == len(time_specific_patterns):
+            grades["correct_time_window"] = 1.0
+        elif matched_time > 0:
+            grades["correct_time_window"] = matched_time / len(time_specific_patterns)
+        else:
+            grades["correct_time_window"] = 0.0
+    else:
+        # No time-specific expectations — default to high if tool called
+        grades["correct_time_window"] = 1.0 if grades["correct_source"] > 0 else 0.0
+
+    # Dimension 3: real_task (not fake task_id, hallucinated entities, non-existent SKUs)
+    # 1.0 if: no hallucination warns, no blacklist words, expected workflow if required
+    # 0.5 if: some hallucination risk but task proceeded
+    # 0.0 if: clear hallucinations or invalid entities
+    blacklist = GLOBAL_BLACKLIST + c.must_not_contain
+    blacklist_hits = sum(1 for bw in blacklist if re.search(bw, clean_reply))
+    if blacklist_hits > 0:
+        grades["real_task"] = 0.0
+    elif warns:
+        grades["real_task"] = 0.5
+    else:
+        grades["real_task"] = 1.0
+
+    # Dimension 4: fail_closed (don't make up data when unavailable)
+    # 1.0 if: passes check() + all must_contain matched + no fabricated values
+    # 0.5 if: partial data available, missing reported honestly
+    # 0.0 if: fabricates entire response when data unavailable
+    _, reasons = check(c, resp)
+    if not reasons:
+        grades["fail_closed"] = 1.0
+    elif len(reasons) <= 2 and any("缺关键词" not in r for r in reasons):
+        # Some failure but not systematic fabrication
+        grades["fail_closed"] = 0.5
+    else:
+        # Multiple failures suggest making up values
+        grades["fail_closed"] = 0.0
+
+    # Weighted overall score
+    weights = c.rubric_weights
+    overall = sum(grades[dim] * weights.get(dim, 0.25) for dim in grades.keys())
+    grades["overall"] = round(overall, 3)
+
+    return grades
+
+
 def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] = None,
           base_url: str = "") -> tuple[bool, List[str]]:
     """返回 (pass, reasons)。reasons 是失败原因列表，pass 时为空。"""
@@ -1158,6 +1286,7 @@ def main():
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
     ap.add_argument("--filter", help="只跑 name 含此关键词的 case")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--json-output", help="Export grading matrix as JSON to this file (for baseline comparison)")
     args = ap.parse_args()
 
     print(f"=== hipop-agent-os smoke test ===")
@@ -1208,6 +1337,7 @@ def main():
 
     passed, failed = 0, 0
     failures = []
+    graded_results = []  # WS-163: Collect graded scores
 
     t0 = time.time()
     for i, c in enumerate(cases, 1):
@@ -1215,24 +1345,81 @@ def main():
         t = time.time()
         resp = post_chat(opener, args.url, c.question, c.store, c.timeout)
         ok, reasons = check(c, resp, opener, args.url)
+        grades = grade_case(c, resp)  # WS-163: Compute grades
+        graded_results.append({
+            "name": c.name,
+            "question": c.question,
+            "pass": ok,
+            "grades": grades,
+        })
         elapsed = time.time() - t
         if ok:
             passed += 1
-            print(f"✓ ({elapsed:.1f}s)")
+            print(f"✓ ({elapsed:.1f}s)", end="")
+            print(f" [score {grades['overall']:.2f}]")  # Show overall graded score
             if args.verbose:
                 print(f"    tools: {resp.get('tools_used')}")
                 print(f"    reply: {(resp.get('reply') or '')[:120]}")
+                print(f"    grades: {grades}")
         else:
             failed += 1
             failures.append((c.name, reasons, resp))
-            print(f"✗ ({elapsed:.1f}s)")
+            print(f"✗ ({elapsed:.1f}s)", end="")
+            print(f" [score {grades['overall']:.2f}]")  # Show overall graded score even on fail
             for r in reasons:
                 print(f"    - {r}")
             if args.verbose:
                 print(f"    reply preview: {(resp.get('reply') or '')[:200]}")
+                print(f"    grades: {grades}")
 
     total = time.time() - t0
     print(f"\n--- {passed} passed, {failed} failed in {total:.1f}s ---")
+
+    # WS-163: Output grading matrix
+    print("\n=== WS-163 Graded Evaluation Matrix ===")
+    print(f"{'Case':<60} {'Pass':<6} {'Source':<8} {'Time':<8} {'Real':<8} {'Closed':<8} {'Overall':<8}")
+    print("-" * 110)
+    for result in graded_results:
+        g = result["grades"]
+        status = "PASS" if result["pass"] else "FAIL"
+        case_name = result["name"][:57] + "..." if len(result["name"]) > 60 else result["name"]
+        print(
+            f"{case_name:<60} {status:<6} "
+            f"{g['correct_source']:<8.2f} {g['correct_time_window']:<8.2f} "
+            f"{g['real_task']:<8.2f} {g['fail_closed']:<8.2f} {g['overall']:<8.2f}"
+        )
+
+    # Summary statistics
+    avg_overall = sum(r["grades"]["overall"] for r in graded_results) / len(graded_results) if graded_results else 0
+    avg_by_dim = {}
+    for dim in ["correct_source", "correct_time_window", "real_task", "fail_closed"]:
+        scores = [r["grades"][dim] for r in graded_results]
+        avg_by_dim[dim] = sum(scores) / len(scores) if scores else 0
+    print("-" * 110)
+    print(f"{'AVERAGE':<60} {'':<6} "
+          f"{avg_by_dim['correct_source']:<8.2f} {avg_by_dim['correct_time_window']:<8.2f} "
+          f"{avg_by_dim['real_task']:<8.2f} {avg_by_dim['fail_closed']:<8.2f} {avg_overall:<8.2f}")
+
+    # WS-163: JSON export for baseline comparison (future DeepSeek vs stronger model)
+    if args.json_output:
+        json_export = {
+            "model": os.environ.get("MODEL_NAME", "unknown"),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cases": graded_results,
+            "averages": {
+                "correct_source": round(avg_by_dim["correct_source"], 3),
+                "correct_time_window": round(avg_by_dim["correct_time_window"], 3),
+                "real_task": round(avg_by_dim["real_task"], 3),
+                "fail_closed": round(avg_by_dim["fail_closed"], 3),
+                "overall": round(avg_overall, 3),
+            }
+        }
+        try:
+            with open(args.json_output, "w") as f:
+                json.dump(json_export, f, indent=2, ensure_ascii=False)
+            print(f"\n✓ JSON export: {args.json_output}")
+        except Exception as e:
+            print(f"\n✗ JSON export failed: {e}")
 
     if failed:
         print("\n=== 失败详情 ===")
