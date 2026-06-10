@@ -46,6 +46,7 @@ def _ev(tool, ok, entity, kind, **kw):
         "order_nos": kw.get("order_nos", []),
         "statuses": kw.get("statuses", []),
         "has_stock_value": kw.get("has_stock_value", False),
+        "stock_values": kw.get("stock_values", []),
     }
     if tool == "query_stock_split":
         base["slots_proven"] = bool(base["has_stock_value"])
@@ -188,11 +189,12 @@ def test_no_false_positive_on_successful_logistics_answer():
     tl = [{"name": "query_sku_live", "args": {"sku": "TBC0168A"}, "result_error": None,
            "factslot_evidence": _ev("query_sku_live", True, "TBC0168A", "sku",
                                      forwarders=["Aramex"], tracking_nos=["AB123456789012"],
-                                     order_nos=["PD2026001"])}]
+                                     order_nos=["PD2026001"], statuses=["在途"])}]
     reply = "SKU TBC0168A 当前有 1 个在途货单 PD2026001，运单号 AB123456789012，承运商 Aramex。"
     out, warns = _sanitize(reply, ["query_sku_live"], tl)
     body = _answer_body(out)
     assert "Aramex" in body and "AB123456789012" in body, body
+    assert "在途" in body, f"工具背书的在途状态不应被删: {body}"
     assert "无法确认" not in out, f"成功回答不应被加错误模板: {out[:200]}"
     factslot_warns = [w for w in warns if "禁编承重墙" in w]
     assert not factslot_warns, f"成功回答不应触发承重墙告警: {factslot_warns}"
@@ -208,14 +210,56 @@ def test_no_false_positive_on_rule_doc_explanation():
 
 
 def test_success_stock_numbers_not_scrubbed():
-    """库存查询成功（有 has_stock_value）→ 正文数字不被删（避免误拦）。"""
+    """库存查询成功（数值都来自工具）→ 正文数字不被删（避免误拦）。"""
     tl = [{"name": "query_stock_split", "args": {"sku": "TBC0168A"}, "result_error": None,
-           "factslot_evidence": _ev("query_stock_split", True, "TBC0168A", "sku", has_stock_value=True)}]
+           "factslot_evidence": _ev("query_stock_split", True, "TBC0168A", "sku",
+                                     has_stock_value=True, stock_values=[509, 200, 309])}]
     reply = "SKU TBC0168A 当前库存 509 件（义乌 200、noon 309）。"
     out, warns = _sanitize(reply, ["query_stock_split"], tl)
     body = _answer_body(out)
-    assert "509" in body, f"成功库存数字不应被删: {body}"
+    assert "509" in body and "200" in body and "309" in body, f"成功库存数字不应被删: {body}"
     assert not [w for w in warns if "禁编承重墙" in w]
+
+
+# ── 验收 2（Round-2 补强）：成功分支状态/库存数量也按包含关系校验 ──────────────────
+
+def test_success_status_not_in_tool_return_is_scrubbed():
+    """query_order_live 成功状态=待发货，回复写"已签收"（跨桶编造）→ 正文删该状态。"""
+    tl = [{"name": "query_order_live", "args": {"order_no": "PD2026001"}, "result_error": None,
+           "factslot_evidence": _ev("query_order_live", True, "PD2026001", "order",
+                                     forwarders=["Aramex"], tracking_nos=["AB123456789012"],
+                                     order_nos=["PD2026001"], statuses=["待发货"])}]
+    reply = "货单 PD2026001 承运商 Aramex，运单号 AB123456789012，状态已签收，预计今天送达。"
+    out, warns = _sanitize(reply, ["query_order_live"], tl)
+    body = _answer_body(out)
+    assert "已签收" not in body, f"工具状态是待发货，编造的已签收必须删: {body}"
+    assert "送达" not in body, f"跨桶 ETA（送达）也应删: {body}"
+    assert "Aramex" in body and "AB123456789012" in body, f"工具返回的承运商/运单号不应误删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_success_status_same_bucket_synonym_not_scrubbed():
+    """工具状态=待发货，回复写"等待发货"（同桶同义）→ 不删（避免误拦）。"""
+    tl = [{"name": "query_order_live", "args": {"order_no": "PD2026001"}, "result_error": None,
+           "factslot_evidence": _ev("query_order_live", True, "PD2026001", "order",
+                                     order_nos=["PD2026001"], statuses=["待发货"])}]
+    reply = "货单 PD2026001 当前等待发货中。"
+    out, warns = _sanitize(reply, ["query_order_live"], tl)
+    body = _answer_body(out)
+    assert "等待发货" in body, f"同桶同义状态不应被删: {body}"
+    assert not [w for w in warns if "禁编承重墙" in w]
+
+
+def test_success_stock_value_not_in_tool_return_is_scrubbed():
+    """库存成功为 509/200/309，回复写 999/888/111（工具没给）→ 正文删这些数字。"""
+    tl = [{"name": "query_stock_split", "args": {"sku": "TBC0168A"}, "result_error": None,
+           "factslot_evidence": _ev("query_stock_split", True, "TBC0168A", "sku",
+                                     has_stock_value=True, stock_values=[509, 200, 309])}]
+    reply = "SKU TBC0168A 当前库存 999 件（义乌 888、noon 111）。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "999" not in body and "888" not in body and "111" not in body, f"编造库存数字必须删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
 
 
 # ── 接线：两个 provider 都在 tool_log 写入 factslot_evidence ──────────────────────
@@ -242,6 +286,9 @@ TESTS = [
     test_no_false_positive_on_successful_logistics_answer,
     test_no_false_positive_on_rule_doc_explanation,
     test_success_stock_numbers_not_scrubbed,
+    test_success_status_not_in_tool_return_is_scrubbed,
+    test_success_status_same_bucket_synonym_not_scrubbed,
+    test_success_stock_value_not_in_tool_return_is_scrubbed,
     test_both_providers_wire_factslot_evidence,
 ]
 
