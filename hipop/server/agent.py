@@ -3137,6 +3137,81 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _deterministic_multi_workflow_request(question: str) -> List[Dict[str, str]]:
+    q = (question or "").lower()
+    # WS-145 肯定执行意图门同样约束多 workflow 路由。非执行语气
+    # （能不能/如果/影响面/否定）不能先试 run_workflow 再把门的拒绝渲染成「启动失败」。
+    from . import _execution_intent_gate as _intent_gate
+    if not _intent_gate.enters_execution(question or ""):
+        return []
+    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
+                                 "重跑", "重新计算")):
+        return []
+
+    if "erp" not in q:
+        return []
+
+    wants_products = "商品库" in q or any(k in q for k in ("商品", "产品"))
+    wants_sales_price = "销量价格" in q or ("销量" in q and "价格" in q)
+    if wants_products and wants_sales_price:
+        return [
+            {"workflow": "wf2_products_v2", "label": "ERP 商品库刷新"},
+            {"workflow": "wf2_sales_v2", "label": "销量价格刷新"},
+        ]
+    return []
+
+
+def _deterministic_erp_refresh_time_request(question: str) -> bool:
+    q = (question or "").lower()
+    from . import _execution_intent_gate as _intent_gate
+    gate_decision = _intent_gate.evaluate(question or "")
+    is_time_query = _intent_gate.is_refresh_time_query(question or "")
+    if gate_decision.enters_execution:
+        return False
+    if "erp" not in q:
+        return False
+    if not (
+        gate_decision.has_refresh_trigger
+        or is_time_query
+        or any(v in q for v in ("更新", "刷新过", "更新过", "同步过", "刷过", "刷的"))
+    ):
+        return False
+    has_time_question = is_time_query or any(x in q for x in (
+        "上次", "什么时候", "多久前", "几天前", "哪天", "何时", "最近一次",
+        "刷新时间", "刷新日期", "更新时间", "更新日期", "刷新过", "更新过", "刷过", "刷的",
+    ))
+    if not has_time_question:
+        return False
+    wants_products = "商品库" in q or any(k in q for k in ("商品", "产品"))
+    wants_sales_price = "销量价格" in q or ("销量" in q and "价格" in q)
+    return wants_products and wants_sales_price
+
+
+def _format_erp_refresh_time_reply(store: str, health: dict) -> str:
+    sources = (health or {}).get("sources") or {}
+
+    def _source_text(key: str, label: str) -> str:
+        source = sources.get(key) or {}
+        latest = source.get("latest") or "无记录"
+        stale_days = source.get("stale_days")
+        if stale_days is None:
+            age = "暂无可计算天数"
+        elif stale_days <= 0:
+            age = "今天"
+        else:
+            age = f"{stale_days} 天前"
+        return f"{label}最近刷新时间：{latest}（{age}）"
+
+    return (
+        f"{store.upper()} "
+        + "；".join([
+            _source_text("erp_products", "ERP 商品库"),
+            _source_text("erp_sales", "ERP 销量价格"),
+        ])
+        + "。这里只能按日期粒度回答，没有具体几点；本轮没有触发后台刷新。"
+    )
+
+
 def _deterministic_export_request(question: str) -> Optional[Dict[str, str]]:
     q = question or ""
     if not any(x in q for x in ("导出", "下载", "excel", "Excel", "表格", "xlsx")):
@@ -4314,6 +4389,172 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    if _deterministic_erp_refresh_time_request(question):
+        store = (scope.get("store") or "KSA").upper()
+        reply = _format_erp_refresh_time_reply(store, _data.get_data_health(store))
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "查询",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_erp_refresh_time_router",
+            "hallucination_warnings": None,
+        }
+
+    if _deterministic_data_freshness_request(question):
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool("data_health_check", {"store": store}, user=scope)
+        reply = _format_data_freshness_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["data_health_check"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_data_freshness_router",
+            "hallucination_warnings": None,
+        }
+
+    # WS-98 Round-2：非执行语气的刷新/重算意图（询问/假设/只问影响面）确定性短路，
+    # 交回 WS-145 结构门的干净解释，绝不落 LLM。否则 LLM 会去试 run_workflow——
+    # 虽被 _exec_tool 拦下不落任务，却会污染 tools_used 且触发 _safety 假活 banner，
+    # 把「能不能帮我刷新…?」误渲染成带警告/「启动失败」的回复（验门人 Round-2 红队洞）。
+    # NEGATED 不在此短路：它常是「不用刷新，但告诉我哪些要补」这类仍要数据答案的句子，
+    # 留给 LLM 给陈旧警示 + 答案（smoke「用户拒绝刷新」）。
+    if (
+        _intent_decision.has_refresh_trigger
+        and _intent_decision.mood in (
+            _intent_gate.IntentMood.INTERROGATIVE,
+            _intent_gate.IntentMood.HYPOTHETICAL,
+            _intent_gate.IntentMood.IMPACT_QUERY,
+        )
+    ):
+        reply = _intent_gate.explain_reply(_intent_decision.mood, question)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "查询",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "execution_intent_gate_explain_non_executory",
+            "hallucination_warnings": None,
+        }
+
+    direct_workflows = _deterministic_multi_workflow_request(question)
+    if direct_workflows:
+        workflow_tasks = []
+        reply_parts = []
+        for direct_workflow in direct_workflows:
+            workflow = direct_workflow["workflow"]
+            label = direct_workflow["label"]
+            tool_args = {"workflow": workflow, "followup_prompt": question}
+            tool_result = _exec_tool("run_workflow", tool_args, user=scope)
+            if isinstance(tool_result, dict) and tool_result.get("ok"):
+                task_id = tool_result["task_id"]
+                workflow_tasks.append({
+                    "ok": True,
+                    "task_id": task_id,
+                    "workflow": tool_result.get("workflow", workflow),
+                    "label": tool_result.get("label", label),
+                    "total_steps": tool_result.get("total_steps", 0),
+                    "affected_modules": tool_result.get("affected_modules", []),
+                    "followup_prompt": tool_result.get("followup_prompt"),
+                })
+                reply_parts.append(_workflow_receipt_reply(
+                    task_id, tool_result.get("workflow", workflow), label
+                ))
+                continue
+
+            existing_task_id = None
+            if (
+                isinstance(tool_result, dict)
+                and tool_result.get("action_type") == "denied"
+                and "已有运行中实例" in (tool_result.get("reason") or "")
+            ):
+                existing = _current_workflow_task(workflow)
+                if existing:
+                    existing_task_id = existing["task_id"]
+                    workflow_tasks.append({
+                        "ok": True,
+                        "task_id": existing_task_id,
+                        "workflow": existing["workflow"],
+                        "label": label,
+                        "total_steps": None,
+                        "affected_modules": [],
+                        "followup_prompt": question,
+                        "state": existing.get("state"),
+                        "already_running": True,
+                    })
+                    reply_parts.append(
+                        f"{label}（{workflow}）已有运行中的后台任务 `{existing_task_id}`，"
+                        "本轮未新建重复任务。请在工作台任务面板查看进度。"
+                    )
+                    continue
+                existing_task_id = _existing_workflow_task_id(tool_result)
+
+            if existing_task_id:
+                label2, total_steps, affected = _workflow_registry_summary(workflow, label)
+                workflow_tasks.append({
+                    "ok": True,
+                    "task_id": existing_task_id,
+                    "workflow": workflow,
+                    "label": label2,
+                    "total_steps": total_steps,
+                    "affected_modules": affected,
+                    "followup_prompt": question,
+                    "already_running": True,
+                })
+                reply_parts.append(
+                    f"{label2}（{workflow}）已有同类后台任务在运行，未新建重复任务。\n"
+                    f"任务 ID：{existing_task_id}｜当前状态：运行中或排队。\n"
+                    "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
+                )
+                continue
+
+            reason = (
+                (tool_result or {}).get("message")
+                or (tool_result or {}).get("error")
+                or (tool_result or {}).get("reason")
+                or "触发失败"
+            )
+            workflow_tasks.append({
+                "ok": False,
+                "workflow": workflow,
+                "label": label,
+                "error": reason,
+                "task_id": None,
+            })
+            reply_parts.append(f"{label}（{workflow}）启动失败：{reason}。")
+
+        return {
+            "reply": "\n\n".join(reply_parts),
+            "clean_reply": "\n\n".join(reply_parts),
+            "references": [],
+            "action_id": None,
+            "tools_used": ["run_workflow"],
+            "tag": "执行",
+            "workflow_tasks": workflow_tasks,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "deterministic_multi_workflow_router",
+            "hallucination_warnings": None,
+        }
+
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         return _execute_workflow_route(direct_workflow, question, scope)
@@ -4374,24 +4615,6 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_scope_overview_router",
-            "hallucination_warnings": None,
-        }
-
-    if _deterministic_data_freshness_request(question):
-        store = scope.get("store") or "KSA"
-        tool_result = _exec_tool("data_health_check", {"store": store}, user=scope)
-        reply = _format_data_freshness_reply(store, tool_result)
-        return {
-            "reply": reply,
-            "clean_reply": reply,
-            "references": _dedup_refs((tool_result or {}).get("references", [])),
-            "action_id": None,
-            "tools_used": ["data_health_check"],
-            "tag": "查询",
-            "workflow_task": None,
-            "provider": _provider.get_provider(),
-            "confidence": 1.0,
-            "judge_method": "deterministic_data_freshness_router",
             "hallucination_warnings": None,
         }
 

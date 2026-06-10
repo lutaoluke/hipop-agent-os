@@ -106,6 +106,19 @@ _IMPACT_RE = re.compile(
     r"风险(?:是什么|有哪些|多大|大不大)|会不会影响|动到什么|改动(?:什么|哪些)"
 )
 
+# 读取刷新时间：时间疑问结构 + 刷新/更新/同步动作。它虽然含「刷新」动词，
+# 但语义是读上次时间，不是肯定执行请求；必须在结构门里判成非执行。
+_REFRESH_TIME_MARKER = r"(?:上次|上一次|最近一次|多久前|几天前|什么时候|啥时候|何时|哪天)"
+_REFRESH_TIME_ACTION = r"(?:刷新|更新|同步|重算|刷(?:新)?(?:过|的)|刷(?:库存|库))"
+_SAME_CLAUSE_GAP = r"[^，。！？!?；;、,\n\r\t]{0,24}"
+_REFRESH_TIME_QUERY_RE = re.compile(
+    rf"(?:{_REFRESH_TIME_MARKER}{_SAME_CLAUSE_GAP}{_REFRESH_TIME_ACTION})|"
+    rf"(?:{_REFRESH_TIME_ACTION}{_SAME_CLAUSE_GAP}{_REFRESH_TIME_MARKER})"
+)
+_REFRESH_TIME_FIELD_RE = re.compile(
+    r"(?:刷新|更新|同步|重算)[^，。！？!?；;、,\n\r\t]{0,6}(?:时间|日期)"
+)
+
 # 祈使/请求标记（帮我/请/现在就…），用于把「带请求语气的句子」判为执行而非纯疑问。
 _IMPERATIVE_RE = re.compile(
     r"帮我|帮忙|给我|请(?!问)|麻烦|现在就|马上|立刻|立即|赶紧|快.{0,2}把|去把|来把"
@@ -168,12 +181,20 @@ def _clause_negated(clause: str) -> bool:
 
 
 def has_execution_verb(question: str) -> bool:
-    return bool(_EXEC_VERB_RE.search(question or "") or _REFRESH_TRIGGER_RE.search(question or ""))
+    q = question or ""
+    return bool(_EXEC_VERB_RE.search(q) or _REFRESH_TRIGGER_RE.search(q) or is_refresh_time_query(q))
 
 
 def has_refresh_trigger(question: str) -> bool:
     """是否命中工作流刷新路由触发集（agent 据此选 wf1/wf3/wf5）。"""
-    return bool(_REFRESH_TRIGGER_RE.search((question or "").lower()))
+    q = (question or "").lower()
+    return bool(_REFRESH_TRIGGER_RE.search(q) or is_refresh_time_query(q))
+
+
+def is_refresh_time_query(question: str) -> bool:
+    """是否是在询问刷新/更新/同步的上次时间，而不是请求执行刷新。"""
+    q = (question or "").lower()
+    return bool(_REFRESH_TIME_QUERY_RE.search(q) or _REFRESH_TIME_FIELD_RE.search(q))
 
 
 def classify_mood(question: str) -> IntentMood:
@@ -198,7 +219,11 @@ def classify_mood(question: str) -> IntentMood:
     # 3) 只问影响面 —— 同分句内问影响/后果/风险，只解释不执行。
     if _IMPACT_RE.search(clause):
         return IntentMood.IMPACT_QUERY
-    # 4) 疑问句 —— 必须压过祈使请求：用户问「能不能帮我刷新库存？」里虽含「帮我」，
+    # 4) 只读刷新时间 —— 「上次什么时候刷新过 / 多久前刷的」即使无问号，
+    #    也不是执行命令，必须压过裸「刷新/刷」动词。
+    if is_refresh_time_query(q):
+        return IntentMood.INTERROGATIVE
+    # 5) 疑问句 —— 必须压过祈使请求：用户问「能不能帮我刷新库存？」里虽含「帮我」，
     #    但整体是询问而非执行命令，绝不能因为有「帮我」就误进执行路由（验门人红队洞）。
     #    判据（锚定执行动词分句，避免汇报性从句误伤）：
     #      a) 执行动词分句本身带疑问情态（能不能/可不可以/能否…）或以疑问助词收尾（…吗？）；
@@ -209,7 +234,7 @@ def classify_mood(question: str) -> IntentMood:
     )
     if clause_is_question or (_QUESTION_TAIL_RE.search(q) and not clause_is_imperative):
         return IntentMood.INTERROGATIVE
-    # 5) 其余（含祈使请求与无修饰的祈使动词）= 肯定祈使执行。
+    # 6) 其余（含祈使请求与无修饰的祈使动词）= 肯定祈使执行。
     return IntentMood.EXECUTE
 
 

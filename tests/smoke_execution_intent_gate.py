@@ -31,7 +31,11 @@ if REPO not in sys.path:
 
 from hipop.server import _execution_intent_gate as gate
 from hipop.server._execution_intent_gate import IntentMood, RiskTier, RecoveryAction
-from hipop.server.agent import _deterministic_workflow_request
+from hipop.server.agent import (
+    _deterministic_erp_refresh_time_request,
+    _deterministic_multi_workflow_request,
+    _deterministic_workflow_request,
+)
 from hipop.server import agent as _agent
 from hipop.server import _provider as _prov
 
@@ -120,6 +124,40 @@ def test_router_blocks_interrogative_with_imperative():
     """路由层:「能不能帮我刷新库存？」不进 wf 路由（修前会因含「帮我刷新」误进）。"""
     for q in ("能不能帮我刷新库存？", "可以帮我刷新库存吗？", "能否帮我刷库存？"):
         assert _deterministic_workflow_request(q) is None, f"{q!r} 不应路由"
+
+
+def test_multi_workflow_router_respects_non_executory_gate():
+    """WS-98 × WS-145:ERP 商品库+销量价格多 workflow 路由也必须先过结构意图门。
+
+    修前（PR #82 rebased 后）:_deterministic_multi_workflow_request 只看关键词，
+    「能不能帮我刷新…?」/「如果刷新…会怎样」会返回 wf2_products_v2 + wf2_sales_v2，
+    之后 _exec_tool 虽会拦任务，但 chat reply 会变成误导性的「启动失败」。
+    """
+    for q in (
+        "能不能帮我刷新 ERP 商品库和销量价格？",
+        "如果刷新 ERP 商品库和销量价格会怎样？",
+    ):
+        assert gate.enters_execution(q) is False, f"{q!r} 不应进执行门"
+        assert _deterministic_multi_workflow_request(q) == [], f"{q!r} 不应路由到 wf2 多任务"
+
+
+def test_refresh_time_questions_without_question_mark_are_read_intent():
+    """WS-98 Round-3:无问号的「上次/多久前刷的」仍是读取刷新时间，不是执行刷新。
+
+    修前:「ERP 商品库和销量价格上次什么时候刷新过」被结构门判 EXECUTE，
+    deterministic_erp_refresh_time_router 弃权，随后 multi workflow 路由真起 wf2。
+    「多久前刷的」还会掉到普通查询路由，答成销量榜。这里把两句都钉到结构门。
+    """
+    for q in (
+        "ERP 商品库和销量价格上次什么时候刷新过",
+        "ERP 商品库和销量价格多久前刷的",
+    ):
+        d = gate.evaluate(q)
+        assert d.mood == IntentMood.INTERROGATIVE, f"{q!r} 应判读时间问句"
+        assert d.enters_execution is False, f"{q!r} 不应进执行路由"
+        assert d.blocks_llm_execution is True, f"{q!r} 应拦 LLM 偷跑 run_workflow"
+        assert _deterministic_erp_refresh_time_request(q) is True, f"{q!r} 应走刷新时间读路由"
+        assert _deterministic_multi_workflow_request(q) == [], f"{q!r} 不应路由到 wf2 多任务"
 
 
 # ── 2) 风险分层 + 自动补调策略 ──────────────────────────────────────────────
@@ -348,6 +386,64 @@ def test_chat_interrogative_creates_no_task():
     assert "run_workflow" not in (result.get("tools_used") or []), result
 
 
+def test_chat_multi_workflow_non_executory_has_clean_reply_no_tool():
+    """WS-98 Round-2 红队:多 workflow 非执行语气不得渲染「启动失败」或记录 run_workflow。
+
+    关键:provider mock 一旦被调用就 raise —— 钉死「非执行刷新意图必须在确定性结构门
+    短路、绝不落 LLM」。验门人 Round-2 实测的回归正是 chat() 落到 LLM、LLM 去试
+    run_workflow（被 _exec_tool 拦下不落任务，却污染 tools_used + 触发 _safety 假活
+    banner，把「能不能帮我刷新…?」误渲染成带警告的回复）。旧 mock 返回干净 reply 把这条
+    路径藏住了——provider 该被调用却假装没事。改成 side_effect=raise 后,只有真短路才过。
+    """
+    def _boom(*a, **k):
+        raise AssertionError("provider.chat_with_tools 不应被调用:非执行刷新意图必须确定性短路,不落 LLM")
+
+    for q in (
+        "能不能帮我刷新 ERP 商品库和销量价格？",
+        "如果刷新 ERP 商品库和销量价格会怎样？",
+    ):
+        with patch.object(_prov, "chat_with_tools", side_effect=_boom), \
+             patch.object(_prov, "get_provider", return_value="smoke"):
+            result = _agent.chat([{"role": "user", "content": q}], _SCOPE)
+        assert not (result.get("workflow_tasks") or result.get("workflow_task")), result
+        assert result.get("tools_used") == [], result
+        assert result.get("judge_method") == "execution_intent_gate_explain_non_executory", result
+        assert result.get("hallucination_warnings") in (None, [], {}), result
+        reply = result.get("reply") or ""
+        assert "启动失败" not in reply and "run_workflow" not in reply, reply
+        assert "本轮我先不动手" in reply or "本轮不执行" in reply, reply
+
+
+def test_chat_refresh_time_without_question_mark_has_clean_read_reply_no_tool():
+    """WS-98 Round-3:读刷新时间即使不带问号，也必须只回时间、不落 LLM、不起 wf2。"""
+    def _boom(*a, **k):
+        raise AssertionError("provider.chat_with_tools 不应被调用:刷新时间读意图必须确定性短路")
+
+    fake_health = {
+        "sources": {
+            "erp_products": {"latest": "2026-06-09", "stale_days": 1},
+            "erp_sales": {"latest": "2026-06-10", "stale_days": 0},
+        }
+    }
+    for q in (
+        "ERP 商品库和销量价格上次什么时候刷新过",
+        "ERP 商品库和销量价格多久前刷的",
+    ):
+        with patch.object(_prov, "chat_with_tools", side_effect=_boom), \
+             patch.object(_prov, "get_provider", return_value="smoke"), \
+             patch.object(_agent._data, "get_data_health", return_value=fake_health):
+            result = _agent.chat([{"role": "user", "content": q}], _SCOPE)
+        assert not (result.get("workflow_tasks") or result.get("workflow_task")), result
+        assert result.get("tools_used") == [], result
+        assert result.get("judge_method") == "deterministic_erp_refresh_time_router", result
+        assert result.get("hallucination_warnings") in (None, [], {}), result
+        reply = result.get("reply") or ""
+        assert "商品库" in reply and "销量价格" in reply, reply
+        assert "2026-06-09" in reply and "2026-06-10" in reply, reply
+        for bad in ("启动失败", "run_workflow", "已触发", "后台任务号"):
+            assert bad not in reply, reply
+
+
 def test_chat_low_risk_failure_routes_to_plan_confirm():
     """chat()「帮我刷库存」低风险触发失败（自动补调一次后仍失败）→ 接线必须转 plan→confirm:
     追加「下一步…不再自动重复触发…回确认/取消」，绝不返回「已触发/已完成」假证据，也不无限重试。
@@ -382,6 +478,8 @@ if __name__ == "__main__":
         test_interrogative_with_imperative_not_execute,
         test_imperative_with_reporting_subclause_still_executes,
         test_router_blocks_interrogative_with_imperative,
+        test_multi_workflow_router_respects_non_executory_gate,
+        test_refresh_time_questions_without_question_mark_are_read_intent,
         test_low_risk_internal_action,
         test_high_risk_external_and_txn,
         test_external_notify_phrasings_confirm_first,
@@ -404,6 +502,8 @@ if __name__ == "__main__":
         test_chat_high_risk_confirm_first_no_task,
         test_chat_affirmative_stock_creates_real_task,
         test_chat_interrogative_creates_no_task,
+        test_chat_multi_workflow_non_executory_has_clean_reply_no_tool,
+        test_chat_refresh_time_without_question_mark_has_clean_read_reply_no_tool,
         test_chat_low_risk_failure_routes_to_plan_confirm,
     ]
     failed = 0

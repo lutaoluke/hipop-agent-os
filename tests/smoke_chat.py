@@ -57,10 +57,15 @@ class Case:
     question: str
     store: str = "KSA"
     must_use_tools: List[str] = field(default_factory=list)
+    expected_tools: Optional[List[str]] = None                       # 若设置，tools_used 必须精确等于该列表
     must_contain: List[str] = field(default_factory=list)        # reply 必须含
     must_not_contain: List[str] = field(default_factory=list)    # reply 必须不含（防 hallucinate）
     must_warn: bool = False                                       # _safety 应该报警告
+    must_not_warn: bool = False                                   # _safety 不应产生 hallucination banner
     expected_workflow: Optional[str] = None                      # 真触发的 workflow 名必须精确等于此值
+    expected_workflows: List[str] = field(default_factory=list)   # 多 workflow 场景，每条都必须有结果
+    must_not_workflow_prefixes: List[str] = field(default_factory=list)  # 禁止创建指定前缀 workflow task
+    require_task_evidence: bool = False                           # 成功 task_id 必须能从 /api/tasks 回读事件
     allow_existing_workflow_deny: bool = False                    # 已有运行中实例的防并发拒绝可无新 task
     t07_guard: bool = False                                       # T07 freshness 结构不变量检查
     timeout: int = 60
@@ -500,6 +505,96 @@ CASES: List[Case] = [
             "组长.{0,5}管理员.{0,5}才能",
         ],
     ),
+    # ─── T36 商品库 + 销量价格刷新（WS-98）─────────────────────────────────────
+    # fail-then-pass：旧路径可能只在 reply 里编短 task_id，或返回 task_id 但
+    # /api/tasks/{task_id} 查不到 agent_events。本 case 钉死原始同一句话：
+    # 成功项必须有真实任务证据；失败项必须显式报错，且 _safety 不应再加假宣称 banner。
+    Case(
+        name="T36: 刷新 ERP 商品库和销量价格（task_id 必须可回读）",
+        question=(
+            "run_id=HIPOP-DG-50-20260605-230000; case=T36. "
+            "请帮我刷新 ERP 商品库和销量价格，并返回后台任务号。"
+        ),
+        must_use_tools=["run_workflow"],
+        expected_workflows=["wf2_products_v2", "wf2_sales_v2"],
+        require_task_evidence=True,
+        must_not_warn=True,
+        timeout=120,
+    ),
+    Case(
+        name="T36 负控：询问 ERP 商品库和销量价格上次刷新时间（不得创建 wf2 任务）",
+        question="请问 ERP 商品库和销量价格上次是什么时候刷新过？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"已触发|已创建|后台任务号|任务\s*ID|run_workflow",
+        ],
+        must_not_warn=True,
+    ),
+    # T36 Round-3 负控（Luke 决策 a）：用户问「上次什么时候刷的 / 多久前刷的」
+    # 即使不带问号，也是在读刷新时间，不能被结构门当成肯定执行、不能创建 wf2 任务。
+    Case(
+        name="T36 负控4：无问号『上次什么时候刷新过』只读时间（不得创建 wf2 任务）",
+        question="ERP 商品库和销量价格上次什么时候刷新过",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|今天|\d+\s*天前|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"启动失败|已触发|已创建|后台任务号|任务\s*ID|run_workflow",
+        ],
+        must_not_warn=True,
+    ),
+    Case(
+        name="T36 负控5：无问号『多久前刷的』只读时间（不得创建 wf2 任务）",
+        question="ERP 商品库和销量价格多久前刷的",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[
+            r"商品库|ERP 商品",
+            r"销量价格|ERP 销量",
+            r"\d{4}-\d{2}-\d{2}|今天|\d+\s*天前|无记录|暂无|没有|无法",
+        ],
+        must_not_contain=[
+            r"启动失败|已触发|已创建|后台任务号|任务\s*ID|run_workflow|销量排行|销量榜|Top",
+        ],
+        must_not_warn=True,
+    ),
+    # T36 Round-2 负控（验门人红队洞）：非执行语气的「刷新 ERP 商品库和销量价格」必须
+    # 由 WS-145 结构门确定性短路给干净解释——tools_used=[]、不试 run_workflow、不渲染
+    # 「启动失败」、不被 _safety 标假活 banner。旧 PR(c5bad07) 关键词路由会渲染「启动
+    # 失败」；rebase 后的中间态会落到 LLM 去试 run_workflow（被拦但污染 tools_used + 触发
+    # _safety 警告）。这两条在 live server 上把整条端到端路径钉死，不靠 mock provider。
+    Case(
+        name="T36 负控2：询问句『能不能帮我刷新 ERP 商品库和销量价格?』（结构门干净回复，零工具）",
+        question="能不能帮我刷新 ERP 商品库和销量价格？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[r"本轮我先不动手|本轮不执行"],
+        must_not_contain=[
+            r"启动失败|run_workflow|已触发|已刷新|后台任务号",
+        ],
+        must_not_warn=True,
+    ),
+    Case(
+        name="T36 负控3：假设句『如果刷新 ERP 商品库和销量价格会怎样?』（只说明影响，零工具）",
+        question="如果刷新 ERP 商品库和销量价格会怎样？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[r"本轮不执行|本轮我先不动手|影响面"],
+        must_not_contain=[
+            r"启动失败|run_workflow|已触发|已刷新|后台任务号",
+        ],
+        must_not_warn=True,
+    ),
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
     # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
     # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的
@@ -742,7 +837,38 @@ def post_chat(opener: urllib.request.OpenerDirector, base_url: str, question: st
         return {"_error": f"{type(e).__name__}: {e}"}
 
 
-def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
+_EXPLICIT_WORKFLOW_FAILURE_RE = re.compile(
+    r"失败|未创建|没有创建|未能创建|触发失败|启动失败|执行失败|permission|denied|unknown|error",
+    re.IGNORECASE,
+)
+
+
+def check_task_evidence(opener: urllib.request.OpenerDirector, base_url: str,
+                        task_id: str, workflow: str) -> Optional[str]:
+    req = urllib.request.Request(
+        f"{base_url}/api/tasks/{urllib.parse.quote(task_id, safe='')}",
+        headers=_auth_headers(),
+    )
+    try:
+        with opener.open(req, timeout=15) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")[:200]
+        return f"task_id={task_id} /api/tasks HTTP {e.code}: {detail}"
+    except Exception as e:
+        return f"task_id={task_id} /api/tasks {type(e).__name__}: {e}"
+
+    task = body.get("task") or {}
+    events = body.get("events") or []
+    if task.get("workflow") != workflow:
+        return f"task_id={task_id} workflow 不匹配: {task.get('workflow')!r} != {workflow!r}"
+    if not events:
+        return f"task_id={task_id} 查无 agent_events（假活/任务证据缺失）"
+    return None
+
+
+def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] = None,
+          base_url: str = "") -> tuple[bool, List[str]]:
     """返回 (pass, reasons)。reasons 是失败原因列表，pass 时为空。"""
     reasons = []
 
@@ -761,6 +887,9 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     for t in c.must_use_tools:
         if t not in tools:
             reasons.append(f"未调用 tool: {t} (实际: {tools})")
+
+    if c.expected_tools is not None and tools != c.expected_tools:
+        reasons.append(f"tools_used 不匹配: {tools!r} != {c.expected_tools!r}")
 
     for kw in c.must_contain:
         if not re.search(kw, reply):
@@ -790,8 +919,55 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
                 f"选错 workflow: {wf_names!r}（应精确含 {c.expected_workflow!r}；"
                 "老 wf3 / 其它 v2 工作流都=选错）")
 
+    if c.expected_workflows:
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        for expected in c.expected_workflows:
+            found = next((t for t in wf_tasks if t.get("workflow") == expected), None)
+            if not found:
+                wf_names = [t.get("workflow", "?") for t in wf_tasks]
+                reasons.append(f"缺少 workflow 结果: {expected!r} (实际: {wf_names!r})")
+                continue
+
+            if found.get("ok") is False:
+                failure_text = " ".join([
+                    reply,
+                    str(found.get("error") or ""),
+                    str(found.get("message") or ""),
+                ])
+                if expected not in reply:
+                    reasons.append(f"{expected} 失败未在 reply 中点名（无法唯一定位失败项）")
+                if not _EXPLICIT_WORKFLOW_FAILURE_RE.search(failure_text):
+                    reasons.append(f"{expected} 失败未显式说明原因: {found}")
+                continue
+
+            task_id = found.get("task_id")
+            if not task_id:
+                reasons.append(f"{expected} 成功项缺 task_id: {found}")
+                continue
+            if c.require_task_evidence:
+                if opener is None or not base_url:
+                    reasons.append(f"{expected} 未执行 task evidence 回读检查（runner 未传 opener/base_url）")
+                else:
+                    err = check_task_evidence(opener, base_url, task_id, expected)
+                    if err:
+                        reasons.append(err)
+
+    if c.must_not_workflow_prefixes:
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        for wf_task in wf_tasks:
+            workflow = wf_task.get("workflow") or ""
+            blocked = next((p for p in c.must_not_workflow_prefixes if workflow.startswith(p)), None)
+            if blocked:
+                reasons.append(f"不应创建 workflow task: {workflow!r} 命中前缀 {blocked!r}")
+
     if c.must_warn and not warns:
         reasons.append("应被 _safety 标警告，但 hallucination_warnings 为空")
+    if c.must_not_warn and warns:
+        reasons.append(f"_safety 不应报警但 hallucination_warnings 非空: {warns}")
 
     if c.t07_guard:
         # T07 结构不变量：对运营销量查询，回复必须由真实数据支撑，禁模拟数。
@@ -1038,7 +1214,7 @@ def main():
         print(f"[{i}/{len(cases)}] {c.name} ", end="", flush=True)
         t = time.time()
         resp = post_chat(opener, args.url, c.question, c.store, c.timeout)
-        ok, reasons = check(c, resp)
+        ok, reasons = check(c, resp, opener, args.url)
         elapsed = time.time() - t
         if ok:
             passed += 1
