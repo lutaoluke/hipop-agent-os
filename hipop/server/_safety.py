@@ -337,6 +337,117 @@ def _check_fake_task_ids(reply: str, tool_log: list) -> List[str]:
     return warns
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# WS-146 假活硬切（hard-cut）—— 无真实任务证据时,把"已启动/已完成/已刷新/任务号/
+# accepted/SSE 进度"等假成功段从用户可见正文里**删除或替换成真相标注**,而不是只在
+# 头部贴 banner、把假成功文本原样留在正文(那正是本条要堵死的死法:安全门只贴警告、
+# 旧假成功文本仍保留;没有真实任务证据时仍允许假成功进入用户可见回复)。
+# ════════════════════════════════════════════════════════════════════════════
+
+# 替换后写入正文的真相标注（复用既有 promise_workflow 措辞,保持一致,且不含任何
+# 会被本组规则二次命中的假语素 → 逐句替换天然幂等）。
+_HARD_CUT_MARKER = "[本轮未创建刷新任务 / 未启动后台流程]"
+
+# 句内非边界字符（。/！/？/；/换行 之间为一句）。
+_SENT = r"[^。\n!?！？；;]*"
+
+# (a) 启动态 + 8 位任务号 + 前端假进度（上下文锚定,与既有 promise_workflow 硬切口径一致）。
+_PW_SENTENCE_PAT = re.compile(
+    r'[^。\n!？]*(?:'
+    r'[0-9a-f]{8}|前端会推送进度|'
+    r'(?:已触发|已启动|已开始|再次触发).{0,30}(?:工作流|库存|物流|刷新|任务|后台)|'
+    r'任务.{0,10}(?:提交|启动|在后台)'
+    r')[^。\n!？]*[。!？]?'
+)
+
+# (a2) 启动态：执行动作主语 + 启动语素（双向，覆盖"库存刷新已启动"这类**上下文在动词前**
+#      的说法 —— _PW_SENTENCE_PAT 只锚"动词在前、上下文在后"，会漏掉这类）。主语收窄到
+#      执行类动作词（库存/物流/刷新/同步/重算/销售周期/补货/工作流/扫描），启动语素不含
+#      过泛的"已开始"，避免误伤普通查询里的"库存周转已开始改善"。
+_STARTED_SENTENCE_PAT = re.compile(
+    _SENT + r"(?:库存|物流|刷新|同步|重算|重新计算|销售周期|补货|工作流|扫描)"
+    r"[^。\n!?！？；;]{0,10}"
+    r"(?:已启动|已触发|启动成功|已在[^。\n!?！？；;]{0,4}后台|已经在[^。\n!?！？；;]{0,4}(?:后台|跑))"
+    + _SENT + r"[。!?！？；;]?"
+)
+
+# (b) 完成态假成功（与 _DONE_CLAIM_RE 同口径 + "刷新/更新**已完成**"），整句替换。
+#     刷新/更新类必须带"完成"框（已完成/完毕/跑完），不命中"数据已更新到 2026-06-09"这种
+#     合法的时效陈述 —— 那是 freshness 事实，不是假任务声明。
+_DONE_SENTENCE_PAT = re.compile(
+    _SENT + r"(?:"
+    r"已重新计算|重算[^。\n!?！？；;]{0,5}(?:完|好|了)|跑完了|跑好了|"
+    r"(?:销售周期|补货)[^。\n!?！？；;]{0,15}(?:已完成|完成了|跑完)|"
+    r"任务[^。\n!?！？；;]{0,5}已完成|"
+    r"(?:刷新|更新|同步|重算|重新计算)[^。\n!?！？；;]{0,4}(?:已完成|完成了|完毕|已完毕)|"
+    r"已刷新完成|已更新完成|刷新已完成|更新已完成"
+    r")" + _SENT + r"[。!?！？；;]?"
+)
+
+# (c) accepted 状态 / SSE 假进度（T38 假任务证据），整句替换。
+_ACCEPTED_SENTENCE_PAT = re.compile(
+    _SENT + r"(?:"
+    r"(?:状态|status)[^。\n!?！？；;]{0,12}accepted|任务[^。\n!?！？；;]{0,20}accepted|"
+    r"SSE[^。\n!?！？；;]{0,20}(?:推送|进度|实时|订阅)|"
+    r"前端[^。\n!?！？；;]{0,10}(?:SSE|订阅|推送)[^。\n!?！？；;]{0,10}(?:进度|推送)"
+    r")" + _SENT + r"[。!?！？；;]?",
+    re.IGNORECASE,
+)
+
+_MARKER_DEDUP_RE = re.compile(r"(?:" + re.escape(_HARD_CUT_MARKER) + r"\s*){2,}")
+
+
+def _no_real_task_evidence(tools_used: Optional[list], tool_log: Optional[list]) -> bool:
+    """本轮是否缺真实后台任务证据（无 ok=True + task_id 的 run_workflow）。
+
+    判据（优先级,从强到弱）:
+      1. tool_log 里有 run_workflow ok=True + task_id → 有真实任务 → False(不硬切)。
+      2. tool_log 里有 run_workflow 条目但都不是成功+task_id（失败/未创建）→ True。
+      3. tool_log 无 run_workflow 条目,但 tools_used 含 run_workflow（调用形状未带进
+         tool_log,无法证伪）→ 保守视为有证据,不硬切 → False。
+      4. 两处都没有 run_workflow → 无证据 → True。
+    """
+    wf_entries = [t for t in (tool_log or []) if t.get("name") == "run_workflow"]
+    if any(t.get("ok") and t.get("task_id") for t in wf_entries):
+        return False
+    if wf_entries:
+        return True
+    if "run_workflow" in (tools_used or []):
+        return False
+    return True
+
+
+def _hard_cut_fake_activity(reply: str, tool_log: Optional[list]) -> str:
+    """逐句把假成功段替换成 `_HARD_CUT_MARKER`。只在 `_no_real_task_evidence` 为真时调用。
+
+    marker 自身不含任何假语素 → 重复替换/多规则叠加均幂等;普通查询回复不含这些锚定
+    语素 → 不被误删。
+    """
+    out = reply
+    out = _PW_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
+    out = _STARTED_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
+    out = _DONE_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
+    out = _ACCEPTED_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
+
+    # 残留的假任务号（未由 run_workflow 返回的 8 位十六进制）整句切掉。无真实任务时
+    # real_ids 为空集,任何被提及的 task_id 都是编造的。
+    real_ids = {
+        (t.get("task_id") or "").lower() for t in (tool_log or [])
+        if t.get("name") == "run_workflow" and t.get("task_id")
+    }
+    fake_ids = {m.lower() for m in _TASK_ID_MENTION_RE.findall(out)} - real_ids
+    for fid in fake_ids:
+        out = re.sub(
+            r"[^。\n!?！？；;]*" + re.escape(fid) + r"[^。\n!?！？；;]*[。!?！？；;]?",
+            _HARD_CUT_MARKER + " ", out, flags=re.IGNORECASE,
+        )
+
+    out = _MARKER_DEDUP_RE.sub(_HARD_CUT_MARKER + " ", out)
+    if out != reply and _HARD_CUT_MARKER not in out:
+        out = out.rstrip() + "\n" + _HARD_CUT_MARKER
+    return out.strip()
+
+
 # 声明对象 -> 能证明该对象被查询过的工具。不要用"任意数据工具"互相背书。
 _CLAIM_TOOL_MAP = {
     "product_sku": frozenset({"list_products", "query_sku"}),
@@ -686,17 +797,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "这是 hallucinate（实际没创建后台任务，请重发"
             "『帮我扫一下 ERP 物流』之类更明确的指令）"
         )
-        # 结构性清除：假任务号 / 假成功段 / 假前端进度 → 替换为真相标注
-        _pw_sentence_pat = re.compile(
-            r'[^。\n!？]*(?:'
-            r'[0-9a-f]{8}|前端会推送进度|'
-            r'(?:已触发|已启动|已开始|再次触发).{0,30}(?:工作流|库存|物流|刷新|任务|后台)|'
-            r'任务.{0,10}(?:提交|启动|在后台)'
-            r')[^。\n!？]*[。!？]?'
-        )
-        reply = _pw_sentence_pat.sub("[本轮未创建刷新任务 / 未启动后台流程] ", reply)
-        if "本轮未创建刷新任务" not in reply and "未启动后台流程" not in reply:
-            reply += "\n[本轮未创建刷新任务 / 未启动后台流程]"
+        # 启动态假成功段（假任务号 / 已触发 / 假前端进度）的硬切由文末统一的
+        # WS-146 _hard_cut_fake_activity 负责（无真实任务证据时整句删除/替换）。
 
     # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
     # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词
@@ -728,6 +830,13 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
                 "⚠️ Agent 宣称任务已完成，但仅有创建证据（run_workflow），无完成回读 — "
                 "假完成声明（T38）"
             )
+
+    # WS-146 假活硬切：本轮无真实任务证据（无 ok=True+task_id 的 run_workflow）时，把
+    # 上面各路检测命中的"已启动/已完成/已刷新/任务号/accepted/SSE 进度"假成功段从正文里
+    # **真删/真替换**，不只贴 banner。放在所有 run_workflow 类假活检测之后：警告已生成喂
+    # confidence，这里把正文里残留的假成功段切掉，堵死"安全门只贴警告、旧假成功文本仍保留"。
+    if _no_real_task_evidence(tools_used, tool_log):
+        reply = _hard_cut_fake_activity(reply, tool_log)
 
     # Chat 没有人类可依赖的"稍后自动回来通知/答复"承诺；任务进度只能看任务面板，
     # 或在完成后由用户重新提问。即使本轮真的调了 run_workflow，也不能把异步
