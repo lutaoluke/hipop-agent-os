@@ -407,6 +407,60 @@ def test_logistics_correct_row_binding_not_scrubbed():
     assert not [w for w in warns if "禁编承重墙" in w], warns
 
 
+# ── 路线 b Round-4：后置标签抢绑 / 长说明物流行 / 非库存单位误伤 ─────────────────────
+
+def test_stock_postfix_label_steal_scrubbed():
+    """打回点 1：后置标签抢绑——"总库存…是 200，义乌…是 509"，200 右侧先撞"义乌"被错绑放行。
+    改为只认本子句**前置**标签 → 200 归总库存(509) 删、509 归义乌(200) 删。含对称变体。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    for reply in (
+        "总库存这一项当前系统确认下来是 200 件，义乌这一项当前确认是 509 件。",
+        "义乌这一项确认是 509 件，总库存这一项确认是 200 件。",     # 对称：换序
+        "总库存当前确认是 200 件 义乌当前确认是 509 件。",          # 对称：无逗号同句
+    ):
+        out, warns = _sanitize(reply, ["query_stock_split"], tl)
+        body = _answer_body(out)
+        assert "是 200 件" not in body and "是 509 件" not in body, f"后置标签抢绑错值必删: {body}"
+        assert "总库存：509" in body and "义乌：200" in body, body
+        assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_logistics_long_explanation_correct_not_scrubbed():
+    """打回点 2：长说明插在货单与承运商之间，正确行不被误删（去 cap=40 + 顺序对齐）。"""
+    tl = _sku_live_two_orders()
+    reply = ("货单 PD2026001，经过这两天的物流跟踪和仓库多方确认核对，目前由 Aramex 承运；"
+             "另一个货单 PD2026002，根据系统最新回传的多条信息，目前由 SMSA 承运。")
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "[承运商未确认]" not in body, f"长说明下正确行不应被误删: {body}"
+    assert not [w for w in warns if "禁编承重墙" in w], warns
+
+
+def test_logistics_long_explanation_swap_scrubbed():
+    """打回点 2：长说明插队 + 承运商对调 → 仍按顺序对齐判错配并删（不因超距 fail-open 漏过）。"""
+    tl = _sku_live_two_orders()
+    reply = ("货单 PD2026001，经过这两天的物流跟踪和仓库多方确认核对，目前由 SMSA 承运；"
+             "另一个货单 PD2026002，根据系统最新回传的多条信息，目前由 Aramex 承运。")
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "[承运商未确认]" in body, f"长说明插队的承运商对调应被删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_nonstock_numbers_with_units_preserved():
+    """打回点 3：非库存单位数字（秒/%/天）+ 补货建议数字 不被"库存"语境吸入误删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = ("库存查询耗时 3 秒。SKU TBC0168A 总库存 509 件，近 30 天动销良好，"
+             "退货率占比 3.06%，建议补货 50 件。")
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "3 秒" in body, f"耗时 3 秒 不应删: {body}"
+    assert "30 天" in body, f"近 30 天 不应删: {body}"
+    assert "3.06%" in body, f"占比 3.06% 不应删: {body}"
+    assert "补货 50 件" in body, f"补货建议数字不应误拦: {body}"
+    assert "总库存 509" in body, f"正确总库存应保留: {body}"
+
+
 # ── 路线 b Round-3：fail-closed 兜底（非枚举连接词）+ 多货单同句按行绑定 ─────────────
 
 def test_stock_arbitrary_connector_misbinding_scrubbed():
@@ -500,6 +554,10 @@ TESTS = [
     test_stock_unbindable_number_fail_closed,
     test_stock_non_inventory_number_not_touched,
     test_logistics_multi_order_same_segment_swap_scrubbed,
+    test_stock_postfix_label_steal_scrubbed,
+    test_logistics_long_explanation_correct_not_scrubbed,
+    test_logistics_long_explanation_swap_scrubbed,
+    test_nonstock_numbers_with_units_preserved,
     test_both_providers_wire_factslot_evidence,
 ]
 

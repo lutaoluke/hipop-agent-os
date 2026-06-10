@@ -100,11 +100,15 @@ _STOCK_LABELS = [
     "待发货", "待发", "待发出", "待出库", "可售", "可用",
 ]
 
-# Round-3：库存数字改"标签驱动 + fail-closed"（不再枚举连接词）。
+# Round-3/4：库存数字改"标签驱动 + fail-closed"（不再枚举连接词）。
 # 纯数字 token（两侧非字母数字）—— 不吃 SKU/货单号里的数字（PD2026001 / TBC0168A）。
 _BARE_NUM_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])")
-# 数字紧跟的计量单位 → 这是个数量
+# 数字紧跟的库存计量单位 → 这是个库存数量
 _STOCK_UNIT_RE = re.compile(r"^\s*(?:件|个|箱|套|双|pcs|PCS|现货)")
+# 数字右侧的**明确非库存**指示（时间/百分比/货币/小数续位/日期分隔）→ 这数字不是库存量（Round-4 打回点 3）
+_NONSTOCK_RIGHT_RE = re.compile(r"^\s*(?:秒|%|％|‰|天|日(?![用])|号|月|年|周|小时|分钟|分|时|元|¥|\$|美元|次|页|倍|\.|．|:|：|-|/)")
+# 子句边界（库存数字只在"本子句的前置库存标签"下绑定，防下一个槽的标签隔句抢绑）
+_CLAUSE_DELIM_RE = re.compile(r"[。！？!?，,、；;\n（）()【】「」：:]")
 
 
 def _safety_detectors():
@@ -329,16 +333,15 @@ def scrub_fabricated_slots(
     """把 reply 正文里"工具没返回过"的承运商/运单号/数量/状态就地删掉。
 
     结构判别（非穷举词表）——四类事实槽都校验"值 + 绑定关系"，不只是"值出现过"：
-      - 物流按行绑定（路线 b Round-1/2）：**位置就近**把每个承运商/运单号绑到最近的货单号，
-        校验该行；真承运商/运单号挂错单（对调）→ 删。多货单同 segment 也逐 token 判，
-        不 fail-open 跳过。无就近货单的 token 交全局 scrub。
+      - 物流按行绑定（Round-4）：**出现顺序对齐**——第 i 个承运商/运单号绑第 i 个货单号
+        （不再用字符距离 cap，去掉超距回落全局 allow 的 fail-open，长说明插队也不漏/不误删）；
+        与货单对调即删；超出货单数的 token 不绑，交全局判编造（防一般罗列误删）。
       - 承运商：闭集实体命中但不在任何 forwarders allow-set → 完全编造 → 删。
       - 运单号：id 形 token，不在 tracking_nos/order_nos allow-set、也非被查 id / 问句 token → 删。
-      - 库存数量：**标签驱动 + fail-closed（Round-3）**——扫每个裸数字，看邻近库存标签：
-        标签∈bind → 数字必须 == 该槽绑定值否则删；库存语境（带单位 或 邻近标签）但绑不到
-        具体槽位 → fail-closed 删（**不再"值∈工具值集合即放行"**，那是被自然句绕过的根因）；
-        既无单位又无邻近标签 → 非库存语境数字（日期/百分比/天数）→ 不动。失败/空 → 全删。
-        仅在无成功物流查询时启用（避免误删物流"在途 N"计数）。
+      - 库存数量：**本子句前置标签绑定 + fail-closed（Round-4）**——每个数字只认它所在子句里、
+        它**前面**最近的库存标签（后一个槽的标签不许隔句抢绑）；右侧明确非库存（秒/%/天/小数/
+        日期）直接放行；标签∈bind → 必须==槽值否则删；标签 generic/失败空 → fail-closed 删；
+        子句无前置库存标签的数字（补货建议/一般数）→ 放行。仅在无成功物流查询时启用。
       - 状态：成功 → reply 状态桶必须 ∈ 工具状态桶（同桶同义放行、跨桶编造删，无法识别桶
         时 fail-open）；纯失败/空 → 删全部状态断言。
     allow-set / 绑定映射取所有"成功且有槽值"调用的并集，天然处理混合（A 成功 B 失败）场景。
@@ -409,49 +412,52 @@ def scrub_fabricated_slots(
     redacted = {"carrier": [], "id": [], "qty": 0, "status": 0}
 
     if logistics_called:
-        # ① 按行绑定校验（Round-1 打回点 2 + Round-2 收口）：用**位置就近**把每个承运商/运单号
-        #    绑到最近的货单号（货单号一般在前："货单 PDxxx 由 CARRIER"），校验该行绑定。
-        #    多货单同 segment 不再 fail-open 跳过——逐 token 按最近货单判定，承运商/运单对调
-        #    （真值挂错单）就删。无就近货单的 token 交全局 scrub。
+        # ① 按行绑定（Round-4 打回点 2）：用**出现顺序对齐**而非字符距离——第 i 个承运商/运单号
+        #    绑到第 i 个货单号。去掉 cap=40 超距回落全局 allow 的 fail-open（长说明插队漏过 /
+        #    误删正确行的根因）。承运商/运单与货单对调（真值挂错单）即删；超出货单数的 token
+        #    不绑（交全局判编造），避免把"另外合作的物流商有 X"这类一般罗列误删。
         if order_forwarders or order_tracking:
-            order_occ = []  # [(pos, order_no_norm)]
-            for on in (order_forwarders.keys() | order_tracking.keys()):
-                for mo in re.finditer(re.escape(on), reply, re.IGNORECASE):
-                    order_occ.append((mo.start(), on))
+            order_set = set(order_forwarders.keys()) | set(order_tracking.keys())
+            occ = sorted(
+                ((mo.start(), on) for on in order_set
+                 for mo in re.finditer(re.escape(on), reply, re.IGNORECASE)),
+                key=lambda x: x[0],
+            )
+            orders_seq, _seen = [], set()      # 货单号按首次出现顺序去重
+            for _p, on in occ:
+                if on not in _seen:
+                    _seen.add(on)
+                    orders_seq.append(on)
 
-            def _nearest_order(pc: int, cap: int = 40):
-                before = [(p, o) for p, o in order_occ if p <= pc and pc - p <= cap]
-                if before:
-                    return max(before, key=lambda x: x[0])[1]
-                after = [(p, o) for p, o in order_occ if p > pc and p - pc <= cap]
-                if after:
-                    return min(after, key=lambda x: x[0])[1]
-                return None
+            _ci = [0]
 
             def _c_row_sub(m: re.Match) -> str:
-                val = m.group(0)
-                nv = _norm(val)
-                on = _nearest_order(m.start())
-                if on is None:
-                    return val                            # 无就近货单 → 交全局
-                allowed = order_forwarders.get(on, set())
+                i = _ci[0]
+                _ci[0] += 1
+                if i >= len(orders_seq):
+                    return m.group(0)                     # 超出货单数 → 不绑，交全局
+                allowed = order_forwarders.get(orders_seq[i], set())
+                nv = _norm(m.group(0))
                 if allowed and nv not in allowed and nv in carrier_allow:
-                    redacted["carrier"].append(val)       # 真承运商挂错单 → 删
+                    redacted["carrier"].append(m.group(0))   # 真承运商挂错单（顺序对调）→ 删
                     return _REDACT_CARRIER
-                return val
+                return m.group(0)
             reply = carrier_re.sub(_c_row_sub, reply)
+
+            _ti = [0]
 
             def _t_row_sub(m: re.Match) -> str:
                 tok = m.group(0)
                 up = _norm(tok)
-                if up in (order_forwarders.keys() | order_tracking.keys()):
-                    return tok                            # 这本身是货单号
-                on = _nearest_order(m.start())
-                if on is None:
+                if up in order_set:
+                    return tok                            # 这本身是货单号，不计入运单序列
+                i = _ti[0]
+                _ti[0] += 1
+                if i >= len(orders_seq):
                     return tok
-                bound_t = order_tracking.get(on)
-                if up != bound_t and up in tracking_allow:
-                    redacted["id"].append(tok)            # 真运单号挂错单 → 删
+                bound_t = order_tracking.get(orders_seq[i])
+                if bound_t and up != bound_t and up in tracking_allow:
+                    redacted["id"].append(tok)            # 真运单号挂错单（顺序对调）→ 删
                     return _REDACT_ID
                 return tok
             reply = id_re.sub(_t_row_sub, reply)
@@ -486,45 +492,47 @@ def scrub_fabricated_slots(
         if e.get("tool") in _STOCK_TOOLS and e.get("ok") and e.get("has_stock_value"):
             for kw, v in (e.get("stock_bind") or {}).items():
                 stock_bind[kw] = v
-    # ── 库存数量：标签驱动 + fail-closed（Round-3 打回点 1，根因在 fail-open 兜底）──────
-    # 不再枚举连接词，也不再"数字∈工具值集合即放行"。规则：
-    #   · 扫描每个裸数字（两侧非字母数字，避开 SKU/货单号里的数字）；
-    #   · 看它前后窗口里最近的库存标签：标签 ∈ bind → 数字必须 == 该槽绑定值，否则删；
-    #   · 是库存语境数字（带计量单位 或 邻近库存标签）但无法绑定到具体槽位 → fail-closed 删；
-    #   · 既无单位又无邻近标签 → 非库存语境数字（日期/百分比/天数）→ 不动（防误拦）。
-    # 失败/空分支 stock_bind 为空 → 所有库存语境数字一律删。权威块仍渲染正确绑定值。
+    # ── 库存数量：子句内"前置标签"绑定 + fail-closed（Round-4 打回点 1+3）────────────────
+    # 关键改动（不枚举连接词）：
+    #   · 每个数字只认**它所在子句里、它前面**最近的库存标签做绑定（后面那个槽的标签不许隔
+    #     着抢绑——这是"总库存…是 200，义乌…是 509"里 200 被义乌抢绑漏过的根因）；
+    #   · 数字右侧是明确非库存指示（秒/%/天/日期/小数续位）→ 直接放行，不被"库存"二字吸入
+    #     （"库存查询耗时 3 秒"的 3 不删）；
+    #   · 该数字所在子句**有库存标签**才进绑定/兜底：标签∈bind → 必须==槽值否则删；标签是
+    #     generic（库存/现货）或失败空 → fail-closed 删。子句**没有库存标签**的数字（补货建议
+    #     "建议补 50 件"、一般数字）→ 放行，防误拦。失败/空分支 stock_bind 空 → 标签子句数字全删。
     _detect_labels = sorted(set(_STOCK_LABELS) | set(stock_bind.keys()), key=len, reverse=True)
     if stock_called and not logistics_proven:
-        _W = 10
-
-        def _nearest_stock_label(left: str, right: str):
-            best, best_dist = None, 10 ** 9
+        def _clause_preceding_label(full: str, s: int):
+            cd = list(_CLAUSE_DELIM_RE.finditer(full, 0, s))
+            cstart = cd[-1].end() if cd else 0
+            clause_before = full[cstart:s]      # 本子句、数字之前的文本
+            # 取"结束位置最靠近数字"的前置标签；结束位置相同（如"总库存"含"库存"）取更长的，
+            # 防 generic 子串标签把具体槽标签抢走。
+            best, best_key = None, (-1, -1)
             for k in _detect_labels:
-                i = left.rfind(k)               # 标签在数字之前（取最靠近末尾的）
-                if i >= 0:
-                    d = len(left) - (i + len(k))
-                    if d < best_dist:
-                        best, best_dist = k, d
-            for k in _detect_labels:
-                i = right.find(k)               # 标签在数字之后（取最靠近开头的）
-                if i >= 0 and i < best_dist:
-                    best, best_dist = k, i
+                i = clause_before.rfind(k)
+                if i < 0:
+                    continue
+                key = (i + len(k), len(k))
+                if key > best_key:
+                    best, best_key = k, key
             return best
 
         def _qty_sub(m: re.Match) -> str:
             s, e, full = m.start(), m.end(), m.string
-            left, right = full[max(0, s - _W):s], full[e:e + _W]
-            has_unit = bool(_STOCK_UNIT_RE.match(right))
-            label = _nearest_stock_label(left, right)
-            if label is None and not has_unit:
-                return m.group(0)               # 非库存语境数字 → 不动
-            bound = stock_bind.get(label) if label is not None else None
+            if _NONSTOCK_RIGHT_RE.match(full[e:e + 4]):
+                return m.group(0)               # 秒/%/天/小数/日期 → 非库存量，放行
+            label = _clause_preceding_label(full, s)
+            if label is None:
+                return m.group(0)               # 本子句无前置库存标签 → 非库存槽数字，放行
+            bound = stock_bind.get(label)
             if bound is not None:
                 if int(m.group(0)) == bound:
                     return m.group(0)           # 值-槽绑定正确 → 放行
                 redacted["qty"] += 1
                 return _REDACT_QTY              # 跨槽搬运（值真关系假）→ 删
-            redacted["qty"] += 1                # 库存语境但绑不到槽 → fail-closed 删
+            redacted["qty"] += 1                # 库存标签子句但绑不到具体槽 → fail-closed 删
             return _REDACT_QTY
         reply = _BARE_NUM_RE.sub(_qty_sub, reply)
 
