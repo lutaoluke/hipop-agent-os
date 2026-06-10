@@ -102,17 +102,28 @@ def count_module_string_consts(src: str):
 
     纯静态解析，不 import agent.py（避免依赖 anthropic 等重运行时）。字节量按
     赋值右值的源码片段长度计，撑大已有 prompt（删空行抵消行数）也会被字节预算抓到。
+
+    同时覆盖普通赋值 `NAME = "..."`（ast.Assign）与带类型标注的赋值
+    `NAME: str = "..."`（ast.AnnAssign）—— 否则 typed prompt 常量可绕过本棘轮
+    （验门人 PR #105 复验复现的真实绕过口）。
     """
     tree = ast.parse(src)
     count = 0
     total_bytes = 0
     for node in tree.body:  # 仅模块级
+        # NAME = "..."（可多目标）
         if isinstance(node, ast.Assign) and _is_string_value(node.value):
             seg = ast.get_source_segment(src, node.value) or ""
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     count += 1
                     total_bytes += len(seg)
+        # NAME: type = "..."（annotated；value 为 None 的纯标注不计）
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+              and isinstance(node.target, ast.Name) and _is_string_value(node.value)):
+            seg = ast.get_source_segment(src, node.value) or ""
+            count += 1
+            total_bytes += len(seg)
     return count, total_bytes
 
 
@@ -261,6 +272,15 @@ def test_prompt_constant_budget():
     assert c2 == count + 1, "prompt 检测器自检失败：新增 prompt 常量个数未被计入（行数门挡不住的绕过口）"
     assert b2 > total, "prompt 检测器自检失败：新增 prompt 常量字节量未增"
 
+    # detector self-test A2：typed annotated 常量 `NAME: str = "..."` 同样必须被计入。
+    # 验门人 PR #105 复验复现的绕过口——旧版只看 ast.Assign，typed 常量逃逸（仍 5/11735）。
+    added_typed = src + '\n\nFAKE_REGRESS_PROMPT: str = "你是一个 typed 塞回来的业务 prompt"\n'
+    c2t, b2t = count_module_string_consts(added_typed)
+    assert c2t == count + 1, (
+        "prompt 检测器自检失败：typed annotated prompt 常量(NAME: str = ...)未被计入 "
+        "—— 即 SYSTEM_PROMPT_NEW: str = ... + 删空行 的绕过口（验门人复验红）。")
+    assert b2t > total, "prompt 检测器自检失败：typed prompt 常量字节量未增"
+
     # detector self-test B：撑大已有 prompt（不新增常量、不加净行）→ 字节量必须增
     grown = src.replace("SYSTEM_PROMPT_LEGACY", "SYSTEM_PROMPT_LEGACY", 1)  # noop 保险
     grown = re.sub(r'(_OFFER_LINE\s*=\s*)"[^"]*"',
@@ -270,7 +290,7 @@ def test_prompt_constant_budget():
         assert b3 > total, "prompt 检测器自检失败：撑大已有常量字节量未被识别"
 
     print(f"  ✓ prompt 常量棘轮：{count} 个 / {total} 字节 ≤ 基线 {PROMPT_CONST_COUNT_BUDGET} 个 / "
-          f"{PROMPT_CONST_BYTES_BUDGET} 字节（自检：新增常量 + 撑大常量两种回潮均被识别）")
+          f"{PROMPT_CONST_BYTES_BUDGET} 字节（自检：新增常量 / typed 常量 / 撑大常量三种回潮均被识别）")
 
 
 def test_destructive_funnel_no_bypass():
