@@ -3,6 +3,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 jinja2>=3.1
 python-multipart>=0.0.9     # FastAPI form / file upload
+apscheduler>=3.10           # 每日自动刷新 scheduler
 requests>=2.31
 websocket-client>=1.7        # ERP token 抓取（绕开 playwright）
 playwright>=1.40             # ERP token 兜底路径

@@ -93,6 +93,95 @@ _STALE_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# WS-133 Round-3: 物流编造声明检测器
+# Rule B/D（货单/SKU 未找到——确定性结论）：捡拾在途声明 AND 否定旁路借口
+# "只是延迟/同步慢" 在 not-found 语境下是隐含"货单其实存在"的旁路声明。
+_NOT_FOUND_FABRICATION_RE = re.compile(
+    r"当前.{0,3}在途|已在途|目前在途"    # 正向在途声明
+    r"|在途\s*\d+\s*件?"                # 具体在途数量
+    r"|预计.{0,8}(?:到仓|到货|到达)"    # 预计到货
+    r"|货代.{0,3}为\s*\S+"              # 货代已分配
+    r"|只是.{0,8}(?:延迟|慢|同步)"      # 旁路借口（暗示货单存在只是延迟）
+    r"|当前.{0,5}(?:没有|无).{0,3}在途" # 编造"无在途"结论
+    r"|没有在途库存"
+)
+
+# Rule F2/H/F（查询出错——结果不确定）：同上但不含旁路借口
+# 查询失败时说"只是网络延迟，请重试"是合理的，不应触发警告。
+_ERROR_FABRICATION_RE = re.compile(
+    r"当前.{0,3}在途|已在途|目前在途"
+    r"|在途\s*\d+\s*件?"
+    r"|预计.{0,8}(?:到仓|到货|到达)"
+    r"|货代.{0,3}(?:为|是)\s*\S+"
+    r"|跟踪号.{0,3}(?:是|为)\s*\S+"
+    r"|当前.{0,5}(?:没有|无).{0,3}在途"
+    r"|没有在途库存"
+    r"|没有在途"
+    r"|(?:状态|库存|一切|都).{0,4}正常"          # 状态/库存/一切正常 等积极结论
+    r"|预计.{0,8}(?:到仓|到货|到达|送达|送到|签收|抵达)"  # ETA 同义扩展
+    r"|已\s*(?:发货|发出|揽收|签收|出库|发运|送达)"        # 已发货/已签收 等完成态
+)
+
+# ── WS-133 Round-5：结构判别（取代逐句加词的黑名单）─────────────────────────────
+# 教训（WS-55/WS-128 + 本 PR 前 4 轮）：对自由中文逐句枚举"编造措辞"永不收敛——
+# 红队每轮换同义词就能绕（货代为→货代是→物流商是→走的是…）。
+# 改为按"失败的查询不可能产生的确定结果"的【形状 + 闭集实体】判别：
+#   1) id 形 token（跟踪号/别的单号）且不等于被查询 id —— 失败查询拿不到新 id；
+#   2) 承运商闭集命中 —— 货代是有限现实实体，枚举=领域建模，非穷举措辞；
+#   3) 具体数量（N 件 / 在途 N）；
+#   4) 既有语义断言短语（在途/ETA/状态正常…，见 _ERROR_FABRICATION_RE）。
+
+# 真实承运商/货代闭集（有限现实域实体）
+_CARRIERS_CN = ["顺丰", "圆通", "中通", "申通", "韵达", "百世", "极兔",
+                "德邦", "京东", "邮政", "菜鸟", "跨越", "宅急送"]
+_CARRIERS_EN = ["EMS", "YTO", "STO", "ZTO", "YUNDA", "DHL", "UPS",
+                "FEDEX", "TNT", "ARAMEX", "SMSA", "DPD", "GLS"]
+_CARRIER_RE = re.compile(
+    "|".join(re.escape(c) for c in _CARRIERS_CN)
+    + "|" + "|".join(rf"\b{re.escape(c)}\b" for c in _CARRIERS_EN),
+    re.IGNORECASE,
+)
+# id 形 token：≥2 字母后接 ≥3 数字（YT123456 / SF123 / YT888），或 ≥8 位纯数字（长跟踪号）
+_ID_TOKEN_RE = re.compile(r"\b[A-Za-z]{2,}\d{3,}[A-Za-z0-9]*\b|\b\d{8,}\b")
+# 具体数量声明（物流/库存语境）
+_QTY_RESULT_RE = re.compile(
+    r"\d+\s*(?:件|个|箱|pcs|现货)"
+    r"|(?:在途|在库|现货|库存)\s*\d+",
+    re.IGNORECASE,
+)
+
+# Rule I: workflow failure false-success claims.
+# Keep the broad "already triggered/started/submitted" claims, but scope
+# "processing" language so honest failure text such as "不会继续处理" or
+# "请到后台处理" does not look like a backend-success promise.
+_WF_FALSE_SUCCESS_CLAIM_RE = re.compile(
+    r"(已触发|已启动|已开始|任务已.{0,5}(创建|提交|启动|运行)|"
+    r"已为.{0,5}(你|您).{0,5}触发|系统已经在.{0,5}后台|后台.{0,5}(跑|运行)了|"
+    r"(?:系统|后台)(?![^。；\n!?]{0,6}(?:不|不会|不能|无法|未|没)).{0,10}(会|将).{0,10}(继续|处理)|"
+    r"(?:系统|后台).{0,10}(?:自动|正在).{0,5}处理|已安排.{0,10}处理|"
+    r"会.{0,4}继续.{0,4}(?:帮你)?处理|将继续.{0,5}处理)"
+)
+_WF_NON_SUCCESS_PROCESSING_RE = re.compile(
+    r"(?:"
+    r"(?:不会|不能|无法|未|没|不再).{0,4}继续.{0,4}处理"
+    r"|不\s*继续.{0,4}处理"
+    r"|请.{0,4}到后台.{0,4}处理"
+    r"|到后台.{0,4}处理"
+    r"|(?:人工|手动).{0,4}处理"
+    r")"
+)
+
+
+def _workflow_failure_claims_success(reply: str) -> bool:
+    """Return True when a failed workflow reply still promises backend success."""
+    for part in re.split(r"[。；\n!?！？]", reply or ""):
+        if not _WF_FALSE_SUCCESS_CLAIM_RE.search(part):
+            continue
+        scrubbed = _WF_NON_SUCCESS_PROCESSING_RE.sub("", part)
+        if _WF_FALSE_SUCCESS_CLAIM_RE.search(scrubbed):
+            return True
+    return False
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -497,6 +586,30 @@ def _get_tool_arg(t: dict, key: str):
     return (args.get(key) or "") if isinstance(args, dict) else ""
 
 
+def _has_fabricated_result(reply: str, failed_entries: list) -> bool:
+    """实时查询/登录失败且无数据时，回复出现「失败查询不可能产生」的确定结果即判编造。
+
+    结构判别（非穷举措辞），见 _CARRIER_RE / _ID_TOKEN_RE / _QTY_RESULT_RE 注释。
+    被查询 id 本身在失败说明里复述是合法的（"货单 PD-X 查询失败"），需排除。
+    """
+    if _ERROR_FABRICATION_RE.search(reply) or _CARRIER_RE.search(reply) \
+            or _QTY_RESULT_RE.search(reply):
+        return True
+    # 被查询 id 集合（order_no / sku）——合法复述，从 id 形检测里剔除
+    qids = set()
+    for t in (failed_entries or []):
+        for k in ("order_no", "sku"):
+            v = _get_tool_arg(t, k)
+            if v:
+                qids.add(str(v).strip().upper())
+    for m in _ID_TOKEN_RE.finditer(reply):
+        tok = m.group(0).upper()
+        if any(tok == q or tok in q or q in tok for q in qids):
+            continue  # 复述被查询 id，放行
+        return True  # 出现新的 id 形 token = 失败查询编造出的结果
+    return False
+
+
 def _stale_query_skus(tool_log: list) -> List[str]:
     skus: List[str] = []
     for t in (tool_log or []):
@@ -815,9 +928,15 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_order_live"
         and t.get("result_error") == "order_not_found_in_erp"
     ]
-    if order_not_found_entries and not re.search(
-        r"(未找到|不存在|无物流|找不到|无记录|没有.{0,5}找到|该货单.{0,10}(不|无)|ERP.*无记录|核实货单号)",
-        reply,
+    if order_not_found_entries and (
+        # 有正向编造声明（含旁路借口）→ 不论回复是否同时说了"未找到"都要拦截
+        _NOT_FOUND_FABRICATION_RE.search(reply)
+        or not re.search(
+            # (?<!不是) 防止"不是不存在"绕过；其他否定否定模式已由上方
+            # _NOT_FOUND_FABRICATION_RE 中的正向声明检测兜底。
+            r"(未找到|(?<!不是)不存在|无物流|找不到|无记录|没有.{0,5}找到|ERP.*无记录|核实货单号)",
+            reply,
+        )
     ):
         order_nos = [_get_tool_arg(t, "order_no") for t in order_not_found_entries]
         order_str = "、".join(filter(None, order_nos)) or "该货单"
@@ -867,9 +986,12 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "query_sku_live"
         and t.get("result_error") == "sku_no_orders_in_erp"
     ]
-    if sku_not_found_entries and not re.search(
-        r"(未找到|不存在|无货单|找不到|无记录|没有.{0,5}找到|该SKU.{0,10}(不|无)|ERP.*无记录|无在途|核实.*SKU)",
-        reply,
+    if sku_not_found_entries and (
+        _NOT_FOUND_FABRICATION_RE.search(reply)
+        or not re.search(
+            r"(未找到|(?<!不是)不存在|无货单|找不到|无记录|没有.{0,5}找到|ERP.*无记录|无在途|核实.*SKU)",
+            reply,
+        )
     ):
         sku_nos = [_get_tool_arg(t, "sku") for t in sku_not_found_entries]
         sku_str = "、".join(filter(None, sku_nos)) or "该 SKU"
@@ -914,6 +1036,138 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         reply = sentence_pat_tracking.sub(
             "[⚠️ 被 _safety 拦掉：未调物流查询工具，不许假称正在查跟踪号] ",
             reply,
+        )
+
+    # ── WS-133 全局禁编门：实时源失败 / 工作流失败 必须明说原因 ──────────────────────
+
+    # Rule F: query_order_live 返回 erp_login_failed_no_cache（ERP 登录失败，单货单无缓存）
+    # reply 必须说明 ERP 失败和无缓存；否则用户以为可以稍等，实际上根本没数据。
+    order_erp_login_failed = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "erp_login_failed_no_cache"
+    ]
+    if order_erp_login_failed and (
+        # 即使回复开头已说明 ERP 登录失败/无缓存，后缀只要再出现「失败查询不可能产生」
+        # 的确定结果（id 形跟踪号 / 承运商 / 数量 / 在途·ETA·状态正常…）仍须告警 —
+        # Round-5：结构判别（_has_fabricated_result），取代逐句加词的黑名单（洞F 收口）。
+        _has_fabricated_result(reply, order_erp_login_failed)
+        or not re.search(
+            r"(ERP.{0,10}(失败|登录|无法)|实时.{0,5}失败|登录.{0,5}失败|查询失败|无缓存|没有缓存|暂时无法)",
+            reply,
+        )
+    ):
+        order_nos = [_get_tool_arg(t, "order_no") for t in order_erp_login_failed]
+        order_str = "、".join(filter(None, order_nos)) or "该货单"
+        erp_fail_prefix = (
+            f"**ERP 实时查询失败（{order_str}）**：ERP 登录失败，单货单查询无缓存兜底。"
+            "请稍后重试，或改用 query_sku_live 查 SKU 级缓存。\n\n"
+        )
+        reply = erp_fail_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live({order_str}) 返回 erp_login_failed_no_cache，"
+            "回复未说明 ERP 失败和无缓存，已自动补充（WS-133 Rule F）"
+        )
+
+    # Rule F2: query_order_live 返回 order_lookup_unavailable_no_erp_credentials
+    # （ERP 账号未配置，与 erp_login_failed 不同）— reply 不得编造货单在途状态。
+    order_no_credentials = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_order_live"
+        and t.get("result_error") == "order_lookup_unavailable_no_erp_credentials"
+    ]
+    if order_no_credentials and (
+        # 即使回复开头已说明 ERP 未配置，后缀出现编造结果仍须拦截（Round-5 结构判别）
+        _has_fabricated_result(reply, order_no_credentials)
+        or not re.search(
+            r"(ERP.{0,10}(未配置|无配置|没配置|账号|凭据|credentials)|配置.{0,5}dbuyerp"
+            r"|无法确认|ERP.{0,5}(失败|不可用)|账号未配|暂无凭据)",
+            reply,
+        )
+    ):
+        order_nos2 = [_get_tool_arg(t, "order_no") for t in order_no_credentials]
+        order_str2 = "、".join(filter(None, order_nos2)) or "该货单"
+        no_cred_prefix = (
+            f"**无法查询货单 {order_str2}**：本店铺 ERP 账号未配置，"
+            "无法确认该货单是否存在。请先配置 dbuyerp 后重试。\n\n"
+        )
+        reply = no_cred_prefix + reply
+        warnings.append(
+            f"⚠️ query_order_live({order_str2}) 返回 order_lookup_unavailable_no_erp_credentials，"
+            "回复未说明 ERP 账号未配置，已自动补充（WS-133 Rule F2）"
+        )
+
+    # Rule G: query_sku_live 返回实时失败 + 回退缓存（result_keys 含 live_query_failed_reason）
+    # reply 必须告知用户数据来自 wf3 缓存，不是实时；否则用户误以为是实时数据。
+    sku_live_failed_cache = [
+        t for t in (tool_log or [])
+        if t.get("name") == "query_sku_live"
+        and "live_query_failed_reason" in (t.get("result_keys") or [])
+    ]
+    if sku_live_failed_cache and not re.search(
+        r"(ERP.{0,10}失败|实时.{0,10}失败|缓存.{0,5}数据|wf3.{0,5}缓存|非实时|来自.{0,5}缓存"
+        r"|登录.{0,5}失败|实时拉失败|缓存版本)",
+        reply,
+    ):
+        sku_strs = [_get_tool_arg(t, "sku") for t in sku_live_failed_cache]
+        sku_str = "、".join(filter(None, sku_strs)) or "该 SKU"
+        live_fail_prefix = (
+            f"**⚠️ {sku_str} ERP 实时查询失败，以下数据来自 wf3 缓存（非实时）**："
+            "ERP 登录失败，已回退到缓存数据。若需准确实时数据请稍后重试。\n\n"
+        )
+        reply = live_fail_prefix + reply
+        warnings.append(
+            f"⚠️ query_sku_live({sku_str}) ERP 实时失败（live_query_failed_reason），"
+            "回复未标注为缓存数据，已自动补充（WS-133 Rule G）"
+        )
+
+    # Rule H: query_sku_live 或 query_order_live 返回 erp_fetch_error（网络/接口异常）
+    # reply 必须说明查询失败；否则 Agent 可能用旧数据或编默认值。
+    erp_fetch_errors = [
+        t for t in (tool_log or [])
+        if t.get("name") in ("query_sku_live", "query_order_live")
+        and (t.get("result_error") or "").startswith("erp_fetch_error")
+    ]
+    if erp_fetch_errors and (
+        # 即使回复已说明查询失败，后缀出现编造结果仍须拦截（Round-5 结构判别）
+        _has_fabricated_result(reply, erp_fetch_errors)
+        or not re.search(
+            r"(查询失败|ERP.{0,5}(失败|异常)|实时.{0,5}失败|获取失败|抓取失败|接口.{0,5}失败"
+            r"|网络.{0,5}(错误|异常)|请求失败|暂时无法.{0,5}(查|获取)|无法查询)",
+            reply,
+        )
+    ):
+        items = [
+            _get_tool_arg(t, "order_no") or _get_tool_arg(t, "sku")
+            for t in erp_fetch_errors
+        ]
+        item_str = "、".join(filter(None, items)) or "该查询"
+        fetch_fail_prefix = (
+            f"**ERP 查询异常（{item_str}）**：实时接口请求失败，当前无法获取数据。"
+            "请稍后重试。\n\n"
+        )
+        reply = fetch_fail_prefix + reply
+        warnings.append(
+            f"⚠️ ERP 查询异常 erp_fetch_error（{item_str}），"
+            "回复未说明失败原因，已自动补充（WS-133 Rule H）"
+        )
+
+    # Rule I: run_workflow 被调用但返回 ok=False（工作流创建失败），
+    # reply 不得宣称"已触发/任务已创建/已启动" — 这是假成功声明。
+    # 注意：仅在 run_workflow 有 result_error 时才检查（ok=True 时 result_error=None）。
+    wf_failed_entries = [
+        t for t in (tool_log or [])
+        if t.get("name") == "run_workflow"
+        and t.get("result_error")  # ok=False → result dict 有 "error" key
+    ]
+    # 不设"已说失败"豁免——"虽然刚才失败，但现在已触发"类混淆句 既提失败又宣称成功，
+    # 属于更严重的编造；合法的失败回复（"触发失败，请重试"）不含成功声明词，不匹配此检查。
+    if wf_failed_entries and _workflow_failure_claims_success(reply):
+        wf_names = [_get_tool_arg(t, "workflow") for t in wf_failed_entries]
+        wf_str = "、".join(filter(None, wf_names)) or "工作流"
+        warnings.append(
+            f"⚠️ run_workflow({wf_str}) 返回失败（{wf_failed_entries[0].get('result_error', '')[:60]}），"
+            "但回复宣称已触发/已启动 — 这是假成功声明（WS-133 Rule I）"
         )
 
     if warnings:
