@@ -1,0 +1,38 @@
+name: gate-chat-coverage
+# harness 门2(交付门)· WS-154 验收 #2 的机械化:
+#   「改了用户可见 chat 行为(或其生产路径)的 PR,close 前必须声明对应 chat smoke」。
+# 口径(规划小队 2026-06-10 收口,写入 issue metadata):每个 PR 收尾正文必须含一行
+#     chat smoke: <smoke 名/命令>      # 改了 chat 行为 → 指向钉死它的 smoke
+#   或
+#     chat smoke: N/A — <一句话理由>   # 非 chat 改动 → 显式声明 + 理由
+#   缺行 / 弱 N/A(无理由)→ 这道 check 红 → 设为 required 即拦合并。
+#   「这次到底算不算改了 chat 行为 / N/A 站不站得住」= 验门人裁量(口径授权打回弱 N/A),不在此硬判。
+#   行为文件 / 判定细节集中在 tests/ws154_chat_coverage_gate.py,规划小队可继续细化。
+#
+# 安全:纯确定性 —— 读 PR 正文 + 正则判定,零 secret / 零 live 凭据 / 零 DB / GitHub-hosted,
+#   fork PR 也能安全跑,不存在凭据外泄面(对照被撤掉的 self-hosted live gate)。
+
+on:
+  pull_request:
+    branches: [main]
+    # edited:作者补 `chat smoke:` 声明行后,改 PR 正文也要重跑这道门(否则改了 body 不重判,门一直红)。
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  chat-smoke-declared:
+    name: chat 覆盖门(PR 必须声明 chat smoke 归属)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Gate — PR 正文必须声明 chat smoke
+        env:
+          # 把 PR 正文透进环境变量;脚本读它校验 `chat smoke:` 声明行。
+          WS154_PR_BODY: ${{ github.event.pull_request.body }}
+        # python 真实执行,违例 exit 1 → job 红;不加 `|| true`、无 continue-on-error。
+        run: python tests/ws154_chat_coverage_gate.py
