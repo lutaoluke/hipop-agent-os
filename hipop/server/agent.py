@@ -3139,7 +3139,10 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
 
 def _deterministic_multi_workflow_request(question: str) -> List[Dict[str, str]]:
     q = (question or "").lower()
-    if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新")):
+    # WS-145 肯定执行意图门同样约束多 workflow 路由。非执行语气
+    # （能不能/如果/影响面/否定）不能先试 run_workflow 再把门的拒绝渲染成「启动失败」。
+    from . import _execution_intent_gate as _intent_gate
+    if not _intent_gate.enters_execution(question or ""):
         return []
     if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
                                  "重跑", "重新计算")):
@@ -3160,21 +3163,19 @@ def _deterministic_multi_workflow_request(question: str) -> List[Dict[str, str]]
 
 def _deterministic_erp_refresh_time_request(question: str) -> bool:
     q = (question or "").lower()
+    from . import _execution_intent_gate as _intent_gate
+    gate_decision = _intent_gate.evaluate(question or "")
+    if gate_decision.enters_execution:
+        return False
     if "erp" not in q:
         return False
-    if not any(v in q for v in ("刷新", "更新", "同步", "刷新过", "更新过", "同步过")):
+    if not (gate_decision.has_refresh_trigger or any(v in q for v in ("更新", "刷新过", "更新过", "同步过"))):
         return False
     has_time_question = any(x in q for x in (
         "上次", "什么时候", "多久前", "几天前", "哪天", "何时", "最近一次",
         "刷新时间", "更新时间", "刷新过", "更新过",
     ))
     if not has_time_question:
-        return False
-    # 明确执行短语仍交给 workflow router；"请问/想问"不算执行。
-    if any(x in q for x in (
-        "帮我刷新", "请刷新", "刷新一下", "刷一下", "帮我同步", "同步一下",
-        "跑一下", "拉一下", "重算", "触发", "启动", "创建", "执行",
-    )):
         return False
     wants_products = "商品库" in q or any(k in q for k in ("商品", "产品"))
     wants_sales_price = "销量价格" in q or ("销量" in q and "价格" in q)
