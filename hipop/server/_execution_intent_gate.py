@@ -118,8 +118,18 @@ _TXN_BATCH_RISK_RE = re.compile(_TXN_BATCH_RISK)
 # 外部通知段复用 _EXTERNAL_NOTIFY（与 notify_via_feishu schema 对齐），单一来源。
 _HIGH_RISK_RE = re.compile(_TXN_BATCH_RISK + "|" + _EXTERNAL_NOTIFY)
 
-# 飞书/外部主动通知动作（与 _EXTERNAL_NOTIFY 同源，单独编译供 WS-150 确定性拒绝判定）。
-_FEISHU_NOTIFY_RE = re.compile(_EXTERNAL_NOTIFY)
+# WS-150 收敛（码长 Round-2 口径）：把「外部通知」拆成两个互不吞的子集 ——
+#   (1) 显式飞书渠道 / 群广播 → 工作台做不到（notify_via_feishu 只读 stub），确定性拒绝；
+#   (2) 通用人对人通知（通知<人名> / @<人> / 通知运营 / 发邮件…，无飞书渠道词）
+#       → 仍是高风险外部副作用，维持 WS-145 的 confirm-first，**飞书拒绝门不得吞它**。
+# 故 _FEISHU_CHANNEL_RE 必须比 _EXTERNAL_NOTIFY 窄：只命中显式飞书 + 群广播，
+# 不命中「通知<人>」。_EXTERNAL_NOTIFY 仍保持宽（供 _HIGH_RISK_RE / _EXEC_VERB_RE：
+# 两类外部通知都算高风险动作），分流由 is_unsupported_feishu_notify 决定。
+# 本产品对外「群」只有飞书群一条，故群广播（推到群/通知群/发到群）归入飞书拒绝。
+_FEISHU_CHANNEL_RE = re.compile(
+    r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|推送?到飞书|推到飞书|"   # 显式飞书渠道
+    r"通知群|群通知|发到群|发群里|群里发|推送到群|推到.{0,4}群|推进.{0,3}群"  # 群广播（本产品「群」即飞书群）
+)
 
 _CLAUSE_SEP_RE = re.compile(r"[，。！？!?；;、,\n\r\t ]+")
 
@@ -194,20 +204,22 @@ def classify_risk(question: str) -> RiskTier:
 
 
 def is_unsupported_feishu_notify(question: str) -> bool:
-    """WS-150: 工作台对外主动通知只有飞书一条通道，且当前为只读集成
-    （notify_via_feishu 是 stub，永远返回 supported=False）。
+    """WS-150（码长 Round-2 收敛）：只命中**显式飞书渠道 / 群广播**请求。
 
-    凡是「发飞书 / 通知群 / 推送 / 通知某人 / @同事」这类主动外发请求，本质都是
-    workbench 物理上做不到的主动飞书推送 —— 应返回确定性「只读/暂不支持」拒绝，
-    而不是让用户去 confirm 一个做不到的动作（confirm 后仍会落到 stub，反而诱发
-    「已发飞书」幻觉，正是本条要消除的死法）。判定复用 _EXTERNAL_NOTIFY 词法
-    （_FEISHU_NOTIFY_RE），与 notify_via_feishu schema / _HIGH_RISK_RE 外部通知段
-    保持单一来源，避免词表分叉。
+    工作台主动发飞书是只读 stub（notify_via_feishu 永远 supported=False），所以
+    「发飞书 / 发到飞书群 / 推到群里 / 通知群」这类显式飞书/群广播应走确定性
+    「只读、不支持主动发」拒绝，而不是让用户去 confirm 一个做不到的动作（confirm
+    后仍落 stub，反而诱发「已发飞书」幻觉 —— 正是本条要消除的死法）。
 
-    注意：本函数只回答「这是不是一条主动飞书通知请求」。当同一句还夹带交易/采购/
-    批量等**真高风险**动作时，是否让位给 confirm-first 由 evaluate() 决定，不在此处。
+    **边界（两轮反向打地鼠的收口点）**：通用「人对人」通知（通知<人名> / @<人> /
+    通知运营 / 发邮件…，**无飞书渠道词**）不归本函数 —— 它仍是高风险外部副作用，
+    维持 WS-145 的 confirm-first（见 classify_risk → _HIGH_RISK_RE），飞书拒绝门
+    不得吞它。故这里用窄的 _FEISHU_CHANNEL_RE，而非宽的 _EXTERNAL_NOTIFY。
+
+    注意：本函数只回答「这是不是一条显式飞书/群广播请求」。当同一句还夹带交易/
+    采购/批量等**真高风险**动作时，是否让位给 confirm-first 由 evaluate() 决定。
     """
-    return bool(_FEISHU_NOTIFY_RE.search(question or ""))
+    return bool(_FEISHU_CHANNEL_RE.search(question or ""))
 
 
 class GateDecision(NamedTuple):

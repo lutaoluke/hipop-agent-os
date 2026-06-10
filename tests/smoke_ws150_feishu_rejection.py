@@ -34,16 +34,22 @@ def test_deterministic_feishu_rejection_triggers():
     from hipop.server._execution_intent_gate import is_unsupported_feishu_notify
 
     test_cases = [
+        # 显式飞书渠道 / 群广播 → 确定性拒绝（True）
         ("发飞书", True),
         ("发到飞书", True),
         ("飞书群通知", True),
+        ("推送到飞书", True),
         ("推到群里", True),
         ("通知群", True),
-        ("发通知", True),
-        ("通知刘鹤", True),
-        ("推送消息给张三", True),
-        ("发邮件", True),
-        ("@同事看一下", True),
+        ("发到飞书群", True),
+        # 通用「人对人」通知（无飞书渠道词）→ 不归飞书拒绝（False），由 confirm-first 处理
+        ("通知刘鹤", False),
+        ("通知运营一下", False),
+        ("@同事看一下", False),
+        ("发通知", False),
+        ("推送消息给张三", False),
+        ("发邮件", False),
+        # 非外发请求 → False
         ("普通对话没有飞书", False),
         ("查库存吧", False),
         ("查一下飞书有没有新通知", False),  # 查询型不算主动外发

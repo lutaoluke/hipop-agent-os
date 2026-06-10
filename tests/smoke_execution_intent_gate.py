@@ -133,29 +133,44 @@ def test_high_risk_external_and_txn():
         assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 应判高风险"
 
 
-def test_external_notify_phrasings_unsupported_feishu():
-    """WS-150 收敛（取代 WS-145 的「外部通知 → confirm-first」契约）。
+def test_external_notify_phrasings_confirm_first():
+    """WS-145 红队契约（WS-150 收敛后仍成立）：**通用「人对人」外部通知** ——
+    notify_via_feishu schema 明写的运营说法「通知刘鹤 / @同事 / 通知运营」，**无显式
+    飞书渠道词**，仍是高风险外部副作用 → confirm-first，飞书拒绝门不得吞它。
 
-    工作台对外主动通知只有飞书一条通道，且 notify_via_feishu 是只读 stub
-    （supported=False）。notify_via_feishu schema 明写的运营说法
-    「发飞书 / 通知刘鹤 / 推到群里 / @同事 / 通知运营」本质都是做不到的主动飞书推送，
-    应走**确定性「只读/暂不支持」拒绝**，而非让用户去 confirm 一个物理上做不到的动作
-    （confirm 后仍落到 stub，反而诱发「已发飞书」幻觉 —— 正是 WS-150 要消除的死法）。
-
-    WS-145 的安全内核仍保留：这些请求 has_exec_verb=True、绝不直接进执行路由
-    （enters_execution=False）；只是补救手段从 confirm-first 升级为确定性拒绝（更强）。
+    这正是 PR #92 Round-2 被打回的点：飞书不支持检测过宽，把这些通用通知误判成
+    unsupported_feishu_notify / needs_confirm_first=False。收敛后它们必须 confirm-first。
     """
     for q in (
         "帮我通知刘鹤这批货到了",
-        "推到群里",
         "@同事看一下这个库存",
-        "把补货建议发到飞书群",
         "通知运营一下",
+    ):
+        assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 外部通知应判高风险"
+        d = gate.evaluate(q)
+        assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
+        assert d.unsupported_feishu_notify is False, f"{q!r} 无飞书渠道词 → 不归飞书拒绝"
+        assert d.needs_confirm_first is True, f"{q!r} 应 confirm-first 不自动执行"
+        assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
+
+
+def test_explicit_feishu_channel_unsupported():
+    """WS-150 收敛：**显式飞书渠道 / 群广播**请求（发飞书 / 发到飞书群 / 推到群里 /
+    通知群）→ 工作台只读、不支持主动发 → 确定性拒绝（非通用 confirm-first）。
+
+    本产品对外「群」只有飞书群一条，故群广播归入飞书拒绝。WS-145 安全内核保留：
+    has_exec_verb=True、绝不直接进执行路由。
+    """
+    for q in (
+        "帮我发飞书通知大家",
+        "把补货建议发到飞书群",
+        "把库存情况推到群里",
+        "通知群里这批货到了",
     ):
         d = gate.evaluate(q)
         assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
-        assert d.unsupported_feishu_notify is True, f"{q!r} 应判主动飞书通知不支持 → 确定性拒绝"
-        assert d.needs_confirm_first is False, f"{q!r} 不再走通用 confirm-first（已被确定性拒绝取代）"
+        assert d.unsupported_feishu_notify is True, f"{q!r} 显式飞书/群广播 → 确定性拒绝"
+        assert d.needs_confirm_first is False, f"{q!r} 不走通用 confirm-first（已被确定性拒绝取代）"
         assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
 
 
@@ -366,7 +381,8 @@ if __name__ == "__main__":
         test_router_blocks_interrogative_with_imperative,
         test_low_risk_internal_action,
         test_high_risk_external_and_txn,
-        test_external_notify_phrasings_unsupported_feishu,
+        test_external_notify_phrasings_confirm_first,
+        test_explicit_feishu_channel_unsupported,
         test_notify_plus_transaction_still_confirm_first,
         test_plain_notification_query_not_misfired,
         test_recovery_low_risk_first_attempt_retries_once,
