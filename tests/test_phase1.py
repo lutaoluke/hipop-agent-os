@@ -51,6 +51,24 @@ def _load_ws134_operational_numeric_tools_smoke():
     return mod
 
 
+def _load_ws147_daily_scheduler_smoke():
+    path = REPO_ROOT / "tests" / "smoke_ws147_daily_scheduler.py"
+    spec = importlib.util.spec_from_file_location("smoke_ws147_daily_scheduler", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ws147_daily_refresh_noon_yesterday_contract():
+    """WS-147: daily scheduler runs at noon and refresh_all snapshots yesterday only."""
+    smoke = _load_ws147_daily_scheduler_smoke()
+    smoke.test_daily_refresh_scheduler_contract()
+    smoke.test_cron_uses_managed_refresh_with_yesterday_spec()
+    smoke.test_refresh_all_runs_snapshot_for_business_date_and_blocks_today()
+    smoke.test_daily_refresh_verifier_blocks_today_and_requires_snapshot_step()
+
+
 def test_ws134_operational_numeric_tools_use_evidence_gates():
     """WS-134: numeric ops answers route through deterministic tools and evidence gates."""
     smoke = _load_ws134_operational_numeric_tools_smoke()

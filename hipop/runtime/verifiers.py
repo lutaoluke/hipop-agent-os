@@ -15,6 +15,7 @@ verify 结果会进 task.result_summary，FAIL 时 task.state = 'done_unverified
 from __future__ import annotations
 
 import os
+import json
 import time
 from typing import Callable, Optional
 
@@ -138,6 +139,66 @@ def verify_freshness_gate_matrix(now=None) -> dict:
         "evidence": evidence,
         "verdict": "freshness gate matrix passed" if not failures else "; ".join(failures),
     }
+
+
+def verify_daily_refresh_contract(spec=None, progress=None, now=None) -> dict:
+    """WS-147 deterministic contract for refresh_all_v2 daily runs.
+
+    The runner must carry a past business_date and must run the stock history
+    snapshot step with that cutoff. Today/future dates are incomplete facts.
+    """
+    from hipop.runtime import daily_refresh
+
+    spec = spec or {}
+    progress = progress or {}
+    business_date_raw = (
+        progress.get("business_date")
+        or spec.get("business_date")
+        or spec.get("as_of_date")
+    )
+    steps_done = set(progress.get("steps_done") or [])
+    snapshot_step_done = "wf1_stock_snapshot_v2" in steps_done
+
+    failures = []
+    business_date = business_date_raw
+    try:
+        business_date = daily_refresh.validate_business_date_cutoff(
+            business_date_raw,
+            now=now,
+        )
+    except Exception as exc:
+        failures.append(str(exc))
+
+    if not snapshot_step_done:
+        failures.append("wf1_stock_snapshot_v2 未完成，refresh_all 未冻结业务日快照")
+
+    evidence = {
+        "business_date": business_date_raw,
+        "snapshot_step_done": snapshot_step_done,
+        "steps_done": sorted(steps_done),
+    }
+    ok = not failures
+    return {
+        "ok": ok,
+        "evidence": evidence,
+        "verdict": (
+            f"daily refresh cutoff ok: business_date={business_date}, snapshot step done"
+            if ok else
+            "；".join(failures)
+        ),
+    }
+
+
+def _load_task_json(task_id: str, kind: str) -> dict:
+    try:
+        from hipop.server import runtime as _runtime
+        path = _runtime._task_paths(task_id).get(kind)
+        if not path or not os.path.exists(path):
+            return {}
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def _noon_freshness_max_hours(override=None) -> float:
@@ -407,6 +468,15 @@ def _v_wf1_stock_snapshot(task_id, tenant_id, started_at, **kw):
                     (f"{bad_dates} 行 as_of_date 非法业务日 {bad_samples}（占位/不存在的日期）"
                      if bad_dates else "0 行历史写入 — latest wf1_stock 可能为空")),
     }
+
+
+@register("refresh_all_v2")
+def _v_refresh_all(task_id, tenant_id, started_at, **kw):
+    """refresh_all_v2 must freeze a past business date, never today's partial data."""
+    raw_spec = _load_task_json(task_id, "spec")
+    progress = _load_task_json(task_id, "progress")
+    spec = raw_spec.get("spec") or raw_spec
+    return verify_daily_refresh_contract(spec=spec, progress=progress)
 
 
 @register("wf5_sales_cycle_v2")
