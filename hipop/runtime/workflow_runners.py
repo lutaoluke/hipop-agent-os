@@ -37,6 +37,16 @@ def list_runners() -> list[str]:
     return list(_RUNNERS.keys())
 
 
+def _refresh_all_business_date(spec: dict | None) -> str:
+    """Resolve refresh_all business cutoff date; default is yesterday, never today."""
+    from hipop.runtime import daily_refresh
+    payload = spec or {}
+    requested = payload.get("business_date") or payload.get("as_of_date")
+    if requested is None:
+        requested = daily_refresh.business_date_yesterday()
+    return daily_refresh.validate_business_date_cutoff(requested)
+
+
 # 生产入口加载即接线 noon live row producers（import 副作用，单一收口）。worker/api 运行任何
 # workflow 都会 import 本模块 → 连带加载 live_producers → 已就绪抓取器（WS-58 订单）的 live
 # producer 自动注册，run_live 默认走真抓取器、不再回落 CSV。详见 live_producers 模块。
@@ -352,11 +362,12 @@ def _run_test_sleep(task_id, tenant_id, actor, spec, progress, heartbeat, save_p
 
 @register("refresh_all_v2")
 def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
-    """全量刷新 — 串行跑 ERP + noon 实时 ingest → 分析，无需任何手工 CSV（WS-32.5）。
+    """全量刷新 — 串行跑 ERP + noon 实时 ingest → 昨日业务日快照 → 分析。
 
     步序（在对应 ERP ingest 之后、依赖它的分析步之前插入 noon 实时 ingest 两步）：
       wf2_products → wf2_sales → noon 订单实时 → wf1_stock → noon 可售库存实时
-      → 库存快照合并 → wf5（销售周期/补货）→ wf3（物流）→ wf6（告警）
+      → 库存快照合并 → wf1_stock_snapshot(as_of_date=business_date) →
+      wf5（销售周期/补货）→ wf3（物流）→ wf6（告警）
 
     在途/送仓（ASN）口径不接 noon live：由已有 ERP 链（wf1_stock + WS-10/11
     pending_inbound_qty）覆盖，本编排不动它（WS-60 已取消）。
@@ -370,8 +381,11 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
 
     Chunked checkpoint：每个 step 完了写 progress.steps_done，重启从下一个 step 续。
     """
+    spec = spec or {}
+    business_date = _refresh_all_business_date(spec)
     # kind：erp（ERP ingest，与 noon 无关）/ noon_live（noon 实时 ingest）/
     #       analysis_needs_noon（消费 noon 数据的分析步，noon blocked 时必须跳过）/
+    #       snapshot_needs_noon_stock（冻结库存历史，noon 库存 blocked 时必须跳过）/
     #       analysis（不依赖 noon 的分析步，noon blocked 也照跑）。
     steps = [
         ("wf2_products_v2", "ERP 商品库", "erp"),
@@ -381,6 +395,7 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
         ("wf1_stock_v2", "ERP 库存", "erp"),
         ("noon_live_ingest", "noon 可售库存实时", "noon_live"),
         ("wf1_stock_merge_v2", "库存快照合并", "erp"),
+        ("wf1_stock_snapshot_v2", "库存历史快照（截止业务日）", "snapshot_needs_noon_stock"),
         ("wf5_sales_cycle_v2", "销售周期", "analysis_needs_noon"),
         ("wf3_logistics_v2", "物流采集", "analysis"),
         ("wf6_alerts_v2", "物流告警", "analysis"),
@@ -399,6 +414,8 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
             "noon_blocked": noon_blocked,
             "skipped": skipped,
             "current_step": current,
+            "business_date": business_date,
+            "cutoff_rule": "yesterday_or_explicit_past_date",
         })
 
     for step_workflow, step_name, kind in steps:
@@ -413,11 +430,20 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
             skipped.append({"step": step_workflow, "reason": reason})
             _checkpoint(step_workflow)
             continue
+        if kind == "snapshot_needs_noon_stock" and "noon_live_ingest" in noon_blocked:
+            reason = "upstream noon stock blocked: noon_live_ingest"
+            print(f"[refresh_all_v2] SKIP {step_workflow}（{reason}，不冻结不完整库存事实）", flush=True)
+            skipped.append({"step": step_workflow, "reason": reason})
+            _checkpoint(step_workflow)
+            continue
         print(f"[refresh_all_v2] → {step_workflow} ({step_name})", flush=True)
         heartbeat()
         try:
             sub_runner = get_runner(step_workflow)
-            res = sub_runner(task_id, tenant_id, actor, {}, {}, heartbeat, lambda p: None) or {}
+            step_spec = {}
+            if step_workflow == "wf1_stock_snapshot_v2":
+                step_spec = {"as_of_date": business_date}
+            res = sub_runner(task_id, tenant_id, actor, step_spec, {}, heartbeat, lambda p: None) or {}
             steps_done.add(step_workflow)
             if kind == "noon_live":
                 src = res.get("source")
@@ -439,7 +465,8 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
     n_live = sum(1 for s in noon_sources.values() if s == "live")
     n_fallback = sum(1 for s in noon_sources.values() if s == "csv_fallback")
     summary = (f"refresh_all: {len(steps_done)}/{len(steps)} steps done, "
-               f"{len(failures)} failed; noon live={n_live}/{len(noon_sources)}")
+               f"{len(failures)} failed; business_date={business_date}; "
+               f"noon live={n_live}/{len(noon_sources)}")
     if n_fallback:
         summary += f", csv_fallback={n_fallback}（未走 live，见 noon_sources）"
     if noon_blocked:
@@ -450,4 +477,5 @@ def _run_refresh_all(task_id, tenant_id, actor, spec, progress, heartbeat, save_
         "noon_sources": noon_sources,
         "noon_blocked": noon_blocked,
         "skipped": skipped,
+        "business_date": business_date,
     }

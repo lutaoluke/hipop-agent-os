@@ -853,21 +853,24 @@ WORKFLOW_REGISTRY = {
           "workflows.wf6_alerts_v2:run_v2")],
         ["logistics", "replenish"],
     ),
-    # 全套：商品+销量+(noon订单实时)+库存+(noon库存实时)+快照合并+销售周期+物流+告警 一键跑。
+    # 全套：商品+销量+(noon订单实时)+销量聚合+库存+(noon库存实时)+快照合并+
+    # 昨日业务日历史快照+销售周期+物流+告警 一键跑。
     # 真实执行走 runtime runner（workflow_runners:_run_refresh_all，spawn_task 路径）；本 steps
     # 仅供前端 SSE 渲染 / 审计的步数与标签展示，须与 runner 实际步序一致（WS-32.5 接入 noon 实时）。
     "refresh_all_v2": (
-        "完整刷新（商品→销量→noon订单实时→库存→noon库存实时→快照合并→销售周期→物流→告警）",
+        "完整刷新（商品→销量→noon订单实时→销量聚合→库存→noon库存实时→快照合并→昨日快照→销售周期→物流→告警）",
         [
             (1, "ERP 商品库", "scripts.ingest_erp_products_v2:run_v2"),
             (2, "ERP 销量价格", "scripts.ingest_erp_sales_v2:run_v2"),
             (3, "noon 订单实时（→ wf2_orders/wf2_sku）", "scripts.ingest_noon_csv_v2:run_live"),
-            (4, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
-            (5, "noon 可售库存实时（→ wf1_stock.noon_*）", "scripts.ingest_noon_stock_csv_v2:run_live"),
-            (6, "库存快照合并（→ total_stock）", "scripts.merge_stock_snapshot_v2:run_v2"),
-            (7, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
-            (8, "物流在途", "workflows.wf3_logistics_v2:run_v2"),
-            (9, "物流告警", "workflows.wf6_alerts_v2:run_v2"),
+            (4, "noon 销量聚合 + 评级", "workflows.wf_sales_static_v2:run_v2"),
+            (5, "ERP 库存（6 仓）", "scripts.ingest_erp_stock_v2:run_v2"),
+            (6, "noon 可售库存实时（→ wf1_stock.noon_*）", "scripts.ingest_noon_stock_csv_v2:run_live"),
+            (7, "库存快照合并（→ total_stock）", "scripts.merge_stock_snapshot_v2:run_v2"),
+            (8, "库存历史快照（as_of_date=昨天）", "scripts.stock_history:run_v2"),
+            (9, "销售周期 + 补货决策", "workflows.wf_sales_cycle:run_v2"),
+            (10, "物流在途", "workflows.wf3_logistics_v2:run_v2"),
+            (11, "物流告警", "workflows.wf6_alerts_v2:run_v2"),
         ],
         ["sales", "replenish", "logistics"],
     ),

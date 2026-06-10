@@ -1,7 +1,7 @@
 """每日自动刷新调度器。
 
 为每个 active tenant 跑 refresh_all_v2，留痕 actor.source='cron'。
-默认 02:00。可通过 env 调：
+默认 12:00，业务日期截止到昨天。可通过 env 调：
   DAILY_REFRESH_HOUR / DAILY_REFRESH_MINUTE
   DISABLE_DAILY_REFRESH=1 关掉
 """
@@ -9,11 +9,12 @@ from __future__ import annotations
 import os
 import traceback
 import logging
-from uuid import uuid4
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+
+from hipop.runtime import daily_refresh
 
 logger = logging.getLogger("hipop.scheduler")
 
@@ -27,25 +28,35 @@ def _list_active_tenants() -> list[dict]:
     return rows or []
 
 
-def _run_daily_refresh():
-    """每日入口：遍历所有 active tenant，串行跑 refresh_all_v2。"""
-    from . import api as _api
-    from . import data as _data
+def _spawn_refresh_task(tenant_id: int, actor: dict, spec: dict) -> str:
+    """Production cron path: use managed runtime so tasks survive server restarts."""
+    from . import runtime as _runtime
+    return _runtime.spawn_task(
+        workflow="refresh_all_v2",
+        tenant_id=tenant_id,
+        actor=actor,
+        spec=spec,
+    )
+
+
+def _run_daily_refresh(now=None):
+    """每日入口：遍历所有 active tenant，按昨天业务日启动 refresh_all_v2。"""
     tenants = _list_active_tenants()
-    logger.info("[cron] daily_refresh start: %d tenants", len(tenants))
+    spec = daily_refresh.build_daily_refresh_spec(now=now)
+    logger.info("[cron] daily_refresh start: %d tenants business_date=%s",
+                len(tenants), spec["business_date"])
     for t in tenants:
         tid = t["id"]
         try:
-            task_id = uuid4().hex[:8]
             actor = {
                 "user_id": None,
                 "email": "cron@system",
                 "role": "system",
                 "source": "cron",
             }
-            _data.set_current_tenant(tid)
-            _api._run_workflow(task_id, "refresh_all_v2", tid, actor)
-            logger.info("[cron] tenant=%s task=%s done", tid, task_id)
+            task_id = _spawn_refresh_task(tid, actor, spec)
+            logger.info("[cron] tenant=%s task=%s queued business_date=%s",
+                        tid, task_id, spec["business_date"])
         except Exception:
             logger.error("[cron] tenant=%s failed:\n%s", tid, traceback.format_exc())
     logger.info("[cron] daily_refresh finished")
@@ -84,8 +95,8 @@ def start():
     global _scheduler
     if _scheduler and _scheduler.running:
         return _scheduler
-    hour = int(os.environ.get("DAILY_REFRESH_HOUR", "2"))
-    minute = int(os.environ.get("DAILY_REFRESH_MINUTE", "0"))
+    hour = daily_refresh.configured_hour()
+    minute = daily_refresh.configured_minute()
     _scheduler = BackgroundScheduler(timezone=os.environ.get("TZ", "Asia/Shanghai"))
     _scheduler.add_job(
         _run_daily_refresh,
@@ -112,6 +123,6 @@ def start():
     return _scheduler
 
 
-def run_now():
+def run_now(now=None):
     """手动触发一次（调试用）。"""
-    _run_daily_refresh()
+    _run_daily_refresh(now=now)
