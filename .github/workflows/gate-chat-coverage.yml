@@ -1,0 +1,36 @@
+name: gate-chat-coverage
+# harness 门2(交付门)· WS-154 验收 #2 的机械化:
+#   「新 WS 若涉及 chat 行为,必须有对应 smoke 才能 close」。
+# 做法:对 PR 的真实 diff 判定 —— 碰了 chat 行为代码(agent 协调器 / 各 chat 门 / provider / governance)
+#   却没动任何 chat smoke → 这道 check 红 → 配 branch protection 设为 required 即拦住合并。
+# 口径(哪些算 chat 行为文件 / 哪些算对应 smoke)集中在 tests/ws154_chat_coverage_gate.py 顶部常量,
+#   规划小队定稿后改那两个清单即可,无需改本 workflow。
+#
+# 为什么安全可放心跑(对照另一条「live e2e」的公开仓安全坑):
+#   纯确定性 git diff + python 判定,不需要任何 secret / live 凭据 / DB / self-hosted runner,
+#   fork PR 也能安全跑(GitHub-hosted、只读、无密钥),不存在凭据外泄面。
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  chat-coverage:
+    name: chat 覆盖门(改 chat 行为必须配 smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要 base 历史来算 base...HEAD diff
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Gate — 改了 chat 行为必须配 chat smoke
+        env:
+          # PR 的 base commit;三点 diff(base...HEAD)= 本 PR 真实引入的改动
+          WS154_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        # 直接 python 执行,退出码冒泡(违例 exit 1 → job 红);不加 `|| true`。
+        run: python tests/ws154_chat_coverage_gate.py
