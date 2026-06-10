@@ -46,12 +46,82 @@ def get_thresholds():
     }
 
 
+def check_baseline_decision():
+    """WS-163: Verify decision① (KEEP DeepSeek) is supported by baseline data.
+
+    Reads baseline_deepseek.json and baseline_opus.json, verifies:
+    - avg_gap ≤ 0.05 (routing already solved most cases)
+    - keep_cases ≥ 90% (high proportion solved)
+    - decision① = KEEP DeepSeek (not UPGRADE)
+
+    Returns 0 (PASS) or 1 (FAIL).
+    """
+    import json
+    from pathlib import Path
+
+    baseline_deepseek = Path("tests/baseline_deepseek.json")
+    baseline_opus = Path("tests/baseline_opus.json")
+
+    if not baseline_deepseek.exists() or not baseline_opus.exists():
+        print("✗ Baseline JSON files missing (needed for decision① verification)")
+        return 1
+
+    with open(baseline_deepseek) as f:
+        arm_a = json.load(f)
+    with open(baseline_opus) as f:
+        arm_b = json.load(f)
+
+    # Compute gap statistics
+    gaps = []
+    for case_a in arm_a.get("cases", []):
+        name = case_a["name"]
+        case_b = next((c for c in arm_b.get("cases", []) if c["name"] == name), None)
+        if not case_b:
+            continue
+        gap = abs(case_b["grades"]["overall"] - case_a["grades"]["overall"])
+        gaps.append(gap)
+
+    if not gaps:
+        print("✗ No cases found in baseline matrices")
+        return 1
+
+    avg_gap = sum(gaps) / len(gaps)
+    keep_count = sum(1 for g in gaps if g <= 0.05)
+    keep_pct = (keep_count / len(gaps)) * 100 if gaps else 0
+
+    print(f"\n=== WS-163 Decision① Verification (KEEP DeepSeek) ===")
+    print(f"Cases analyzed: {len(gaps)}")
+    print(f"Average gap: {avg_gap:.3f} (threshold ≤ 0.05)")
+    print(f"Keep DeepSeek: {keep_count}/{len(gaps)} ({keep_pct:.0f}%) — threshold ≥ 90%")
+
+    # Verdict
+    ok_gap = avg_gap <= 0.05
+    ok_keep_pct = keep_pct >= 90
+
+    if ok_gap and ok_keep_pct:
+        print(f"✓ DECISION① VERIFIED: KEEP DeepSeek (routing sufficient)")
+        return 0
+    else:
+        print(f"✗ DECISION① FAILED:")
+        if not ok_gap:
+            print(f"  - Gap {avg_gap:.3f} exceeds threshold 0.05")
+        if not ok_keep_pct:
+            print(f"  - Keep rate {keep_pct:.0f}% below threshold 90%")
+        return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="WS-163 graded eval threshold gate")
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
     ap.add_argument("--filter", help="Only run cases matching this keyword")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--check-baseline-decision", action="store_true",
+                    help="Verify decision① (KEEP DeepSeek) from baseline matrices")
     args = ap.parse_args()
+
+    # Baseline decision verification mode (offline, no server needed)
+    if args.check_baseline_decision:
+        return check_baseline_decision()
 
     print(f"=== WS-163 Graded Eval Threshold Gate ===")
     print(f"URL: {args.url}")
