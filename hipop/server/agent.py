@@ -169,6 +169,9 @@ TOOLS = [
             "summary_skus（SKU 维度，含变体）。"
             "用户问『商品/产品总数』时优先报 summary_products.total（这是 ERP 后台筛店铺看到的数字）。"
             "用户问『SKU 总数』或『变体』时报 summary_skus.total。"
+            "用户问『近30天销量最高/销量排行/销量 TopN』时必须调用本工具并设置 limit=N；"
+            "items 已按 wf2_sku.sales_30d DESC、sales_180d DESC 排序，limit=N 即近30天销量 TopN，"
+            "不要由模型自行排序或补数字。"
             "is_listed=1 = 已绑定 noon 平台 SKU id（在线上能搜到/可下单）；is_listed=0 = 草稿/未挂平台。"
             "listing='listed'/'unlisted'/'all' 控制示例返回；sales_only=true 仅含 sales_180d>0；limit=0 时不返示例。"
         ),
@@ -178,7 +181,11 @@ TOOLS = [
                 "store": {"type": "string", "enum": ["KSA", "UAE"]},
                 "listing": {"type": "string", "enum": ["all", "listed", "unlisted"], "default": "all"},
                 "sales_only": {"type": "boolean", "default": False, "description": "true=仅含 180 天内有销量"},
-                "limit": {"type": "integer", "default": 0, "description": "返回示例 SKU 行数，0=只要聚合"},
+                "limit": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "返回示例 SKU 行数；0=只要聚合。问近30天销量 TopN 时传 N，items 即按 sales_30d DESC 的 TopN。",
+                },
             },
             "required": ["store"],
         },
@@ -941,20 +948,48 @@ def tool_list_products(store: str, listing: str = "all",
     filtered_count = _data._scalar(f"SELECT COUNT(*) FROM {tbl} {where_sql}") or 0
 
     items = []
-    if limit and limit > 0:
+    evidence = None
+    requested_limit = max(0, min(int(limit or 0), 50))
+    if requested_limit > 0:
         rows = _data._fetch(f"""
-            SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price
+            SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price,
+                   as_of_date, imported_at
             FROM {tbl} {where_sql}
-            ORDER BY COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC
+            ORDER BY (sales_30d IS NULL) ASC,
+                     COALESCE(sales_30d,0) DESC,
+                     COALESCE(sales_180d,0) DESC,
+                     partner_sku ASC
             LIMIT ?
-        """, (int(limit),))
+        """, (requested_limit,))
         items = [{
             "sku": r["partner_sku"], "title": r["title"],
             "is_listed": bool(r["is_listed"]),
-            "sales_30d": r["sales_30d"] or 0,
-            "sales_180d": r["sales_180d"] or 0,
+            "sales_30d": r["sales_30d"],
+            "sales_180d": r["sales_180d"],
             "price": r["latest_price"],
+            "as_of_date": r.get("as_of_date"),
         } for r in rows]
+        fetched_at = None
+        for r in rows:
+            fetched_at = max(
+                [x for x in (fetched_at, r.get("as_of_date"), (r.get("imported_at") or "")[:10]) if x],
+                default=None,
+            )
+        if items:
+            from hipop.scripts.evidence_contract import (
+                build_query_evidence as _build_query_evidence,
+                SOURCE_CACHE as _SRC_CACHE,
+            )
+            evidence = _build_query_evidence(
+                source=_SRC_CACHE,
+                fetched_at=fetched_at,
+                coverage=(
+                    f"{store} wf2_sku.sales_30d DESC Top{requested_limit}；"
+                    f"limit={requested_limit} 即近30天销量 TopN；"
+                    f"listing={listing}；sales_only={bool(sales_only)}"
+                ),
+                context="list_products_sales_topn",
+            )
 
     return {
         "store": store,
@@ -975,10 +1010,27 @@ def tool_list_products(store: str, listing: str = "all",
             "_dim": "sku (含每个 product 下的颜色/尺寸变体)"
         },
         "filter": {"listing": listing, "sales_only": sales_only},
+        "sort": {
+            "field": "sales_30d",
+            "direction": "desc",
+            "tie_breakers": ["sales_180d desc", "partner_sku asc"],
+            "meaning": "limit=N returns near-30-day sales TopN",
+        },
+        "n_requested": requested_limit,
+        "n_returned": len(items),
         "filtered_count": filtered_count,
         "items": items,
+        "evidence": evidence,
         "references": [
-            {"table": tbl, "where": where_sql or "(全表)"},
+            {
+                "table": tbl,
+                "where": (
+                    f"{where_sql} ORDER BY sales_30d DESC, sales_180d DESC "
+                    f"LIMIT {requested_limit}"
+                    if requested_limit > 0 else where_sql
+                ),
+                "as_of_date": (evidence or {}).get("fetched_at"),
+            },
         ],
     }
 
@@ -2560,6 +2612,64 @@ def _deterministic_total_stock_topn_request(question: str) -> "Optional[int]":
     return 10
 
 
+def _deterministic_product_sales_topn_request(question: str) -> "Optional[int]":
+    q = question or ""
+    if "销量" not in q:
+        return None
+    if any(x in q for x in ("库存", "补货", "货单", "物流")):
+        return None
+    if any(x in q for x in ("180天", "历史", "总销量")):
+        return None
+    has_subject = any(x in q for x in ("商品", "产品", "SKU", "sku", "Sku", "款"))
+    has_top_intent = any(x in q for x in ("最高", "最多", "排行", "排名", "Top", "top", "TOP", "前"))
+    if not (has_subject and has_top_intent):
+        return None
+    patterns = (
+        r"(?:Top|top|TOP)\s*(\d+)",
+        r"前\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最高的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最多的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"(\d+)\s*(?:个|名|款|条)\s*(?:商品|产品|SKU|sku)",
+    )
+    for pat in patterns:
+        m = _re.search(pat, q)
+        if m:
+            return max(1, min(int(m.group(1)), 50))
+    return 10
+
+
+def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 近30天销量 TopN 暂时不可用。"
+    if tool_result.get("error"):
+        return f"{store} 近30天销量 TopN 暂时不可用：{tool_result.get('error')}"
+    items = tool_result.get("items") or []
+    if not items:
+        return f"{store} 暂无可排序的近30天销量商品数据。"
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="list_products_sales_topn_reply")
+    except _ContractViolation as _e:
+        return (
+            f"{store} 近30天销量 TopN 缺少可追溯证据（来源/取数时间/口径），"
+            f"按规则不出数。详情：{_e}"
+        )
+    lines = [f"{store} 近30天销量最高的 {len(items)} 个商品：", ""]
+    for i, item in enumerate(items[:10], 1):
+        sku = item.get("sku") or "?"
+        title = (item.get("title") or "").strip()
+        name = f"{sku}（{title}）" if title else sku
+        sales_30d = item.get("sales_30d")
+        lines.append(f"{i}. **{name}**：近30天销量 {_fmt_int(sales_30d)}")
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
+    return "\n".join(lines)
+
+
 def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if not isinstance(tool_result, dict):
         return f"{store} 库存查询暂不可用，请稍后重试。"
@@ -3158,6 +3268,29 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_sales_topn_n = _deterministic_product_sales_topn_request(question)
+    if direct_sales_topn_n is not None:
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool(
+            "list_products",
+            {"store": store, "listing": "all", "limit": direct_sales_topn_n},
+            user=scope,
+        )
+        reply = _format_product_sales_topn_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["list_products"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0 if not (tool_result or {}).get("error") else 0.8,
+            "judge_method": "deterministic_product_sales_topn_router",
             "hallucination_warnings": None,
         }
 
