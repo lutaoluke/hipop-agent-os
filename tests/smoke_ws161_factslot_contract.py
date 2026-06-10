@@ -210,14 +210,12 @@ def test_no_false_positive_on_rule_doc_explanation():
 
 
 def test_success_stock_numbers_not_scrubbed():
-    """库存查询成功（数值都来自工具）→ 正文数字不被删（避免误拦）。"""
-    tl = [{"name": "query_stock_split", "args": {"sku": "TBC0168A"}, "result_error": None,
-           "factslot_evidence": _ev("query_stock_split", True, "TBC0168A", "sku",
-                                     has_stock_value=True, stock_values=[509, 200, 309])}]
-    reply = "SKU TBC0168A 当前库存 509 件（义乌 200、noon 309）。"
+    """库存查询成功，正文用具体槽位标签 + 正确值（总库存 509/义乌 200/noon 309）→ 不删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 当前总库存 509 件（义乌 200、noon 仓 309）。"
     out, warns = _sanitize(reply, ["query_stock_split"], tl)
     body = _answer_body(out)
-    assert "509" in body and "200" in body and "309" in body, f"成功库存数字不应被删: {body}"
+    assert "总库存 509" in body and "义乌 200" in body and "309" in body, f"正确绑定库存数字不应被删: {body}"
     assert not [w for w in warns if "禁编承重墙" in w]
 
 
@@ -409,6 +407,58 @@ def test_logistics_correct_row_binding_not_scrubbed():
     assert not [w for w in warns if "禁编承重墙" in w], warns
 
 
+# ── 路线 b Round-3：fail-closed 兜底（非枚举连接词）+ 多货单同句按行绑定 ─────────────
+
+def test_stock_arbitrary_connector_misbinding_scrubbed():
+    """打回点 1：非枚举连接词"约为/大约"——总库存约为 200、义乌大约 509（值真关系假）必删。
+    标签驱动取邻近标签做绑定校验，不靠枚举连接词。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    for reply in (
+        "SKU TBC0168A 当前总库存约为 200 件，义乌大约 509 件。",
+        "SKU TBC0168A 总库存有 200 件。",
+        "SKU TBC0168A 总库存达 200 件。",
+    ):
+        out, warns = _sanitize(reply, ["query_stock_split"], tl)
+        body = _answer_body(out)
+        assert "200 件" not in body, f"总库存绑 200（应 509）必删: {body}"
+        assert "总库存：509" in body, f"权威块应给正确总库存: {body}"
+        assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_stock_unbindable_number_fail_closed():
+    """打回点 1 根因：库存语境数字绑不到具体槽位（generic 库存/无单位裸数）→ fail-closed 删，
+    不再因"值∈工具值集合"放行。工具 总库存=509，回复笼统写"库存大概 509"也删（绑不到 total）。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 库存大概 509 件吧。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "509 件" not in body, f"绑不到具体槽位的库存数字应 fail-closed 删: {body}"
+    assert "总库存：509" in body, f"权威块仍给正确值: {body}"
+
+
+def test_stock_non_inventory_number_not_touched():
+    """不误拦：非库存语境数字（天数/百分比）不动。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 总库存 509 件，近 30 天动销良好，退货率 3.06%，建议补货。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "30 天" in body and "3.06%" in body, f"非库存数字（天数/百分比）不应被删: {body}"
+    assert "建议补货" in body, f"补货建议应放行: {body}"
+
+
+def test_logistics_multi_order_same_segment_swap_scrubbed():
+    """打回点 2：两个货单号在**同一 segment**（无标点切分），承运商对调——
+    旧版 len!=1 fail-open 跳过；位置就近绑定必须逐 token 删错配。"""
+    tl = _sku_live_two_orders()
+    # 同一句内（仅空格分隔，无逗号/句号），承运商对调
+    reply = "货单 PD2026001 由 SMSA 承运 货单 PD2026002 由 Aramex 承运"
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "PD2026001 由 SMSA" not in body, f"同句多货单 PD2026001 挂错 SMSA 必删: {body}"
+    assert "PD2026002 由 Aramex" not in body, f"同句多货单 PD2026002 挂错 Aramex 必删: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
 # ── 接线：两个 provider 都在 tool_log 写入 factslot_evidence ──────────────────────
 
 def test_both_providers_wire_factslot_evidence():
@@ -446,6 +496,10 @@ TESTS = [
     test_logistics_carrier_row_swap_scrubbed,
     test_logistics_tracking_row_swap_scrubbed,
     test_logistics_correct_row_binding_not_scrubbed,
+    test_stock_arbitrary_connector_misbinding_scrubbed,
+    test_stock_unbindable_number_fail_closed,
+    test_stock_non_inventory_number_not_touched,
+    test_logistics_multi_order_same_segment_swap_scrubbed,
     test_both_providers_wire_factslot_evidence,
 ]
 
