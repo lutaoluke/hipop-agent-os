@@ -160,6 +160,28 @@ def test_success_stock_wrong_values_also_removed_from_prose():
         assert "总库存：509" in _answer_body(out) and "义乌：200" in _answer_body(out), reply
 
 
+def test_success_stock_value_before_label_and_parenthetical_removed():
+    """验门人 Round-1 打回点 1：value-before-label / 括号标签 也是库存值↔仓库绑定 → 移除。
+    `509 件是总库存`、`509 件(总库存)`、`200 件在义乌` 这类标签在数字之后/括号里的绑定。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    for reply in (
+        "509 件是总库存，200 件在义乌，309 件在 noon 仓。",
+        "509 件(总库存)，200 件(义乌)，309 件(noon 仓)。",
+        "经核对，总计 509 件为总库存，其中义乌 200 件。",
+    ):
+        out, warns = _sanitize(reply, ["query_stock_split"], tl)
+        _assert_no_stock_binding_in_prose(out)
+        assert "总库存：509" in _answer_body(out) and "义乌：200" in _answer_body(out), reply
+
+
+def test_value_before_label_does_not_overdelete_advice():
+    """负向：逗号后另起的补货数字、趋势/占比不被后置标签误删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    out, warns = _sanitize("近 30 天动销良好，建议补货 50 件，退货率占比 3.06%。", ["query_stock_split"], tl)
+    prose = _prose(out)
+    assert "30 天" in prose and "补货 50 件" in prose and "3.06%" in prose, f"非库存数字不应误删: {prose!r}"
+
+
 def test_success_logistics_no_carrier_or_tracking_in_prose():
     """承运商/运单号（对的、错的、对调的）都不进正文，只在权威块；货单号本身保留。"""
     tl = _sku_live_two_orders()
@@ -272,6 +294,18 @@ def test_user_supplied_tracking_in_question_not_removed():
     assert "1234567890123456" in _answer_body(out), _answer_body(out)
 
 
+def test_success_branch_question_tracking_id_moved_not_echoed():
+    """验门人 Round-1 打回点 2：成功分支里 question 自带的运单号不能当成"返回货单的运单号"
+    残留正文——`货单 PD2026001 的运单号是 ZZ999999999999`（ZZ 是用户自带号）必须移到权威块。
+    "用户自带号可回显"只用于失败/未找到场景，不在成功分支做 运单号↔货单 事实出口。"""
+    tl = _sku_live_two_orders()
+    out, warns = _sanitize("货单 PD2026001 的运单号是 ZZ999999999999。", ["query_sku_live"],
+                           tl, question="查 PD2026001 的运单号 ZZ999999999999")
+    prose = _prose(out)
+    assert "ZZ999999999999" not in prose, f"成功分支 question 自带运单号不应残留正文: {prose!r}"
+    assert "PD2026001" in prose, "货单号本身保留"
+
+
 # ── 权威块确定性渲染（值-槽绑定原样） ────────────────────────────────────────────
 
 def test_deterministic_stock_block_renders_bound_values():
@@ -316,6 +350,9 @@ TESTS = [
     test_order_live_login_failed_scrubs_facts,
     test_empty_ok_treated_as_failure,
     test_user_supplied_tracking_in_question_not_removed,
+    test_success_branch_question_tracking_id_moved_not_echoed,
+    test_success_stock_value_before_label_and_parenthetical_removed,
+    test_value_before_label_does_not_overdelete_advice,
     test_deterministic_stock_block_renders_bound_values,
     test_deterministic_orders_block_renders_bound_rows,
     test_both_providers_wire_factslot_evidence,

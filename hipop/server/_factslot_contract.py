@@ -113,6 +113,10 @@ _NONSTOCK_RIGHT_RE = re.compile(r"^\s*(?:秒|%|％|‰|天|日(?![用])|号|月|
 # 注意：不含冒号——"总库存:200""总库存：200" 里冒号是"标签:值"连接符而非子句边界，
 # 切了会让"总库存"与它的值分到两句、数字绑不到标签而漏过。
 _CLAUSE_DELIM_RE = re.compile(r"[。！？!?，,、；;\n（）()【】「」]")
+# value-before-label / 括号标签：数字之后跨过 可选库存单位 + 直接连接词/括号/冒号 后紧跟库存标签
+# → "509 件是总库存""509 件(总库存)""200 件在义乌" 这类后置标签绑定（验门人 Round-1·打回点 1）。
+# 故意不含逗号/顿号——",总库存" 是另起一项而非本数字的标签，含了会误删逗号后的补货数字。
+_STOCK_FOLLOW_PREFIX_RE = re.compile(r"^\s*(?:件|个|箱|套|双|pcs|PCS)?\s*(?:是|为|在|属于|计入|记入|的|（|\(|：|:)?\s*")
 
 
 def _safety_detectors():
@@ -405,9 +409,13 @@ def scrub_fabricated_slots(
         def _id_sub(m: re.Match) -> str:
             tok = m.group(0)
             up = _norm(tok)
-            if up in order_set or up in qids or (up and up in q_upper):
-                return tok                      # 货单号本身 / 被查 id / 问句里的号 → 保留
+            if up in order_set or up in qids:
+                return tok                      # 货单号本身 / 被查实体 id → 保留
             if any(up == d or up in d or d in up for d in qids):
+                return tok
+            # 用户问句自带的号：只在**失败/未找到**分支允许回显（"运单号 X 在 ERP 无记录"）；
+            # 成功分支里它会变成"运单号↔货单"的事实出口 → 必须移到权威块（验门人 Round-1·打回点 2）。
+            if not logistics_proven and up and up in q_upper:
                 return tok
             if logistics_proven:
                 moved["id"] += 1
@@ -417,11 +425,11 @@ def scrub_fabricated_slots(
         reply = id_re.sub(_id_sub, reply)
 
     # ── 路线(甲)·库存：正文不出现"库存数量↔仓库"的事实绑定 ──────────────────────────────
-    # 数字只要**在本子句里、其前面**有库存仓库标签（总库存/义乌/noon/在途…）就是"库存值↔仓库"
-    # 绑定，无论值对错一律移除，指向权威块。判定基于"是否构成事实槽绑定"，不是"是不是数字"：
+    # 数字与库存仓库标签构成"库存值↔仓库"绑定（标签在数字**之前**或**之后/括号里**都算）就是
+    # 事实绑定，无论值对错一律移除，指向权威块。判定基于"是否构成事实槽绑定"，不是"是不是数字"：
     #   · 数字右侧是明确非库存指示（秒/%/天/小时/货币/小数/日期）→ 非库存量，放行；
-    #   · 本子句无前置库存标签 → 补货建议(补 50 件)/趋势/一般数字 → 放行，不误删。
-    #   后置标签不许隔句抢绑（只看本子句、数字之前的标签）。
+    #   · 既无前置库存标签、也无紧跟的后置/括号库存标签 → 补货建议(补 50 件)/趋势/一般数字 → 放行；
+    #   前置标签只看本子句（防隔句抢绑）；后置标签要求紧跟（跨过单位+直接连接词），不吃逗号后另起项。
     _detect_labels = sorted(_STOCK_LABELS, key=len, reverse=True)
     if stock_called and not logistics_proven:
         def _clause_preceding_label(full: str, s: int):
@@ -438,12 +446,21 @@ def scrub_fabricated_slots(
                     best, best_key = k, key
             return best
 
+        def _following_stock_label(full: str, e: int):
+            seg = full[e:e + 14]
+            pm = _STOCK_FOLLOW_PREFIX_RE.match(seg)
+            rest = seg[pm.end():] if pm else seg
+            for k in _detect_labels:
+                if rest.startswith(k):
+                    return k
+            return None
+
         def _qty_sub(m: re.Match) -> str:
             s, e, full = m.start(), m.end(), m.string
             if _NONSTOCK_RIGHT_RE.match(full[e:e + 4]):
                 return m.group(0)               # 秒/%/天/小数/日期 → 非库存量，放行
-            if _clause_preceding_label(full, s) is None:
-                return m.group(0)               # 本子句无前置库存标签 → 非库存槽数字，放行
+            if _clause_preceding_label(full, s) is None and _following_stock_label(full, e) is None:
+                return m.group(0)               # 前后都无库存标签 → 非库存槽数字，放行
             if stock_proven:
                 moved["qty"] += 1               # 成功 → 移到权威块（静默）
                 return _REF_BLOCK
