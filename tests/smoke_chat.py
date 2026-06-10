@@ -916,17 +916,29 @@ def grade_case(c: Case, resp: dict) -> dict:
     warns = resp.get("hallucination_warnings") or []
 
     # Dimension 1: correct_source (data came from real tool/API, not fabricated)
-    # 1.0 if: must_use_tools all called, no hallucination warns
-    # 0.5 if: some tools called but warns present
-    # 0.0 if: no tools called or network error
+    # For cases with must_use_tools: 1.0 if all called + no warns; 0.5 if partial; 0.0 if none/error
+    # For cases WITHOUT must_use_tools: depends on check() pass + no hallucination warns
+    #   (these cases rely on must_contain/must_not_contain for validation, so grader can't
+    #    assume "no tools = fabricated" — but CAN penalize hallucination_warnings as signal)
     if resp.get("_error") or resp.get("_http_error"):
         grades["correct_source"] = 0.0
-    elif all(t in tools for t in c.must_use_tools):
-        grades["correct_source"] = 0.0 if warns else 1.0
-    elif any(t in tools for t in c.must_use_tools):
-        grades["correct_source"] = 0.5
+    elif c.must_use_tools:
+        # Tool-required cases: strict tool checking
+        if all(t in tools for t in c.must_use_tools):
+            grades["correct_source"] = 0.0 if warns else 1.0
+        elif any(t in tools for t in c.must_use_tools):
+            grades["correct_source"] = 0.5
+        else:
+            grades["correct_source"] = 0.0
     else:
-        grades["correct_source"] = 0.0
+        # Non-tool-required cases: penalize warnings, but allow partial credit if check passes
+        ok, _ = check(c, resp)
+        if warns:
+            grades["correct_source"] = 0.5  # Warnings reduce confidence even if check passes
+        elif ok:
+            grades["correct_source"] = 0.9  # Slightly lower than perfect 1.0 for cases without tool evidence
+        else:
+            grades["correct_source"] = 0.3  # Fails check but without tool evidence to fail on
 
     # Dimension 2: correct_time_window (query scoped to right time frame)
     # Examples: 30d queries respect 30d window, historical queries don't fake "today"
@@ -1274,6 +1286,7 @@ def main():
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
     ap.add_argument("--filter", help="只跑 name 含此关键词的 case")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--json-output", help="Export grading matrix as JSON to this file (for baseline comparison)")
     args = ap.parse_args()
 
     print(f"=== hipop-agent-os smoke test ===")
@@ -1386,6 +1399,27 @@ def main():
     print(f"{'AVERAGE':<60} {'':<6} "
           f"{avg_by_dim['correct_source']:<8.2f} {avg_by_dim['correct_time_window']:<8.2f} "
           f"{avg_by_dim['real_task']:<8.2f} {avg_by_dim['fail_closed']:<8.2f} {avg_overall:<8.2f}")
+
+    # WS-163: JSON export for baseline comparison (future DeepSeek vs stronger model)
+    if args.json_output:
+        json_export = {
+            "model": os.environ.get("MODEL_NAME", "unknown"),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cases": graded_results,
+            "averages": {
+                "correct_source": round(avg_by_dim["correct_source"], 3),
+                "correct_time_window": round(avg_by_dim["correct_time_window"], 3),
+                "real_task": round(avg_by_dim["real_task"], 3),
+                "fail_closed": round(avg_by_dim["fail_closed"], 3),
+                "overall": round(avg_overall, 3),
+            }
+        }
+        try:
+            with open(args.json_output, "w") as f:
+                json.dump(json_export, f, indent=2, ensure_ascii=False)
+            print(f"\n✓ JSON export: {args.json_output}")
+        except Exception as e:
+            print(f"\n✗ JSON export failed: {e}")
 
     if failed:
         print("\n=== 失败详情 ===")

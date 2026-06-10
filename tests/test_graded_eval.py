@@ -210,6 +210,64 @@ def test_rubric_weights_respected():
     print(f"✓ {test_rubric_weights_respected.__name__}")
 
 
+def test_no_tool_case_fake_data_penalized():
+    """Red team exploit: case with no must_use_tools but fabricated numbers.
+
+    This catches the case where a SKU query has no must_use_tools requirement,
+    but Agent fabricates a number. Without tool evidence, overall score should be
+    penalized even if check() passes (since check() can't validate the number).
+    """
+    c = Case(
+        name="单 SKU 查询 TBJ0059A（必含 SKU 名）",
+        question="TBJ0059A 卖得怎么样",
+        must_contain=["TBJ0059A"],
+        must_not_contain=["7天销量"],
+        # NOTE: No must_use_tools here (like the real case)
+    )
+    resp = {
+        # Fabricated: TBJ0059A with fake numbers, no tool call
+        "reply": "TBJ0059A 库存999件，近30天销量888件，表现良好。",
+        "clean_reply": "TBJ0059A 库存999件，近30天销量888件，表现良好。",
+        "tools_used": [],  # No tools called
+        "hallucination_warnings": [],
+    }
+    grades = grade_case(c, resp)
+    # Check passes (contains "TBJ0059A", no blacklist words)
+    ok, _ = check(c, resp)
+    assert ok, "check() should pass for this reply"
+    # BUT correct_source should be penalized: no tool evidence
+    # For non-tool cases: 0.9 if check passes + no warns, so penalized below 1.0
+    assert grades["correct_source"] <= 0.9, \
+        f"Expected correct_source ≤ 0.9 (no tool evidence), got {grades['correct_source']}"
+    # Overall should be lower due to missing tool evidence
+    # For non-tool case: correct_source=0.9, time_window=1.0 (no time patterns), real_task=1.0, fail_closed=1.0
+    # overall = 0.9*0.25 + 1.0*0.25 + 1.0*0.25 + 1.0*0.25 = 0.975
+    # The key is that correct_source is penalized below 1.0
+    assert grades["overall"] < 0.98, \
+        f"Expected overall < 0.98 (penalized for no tool evidence), got {grades['overall']}"
+    print(f"✓ {test_no_tool_case_fake_data_penalized.__name__}")
+
+
+def test_no_tool_case_with_warning_drops_source():
+    """Case without must_use_tools but has hallucination warning gets penalized."""
+    c = Case(
+        name="test", question="?",
+        must_contain=["库存"],
+        # No must_use_tools
+    )
+    resp = {
+        "reply": "库存是100件",
+        "clean_reply": "库存是100件",
+        "tools_used": [],
+        "hallucination_warnings": ["⚠️ Agent 编造了字段"],
+    }
+    grades = grade_case(c, resp)
+    # Warnings → correct_source = 0.5 even without tool requirement
+    assert grades["correct_source"] == 0.5, \
+        f"Expected correct_source=0.5 (warning present), got {grades['correct_source']}"
+    print(f"✓ {test_no_tool_case_with_warning_drops_source.__name__}")
+
+
 if __name__ == "__main__":
     tests = [
         test_correct_source_full_score_with_tools,
@@ -223,6 +281,8 @@ if __name__ == "__main__":
         test_fail_closed_zero_with_fabrication,
         test_overall_weighted_average,
         test_rubric_weights_respected,
+        test_no_tool_case_fake_data_penalized,
+        test_no_tool_case_with_warning_drops_source,
     ]
 
     failed = 0
