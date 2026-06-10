@@ -877,29 +877,134 @@ def tool_scope_overview(store: str) -> Dict:
     }
 
 
+def _normalize_replenishment_rows(rows: list) -> list:
+    out = []
+    for row in rows or []:
+        r = dict(row)
+        if r.get("trend") == "急速下降":
+            r["urgency_level"] = "high"
+        elif r.get("trend") in ("下降", "加速增长"):
+            r["urgency_level"] = "mid"
+        else:
+            r["urgency_level"] = "low"
+        r["qty"] = r.get("weekly_total_replenish") or 0
+        try:
+            r["trigger_reasons_list"] = json.loads(r.get("trigger_reasons") or "[]")
+        except Exception:
+            r["trigger_reasons_list"] = []
+        out.append(r)
+    return out
+
+
 def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
     tid = _get_tenant()
     alias = _resolve_entity_alias(store) or ""
-    # WS-62：与 HTTP 入口同源——带库存就绪度。库存未就绪/不完整时，chat 不能把
-    # 空建议当成「不用补货」，必须如实说「库存未就绪/不完整」（防死代码短路）。
-    view = _data.get_replenishment_view(store, limit=limit)
-    stock_status = view["stock_status"]
+    import datetime as _dt
+    from hipop.scripts.freshness_gate import decide_freshness
+
+    # WS-62：与 HTTP 入口同源的库存就绪门。库存未就绪/不完整时，chat 不能把
+    # 空建议当成「不用补货」，必须 fail-closed。
+    stock_status = _data.stock_readiness(tid, alias)
     _last_replenishment_stock_status.set(stock_status)
-    rows = view["rows"]
+    base_refs = [
+        {"table": "wf1_stock",
+         "where": f"tenant_id={tid} AND entity_alias='{alias}' stock_readiness"},
+        {"table": "wf5_sales_cycle",
+         "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0"},
+        {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
+    ]
+    if not stock_status.get("ready"):
+        msg = stock_status.get("message") or "库存数据未就绪，不能给确定补货建议。"
+        return {
+            "store": store, "count": 0, "items": [],
+            "fail_closed": True,
+            "stock_status": stock_status,
+            "warning": msg,
+            "stale_warning": msg,
+            "message": msg,
+            "references": base_refs,
+        }
+
+    latest_wf5 = _data._scalar(
+        "SELECT MAX(updated_at) FROM wf5_sales_cycle "
+        "WHERE tenant_id=? AND entity_alias=? AND weekly_total_replenish > 0",
+        (tid, alias),
+    )
+    freshness_decision = decide_freshness(
+        live_ok=False,
+        live_error="补货建议使用最近一次成功的 wf5_sales_cycle 统一计算结果",
+        cache_available=bool(latest_wf5),
+        cache_fetched_at=latest_wf5,
+        operator_cache_consent=True,
+        cache_requires_consent=False,
+        subject=f"{store} 补货建议",
+    )
+    if not freshness_decision.get("can_output_number"):
+        msg = freshness_decision.get("message") or "补货建议数据缺少更新时间，不能出数。"
+        return {
+            "store": store, "count": 0, "items": [],
+            "fail_closed": True,
+            "stock_status": stock_status,
+            "freshness_decision": freshness_decision,
+            "warning": msg,
+            "stale_warning": msg,
+            "message": msg,
+            "references": base_refs,
+        }
+
+    max_age_days = int(freshness_decision.get("max_cache_age_days") or 3)
+    cutoff = (_dt.date.today() - _dt.timedelta(days=max_age_days)).isoformat()
+    lim = max(1, min(int(limit or 10), 50))
+    rows = _data._fetch(
+        """
+        SELECT w2.partner_sku, w2.title, w2.image_url, w2.sales_30d, w2.latest_price,
+               w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
+               w5.wf5_replenish_qty, w5.lost_replenish_qty, w5.weekly_total_replenish,
+               w5.trigger_reasons, w5.current_pipeline, w5.target_pipeline,
+               w5.updated_at
+        FROM wf2_sku w2
+        JOIN wf5_sales_cycle w5
+          ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
+          AND w2.partner_sku=w5.partner_sku
+        WHERE w2.tenant_id=? AND w2.entity_alias=?
+          AND w2.is_listed=1 AND w5.weekly_total_replenish > 0
+          AND w5.updated_at >= ?
+        ORDER BY w5.weekly_total_replenish DESC
+        LIMIT ?
+        """,
+        (tid, alias, cutoff, lim),
+    )
+    from hipop.scripts.evidence_contract import (
+        build_query_evidence as _build_query_evidence,
+        SOURCE_NOON as _SRC_NOON, SOURCE_ERP as _SRC_ERP, SOURCE_MERGED as _SRC_MERGED,
+    )
+    evidence = _build_query_evidence(
+        source=_SRC_MERGED,
+        fetched_at=latest_wf5,
+        coverage=(
+            f"{store} 补货建议 = 统一库存(不含国际在途) + noon 销量窗口 + "
+            f"wf5_sales_cycle 工作流公式；Top{lim} 按 weekly_total_replenish DESC"
+        ),
+        sub_sources=[_SRC_NOON, _SRC_ERP],
+        context="compute_replenishment",
+    )
     items = [{
         "sku": r["partner_sku"], "title": r["title"], "qty": r["qty"],
         "urgency": r["urgency_level"], "daily_rate": r["daily_rate"], "trend": r["trend"],
         "advice": r["ops_advice"],
-    } for r in rows]
+        "updated_at": r.get("updated_at"),
+    } for r in _normalize_replenishment_rows(rows)]
     return {
         "store": store, "count": len(items), "items": items,
+        "fail_closed": False,
         "stock_status": stock_status,
+        "freshness_decision": freshness_decision,
+        "evidence": evidence,
+        "n_requested": lim,
+        "n_returned": len(items),
         "warning": None if stock_status.get("ready") else stock_status.get("message"),
         "stale_warning": None if stock_status.get("ready") else "库存数据未更新或不完整，当前补货结论偏保守",
-        "references": [
-            {"table": "wf5_sales_cycle", "where": f"tenant_id={tid} AND entity_alias='{alias}' AND weekly_total_replenish>0"},
-            {"table": "wf6_replenishment_queue_v2", "where": f"tenant_id={tid} AND entity_alias='{alias}'"},
-        ],
+        "references": base_refs,
     }
 
 
@@ -999,18 +1104,79 @@ def tool_list_products(store: str, listing: str = "all",
 
     items = []
     evidence = None
+    freshness_decision = None
+    fail_closed = False
+    fail_message = None
+    latest_sales_as_of = None
     requested_limit = max(0, min(int(limit or 0), 50))
     if requested_limit > 0:
+        from hipop.scripts.freshness_gate import decide_freshness
+
+        latest_sales_as_of = _data._scalar(
+            f"SELECT MAX(as_of_date) FROM {tbl} {where_sql} AND sales_30d IS NOT NULL"
+        )
+        freshness_decision = decide_freshness(
+            live_ok=False,
+            live_error="销量 TopN 使用最近一次成功的统一销量快照",
+            cache_available=bool(latest_sales_as_of),
+            cache_fetched_at=latest_sales_as_of,
+            operator_cache_consent=True,
+            cache_requires_consent=False,
+            subject=f"{store} 近30天销量 TopN",
+        )
+        if not freshness_decision.get("can_output_number"):
+            fail_closed = True
+            fail_message = freshness_decision.get("message") or (
+                f"{store} 近30天销量 TopN 缺少可用更新时间，不能出数。"
+            )
+            return {
+                "store": store,
+                "summary_products": {
+                    "total":     prod_agg["product_total"],
+                    "listed":    prod_agg["product_listed"],
+                    "unlisted":  prod_agg["product_unlisted"],
+                    "_dim": "product (= ERP 后台筛选店铺时显示的总数)"
+                },
+                "summary_skus": {
+                    "total":           agg["total"],
+                    "listed":          agg["listed"],
+                    "unlisted":        agg["unlisted"],
+                    "ever_sold_180d":  agg["ever_sold"],
+                    "sold_recent_30d": agg["sold_recent_30d"],
+                    "_dim": "sku (含每个 product 下的颜色/尺寸变体)"
+                },
+                "filter": {"listing": listing, "sales_only": sales_only},
+                "sort": {
+                    "field": "sales_30d",
+                    "direction": "desc",
+                    "tie_breakers": ["sales_180d desc", "partner_sku asc"],
+                    "meaning": "limit=N returns near-30-day sales TopN",
+                },
+                "n_requested": requested_limit,
+                "n_returned": 0,
+                "filtered_count": filtered_count,
+                "items": [],
+                "fail_closed": fail_closed,
+                "message": fail_message,
+                "freshness_decision": freshness_decision,
+                "references": [
+                    {
+                        "table": tbl,
+                        "where": where_sql,
+                        "as_of_date": latest_sales_as_of,
+                    },
+                ],
+            }
         rows = _data._fetch(f"""
             SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price,
                    as_of_date, imported_at
-            FROM {tbl} {where_sql}
+            FROM {tbl} {where_sql} AND as_of_date=?
             ORDER BY (sales_30d IS NULL) ASC,
                      COALESCE(sales_30d,0) DESC,
                      COALESCE(sales_180d,0) DESC,
                      partner_sku ASC
             LIMIT ?
-        """, (requested_limit,))
+        """, (latest_sales_as_of, requested_limit,))
         items = [{
             "sku": r["partner_sku"], "title": r["title"],
             "is_listed": bool(r["is_listed"]),
@@ -1032,9 +1198,10 @@ def tool_list_products(store: str, listing: str = "all",
             )
             evidence = _build_query_evidence(
                 source=_SRC_CACHE,
-                fetched_at=fetched_at,
+                fetched_at=latest_sales_as_of or fetched_at,
                 coverage=(
                     f"{store} wf2_sku.sales_30d DESC Top{requested_limit}；"
+                    f"统一销量快照 as_of_date={latest_sales_as_of}；"
                     f"limit={requested_limit} 即近30天销量 TopN；"
                     f"listing={listing}；sales_only={bool(sales_only)}"
                 ),
@@ -1070,12 +1237,16 @@ def tool_list_products(store: str, listing: str = "all",
         "n_returned": len(items),
         "filtered_count": filtered_count,
         "items": items,
+        "fail_closed": fail_closed,
+        "message": fail_message,
+        "freshness_decision": freshness_decision,
         "evidence": evidence,
         "references": [
             {
                 "table": tbl,
                 "where": (
-                    f"{where_sql} ORDER BY sales_30d DESC, sales_180d DESC "
+                    f"{where_sql} AND as_of_date='{latest_sales_as_of}' "
+                    f"ORDER BY sales_30d DESC, sales_180d DESC "
                     f"LIMIT {requested_limit}"
                     if requested_limit > 0 else where_sql
                 ),
@@ -2766,6 +2937,8 @@ def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
         return f"{store} 近30天销量 TopN 暂时不可用。"
     if tool_result.get("error"):
         return f"{store} 近30天销量 TopN 暂时不可用：{tool_result.get('error')}"
+    if tool_result.get("fail_closed"):
+        return tool_result.get("message") or f"{store} 近30天销量 TopN 数据超过 3 天，不能出数。请先刷新销量后重问。"
     items = tool_result.get("items") or []
     if not items:
         return f"{store} 暂无可排序的近30天销量商品数据。"
@@ -2940,6 +3113,29 @@ def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _deterministic_replenishment_list_request(question: str) -> "Optional[int]":
+    q = question or ""
+    if _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper()):
+        return None
+    triggers = ("补货建议", "本周必补", "该补货", "要补货", "哪些要补", "哪些货要补", "补多少")
+    if not any(t in q for t in triggers):
+        return None
+    if any(t in q for t in ("刷新", "同步", "重算", "跑一下", "重跑", "重新计算")):
+        return None
+    patterns = (
+        r"(?:Top|top|TOP)\s*(\d+)",
+        r"前\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最高的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最多的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"(\d+)\s*(?:个|名|款|条)",
+    )
+    for pat in patterns:
+        m = _re.search(pat, q)
+        if m:
+            return max(1, min(int(m.group(1)), 50))
+    return 10
+
+
 def _deterministic_stock_split_request(question: str) -> Optional[str]:
     """检测「单 SKU 四仓库存拆分」意图，返回 SKU 代码或 None。"""
     q = question or ""
@@ -2979,6 +3175,47 @@ def _format_stock_split_reply(sku: str, tool_result: dict) -> str:
         suffix = _render_freshness_suffix(decision)
         if suffix:
             lines.append(suffix)
+    return "\n".join(lines)
+
+
+def _format_replenishment_list_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 补货建议暂时不可用。"
+    if tool_result.get("fail_closed"):
+        return tool_result.get("message") or f"{store} 补货建议来源不完整或超过 3 天，不能出数。请先刷新库存/销量/补货工作流。"
+    items = tool_result.get("items") or []
+    if not items:
+        stock_status = tool_result.get("stock_status") or {}
+        if stock_status.get("ready") is False:
+            return stock_status.get("message") or f"{store} 库存未就绪，不能给确定补货建议。"
+        return f"{store} 当前没有 weekly_total_replenish > 0 的补货建议。"
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="replenishment_list_reply")
+    except _ContractViolation as _e:
+        return (
+            f"{store} 补货建议缺少可追溯证据（来源/取数时间/口径），"
+            f"按规则不出数。详情：{_e}"
+        )
+    lines = [
+        f"{store} 本周补货建议前 {len(items)} 个 SKU：",
+        "**口径**：统一库存不含国际在途；补货建议来自 wf5_sales_cycle 工作流公式。",
+        "",
+    ]
+    for i, item in enumerate(items[:10], 1):
+        sku = item.get("sku") or "?"
+        title = (item.get("title") or "").strip()
+        name = f"{sku}（{title}）" if title else sku
+        lines.append(
+            f"{i}. **{name}**：建议补货 {_fmt_int(item.get('qty'))} 件，"
+            f"紧急度 {item.get('urgency') or '未标注'}，日销 {_format_metric_value(item.get('daily_rate'))}。"
+        )
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
     return "\n".join(lines)
 
 
@@ -3241,10 +3478,15 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
     # 若数据陈旧则返回确定性陈旧后缀供调用方追加（代码级注入，不依赖 LLM wording）。
     if domain == "sales_skip":
         freshness = _data.check_freshness_coverage(store, "sales", target_date)
-        if freshness.get("covered"):
-            return None  # 数据新鲜，直接让 LLM 答，无需额外提示
         latest = freshness.get("latest_date") or ""
         target = freshness.get("target_date") or ""
+        if freshness.get("covered"):
+            suffix = (
+                "\n\n（提示：按你的要求本轮没有刷新，直接使用当前销量数据"
+                + (f"，最新到 {latest}" if latest else "")
+                + "；noon 销量同步可能滞后，结果偏保守。）"
+            )
+            return {"_stale_skip": True, "_stale_suffix": suffix}
         target_s = f"目标日期 {target} 暂未覆盖" if target_date else "未更新到今天"
         suffix = (
             f"\n\n（⚠️ 提示：当前销量数据{target_s}"
@@ -3659,6 +3901,29 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "provider": _provider.get_provider(),
             "confidence": 1.0 if (tool_result or {}).get("ok") else 0.9,
             "judge_method": "deterministic_replenishment_sku_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_replenishment_limit = _deterministic_replenishment_list_request(question)
+    if direct_replenishment_limit is not None:
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool(
+            "compute_replenishment",
+            {"store": store, "limit": direct_replenishment_limit},
+            user=scope,
+        )
+        reply = _format_replenishment_list_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["compute_replenishment"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0 if not (tool_result or {}).get("fail_closed") else 0.9,
+            "judge_method": "deterministic_replenishment_list_router",
             "hallucination_warnings": None,
         }
 

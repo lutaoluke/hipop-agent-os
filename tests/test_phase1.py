@@ -42,6 +42,22 @@ def _load_ws149_sku_query_paths_smoke():
     return mod
 
 
+def _load_ws134_operational_numeric_tools_smoke():
+    path = REPO_ROOT / "tests" / "smoke_ws134_operational_numeric_tools.py"
+    spec = importlib.util.spec_from_file_location("smoke_ws134_operational_numeric_tools", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ws134_operational_numeric_tools_use_evidence_gates():
+    """WS-134: numeric ops answers route through deterministic tools and evidence gates."""
+    smoke = _load_ws134_operational_numeric_tools_smoke()
+    smoke.test_sales_topn_stale_snapshot_fails_closed()
+    smoke.test_replenishment_list_routes_deterministically_and_blocks_stale_wf5()
+
+
 def test_ws149_query_sku_live_boundary_fail_closed():
     """WS-149: realtime SKU logistics must not silently fallback to stale wf3 cache."""
     smoke = _load_ws149_sku_query_paths_smoke()
