@@ -134,22 +134,63 @@ def test_high_risk_external_and_txn():
 
 
 def test_external_notify_phrasings_confirm_first():
-    """红队（验门人 14:42 覆盖缺口）:notify_via_feishu schema 明写的运营说法
-    「通知刘鹤 / 推到群里 / @同事」必须判外部通知 → 高风险 confirm-first，
-    修前评估为 mood=none / risk=low_auto / confirm=False（外部通知漏网）。
+    """WS-145 红队契约（WS-150 收敛后仍成立）：**通用「人对人」外部通知** ——
+    notify_via_feishu schema 明写的运营说法「通知刘鹤 / @同事 / 通知运营」，**无显式
+    飞书渠道词**，仍是高风险外部副作用 → confirm-first，飞书拒绝门不得吞它。
+
+    这正是 PR #92 Round-2 被打回的点：飞书不支持检测过宽，把这些通用通知误判成
+    unsupported_feishu_notify / needs_confirm_first=False。收敛后它们必须 confirm-first。
     """
     for q in (
         "帮我通知刘鹤这批货到了",
-        "推到群里",
         "@同事看一下这个库存",
-        "把补货建议发到飞书群",
         "通知运营一下",
+        "推送消息给张三",
     ):
         assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 外部通知应判高风险"
         d = gate.evaluate(q)
         assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
+        assert d.unsupported_feishu_notify is False, f"{q!r} 无飞书渠道词 → 不归飞书拒绝"
         assert d.needs_confirm_first is True, f"{q!r} 应 confirm-first 不自动执行"
         assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
+
+
+def test_explicit_feishu_channel_unsupported():
+    """WS-150 收敛：**显式飞书渠道 / 群广播**请求（发飞书 / 发到飞书群 / 推到群里 /
+    通知群）→ 工作台只读、不支持主动发 → 确定性拒绝（非通用 confirm-first）。
+
+    本产品对外「群」只有飞书群一条，故群广播归入飞书拒绝。WS-145 安全内核保留：
+    has_exec_verb=True、绝不直接进执行路由。
+    """
+    for q in (
+        "帮我发飞书通知大家",
+        "把补货建议发到飞书群",
+        "把库存情况推到群里",
+        "把库存情况推送消息到群里",   # 码长 Round-4 漏判点（群广播自然说法）
+        "通知群里这批货到了",
+        "同步到群",
+    ):
+        d = gate.evaluate(q)
+        assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"
+        assert d.unsupported_feishu_notify is True, f"{q!r} 显式飞书/群广播 → 确定性拒绝"
+        assert d.needs_confirm_first is False, f"{q!r} 不走通用 confirm-first（已被确定性拒绝取代）"
+        assert d.enters_execution is False, f"{q!r} 不应直接进执行路由"
+
+
+def test_notify_plus_transaction_still_confirm_first():
+    """WS-150 边界护栏：主动飞书通知与真高风险交易/采购/批量同句出现时，
+    交易不能被「通知不支持」顺带放过 —— 飞书拒绝让位，交易仍 confirm-first。
+    """
+    for q in (
+        "帮我下采购单并通知刘鹤",
+        "下采购单并推到群里",
+        "全店批量覆盖价格再发飞书通知大家",
+    ):
+        d = gate.evaluate(q)
+        assert d.risk == RiskTier.HIGH_CONFIRM, f"{q!r} 含交易/批量应判高风险"
+        assert d.unsupported_feishu_notify is False, f"{q!r} 夹带交易 → 飞书拒绝让位"
+        assert d.needs_confirm_first is True, f"{q!r} 交易仍须 confirm-first，不被通知不支持放过"
+        assert d.enters_execution is False, f"{q!r} 高风险不直接执行"
 
 
 def test_plain_notification_query_not_misfired():
@@ -344,6 +385,8 @@ if __name__ == "__main__":
         test_low_risk_internal_action,
         test_high_risk_external_and_txn,
         test_external_notify_phrasings_confirm_first,
+        test_explicit_feishu_channel_unsupported,
+        test_notify_plus_transaction_still_confirm_first,
         test_plain_notification_query_not_misfired,
         test_recovery_low_risk_first_attempt_retries_once,
         test_recovery_low_risk_second_attempt_plan_confirm,

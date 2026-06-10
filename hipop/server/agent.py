@@ -3912,6 +3912,24 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     _intent_decision = _intent_gate.evaluate(question or "")
     _chat_intent.set(_intent_decision)
 
+    # WS-150: 工作台不支持主动发飞书/通知群（确定性拒绝，不进 confirm-first）
+    if _intent_decision.unsupported_feishu_notify:
+        reply = _intent_gate.unsupported_feishu_notify_reply()
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "拒绝",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "execution_intent_gate_unsupported_feishu_notify",
+            "hallucination_warnings": None,
+        }
+
     # 高风险动作（外部通知/交易·采购·订单/不可回滚/跨店批量覆盖）即使肯定句也不自动执行:
     # 先 confirm，不自动补调。确定性短路，绝不落任务。
     if _intent_decision.needs_confirm_first:
