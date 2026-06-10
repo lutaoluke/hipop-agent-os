@@ -262,6 +262,87 @@ def test_success_stock_value_not_in_tool_return_is_scrubbed():
     assert any("禁编承重墙" in w for w in warns), warns
 
 
+# ── 路线 (b)：源头结构化槽位渲染 + slot-aware 值-槽绑定校验 ──────────────────────
+
+def _stock_result(sku="TBC0168A", total=509, yiwu=200, dongguan=0, saudi=0, noon=309, inbound=0):
+    return {
+        "ok": True, "fail_closed": False, "sku": sku, "store": "KSA",
+        "source": "noon+erp",
+        "split": {"yiwu": yiwu, "dongguan": dongguan, "overseas_saudi_1": saudi,
+                  "noon": noon, "inbound": inbound, "domestic": yiwu + dongguan},
+        "total": total, "erp_in_transit": None,
+    }
+
+
+def _stock_tl(result):
+    from hipop.server._factslot_contract import factslot_evidence_from_result
+    return [{"name": "query_stock_split", "args": {"sku": result["sku"]}, "result_error": None,
+             "factslot_evidence": factslot_evidence_from_result("query_stock_split", result)}]
+
+
+def test_stock_misbinding_total_takes_warehouse_value_is_scrubbed():
+    """3 轮红队卡点：工具 总库存=509/义乌=200，模型把"总库存"写成 200（跨槽搬运，值真关系假）。
+    flat 包含关系放行（200 确实出现过），slot-aware 绑定校验必须删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 总库存 200 件，义乌 200，noon 309。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "总库存 200" not in body, f"跨槽搬运的总库存 200 必须删: {body}"
+    # 权威渲染块把正确绑定值放出来
+    assert "总库存：509" in body, f"应渲染工具绑定的总库存 509: {body}"
+    assert "义乌：200" in body and "noon 仓：309" in body, f"各仓绑定值应原样渲染: {body}"
+    assert any("禁编承重墙" in w for w in warns), warns
+
+
+def test_stock_correct_binding_not_scrubbed():
+    """值-槽绑定正确（总库存 509、义乌 200、noon 309 都对）→ 不删。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    reply = "SKU TBC0168A 总库存 509 件，其中义乌 200、noon 309。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "总库存 509" in body and "义乌 200" in body and "noon 309" in body, f"正确绑定不应被删: {body}"
+    assert not [w for w in warns if "禁编承重墙" in w], warns
+
+
+def test_deterministic_stock_block_renders_bound_values():
+    """成功库存查询 → 即便模型没写数字，也按槽位渲染工具结构化绑定值。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, dongguan=11, saudi=0, noon=309, inbound=5))
+    reply = "你的库存情况如下，请查收。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "总库存：509" in body, f"应渲染总库存: {body}"
+    assert "义乌：200" in body and "东莞：11" in body and "noon 仓：309" in body, f"各仓绑定: {body}"
+    assert "待发货(在途待入库)：5" in body, f"待发货槽绑定: {body}"
+
+
+def test_stock_fail_closed_renders_no_block_uses_error_template():
+    """库存 fail_closed → 不渲染权威块，走确定性错误模板。"""
+    from hipop.server._factslot_contract import factslot_evidence_from_result
+    result = {"ok": False, "fail_closed": True, "sku": "TBC0168A", "message": "快照超 3 天，拒绝出数"}
+    tl = [{"name": "query_stock_split", "args": {"sku": "TBC0168A"}, "result_error": None,
+           "factslot_evidence": factslot_evidence_from_result("query_stock_split", result)}]
+    reply = "SKU TBC0168A 当前库存 509 件。"
+    out, warns = _sanitize(reply, ["query_stock_split"], tl)
+    body = _answer_body(out)
+    assert "509" not in body, f"fail_closed 时库存数字应删: {body}"
+    assert "库存明细" not in body, f"失败不应渲染权威明细块: {body}"
+    assert "无法确认" in out or "拒绝出数" in out, out[:200]
+
+
+def test_deterministic_orders_block_renders_bound_logistics():
+    """query_sku_live 成功 → 按槽位渲染货单/承运商/运单号/状态（值-槽绑定原样）。"""
+    from hipop.server._factslot_contract import factslot_evidence_from_result
+    result = {"ok": True, "sku": "TBC0168A",
+              "in_transit_orders": [
+                  {"order_no": "PD2026001", "forwarder": "Aramex", "tracking_no": "AB123456789012", "qty": 30}]}
+    tl = [{"name": "query_sku_live", "args": {"sku": "TBC0168A"}, "result_error": None,
+           "factslot_evidence": factslot_evidence_from_result("query_sku_live", result)}]
+    reply = "SKU TBC0168A 有在途货单，详情如下。"
+    out, warns = _sanitize(reply, ["query_sku_live"], tl)
+    body = _answer_body(out)
+    assert "PD2026001" in body and "承运商：Aramex" in body and "运单号：AB123456789012" in body, f"物流绑定渲染: {body}"
+
+
 # ── 接线：两个 provider 都在 tool_log 写入 factslot_evidence ──────────────────────
 
 def test_both_providers_wire_factslot_evidence():
@@ -289,6 +370,11 @@ TESTS = [
     test_success_status_not_in_tool_return_is_scrubbed,
     test_success_status_same_bucket_synonym_not_scrubbed,
     test_success_stock_value_not_in_tool_return_is_scrubbed,
+    test_stock_misbinding_total_takes_warehouse_value_is_scrubbed,
+    test_stock_correct_binding_not_scrubbed,
+    test_deterministic_stock_block_renders_bound_values,
+    test_stock_fail_closed_renders_no_block_uses_error_template,
+    test_deterministic_orders_block_renders_bound_logistics,
     test_both_providers_wire_factslot_evidence,
 ]
 
