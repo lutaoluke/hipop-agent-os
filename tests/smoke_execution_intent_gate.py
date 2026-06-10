@@ -145,6 +145,7 @@ def test_external_notify_phrasings_confirm_first():
         "帮我通知刘鹤这批货到了",
         "@同事看一下这个库存",
         "通知运营一下",
+        "推送消息给张三",
     ):
         assert gate.classify_risk(q) == RiskTier.HIGH_CONFIRM, f"{q!r} 外部通知应判高风险"
         d = gate.evaluate(q)
@@ -165,7 +166,9 @@ def test_explicit_feishu_channel_unsupported():
         "帮我发飞书通知大家",
         "把补货建议发到飞书群",
         "把库存情况推到群里",
+        "把库存情况推送消息到群里",   # 码长 Round-4 漏判点（群广播自然说法）
         "通知群里这批货到了",
+        "同步到群",
     ):
         d = gate.evaluate(q)
         assert d.has_exec_verb is True, f"{q!r} 应识别为动作（含执行动词）"

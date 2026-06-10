@@ -34,15 +34,22 @@ def test_deterministic_feishu_rejection_triggers():
     from hipop.server._execution_intent_gate import is_unsupported_feishu_notify
 
     test_cases = [
-        # 显式飞书渠道 / 群广播 → 确定性拒绝（True）
+        # 显式飞书渠道 → 确定性拒绝（True）
         ("发飞书", True),
         ("发到飞书", True),
         ("飞书群通知", True),
         ("推送到飞书", True),
+        ("发到飞书群", True),
+        # 群 / 频道 / 全员 广播自然说法（整类，非逐条枚举）→ 确定性拒绝（True）
         ("推到群里", True),
         ("通知群", True),
-        ("发到飞书群", True),
-        # 通用「人对人」通知（无飞书渠道词）→ 不归飞书拒绝（False），由 confirm-first 处理
+        ("把库存情况推送消息到群里", True),   # 码长 Round-4 漏判点
+        ("同步到群", True),
+        ("通知大家", True),
+        ("广播到频道", True),
+        ("群发这批货到了", True),
+        ("@所有人看一下", True),
+        # 通用「人对人」通知（无飞书/广播目标词）→ 不归飞书拒绝（False），由 confirm-first 处理
         ("通知刘鹤", False),
         ("通知运营一下", False),
         ("@同事看一下", False),
@@ -52,6 +59,7 @@ def test_deterministic_feishu_rejection_triggers():
         # 非外发请求 → False
         ("普通对话没有飞书", False),
         ("查库存吧", False),
+        ("群里有什么新消息", False),          # 查询型，目标在动词前，非广播
         ("查一下飞书有没有新通知", False),  # 查询型不算主动外发
     ]
 
@@ -94,6 +102,37 @@ def test_transaction_still_confirm_first_not_swallowed():
     decision = evaluate("帮我下采购单并通知刘鹤")
     assert decision.unsupported_feishu_notify is False, "夹带采购 → 飞书拒绝让位"
     assert decision.needs_confirm_first is True, "采购仍须 confirm-first，不被通知不支持放过"
+
+
+def test_group_broadcast_class_vs_person_to_person():
+    """WS-150 Round-4：整类「群/频道/全员广播」自然说法 → 确定性拒绝（unsupported）；
+    「人对人」通知 → 维持 confirm_first，两门互不吞。
+
+    覆盖码长 Round-4 漏判点（把库存情况推送消息到群里）+ 同类近义变体，断言非恒真
+    （同一组 phrase 在两个分支上给出相反结论）。
+    """
+    from hipop.server._execution_intent_gate import evaluate
+
+    # 群/频道/全员广播 → unsupported，不走 confirm_first
+    for q in (
+        "把库存情况推送消息到群里",   # 码长点名的漏判 phrase
+        "推送一下消息到频道",          # 同类近义变体
+        "通知大家这批货到了",
+        "同步到群",
+    ):
+        d = evaluate(q)
+        assert d.unsupported_feishu_notify is True, f"{q!r} 群广播应判 unsupported"
+        assert d.needs_confirm_first is False, f"{q!r} 不应走 confirm_first"
+
+    # 人对人通知 → 维持 confirm_first，不被群广播规则吞
+    for q in (
+        "推送消息给张三",              # 码长点名仍须 confirm_first
+        "把这批货的情况推送消息给王经理",  # 同类近义变体
+        "通知刘鹤这批货到了",
+    ):
+        d = evaluate(q)
+        assert d.unsupported_feishu_notify is False, f"{q!r} 人对人不归飞书/广播拒绝"
+        assert d.needs_confirm_first is True, f"{q!r} 应维持 confirm_first"
 
 
 def test_bitable_sync_backend_preserved():
@@ -141,6 +180,7 @@ if __name__ == "__main__":
         test_feishu_rejection_returns_fixed_message,
         test_feishu_priority_before_confirm_first,
         test_transaction_still_confirm_first_not_swallowed,
+        test_group_broadcast_class_vs_person_to_person,
         test_bitable_sync_backend_preserved,
         test_notify_tool_unchanged,
     ]

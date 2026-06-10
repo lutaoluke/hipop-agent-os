@@ -118,17 +118,29 @@ _TXN_BATCH_RISK_RE = re.compile(_TXN_BATCH_RISK)
 # 外部通知段复用 _EXTERNAL_NOTIFY（与 notify_via_feishu schema 对齐），单一来源。
 _HIGH_RISK_RE = re.compile(_TXN_BATCH_RISK + "|" + _EXTERNAL_NOTIFY)
 
-# WS-150 收敛（码长 Round-2 口径）：把「外部通知」拆成两个互不吞的子集 ——
-#   (1) 显式飞书渠道 / 群广播 → 工作台做不到（notify_via_feishu 只读 stub），确定性拒绝；
-#   (2) 通用人对人通知（通知<人名> / @<人> / 通知运营 / 发邮件…，无飞书渠道词）
+# WS-150 收敛（码长 Round-2/4 口径）：把「外部通知」拆成两个互不吞的子集 ——
+#   (1) 显式飞书渠道 / 群·频道·全员广播 → 工作台做不到（notify_via_feishu 只读 stub），确定性拒绝；
+#   (2) 通用人对人通知（通知<人名> / @<人> / 推送消息给<人> / 发邮件…，无飞书/广播目标词）
 #       → 仍是高风险外部副作用，维持 WS-145 的 confirm-first，**飞书拒绝门不得吞它**。
-# 故 _FEISHU_CHANNEL_RE 必须比 _EXTERNAL_NOTIFY 窄：只命中显式飞书 + 群广播，
-# 不命中「通知<人>」。_EXTERNAL_NOTIFY 仍保持宽（供 _HIGH_RISK_RE / _EXEC_VERB_RE：
-# 两类外部通知都算高风险动作），分流由 is_unsupported_feishu_notify 决定。
-# 本产品对外「群」只有飞书群一条，故群广播（推到群/通知群/发到群）归入飞书拒绝。
+# 故飞书拒绝判定必须比 _EXTERNAL_NOTIFY 窄、且不命中「<动作>给<人>」。_EXTERNAL_NOTIFY
+# 仍保持宽（供 _HIGH_RISK_RE / _EXEC_VERB_RE：两类外部通知都算高风险动作），分流由
+# is_unsupported_feishu_notify 决定。
+#
+# (a) 显式飞书渠道。
 _FEISHU_CHANNEL_RE = re.compile(
-    r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|推送?到飞书|推到飞书|"   # 显式飞书渠道
-    r"通知群|群通知|发到群|发群里|群里发|推送到群|推到.{0,4}群|推进.{0,3}群"  # 群广播（本产品「群」即飞书群）
+    r"发飞书|发到飞书|飞书(?:通知|群|推送|消息)|推送?到飞书|推到飞书|往飞书.{0,3}(?:发|推)"
+)
+# (b) 群 / 频道 / 全员 广播 —— 码长 Round-4 要求「一次钉死整类，不逐条枚举短语」：
+#     结构判别 = 广播动词（封闭小集合）+ 广播目标（封闭小集合：群/频道/大家/全员/所有人/全体），
+#     动词与目标之间允许少量插入字（「推送**消息到**群里」「发**一条到**频道」）。
+#     目标必须是「群/频道/大家」这类**面向不特定多数**的对象，故「<动词>给张三 / 通知刘鹤 /
+#     @同事」这类**人对人**不命中本规则 → 维持 confirm-first，两门互不吞。
+_BROADCAST_VERB = r"(?:发送|发|推送|推|通知|告知|知会|同步|广播|播报|转发|群发|@)"
+_BROADCAST_TARGET = r"(?:群(?:里|内|中|聊|组)?|频道|大家|全员|所有人|全体|公屏)"
+# 「群发 / 群播」动词本身即广播（目标隐含为群），不需后接目标；(?<!人) 挡掉「人群发现」类假友。
+_GROUP_BROADCAST_RE = re.compile(
+    r"(?<!人)群发|群播|"
+    + _BROADCAST_VERB + r"[^，。！？!?；;、,\n\r\t]{0,8}?" + _BROADCAST_TARGET
 )
 
 _CLAUSE_SEP_RE = re.compile(r"[，。！？!?；;、,\n\r\t ]+")
@@ -204,22 +216,25 @@ def classify_risk(question: str) -> RiskTier:
 
 
 def is_unsupported_feishu_notify(question: str) -> bool:
-    """WS-150（码长 Round-2 收敛）：只命中**显式飞书渠道 / 群广播**请求。
+    """WS-150（码长 Round-2/4 收敛）：命中**显式飞书渠道**或**群/频道/全员广播**请求。
 
     工作台主动发飞书是只读 stub（notify_via_feishu 永远 supported=False），所以
-    「发飞书 / 发到飞书群 / 推到群里 / 通知群」这类显式飞书/群广播应走确定性
-    「只读、不支持主动发」拒绝，而不是让用户去 confirm 一个做不到的动作（confirm
-    后仍落 stub，反而诱发「已发飞书」幻觉 —— 正是本条要消除的死法）。
+    「发飞书 / 发到飞书群」(显式飞书) 与「推送消息到群里 / 通知大家 / 同步到群 /
+    广播到频道」(面向不特定多数的群·频道·全员广播) 都应走确定性「只读、不支持主动发」
+    拒绝，而不是让用户去 confirm 一个做不到的动作（confirm 后仍落 stub，反而诱发
+    「已发飞书」幻觉 —— 正是本条要消除的死法）。广播类用**动词+广播目标的结构判别**
+    （_GROUP_BROADCAST_RE）整类命中，不逐条枚举短语（码长 Round-4 要求）。
 
-    **边界（两轮反向打地鼠的收口点）**：通用「人对人」通知（通知<人名> / @<人> /
-    通知运营 / 发邮件…，**无飞书渠道词**）不归本函数 —— 它仍是高风险外部副作用，
-    维持 WS-145 的 confirm-first（见 classify_risk → _HIGH_RISK_RE），飞书拒绝门
-    不得吞它。故这里用窄的 _FEISHU_CHANNEL_RE，而非宽的 _EXTERNAL_NOTIFY。
+    **边界（多轮反向打地鼠的收口点）**：通用「人对人」通知（通知<人名> / @<人> /
+    推送消息给<人> / 通知运营 / 发邮件…，**无飞书/广播目标词**）不归本函数 —— 它仍是
+    高风险外部副作用，维持 WS-145 的 confirm-first（见 classify_risk → _HIGH_RISK_RE），
+    飞书/广播拒绝门不得吞它。
 
-    注意：本函数只回答「这是不是一条显式飞书/群广播请求」。当同一句还夹带交易/
-    采购/批量等**真高风险**动作时，是否让位给 confirm-first 由 evaluate() 决定。
+    注意：本函数只回答「这是不是一条飞书/群广播请求」。当同一句还夹带交易/采购/
+    批量等**真高风险**动作时，是否让位给 confirm-first 由 evaluate() 决定。
     """
-    return bool(_FEISHU_CHANNEL_RE.search(question or ""))
+    q = question or ""
+    return bool(_FEISHU_CHANNEL_RE.search(q) or _GROUP_BROADCAST_RE.search(q))
 
 
 class GateDecision(NamedTuple):
@@ -237,12 +252,13 @@ def evaluate(question: str) -> GateDecision:
     mood = classify_mood(question)
     risk = classify_risk(question)
     has_exec = has_execution_verb(question)
-    enters = (mood == IntentMood.EXECUTE) and (risk == RiskTier.LOW_AUTO) and has_exec
     # WS-150: 主动飞书通知工作台不支持 → 跳过通用 confirm-first，返回确定性拒绝。
     # 但若同一句还夹带交易/采购/批量这类**真高风险**动作（如「下采购单并通知刘鹤」），
     # 不能因为「通知不支持」就把采购也一并放过 —— 此时交易仍走 confirm-first，飞书拒绝让位。
     txn_risk = bool(_TXN_BATCH_RISK_RE.search(question or ""))
     unsupported_notify = is_unsupported_feishu_notify(question) and not txn_risk
+    # 被确定性拒绝的请求绝不同时算「进真实执行路由」（如低风险归类的「同步到群」）。
+    enters = (mood == IntentMood.EXECUTE) and (risk == RiskTier.LOW_AUTO) and has_exec and not unsupported_notify
     needs_confirm = (mood == IntentMood.EXECUTE) and (risk == RiskTier.HIGH_CONFIRM) and not unsupported_notify
     blocks = has_exec and mood in (
         IntentMood.NEGATED,
