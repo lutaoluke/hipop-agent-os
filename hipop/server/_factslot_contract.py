@@ -94,12 +94,19 @@ def _status_buckets(text: str) -> set:
     return {b for b, kws in _STATUS_BUCKETS.items() if any(k in t for k in kws)}
 
 
-# 库存语境标签（四仓/库存领域的有限实体集，非穷举措辞）。Round-3 用于"标签驱动 +
-# fail-closed"判定：数字邻近哪个标签、是否绑定到具体槽位。
+# 库存语境标签（四仓/库存领域的有限实体集，非穷举措辞）。仅用于"这数字旁边是不是库存语境"
+# 的存在性判定，**不枚举连接词**。
 _STOCK_LABELS = [
     "义乌", "东莞", "沙特一号仓", "沙特", "海外仓", "海外", "国内仓", "国内", "一号仓",
     "总仓", "noon", "总库存", "总量", "总计", "总数", "国际在途", "库存", "在库", "在途", "现货",
     "待发货", "待发", "待发出", "待出库", "可售", "可用",
+]
+# 具体仓位/口径槽标签（成功分支用：子句里出现这些 = 库存值↔仓库 绑定）。
+# 排除 generic 的"库存/现货/在库/国内/海外/总仓/可售/可用"——它们常做修饰词（"库存查询/库存情况"），
+# generic 词只在"数字 ∈ 工具返回库存值"的 value-driven 路径下才触发，避免误删 generic 语境里的普通数字。
+_STOCK_SLOT_LABELS = [
+    "总库存", "总量", "总计", "总数", "义乌", "东莞", "沙特一号仓", "沙特", "一号仓",
+    "海外仓", "国内仓", "noon", "国际在途", "在途", "待发货", "待发出", "待发", "待出库",
 ]
 
 # Round-3/4：库存数字改"标签驱动 + fail-closed"（不再枚举连接词）。
@@ -109,14 +116,10 @@ _BARE_NUM_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])")
 _STOCK_UNIT_RE = re.compile(r"^\s*(?:件|个|箱|套|双|pcs|PCS|现货)")
 # 数字右侧的**明确非库存**指示（时间/百分比/货币/小数续位/日期分隔）→ 这数字不是库存量（Round-4 打回点 3）
 _NONSTOCK_RIGHT_RE = re.compile(r"^\s*(?:秒|%|％|‰|天|日(?![用])|号|月|年|周|小时|分钟|分|时|元|¥|\$|美元|次|页|倍|\.|．|:|：|-|/)")
-# 子句边界（库存数字只在"本子句的前置库存标签"下绑定，防下一个槽的标签隔句抢绑）。
-# 注意：不含冒号——"总库存:200""总库存：200" 里冒号是"标签:值"连接符而非子句边界，
-# 切了会让"总库存"与它的值分到两句、数字绑不到标签而漏过。
-_CLAUSE_DELIM_RE = re.compile(r"[。！？!?，,、；;\n（）()【】「」]")
-# value-before-label / 括号标签：数字之后跨过 可选库存单位 + 直接连接词/括号/冒号 后紧跟库存标签
-# → "509 件是总库存""509 件(总库存)""200 件在义乌" 这类后置标签绑定（验门人 Round-1·打回点 1）。
-# 故意不含逗号/顿号——",总库存" 是另起一项而非本数字的标签，含了会误删逗号后的补货数字。
-_STOCK_FOLLOW_PREFIX_RE = re.compile(r"^\s*(?:件|个|箱|套|双|pcs|PCS)?\s*(?:是|为|在|属于|计入|记入|的|（|\(|：|:)?\s*")
+# 子句边界：判定"数字与库存标签是否同处一句"。只用强分隔符，**不含括号/冒号**——
+# "509 件(总库存)" 的括号是对前面数字的标注（标签在数字之后/括号里），切了就漏；
+# "总库存:200" 的冒号是"标签:值"连接符。
+_CLAUSE_DELIM_RE = re.compile(r"[。！？!?，,、；;\n]")
 
 
 def _safety_detectors():
@@ -340,18 +343,18 @@ def scrub_fabricated_slots(
 ) -> Tuple[str, List[str]]:
     """路线(甲)：正文里**任何绑定到具体仓库/货单的事实槽值一律移除**（不判对错），指向权威块。
 
-    可判定的结构不变量（不再"判这个值绑对没绑对"——那是被更长句子绕过的匹配游戏）：
-      - 物流：所有闭集承运商名 + 运单号形 id（非货单号本身/非被查实体/非问句 token）一律移除。
-        成功 → 替换为指向权威块的引用（静默，正常渲染不报 banner）；失败/空 → 移除编造值 + 告警。
-        货单号本身保留（用户的引用）。"承运商/运单↔货单 配对错"这条死因从结构上不存在。
-      - 库存数量：数字只要"本子句、其前面"有库存仓库标签（总库存/义乌/noon/在途…）就是
-        "库存值↔仓库"事实绑定，无论对错一律移除；后置标签不许隔句抢绑。右侧明确非库存
-        （秒/%/天/小数/日期）放行；本子句无前置库存标签的数字（补货建议/趋势/一般数）放行。
-        成功 → 引用（静默）；失败/空 → 移除 + 告警。仅在无成功物流查询时启用。
+    可判定的结构不变量，**以"工具本轮返回了哪些事实值"为源头**，不枚举连接词、不靠静态闭集：
+      - 物流·承运商：value-driven —— 凡正文出现工具返回的 forwarder 字面值（任意承运商，
+        在不在预置闭集都无关）→ 移块；_CARRIER_RE 闭集仅作第二层兜底。运单号形 id 同理移除
+        （货单号本身/被查实体保留；用户问句自带号只在失败分支回显）。
+      - 库存数量：判"这数字是不是 库存值↔仓库 断言"靠两个结构信号（满足其一即移），**不看连接词**：
+        (a) 数字与具体仓位/口径槽标签（总库存/义乌/noon/在途…）同处一句（前后皆可）；
+        (b) value-driven：数字 ∈ 工具返回的库存值集合 且 同句有库存语境词（generic 靠真值锚定）。
+        右侧明确非库存（秒/%/天/小数/日期）或同句无库存标签的数字（补货建议/趋势/一般数）→ 放行。
+        成功 → 引用（静默）；失败/空 → fail-closed 移除 + 告警。仅在无成功物流查询时启用。
       - 状态：成功 → reply 状态桶必须 ∈ 工具状态桶（同桶同义放行、跨桶编造删，无法识别桶
         时 fail-open）；纯失败/空 → 删全部状态断言。
     事实槽值的权威出口只有 render_factslot_block；正文不复述具体数值/承运商/运单号。
-    allow-set / 绑定映射取所有"成功且有槽值"调用的并集，天然处理混合（A 成功 B 失败）场景。
     """
     evs = _all_evidence(tool_log)
     if not evs:
@@ -395,16 +398,30 @@ def scrub_fabricated_slots(
     redacted = {"carrier": [], "id": [], "qty": 0, "status": 0}
 
     if logistics_called:
-        # 路线(甲)·物流：正文不出现"承运商/运单号↔货单"的事实绑定 —— 闭集承运商名一律移除、
-        # 运单号形 id（非货单号本身/非被查实体/非问句 token）一律移除，替换为指向权威块的引用。
-        # 不判对错 → "配对错"这条死因从结构上不存在；货单号本身保留（用户的引用）。
-        def _carrier_sub(m: re.Match) -> str:
+        # 路线(甲)·物流：正文不出现"承运商/运单号↔货单"的事实绑定 —— 移除承运商名 + 运单号形 id，
+        # 替换为指向权威块的引用。货单号本身保留（用户的引用）。
+        def _carrier_remove(matched: str) -> str:
             if logistics_proven:
                 moved["carrier"] += 1
                 return _REF_BLOCK               # 成功 → 移到权威块（静默）
-            redacted["carrier"].append(m.group(0))
+            redacted["carrier"].append(matched)
             return _REDACT_CARRIER              # 失败 → 编造移除（告警）
-        reply = carrier_re.sub(_carrier_sub, reply)
+
+        # ① **value-driven（源头化，Round-2 打回点 2）**：以工具本轮返回的 forwarder 字面值为准，
+        #    正文里出现这些值（任意承运商，在不在预置闭集都无关）→ 移块。这样 Naqel 之类
+        #    非闭集承运商也不漏，且换任意承运商都不需要补词表。
+        forwarder_vals = sorted(
+            {str(f).strip() for e in evs
+             if e.get("tool") in _LOGISTICS_TOOLS and e.get("ok") and e.get("slots_proven")
+             for f in (e.get("forwarders") or []) if str(f).strip()},
+            key=len, reverse=True,
+        )
+        for fv in forwarder_vals:
+            reply = re.sub(re.escape(fv), lambda m: _carrier_remove(m.group(0)), reply, flags=re.IGNORECASE)
+
+        # ② 闭集承运商名（_CARRIER_RE）作第二层纵深，兜住"模型编了个工具没返回的已知承运商"。
+        #    主判据是 ① 的工具返回值，这里只是 defense-in-depth、不当唯一源。
+        reply = carrier_re.sub(lambda m: _carrier_remove(m.group(0)), reply)
 
         def _id_sub(m: re.Match) -> str:
             tok = m.group(0)
@@ -424,43 +441,43 @@ def scrub_fabricated_slots(
             return _REDACT_ID
         reply = id_re.sub(_id_sub, reply)
 
-    # ── 路线(甲)·库存：正文不出现"库存数量↔仓库"的事实绑定 ──────────────────────────────
-    # 数字与库存仓库标签构成"库存值↔仓库"绑定（标签在数字**之前**或**之后/括号里**都算）就是
-    # 事实绑定，无论值对错一律移除，指向权威块。判定基于"是否构成事实槽绑定"，不是"是不是数字"：
-    #   · 数字右侧是明确非库存指示（秒/%/天/小时/货币/小数/日期）→ 非库存量，放行；
-    #   · 既无前置库存标签、也无紧跟的后置/括号库存标签 → 补货建议(补 50 件)/趋势/一般数字 → 放行；
-    #   前置标签只看本子句（防隔句抢绑）；后置标签要求紧跟（跨过单位+直接连接词），不吃逗号后另起项。
-    _detect_labels = sorted(_STOCK_LABELS, key=len, reverse=True)
+    # ── 路线(甲)·库存：正文不出现"库存数量↔仓库"的事实绑定（源头化，不枚举连接词）────────────
+    # 判定"这个数字是不是 库存值↔仓库 事实断言"——不看用什么连接词（是/对应/即/在/括号…一律不枚举），
+    # 只看两个结构信号，二者满足其一即移块：
+    #   (a) 数字与**具体仓位/口径槽标签**（总库存/义乌/noon/在途…）同处一句（前后皆可）；
+    #   (b) **value-driven 源头**：数字 ∈ 工具本轮返回的库存值集合，且同句出现任一库存语境词
+    #       （含 generic 库存/现货）——以"工具返回了哪些值"为准，generic 语境靠真值锚定不误删。
+    # 非槽数字（右侧明确非库存单位 秒/%/天/小数/日期，或同句无任何库存标签）→ 放行（趋势/补货建议）。
+    # 失败/空分支（stock_bind 无真值）：用全部库存标签做存在性判定，fail-closed 移除。
+    _stock_vals = {
+        int(v) for e in evs
+        if e.get("tool") in _STOCK_TOOLS and e.get("ok") and e.get("has_stock_value")
+        for v in (e.get("stock_values") or []) if isinstance(v, int)
+    }
     if stock_called and not logistics_proven:
-        def _clause_preceding_label(full: str, s: int):
-            cd = list(_CLAUSE_DELIM_RE.finditer(full, 0, s))
-            cstart = cd[-1].end() if cd else 0
-            clause_before = full[cstart:s]      # 本子句、数字之前的文本
-            best, best_key = None, (-1, -1)     # 结束位置最近 + 更长（防 generic 子串抢绑）
-            for k in _detect_labels:
-                i = clause_before.rfind(k)
-                if i < 0:
-                    continue
-                key = (i + len(k), len(k))
-                if key > best_key:
-                    best, best_key = k, key
-            return best
-
-        def _following_stock_label(full: str, e: int):
-            seg = full[e:e + 14]
-            pm = _STOCK_FOLLOW_PREFIX_RE.match(seg)
-            rest = seg[pm.end():] if pm else seg
-            for k in _detect_labels:
-                if rest.startswith(k):
-                    return k
-            return None
+        def _clause_around(full: str, s: int, e: int) -> str:
+            before = list(_CLAUSE_DELIM_RE.finditer(full, 0, s))
+            cstart = before[-1].end() if before else 0
+            am = _CLAUSE_DELIM_RE.search(full, e)
+            cend = am.start() if am else len(full)
+            return full[cstart:cend]
 
         def _qty_sub(m: re.Match) -> str:
             s, e, full = m.start(), m.end(), m.string
             if _NONSTOCK_RIGHT_RE.match(full[e:e + 4]):
                 return m.group(0)               # 秒/%/天/小数/日期 → 非库存量，放行
-            if _clause_preceding_label(full, s) is None and _following_stock_label(full, e) is None:
-                return m.group(0)               # 前后都无库存标签 → 非库存槽数字，放行
+            clause = _clause_around(full, s, e)
+            n = int(m.group(0))
+            if stock_proven:
+                # 成功：具体槽标签同句  或  工具真返回过该值且同句有库存语境词
+                bound = any(lbl in clause for lbl in _STOCK_SLOT_LABELS) or (
+                    n in _stock_vals and any(lbl in clause for lbl in _STOCK_LABELS)
+                )
+            else:
+                # 失败/空：同句出现任一库存标签即 fail-closed 移除
+                bound = any(lbl in clause for lbl in _STOCK_LABELS)
+            if not bound:
+                return m.group(0)               # 非库存槽数字 → 放行（补货建议/趋势/一般数）
             if stock_proven:
                 moved["qty"] += 1               # 成功 → 移到权威块（静默）
                 return _REF_BLOCK

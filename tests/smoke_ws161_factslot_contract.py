@@ -182,6 +182,52 @@ def test_value_before_label_does_not_overdelete_advice():
     assert "30 天" in prose and "补货 50 件" in prose and "3.06%" in prose, f"非库存数字不应误删: {prose!r}"
 
 
+def test_stock_binding_is_connector_agnostic_not_enumerated():
+    """验门人 Round-2 打回点 1：换任意连接词（对应/即/=…）都不漏——判定靠"数字与槽标签同句"
+    这个结构信号，不枚举连接词小表。"""
+    tl = _stock_tl(_stock_result(total=509, yiwu=200, noon=309))
+    for reply in (
+        "509 件对应总库存，200 件对应义乌，309 件对应 noon 仓。",
+        "509 件即总库存。",
+        "总库存 = 509 件。",
+        "经统计，509 这个数对应的是总库存口径。",
+    ):
+        out, warns = _sanitize(reply, ["query_stock_split"], tl)
+        _assert_no_stock_binding_in_prose(out)
+        assert "总库存：509" in _answer_body(out), reply
+    # 负向：非库存语境数字不被误删
+    out, _ = _sanitize("近 30 天动销良好，建议补货 50 件。", ["query_stock_split"], tl)
+    assert "30 天" in _prose(out) and "补货 50 件" in _prose(out)
+
+
+def _sku_live_custom_forwarder(forwarder="Naqel", tracking="NQ123456789", order="PD2026003"):
+    from hipop.server._factslot_contract import factslot_evidence_from_result
+    result = {"ok": True, "sku": "TBC0168A", "in_transit_orders": [
+        {"order_no": order, "forwarder": forwarder, "tracking_no": tracking, "qty": 12}]}
+    return [{"name": "query_sku_live", "args": {"sku": "TBC0168A"}, "result_error": None,
+             "factslot_evidence": factslot_evidence_from_result("query_sku_live", result)}]
+
+
+def test_carrier_value_driven_non_closed_set_removed():
+    """验门人 Round-2 打回点 2：承运商移块以**工具本轮返回的 forwarder 字面值**为准——
+    Naqel 不在预置闭集 _CARRIER_RE，但工具返回了它 → 正文里的 Naqel 也必须移到权威块。"""
+    tl = _sku_live_custom_forwarder(forwarder="Naqel", tracking="NQ123456789", order="PD2026003")
+    out, warns = _sanitize("货单 PD2026003 由 Naqel 承运，运单号 NQ123456789。", ["query_sku_live"], tl)
+    prose = _prose(out)
+    assert "Naqel" not in prose, f"工具返回的非闭集承运商 Naqel 应移块: {prose!r}"
+    assert "NQ123456789" not in prose, f"运单号应移块: {prose!r}"
+    assert "PD2026003" in prose, "货单号本身保留"
+    assert "承运商：Naqel" in _answer_body(out), "权威块应保留承运商"
+
+
+def test_carrier_value_driven_another_unknown_carrier():
+    """对称：换另一个非闭集承运商（iMile）同样不漏——证明不靠词表。"""
+    tl = _sku_live_custom_forwarder(forwarder="iMile", tracking="IM987654321", order="PD2026007")
+    out, warns = _sanitize("PD2026007 这一单走的是 iMile，单号 IM987654321。", ["query_sku_live"], tl)
+    prose = _prose(out)
+    assert "iMile" not in prose and "IM987654321" not in prose, f"非闭集承运商/运单应移块: {prose!r}"
+
+
 def test_success_logistics_no_carrier_or_tracking_in_prose():
     """承运商/运单号（对的、错的、对调的）都不进正文，只在权威块；货单号本身保留。"""
     tl = _sku_live_two_orders()
@@ -353,6 +399,9 @@ TESTS = [
     test_success_branch_question_tracking_id_moved_not_echoed,
     test_success_stock_value_before_label_and_parenthetical_removed,
     test_value_before_label_does_not_overdelete_advice,
+    test_stock_binding_is_connector_agnostic_not_enumerated,
+    test_carrier_value_driven_non_closed_set_removed,
+    test_carrier_value_driven_another_unknown_carrier,
     test_deterministic_stock_block_renders_bound_values,
     test_deterministic_orders_block_renders_bound_rows,
     test_both_providers_wire_factslot_evidence,
