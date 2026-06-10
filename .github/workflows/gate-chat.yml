@@ -1,0 +1,46 @@
+name: gate-chat
+# harness 门2(交付门)· WS-154 验收 #1/#3 — live 全量 chat e2e 阻断门(Luke 方案 ①)。
+#
+# 跑 tests/smoke_chat.py(~25 个真问真答 case,每 case 真烧一次 LLM)。失败即拦合并,
+# 逐 case ✓/✗ 输出可定位到具体 case(验收 #3)。
+#
+# 安全形态(方案 ①——上轮 pwn-request 安全否决的合规解):
+#   1. 只对**非 fork** 分支跑(下方 `if`)。fork PR 一律跳过,不触达任何 secret / self-hosted runner。
+#      → 只有自己人(可信)代码会上 self-hosted runner,杜绝外部 PR 偷 live 凭据。
+#   2. self-hosted `hipop-live` runner:live LLM key / 真实业务库 / 店铺登录态都在那台机器,
+#      由 runner 环境的 HIPOP_ENV_FILE 提供,**绝不从仓库 / PR 取**。
+#   3. 运行逻辑在 tests/ci_chat_e2e_gate.sh:preflight 缺凭据直接红、retry 1 次吸收 LLM 抖动但
+#      两次都红才判失败(确定性真红的 case 照样红、不被洗白)。本机已自测 preflight/retry 行为。
+#
+# 收尾(只有 owner 能做,见 PR 正文):注册 label=`hipop-live` 的 self-hosted runner(机器上有 live 环境),
+#   并把本 check `gate-chat` 设成 required。
+
+on:
+  pull_request:
+    branches: [main]
+
+# 同一 PR 连续推送时取消上一次还在跑的 chat e2e(省 LLM 调用)
+concurrency:
+  group: gate-chat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chat-e2e:
+    name: chat e2e (live, ~25 cases, 失败即阻断)
+    # 关键安全闸:只有同仓(非 fork)分支才跑;fork PR 跳过,不触达 self-hosted runner / 凭据。
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hipop-live]
+    timeout-minutes: 25
+    env:
+      # 指向 runner 机器上带 DEEPSEEK_API_KEY / DB_URL / JWT_SECRET 的 env 文件;用 repo/runner
+      # variable 覆盖默认值即可,绝不把密钥写进本文件或从 PR 取。
+      HIPOP_ENV_FILE: ${{ vars.HIPOP_ENV_FILE || '/Users/luke/code/hipop/.env.local' }}
+      HIPOP_URL: http://127.0.0.1:8765
+      PYTHON: python3
+    steps:
+      - uses: actions/checkout@v4
+
+      # 全部逻辑(preflight 防空跑 + 起 server + 跑 smoke + retry 不洗白真红)在脚本里,
+      # 由 bash 真实执行;不加 `|| true`、无 continue-on-error,退出码冒泡成 job 红。
+      - name: Gate — live chat e2e (preflight + retry, 失败即阻断)
+        run: bash tests/ci_chat_e2e_gate.sh
