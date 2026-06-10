@@ -69,6 +69,14 @@ def test_ws147_daily_refresh_noon_yesterday_contract():
     smoke.test_daily_refresh_verifier_blocks_today_and_requires_snapshot_step()
 
 
+def test_ws162_tools_registry_manifest_contract():
+    """WS-162: tools registry manifest owns schema/access/risk/role/scope/smoke metadata."""
+    from hipop.runtime.verifiers import verify_tools_registry_manifest_contract
+
+    result = verify_tools_registry_manifest_contract()
+    assert result["ok"], result
+
+
 def test_ws134_operational_numeric_tools_use_evidence_gates():
     """WS-134: numeric ops answers route through deterministic tools and evidence gates."""
     smoke = _load_ws134_operational_numeric_tools_smoke()

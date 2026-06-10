@@ -56,6 +56,14 @@ def test_governance_registry_has_destructive_tools():
         "query_sku 是 read-only，不应进 governance"
 
 
+def test_tools_registry_manifest_is_single_source_of_truth():
+    """WS-162: tool schema/access/risk/role/scope/smoke must live in tools_registry.yaml."""
+    from hipop.runtime.verifiers import verify_tools_registry_manifest_contract
+
+    result = verify_tools_registry_manifest_contract()
+    assert result["ok"], result
+
+
 def test_medium_risk_decide_allows_without_api_key():
     """medium-risk decide() 必须在无 LLM API key 的环境下返回 Allow。
 
@@ -140,6 +148,7 @@ if __name__ == "__main__":
         test_provider_files_have_no_local_exec_tool,
         test_agent_exec_tool_has_governance_dispatch,
         test_governance_registry_has_destructive_tools,
+        test_tools_registry_manifest_is_single_source_of_truth,
         test_medium_risk_decide_allows_without_api_key,
         test_destructive_tool_goes_through_governance_pipeline,
     ]
