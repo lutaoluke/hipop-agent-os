@@ -1002,7 +1002,12 @@ def test_t37_chat_reply_includes_business_impact_when_asked():
         agent_module._exec_tool = old_exec_tool
         agent_module._workflow_receipt_reply = old_receipt_reply
 
-    assert result.get("workflow_task", {}).get("workflow") == "wf1_stock_v2", (
+    # chat() 已迁移到 workflow_tasks(复数 list)契约（与 api.py 生产消费一致）；
+    # 兼容旧单数 workflow_task 字段做回退。
+    _wf_tasks = result.get("workflow_tasks") or (
+        [result["workflow_task"]] if result.get("workflow_task") else []
+    )
+    assert _wf_tasks and _wf_tasks[0].get("workflow") == "wf1_stock_v2", (
         f"T37 exact prompt 应创建真实 workflow_task，实际: {result}"
     )
     reply = result.get("reply") or ""
