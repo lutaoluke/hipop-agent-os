@@ -785,9 +785,14 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     if promise_notify and "notify_via_feishu" not in tools_used:
         warnings.append("⚠️ Agent 宣称已通知/发飞书，但没调 notify_via_feishu — 这是 hallucinate")
 
-    # "已触发 / 已启动 / 再次触发 wf*" → 检查是否真调了 run_workflow
+    # "已触发 / 已启动 / 再次触发 wf*" → 检查是否真调了 run_workflow。
+    # 注意「已开始」必须锚定到执行动作(已开始刷新/重算/执行/跑…)，不能裸命中 ——
+    # 否则「库存周转已开始改善」「销量已开始回升」这类**趋势客观陈述**会被冤成假执行、
+    # 误挂 banner(验门人 FP 打回点)。裸「已触发/已启动」属强执行语素,予以保留。
     promise_workflow = re.search(
-        r"(已触发|已启动|已开始|再次触发|已经在.{0,5}(后台|跑)|"
+        r"(已触发|已启动|"
+        r"已开始[^，。！？!?；;\n]{0,6}(?:刷新|同步|重算|重新计算|执行|跑|拉取|扫描|计算|处理|更新|生成|工作流|任务)|"
+        r"再次触发|已经在.{0,5}(后台|跑)|"
         r"任务.{0,10}(提交|启动)|已让.{0,5}系统|系统已经在.{0,5}后台|后台跑了)",
         reply,
     )

@@ -120,6 +120,51 @@ def test_plain_query_reply_not_touched():
     assert out == reply, f"普通查询不应被硬切改写: {out!r}"
 
 
+# ── 2b) 红队 FP 探针:合法业务事实(数据日期/统计趋势)不挂 banner、不被硬切 ─────
+#    验门人 PR #99 round-1 打回点 —— 正常看数据日期/趋势的客观陈述被冤成「假执行」。
+
+def test_fp_freshness_date_fact_not_flagged():
+    """『数据已更新到 <日期>』『同步至 <日期>』『更新日期：<日期>』是客观时效事实,
+    不是『本轮执行了某动作』的完成声明 → 不挂 banner、不被硬切。"""
+    for r in (
+        "TBB0116A 库存数据已更新到 2026-06-09，近30天销量97件。",
+        "库存同步至 2026-05-31，数据为最新。",
+        "数据更新日期：2026-06-09。",
+        "更新于 2026/6/9，销量稳定。",
+    ):
+        out, warns = _safety.sanitize_reply(
+            r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"freshness 客观事实被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"freshness 客观事实被硬切: {out!r}"
+
+
+def test_fp_trend_description_not_flagged():
+    """『<指标>已开始改善/回升/下滑』是统计趋势描述,不是『已触发/启动工作流』→
+    不挂 banner、不被硬切（裸「已开始」不再误命中执行声明）。"""
+    for r in (
+        "库存周转已开始改善，本月好转。",
+        "销量已开始回升，环比改善。",
+        "周转率已开始下滑，需关注。",
+        "近30天销量趋势已开始回升。",
+    ):
+        out, warns = _safety.sanitize_reply(
+            r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"趋势客观描述被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"趋势客观描述被硬切: {out!r}"
+
+
+def test_fp_chat_boundary_freshness_vs_completion():
+    """边界回归:freshness『更新到 <日期>』豁免,但完成声明『更新到最新了 / 已刷新完成』
+    仍被结构门拦(带「了/完成」无具体日期 = 完成声明,不是 freshness 事实)。"""
+    from hipop.server._chat_boundary import check_task_completion_bypass as _cb
+    # freshness 事实 → 豁免
+    assert not _cb("数据已更新到 2026-06-09。", [{"name": "query_sku"}])
+    # 完成声明 → 仍拦
+    for r in ("数据更新到最新了", "库存同步到最新了", "数据已更新。",
+              "数据已刷新完成，任务已完成，库存已更新。"):
+        assert _cb(r, []), f"完成声明应仍被拦,却放过: {r!r}"
+
+
 # ── 3) chat() E2E:补调失败 → plan→confirm;高风险 → confirm-first ────────────
 
 def test_chat_low_risk_failure_plan_confirm():
@@ -189,6 +234,9 @@ if __name__ == "__main__":
         test_hardcut_failed_run_workflow_claimed_success,
         test_real_run_workflow_task_not_cut,
         test_plain_query_reply_not_touched,
+        test_fp_freshness_date_fact_not_flagged,
+        test_fp_trend_description_not_flagged,
+        test_fp_chat_boundary_freshness_vs_completion,
         test_chat_low_risk_failure_plan_confirm,
         test_chat_high_risk_confirm_first_no_autocall,
         test_chat_affirmative_low_risk_creates_real_task,
