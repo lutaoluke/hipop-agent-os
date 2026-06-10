@@ -480,8 +480,9 @@ def test_live_ok_but_missing_sales_30d_redacts() -> None:
     _seed_wf5_sales_cycle(conn, TODAY)
 
     def mock_live_ok_no_sales(sku, nation_id, token):
-        # ok=True but sales_30d=None (e.g. parse failure / UAE non-SA)
-        return {"ok": True, "sales_30d": None, "history_total": None,
+        # ok=True but sales_30d=None (e.g. parse failure / UAE non-SA).
+        # history_total is intentionally non-None to prove fail-closed blocks it.
+        return {"ok": True, "sales_30d": None, "history_total": 99,
                 "fetched_at": LIVE_FETCHED_AT, "source": "test_partial"}
 
     orig = _agent._sku_sales_live_fn

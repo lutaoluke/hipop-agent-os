@@ -379,7 +379,11 @@ def test_t38_chat_e2e_workflow_task_has_real_task_id():
         "followup_prompt": "请重算销售周期和补货建议",
     }
     result = _chat_with_fake_exec("请重算销售周期和补货建议，并返回任务进度证据", fake_ok)
-    wt = result.get("workflow_task")
+    # T36-S3: backend now returns workflow_tasks (list); backward-compat old dict
+    wt_list = result.get("workflow_tasks") or []
+    if not wt_list and result.get("workflow_task"):
+        wt_list = [result.get("workflow_task")]
+    wt = wt_list[0] if wt_list else None
     assert wt is not None, (
         f"workflow_task is None — T38 trigger did not create real task (result keys: {list(result)})"
     )
@@ -436,7 +440,11 @@ def test_t38_chat_e2e_duplicate_running_returns_real_existing_task():
         "proposal_id": "duplicate123",
     }
     result = _chat_with_fake_exec("重算销售周期", duplicate_denial)
-    wt = result.get("workflow_task")
+    # T36-S3: backend now returns workflow_tasks (list); backward-compat old dict
+    wt_list = result.get("workflow_tasks") or []
+    if not wt_list and result.get("workflow_task"):
+        wt_list = [result.get("workflow_task")]
+    wt = wt_list[0] if wt_list else None
     assert wt is not None, "duplicate running path should return the existing real workflow_task"
     assert wt["task_id"] == existing_task_id, (
         f"workflow_task.task_id {wt['task_id']!r} != existing {existing_task_id!r}"

@@ -9,7 +9,7 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-BASE = "http://127.0.0.1:8765"
+BASE = os.environ.get("HIPOP_URL", "http://127.0.0.1:8765")
 
 
 _client = httpx.Client(trust_env=False, timeout=30)
@@ -22,6 +22,39 @@ def _load_t27_replenishment_smoke():
     assert spec and spec.loader
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_chat_dynamic_expectations_smoke():
+    path = REPO_ROOT / "tests" / "smoke_chat_dynamic_expectations_auth.py"
+    spec = importlib.util.spec_from_file_location("smoke_chat_dynamic_expectations_auth", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_ws149_sku_query_paths_smoke():
+    path = REPO_ROOT / "tests" / "smoke_ws149_sku_query_paths.py"
+    spec = importlib.util.spec_from_file_location("smoke_ws149_sku_query_paths", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ws149_query_sku_live_boundary_fail_closed():
+    """WS-149: realtime SKU logistics must not silently fallback to stale wf3 cache."""
+    smoke = _load_ws149_sku_query_paths_smoke()
+    smoke.test_query_sku_live_login_failure_fails_closed_without_wf3_cache()
+    smoke.test_query_sku_live_success_labels_live_source_and_time()
+
+
+def test_chat_stale_tst001_dynamic_expectations_auth_boundary():
+    """WS-143: chat dynamic prep reuses auth and keeps stale/missing fail-closed."""
+    smoke = _load_chat_dynamic_expectations_smoke()
+    smoke.test_dynamic_prep_uses_authenticated_opener()
+    smoke.test_stale_tst001_found_fail_closed_is_not_classified_as_missing()
+    smoke.test_stale_tst001_missing_still_requires_not_found_reply()
 
 
 def test_chat_t27_replenishment_live_evidence_contract():
@@ -158,6 +191,25 @@ def test_chat_query_sku():
     assert d["reply"]
     assert d.get("references")
     assert "query_sku" in (d.get("tools_used") or [])
+
+
+def test_chat_list_products_sales_topn():
+    """WS-148: 近30天销量 TopN 必须走 list_products，且回复带来源/时间/口径。"""
+    s, b = _post("/api/chat", {
+        "messages": [{"role": "user", "content": "KSA 近30天销量最高的3个商品"}],
+        "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营"},
+    }, timeout=90)
+    d = json.loads(b)
+    assert s == 200 and d["reply"]
+    assert d.get("tools_used") == ["list_products"], \
+        f"TopN 销量问题必须确定性调用 list_products，实际 tools_used={d.get('tools_used')}"
+    assert d.get("judge_method") == "deterministic_product_sales_topn_router", \
+        f"TopN 销量问题不应走 LLM 自由排序，judge_method={d.get('judge_method')}"
+    reply = d["reply"]
+    assert "来源" in reply and "wf2_sku.sales_30d" in reply, \
+        f"TopN 回复必须含来源/口径证据: {reply[:300]}"
+    assert "近30天销量" in reply or "近 30 天销量" in reply, \
+        f"TopN 回复必须明确 30d 销量口径: {reply[:300]}"
 
 
 def test_chat_query_order():

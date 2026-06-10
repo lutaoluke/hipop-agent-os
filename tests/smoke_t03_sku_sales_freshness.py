@@ -197,6 +197,14 @@ def test_tool_fresh_data() -> None:
     _seed_entity(conn)
     today_str = FRESH_AS_OF
     _seed_wf2_sku(conn, today_str, today_str + "T08:00:00", 25)
+    # noon_orders_stale は noon_orders がないと True になる（T36-S3追加）→ 新鮮テストのため今日の注文を1行入れる
+    conn.execute(
+        "INSERT OR REPLACE INTO wf2_orders "
+        "(tenant_id, entity_alias, partner_sku, item_nr, order_date) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (TENANT_ID, ENTITY_ALIAS, SKU, "smoke-fresh-order-001", today_str),
+    )
+    conn.commit()
 
     _agent._chat_tenant.set(TENANT_ID)
     _agent._chat_scope.set({"tenant_id": TENANT_ID, "store": "KSA", "user": "test"})

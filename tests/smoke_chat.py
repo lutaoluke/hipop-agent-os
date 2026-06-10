@@ -23,6 +23,7 @@ import json
 import re
 import time
 import argparse
+import http.cookiejar
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -39,6 +40,10 @@ _URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def _urlopen(req, timeout: int):
     return _URL_OPENER.open(req, timeout=timeout)
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 
 
 # ── case 定义 ────────────────────────────────────────────
@@ -70,6 +75,50 @@ EXISTING_WORKFLOW_DENY_RE = re.compile(
     r"已有.{0,12}运行中实例|已有.{0,12}运行中的后台任务|已有.{0,12}实例.{0,12}运行中|防并发|already.{0,12}running",
     re.IGNORECASE,
 )
+
+SMOKE_EMAIL = "smoke-chat@hipop.local"
+SMOKE_PASSWORD = "smoke-chat-pass"
+
+
+def ensure_smoke_user_tenant1() -> None:
+    """Create/update a tenant=1 smoke user so chat smokes exercise the auth path."""
+    os.environ.setdefault("DB_URL", "postgresql://hipop:hipop_dev_password@localhost:5432/hipop")
+    from hipop.server import auth as _auth
+    from hipop.server import data as _data
+
+    password_hash = _auth.hash_password(SMOKE_PASSWORD)
+    existing = _auth.get_user_by_email(SMOKE_EMAIL)
+    if existing:
+        with _data.conn() as c:
+            c.execute(
+                "UPDATE users SET tenant_id=?, password_hash=?, role=?, active=1 WHERE email=?",
+                (1, password_hash, "owner", SMOKE_EMAIL),
+            )
+            c.commit()
+        return
+    _auth.create_user(
+        1, SMOKE_EMAIL, SMOKE_PASSWORD,
+        display_name="Smoke Chat",
+        role="owner",
+    )
+
+
+def build_authenticated_opener(base_url: str) -> urllib.request.OpenerDirector:
+    ensure_smoke_user_tenant1()
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
+    body = json.dumps({"email": SMOKE_EMAIL, "password": SMOKE_PASSWORD}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/api/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with opener.open(req, timeout=15) as r:
+        payload = json.loads(r.read())
+    if not payload.get("ok"):
+        raise RuntimeError(f"smoke login failed: {payload}")
+    return opener
 
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -106,7 +155,7 @@ def _rate_re(rate: Optional[float]) -> str:
 
 _UNAVAILABLE_RE = (
     r"无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|"
-    r"ERP.*(?:凭据|登录)|同上"
+    r"ERP.*(?:凭据|登录)|同上|过期|已过期"
 )
 
 
@@ -219,10 +268,15 @@ _TBB_TOTAL_RE = _or_unavailable(_num_re(_LIVE["tbb_total_30d"]))
 _TBB_CANCEL_RE = _or_unavailable(_rate_re(_LIVE["tbb_cancel_rate_30d"]))
 _TBB_RETURN_RE = _or_unavailable(_rate_re(_LIVE["tbb_return_rate_30d"]))
 _TBB_HISTORY_RE = _or_unavailable(_num_re(_LIVE["tbb_history_total"]))
+_STALE_TST001_STALE_RE = (
+    r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|"
+    r"不确定|无法确认|不可确认|无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|ERP.*(?:凭据|登录)"
+)
+_STALE_TST001_MISSING_RE = r"未找到|查不到|不存在|不在.*店铺|SKU.{0,6}有误|编码.{0,6}有误"
 _STALE_TST001_RE = (
-    r"过期|超过.*天|数据.*旧|已超|较旧|stale|刷新|上传.*CSV|重新.*ingest|不确定|无法确认|不可确认"
+    _STALE_TST001_STALE_RE
     if _LIVE["stale_tst001"] == "stale"
-    else r"未找到|查不到|不存在|不在.*店铺|SKU.{0,6}有误|编码.{0,6}有误"
+    else _STALE_TST001_MISSING_RE
 )
 
 
@@ -284,6 +338,12 @@ CASES: List[Case] = [
         # product 总数 + 任一上架/未上架真数（按 is_listed=1 新口径，随 live DB 漂移）
         must_contain=[_PRODUCT_TOTAL_RE, _PRODUCT_SPLIT_RE],
     ),
+    Case(
+        name="WS-148 近30天销量 TopN（list_products 确定性路由 + 证据）",
+        question="KSA 近30天销量最高的3个商品",
+        must_use_tools=["list_products"],
+        must_contain=[r"近\s*30\s*天销量", r"来源", r"202\d-\d{2}-\d{2}", r"wf2_sku\.sales_30d"],
+    ),
     # ─── 概览类 ───
     Case(
         name="店铺整体（真实在售 SKU + 红色告警）",
@@ -333,6 +393,9 @@ CASES: List[Case] = [
         ],
         must_not_contain=[
             r"\b13\b",
+            r"\b48\b",
+            r"\b51\b",
+            r"1[,，]?967",
             r"1\.1[0-9]%|1\.12%",
             # 只问数值时不得主动下质量/表现判断
             r"表现.*不错|毛利.*不错|健康.*不错|正常范围|质量.*稳定|利润.*不错|表现良好|不错.*表现",
@@ -487,7 +550,8 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
+def post_chat(opener: urllib.request.OpenerDirector, base_url: str, question: str,
+              store: str, timeout: int) -> dict:
     body = json.dumps({
         "messages": [{"role": "user", "content": question}],
         "scope": {"store": store},
@@ -501,7 +565,7 @@ def post_chat(base_url: str, question: str, store: str, timeout: int) -> dict:
         method="POST",
     )
     try:
-        with _urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"_http_error": e.code, "_body": e.read().decode("utf-8", "ignore")[:500]}
@@ -539,18 +603,22 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
             reasons.append(f"reply 含禁忌词: {bw!r}")
 
     if c.expected_workflow:
-        wt = resp.get("workflow_task") or {}
-        wf = wt.get("workflow") or ""
-        if not wf:
+        # T36-S3 round-4: backend now returns workflow_tasks (list); backward-compat old dict
+        wf_tasks = resp.get("workflow_tasks") or []
+        if not wf_tasks and resp.get("workflow_task"):
+            wf_tasks = [resp.get("workflow_task")]
+        found = next((t for t in wf_tasks if t.get("workflow") == c.expected_workflow), None)
+        if not wf_tasks:
             if not (
                 c.allow_existing_workflow_deny
                 and "run_workflow" in tools
                 and EXISTING_WORKFLOW_DENY_RE.search(reply)
             ):
-                reasons.append("未真触发任何 workflow（workflow_task 为空）")
-        elif wf != c.expected_workflow:
+                reasons.append("未真触发任何 workflow（workflow_tasks 为空）")
+        elif not found:
+            wf_names = [t.get("workflow", "?") for t in wf_tasks]
             reasons.append(
-                f"选错 workflow: {wf!r}（应精确为 {c.expected_workflow!r}；"
+                f"选错 workflow: {wf_names!r}（应精确含 {c.expected_workflow!r}；"
                 "老 wf3 / 其它 v2 工作流都=选错）")
 
     if c.must_warn and not warns:
@@ -559,7 +627,7 @@ def check(c: Case, resp: dict) -> tuple[bool, List[str]]:
     return (len(reasons) == 0), reasons
 
 
-def check_chat_history_endpoint(base_url: str) -> Optional[str]:
+def check_chat_history_endpoint(opener: urllib.request.OpenerDirector, base_url: str) -> Optional[str]:
     """GET /api/chat-history/<store> — 防 PG datetime[-8:-3] 之类的崩溃回归。
     切页面时 chat panel init() 会拿这个 endpoint；它一旦 500，整个 chat panel
     Alpine init 抛错，前端表现为'切页面无法继承聊天记录'。返回 None 为通过。"""
@@ -569,7 +637,7 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
             headers=_auth_headers(),
         )
         try:
-            with _urlopen(req, timeout=15) as r:
+            with opener.open(req, timeout=15) as r:
                 body = json.loads(r.read())
         except urllib.error.HTTPError as e:
             return f"/api/chat-history/{store} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
@@ -585,9 +653,11 @@ def check_chat_history_endpoint(base_url: str) -> Optional[str]:
     return None
 
 
-def _http_json(base_url: str, path: str, timeout: int = 20):
+def _http_json(base_url: str, path: str, timeout: int = 20,
+               opener: Optional[urllib.request.OpenerDirector] = None):
     req = urllib.request.Request(f"{base_url}{path}", headers=_auth_headers())
-    with _urlopen(req, timeout=timeout) as r:
+    open_fn = opener.open if opener is not None else _urlopen
+    with open_fn(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
@@ -630,13 +700,34 @@ def _rate_or_unavailable_re(rate, label: str) -> str:
     return _rate_re(rate, label)
 
 
+def _t04_must_contain_patterns(item: dict) -> list:
+    """Build T04 must_contain patterns from an /api/sku-metrics item.
+
+    When data_stale=True the agent returns a blanket stale message (no numbers),
+    so all metric patterns must use _UNAVAILABLE_RE instead of concrete values.
+    """
+    data_stale = item.get("data_stale")
+
+    def _d(val):
+        return None if data_stale else val
+
+    return [
+        _num_or_unavailable_re(_d(item.get("sales_30d"))),
+        _num_or_unavailable_re(_d(item.get("total_orders_30d"))),
+        _rate_or_unavailable_re(_d(item.get("cancel_rate_30d")), "取消率"),
+        _rate_or_unavailable_re(_d(item.get("return_rate_30d")), "退货率"),
+        _num_or_unavailable_re(_d(item.get("history_total"))),
+    ]
+
+
 def _find_case(name_part: str) -> Optional[Case]:
     return next((c for c in CASES if name_part in c.name), None)
 
 
-def _prepare_dynamic_expectations(base_url: str) -> None:
-    rows = _http_json(base_url, "/api/sku-health/KSA?listing=all&limit=10000", timeout=30)
-    today = _http_json(base_url, "/api/today/KSA", timeout=10)
+def _prepare_dynamic_expectations(base_url: str,
+                                  opener: Optional[urllib.request.OpenerDirector] = None) -> None:
+    rows = _http_json(base_url, "/api/sku-health/KSA?listing=all&limit=10000", timeout=30, opener=opener)
+    today = _http_json(base_url, "/api/today/KSA", timeout=10, opener=opener)
     product_ids = {r.get("product_id") for r in rows if r.get("product_id")}
     listed_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and r.get("is_listed")}
     unlisted_product_ids = {r.get("product_id") for r in rows if r.get("product_id") and not r.get("is_listed")}
@@ -665,28 +756,25 @@ def _prepare_dynamic_expectations(base_url: str) -> None:
         c.must_contain = [_num_re(sku_count)]
 
     try:
-        metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20)
+        metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20, opener=opener)
         item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
         c = _find_case("T04 TBB0116A")
         if c and item.get("found"):
             c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
-            c.must_contain = [
-                _num_or_unavailable_re(item.get("sales_30d")),
-                _num_or_unavailable_re(item.get("total_orders_30d")),
-                _rate_or_unavailable_re(item.get("cancel_rate_30d"), "取消率"),
-                _rate_or_unavailable_re(item.get("return_rate_30d"), "退货率"),
-                _num_or_unavailable_re(item.get("history_total")),
-            ]
+            c.must_contain = _t04_must_contain_patterns(item)
     except Exception:
         pass  # endpoint unavailable — T04 uses static DB expectations
 
     try:
-        stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20)
+        stale = _http_json(base_url, "/api/sku-metrics/KSA/STALE_TST001", timeout=20, opener=opener)
         stale_item = next((x for x in stale.get("items", []) if x.get("sku") == "STALE_TST001"), {})
-        c = _find_case("T04 快照过期边界")
+        c = _find_case("T04 快照过期")
         if c and not stale_item.get("found"):
-            c.name = "T04 快照过期边界（动态：fixture SKU 当前不存在时必须诚实未找到）"
-            c.must_contain = [r"未找到|不存在|找不到|没找到|没有找到|没有.*记录|无记录"]
+            c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前不存在时必须诚实未找到）"
+            c.must_contain = [_STALE_TST001_MISSING_RE]
+        elif c and (stale_item.get("data_stale") or stale_item.get("live_sales_failed")):
+            c.name = "T04 快照过期/缺失边界（动态：STALE_TST001 当前 fail-closed，不得给旧值）"
+            c.must_contain = [_STALE_TST001_STALE_RE]
     except Exception:
         pass  # endpoint unavailable — T04 stale case uses static expectations
 
@@ -708,14 +796,19 @@ def main():
         f"stale={_LIVE['stale_tst001']}"
         + (f" error={_LIVE.get('_error')}" if _LIVE.get("_error") else "")
     )
-    err = check_chat_history_endpoint(args.url)
+    try:
+        opener = build_authenticated_opener(args.url)
+    except Exception as e:
+        print(f"\n✗ smoke 登录失败：{type(e).__name__}: {e}")
+        sys.exit(1)
+    err = check_chat_history_endpoint(opener, args.url)
     if err:
         print(f"\n✗ chat-history endpoint 检查失败：{err}")
         print("  （此 endpoint 一崩 → 前端切页面无法继承聊天记录）")
         sys.exit(1)
     print(f"chat-history endpoint: ✓")
     try:
-        _prepare_dynamic_expectations(args.url)
+        _prepare_dynamic_expectations(args.url, opener)
     except Exception as e:
         print(f"\n✗ 动态期望准备失败：{type(e).__name__}: {e}")
         sys.exit(1)
@@ -729,7 +822,7 @@ def main():
     for i, c in enumerate(cases, 1):
         print(f"[{i}/{len(cases)}] {c.name} ", end="", flush=True)
         t = time.time()
-        resp = post_chat(args.url, c.question, c.store, c.timeout)
+        resp = post_chat(opener, args.url, c.question, c.store, c.timeout)
         ok, reasons = check(c, resp)
         elapsed = time.time() - t
         if ok:

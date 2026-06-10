@@ -26,6 +26,11 @@ _last_replenishment_stock_status: contextvars.ContextVar[Optional[dict]] = conte
 _last_sku_rate_stats: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
     "last_sku_rate_stats", default=None
 )
+# WS-145 肯定执行意图门:chat() 入口按本轮句式语气求出的门决策。
+# _exec_tool 据此拒绝「非执行语气下偷偷 run_workflow」（LLM 不许绕）。
+_chat_intent: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "chat_intent", default=None
+)
 
 
 def _get_tenant() -> int:
@@ -167,6 +172,9 @@ TOOLS = [
             "summary_skus（SKU 维度，含变体）。"
             "用户问『商品/产品总数』时优先报 summary_products.total（这是 ERP 后台筛店铺看到的数字）。"
             "用户问『SKU 总数』或『变体』时报 summary_skus.total。"
+            "用户问『近30天销量最高/销量排行/销量 TopN』时必须调用本工具并设置 limit=N；"
+            "items 已按 wf2_sku.sales_30d DESC、sales_180d DESC 排序，limit=N 即近30天销量 TopN，"
+            "不要由模型自行排序或补数字。"
             "is_listed=1 = 已绑定 noon 平台 SKU id（在线上能搜到/可下单）；is_listed=0 = 草稿/未挂平台。"
             "listing='listed'/'unlisted'/'all' 控制示例返回；sales_only=true 仅含 sales_180d>0；limit=0 时不返示例。"
         ),
@@ -176,7 +184,11 @@ TOOLS = [
                 "store": {"type": "string", "enum": ["KSA", "UAE"]},
                 "listing": {"type": "string", "enum": ["all", "listed", "unlisted"], "default": "all"},
                 "sales_only": {"type": "boolean", "default": False, "description": "true=仅含 180 天内有销量"},
-                "limit": {"type": "integer", "default": 0, "description": "返回示例 SKU 行数，0=只要聚合"},
+                "limit": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "返回示例 SKU 行数；0=只要聚合。问近30天销量 TopN 时传 N，items 即按 sales_30d DESC 的 TopN。",
+                },
             },
             "required": ["store"],
         },
@@ -577,6 +589,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
 
     out = []
     refs = []
+    import datetime as _dt
+
+    def _date10(v):
+        if v is None:
+            return ""
+        if hasattr(v, "isoformat"):
+            return v.isoformat()[:10]
+        return str(v)[:10]
+
+    def _days_old(date_str: str):
+        if not date_str:
+            return None
+        try:
+            return max(0, (_dt.date.today() - _dt.date.fromisoformat(date_str[:10])).days)
+        except Exception:
+            return None
+
+    # SKU sales/order metrics depend on noon orders. A fresh ERP product ingest can move
+    # wf2_sku.as_of_date to today while noon order CSV is still old; in that case sales
+    # numbers must be redacted instead of presented as current.
+    latest_noon_order = _date10(_data._scalar(
+        "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
+        (tid, alias),
+    ))
+    noon_order_stale_days = _days_old(latest_noon_order)
+    noon_orders_stale = (noon_order_stale_days is None) or (noon_order_stale_days > 3)
+
     for sku in skus[:3]:
         # ── T03 门：强制走实时取数路径拿销量数字 ──────────────────────
         live_fn = _sku_sales_live_fn if _sku_sales_live_fn is not None else _erp_sku_stats_live
@@ -595,7 +634,9 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                    w2.total_orders, w2.as_of_date, w2.imported_at,
                    w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
                    w5.current_pipeline, w5.weekly_total_replenish,
-                   h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input
+                   w5.updated_at AS wf5_updated_at,
+                   h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input,
+                   h.updated_at AS wf3_updated_at
             FROM wf2_sku w2
             LEFT JOIN wf5_sales_cycle w5
               ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
@@ -609,20 +650,32 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             continue
         r = rows[0]
         as_of = r.get("as_of_date")
+        # 事实源契约（WS-129）：每个来源的时间戳门，NULL → fail-closed
+        wf3_updated_at = r.get("wf3_updated_at") or None
+        wf5_updated_at = r.get("wf5_updated_at") or None
+        imported_at_full = r.get("imported_at") or None
+        wf3_ok = bool(wf3_updated_at)   # wf3_logistics_hub_v2 timestamp gate
+        wf5_ok = bool(wf5_updated_at)   # wf5_sales_cycle timestamp gate
+        wf2_ok = bool(imported_at_full) # wf2_sku.imported_at snapshot gate
         stats_30d: dict = {}
         if as_of:
             try:
                 stats_30d = _data.sku_30d_stats(tid, alias, sku, as_of)
             except Exception:
                 stats_30d = {}
-        # 快照时效门：非销量字段超 3 天 → REDACT。
+        # 快照时效门：as_of_date 超 3 天/缺失，或 noon 订单源超 3 天/缺失
+        # → data_stale=True，销量/订单数值 REDACT 为 null。
+        # 目的：防止过期快照被 LLM 当成新鲜数据呈现；LLM 必须告知数据过期。
         import datetime as _dt
         stale_days_val: int = 0
+        stale_reasons: List[str] = []
         data_stale_val: bool = not as_of
         # stale_confirmed：as_of 成功解析且确实超阈值，才算「确认陈旧」。仅此情形
         # 才允许走 found=False「查不到」短路。as_of 缺失/格式异常（不同 DB 驱动可能
         # 回 date 对象或 'YYYY-MM-DD HH:MM:SS' 等）只做保守 REDACT，不据此判「查不到」。
         stale_confirmed: bool = False
+        if not as_of:
+            stale_reasons.append("wf2_sku_as_of_missing")
         if as_of:
             _parsed_as_of = None
             if hasattr(as_of, "year") and hasattr(as_of, "month") and hasattr(as_of, "day"):
@@ -641,12 +694,23 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
                 stale_days_val = max(0, (_dt.date.today() - _parsed_as_of).days)
                 data_stale_val = stale_days_val > 3
                 stale_confirmed = data_stale_val
+                if stale_confirmed:
+                    stale_reasons.append("wf2_sku_as_of_stale")
             else:
                 # as_of 存在但无法解析 → 保守 REDACT，但不据此短路成「查不到」，
                 # 交由下方 live 成功/失败逻辑决定 found 与 live_sales_failed（修 T03 CI 边界：
                 # 否则 live 失败会被误吞成「快照过期/SKU 查不到」，丢失实时失败证据）。
                 data_stale_val = True
                 stale_confirmed = False
+                stale_reasons.append("wf2_sku_as_of_invalid")
+
+        # noon 订单源过期：即使 wf2_sku 快照新鲜，销量/订单数值也须 REDACT
+        # （WS-145：fresh ERP ingest 把 as_of 推到今天但 noon CSV 仍旧）。
+        if noon_orders_stale:
+            data_stale_val = True
+            stale_reasons.append("noon_orders_stale")
+            if noon_order_stale_days is not None:
+                stale_days_val = max(stale_days_val, noon_order_stale_days)
 
         # T04 口径一致：仅「确认陈旧」（as_of 可解析且超阈值）且无实时销量时，才视为
         # 无有效数据（found=False，回复「查不到」），与 /api/sku-metrics 预检对齐。
@@ -667,25 +731,33 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             return None if data_stale_val else val
 
         def _live_guarded_snapshot(val):
-            return _r(val) if live_has_sales else None
+            # wf5-sourced fields: gated on live freshness AND wf5 timestamp
+            return _r(val) if (live_has_sales and wf5_ok) else None
+
+        def _wf2(val):
+            # wf2 snapshot-sourced fields: gated on imported_at AND live freshness
+            return _r(val) if (live_has_sales and wf2_ok) else None
 
         # 销量字段：优先 live 结果（T03：live 失败则 REDACT，禁止输出旧快照确定数）
-        sales_30d_out = live_result.get("sales_30d") if live_ok else None
-        history_total_out = live_result.get("history_total") if live_ok else None
+        # partial-live fail-closed: live_ok=True but sales_30d=None → also block history_total
+        sales_30d_out = live_result.get("sales_30d") if live_has_sales else None
+        history_total_out = live_result.get("history_total") if live_has_sales else None
 
         item = {
             "sku": sku,
             "found": True,
             "title": r["title"],
             "trend": _live_guarded_snapshot(r["trend"]),
-            "profit_rate_pct": _live_guarded_snapshot(round((r["latest_profit_rate"] or 0) * 100, 1)),
+            "profit_rate_pct": _wf2(round((r["latest_profit_rate"] or 0) * 100, 1)),
             "sales_30d": sales_30d_out,
-            "sales_10d": _live_guarded_snapshot(r["sales_10d"]),
+            "sales_10d": _wf2(r["sales_10d"]),
             "daily_rate": _live_guarded_snapshot(r["daily_rate"]),
             "urgency": _live_guarded_snapshot(r["urgency"]),
             "ops_advice": _live_guarded_snapshot(r["ops_advice"]),
-            "in_transit": r["in_transit_total_qty"],
-            "has_stuck_batch": bool(r["has_stuck_batch"]),
+            "in_transit": r["in_transit_total_qty"] if wf3_ok else None,
+            "in_transit_source": "erp" if wf3_ok else None,
+            "in_transit_updated_at": wf3_updated_at,
+            "has_stuck_batch": bool(r["has_stuck_batch"]) if wf3_ok else None,
             "weekly_replenish": _live_guarded_snapshot(r["weekly_total_replenish"]),
             "total_orders_30d": _live_guarded_snapshot(stats_30d.get("total_30d")),
             "cancel_rate_30d": _live_guarded_snapshot(stats_30d.get("cancel_rate_30d")),
@@ -705,6 +777,11 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             "as_of_date": as_of,
             "data_stale": data_stale_val,
             "stale_days": stale_days_val,
+            "stale_reason": ",".join(stale_reasons) or None,
+            "noon_order_latest": latest_noon_order,
+            "noon_order_stale_days": noon_order_stale_days,
+            "wf5_updated_at": wf5_updated_at,
+            "wf2_imported_at": imported_at_full,
         }
 
         if live_has_sales:
@@ -717,7 +794,8 @@ def tool_query_sku(skus: List[str], store: str = "KSA") -> Dict:
             if live_ok:
                 item["live_sales_error"] = "live_ok_but_missing_sales_30d"
                 item["live_sales_message"] = (
-                    "当前无法实时确认 SKU 销量（实时接口返回但关键指标缺失），已降级（不输出旧缓存确定数）"
+                    "实时源可达但销量数据缺失，无法给出确定数字"
+                    "（sales_30d/history_total 均已拒绝输出，不泄出裸数字）"
                 )
             else:
                 item["live_sales_error"] = (live_result or {}).get("error", "no_live_fn")
@@ -925,20 +1003,48 @@ def tool_list_products(store: str, listing: str = "all",
     filtered_count = _data._scalar(f"SELECT COUNT(*) FROM {tbl} {where_sql}") or 0
 
     items = []
-    if limit and limit > 0:
+    evidence = None
+    requested_limit = max(0, min(int(limit or 0), 50))
+    if requested_limit > 0:
         rows = _data._fetch(f"""
-            SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price
+            SELECT partner_sku, title, is_listed, sales_30d, sales_180d, latest_price,
+                   as_of_date, imported_at
             FROM {tbl} {where_sql}
-            ORDER BY COALESCE(sales_30d,0) DESC, COALESCE(sales_180d,0) DESC
+            ORDER BY (sales_30d IS NULL) ASC,
+                     COALESCE(sales_30d,0) DESC,
+                     COALESCE(sales_180d,0) DESC,
+                     partner_sku ASC
             LIMIT ?
-        """, (int(limit),))
+        """, (requested_limit,))
         items = [{
             "sku": r["partner_sku"], "title": r["title"],
             "is_listed": bool(r["is_listed"]),
-            "sales_30d": r["sales_30d"] or 0,
-            "sales_180d": r["sales_180d"] or 0,
+            "sales_30d": r["sales_30d"],
+            "sales_180d": r["sales_180d"],
             "price": r["latest_price"],
+            "as_of_date": r.get("as_of_date"),
         } for r in rows]
+        fetched_at = None
+        for r in rows:
+            fetched_at = max(
+                [x for x in (fetched_at, r.get("as_of_date"), (r.get("imported_at") or "")[:10]) if x],
+                default=None,
+            )
+        if items:
+            from hipop.scripts.evidence_contract import (
+                build_query_evidence as _build_query_evidence,
+                SOURCE_CACHE as _SRC_CACHE,
+            )
+            evidence = _build_query_evidence(
+                source=_SRC_CACHE,
+                fetched_at=fetched_at,
+                coverage=(
+                    f"{store} wf2_sku.sales_30d DESC Top{requested_limit}；"
+                    f"limit={requested_limit} 即近30天销量 TopN；"
+                    f"listing={listing}；sales_only={bool(sales_only)}"
+                ),
+                context="list_products_sales_topn",
+            )
 
     return {
         "store": store,
@@ -959,10 +1065,27 @@ def tool_list_products(store: str, listing: str = "all",
             "_dim": "sku (含每个 product 下的颜色/尺寸变体)"
         },
         "filter": {"listing": listing, "sales_only": sales_only},
+        "sort": {
+            "field": "sales_30d",
+            "direction": "desc",
+            "tie_breakers": ["sales_180d desc", "partner_sku asc"],
+            "meaning": "limit=N returns near-30-day sales TopN",
+        },
+        "n_requested": requested_limit,
+        "n_returned": len(items),
         "filtered_count": filtered_count,
         "items": items,
+        "evidence": evidence,
         "references": [
-            {"table": tbl, "where": where_sql or "(全表)"},
+            {
+                "table": tbl,
+                "where": (
+                    f"{where_sql} ORDER BY sales_30d DESC, sales_180d DESC "
+                    f"LIMIT {requested_limit}"
+                    if requested_limit > 0 else where_sql
+                ),
+                "as_of_date": (evidence or {}).get("fetched_at"),
+            },
         ],
     }
 
@@ -1178,22 +1301,67 @@ def tool_run_workflow(workflow: str, followup_prompt: str = "") -> Dict:
         from uuid import uuid4
         import threading
         task_id = uuid4().hex[:8]
+        # WS-144：legacy thread 路径也先同步写一条 durable queued event，保证执行记录
+        # 有 ≥1 个真实步骤可查（不靠后台线程异步落库，否则返回时无证据 = 接线缺失）。
+        _data.set_current_tenant(tid)
+        _data.write_event(
+            task_id, 0, "任务排队", "queued",
+            _json.dumps({"workflow": workflow, "label": label,
+                         "affected_modules": affected, "total_steps": len(steps),
+                         "tenant_id": tid, "runtime": "legacy_thread"}, ensure_ascii=False),
+            actor=actor,
+        )
         threading.Thread(
             target=_api._run_workflow, args=(task_id, workflow, tid, actor), daemon=True,
         ).start()
-    return {
-        "ok": True,
-        "task_id": task_id,
+
+    # WS-144 统一执行记录契约（样板执行工具）：回读 durable events 证明任务真实落库，
+    # 据此构造 execution_record。没有真实 task_id + ≥1 步骤就不算"已执行/已启动"。
+    from hipop.scripts.evidence_contract import (
+        build_execution_record as _build_execution_record,
+        render_execution_suffix as _render_execution_suffix,
+        EXEC_RUNNING as _EXEC_RUNNING, EXEC_CREATE_FAILED as _EXEC_CREATE_FAILED,
+        ContractViolation as _ExecContractViolation,
+    )
+    try:
+        # 回读放进 try 内：DB 读失败同样视为"无可查记录" → fail-closed，不冒充已启动。
+        _durable_events = _data.get_events_after(task_id, 0)
+        execution_record = _build_execution_record(
+            status=_EXEC_RUNNING,
+            task_id=task_id,
+            workflow=workflow,
+            steps=[{"step_no": e.get("step_no"), "step_name": e.get("step_name"),
+                    "status": e.get("status")} for e in _durable_events],
+            context="run_workflow",
+        )
+        exec_hint = _render_execution_suffix(execution_record)
+    except (_ExecContractViolation, Exception) as _e:
+        # fail-closed：任务没产生可查的真实记录 → 如实标 create_failed，不冒充已启动。
+        execution_record = _build_execution_record(
+            status=_EXEC_CREATE_FAILED, workflow=workflow,
+            reason=f"任务未落库可查记录：{_e}", context="run_workflow",
+        )
+        exec_hint = _render_execution_suffix(execution_record)
+
+    # WS-144 round-1：失败语义不许只藏在 execution_record 内层。
+    # create_failed → 外层 ok=False + error，让"只看 ok"的下游也能确定识别失败，
+    # 不会把没落库的任务误读成已启动（验门人 14:37 指出的歧义）。
+    exec_failed = execution_record["status"] == _EXEC_CREATE_FAILED
+    result = {
+        "ok": not exec_failed,
+        # 没产生可查真实任务时不外泄生成的临时 id 冒充"已创建任务"。
+        "task_id": None if exec_failed else task_id,
         "workflow": workflow,
         "label": label,
         "total_steps": len(steps),
         "affected_modules": affected,
         "followup_prompt": followup_prompt or None,
-        "hint": (
-            f"已创建后台任务 {task_id}（{label}）。"
-            f"请在工作台任务面板查看进度；影响模块：{affected}。"
-        ),
+        "execution_record": execution_record,
+        "hint": f"{exec_hint}请在工作台任务面板查看进度；影响模块：{affected}。",
     }
+    if exec_failed:
+        result["error"] = execution_record.get("reason") or "工作流任务未确认创建成功"
+    return result
 
 
 def tool_query_1688_similar(image_url: str, pack: int = 1,
@@ -1259,45 +1427,8 @@ def _erp_token_or_error(tid: int):
     if not token:
         return None, {"ok": False, "error": "erp_login_failed",
                        "message": f"ERP 凭据存在但 playwright 登录失败 "
-                                   "（dbuyerp 可能在风控同账号短时间多次登），稍后重试或用 wf3 缓存"}
+                                   "（dbuyerp 可能在风控同账号短时间多次登），稍后重试"}
     return token, None
-
-
-def _query_sku_from_cache(sku: str, tid: int) -> dict:
-    """ERP 拿不到 token 时的 fallback：从 wf3_logistics_hub_v2 缓存读。
-    数据可能 N 天前但总比 hallucinate 强。"""
-    from . import data as _data
-    _data.set_current_tenant(tid)
-    rows = _data._fetch(
-        "SELECT sku, in_transit_total_qty, total_transit_qty, transit_batches_json, "
-        "       updated_at FROM wf3_logistics_hub_v2 "
-        "WHERE tenant_id=? AND sku=?",
-        (tid, sku),
-    )
-    if not rows:
-        return {"ok": True, "sku": sku, "fetched_from": "wf3_cache_no_data",
-                "in_transit_total_qty": 0, "stale_warn": "wf3 缓存里这个 SKU 没数据"}
-    r = rows[0]
-    try:
-        import json as _json
-        batches = _json.loads(r.get("transit_batches_json") or "[]")
-    except Exception:
-        batches = []
-    upd = r.get("updated_at")
-    return {
-        "ok": True,
-        "sku": sku,
-        "fetched_from": "wf3_logistics_hub_v2 cache (ERP 实时拿不到 token 时的兜底)",
-        "stale_warn": f"⚠️ 此为 wf3 缓存数据，更新于 {upd}（非实时）。若需实时请稍后重试。",
-        "in_transit_total_qty": r.get("in_transit_total_qty") or 0,
-        "total_transit_qty": r.get("total_transit_qty") or 0,
-        "cache_updated_at": str(upd) if upd else None,
-        "in_transit_orders": [
-            {"order_no": b.get("order_no"), "qty": b.get("qty"),
-             "forwarder": b.get("forwarder"), "tracking_no": b.get("tracking_no")}
-            for b in batches[:10]
-        ],
-    }
 
 
 def _patch_wls_token(token: str):
@@ -1345,23 +1476,64 @@ def _physical_tracking_url(forwarder: str, tracking_no: str) -> str:
     return f"{base}{sep}msg={tracking_no}" if "tracking" in base.lower() else f"{base}{sep}no={tracking_no}"
 
 
+def _utc_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     """实时查单 SKU ERP 在途货单 — 不读 wf3 缓存，每次直连。
     with_nodes=True 时对每个在途货单跑 playwright 抓物流站节点（慢 5-10s/单）。
     默认 False（只 ERP 拉单 + tracking_no，快），用户问'节点'/'卡哪'时设 True。"""
     tid = _get_tenant()
+    fetched_at = _utc_now_iso()
+    live_source = "ERP /delivery (realtime)"
     token, err = _erp_token_or_error(tid)
     if err:
+        if err.get("error") == "no_erp_credentials":
+            return {
+                "ok": False,
+                "error": "sku_live_unavailable_no_erp_credentials",
+                "sku": sku,
+                "source": live_source,
+                "fetched_at": fetched_at,
+                "cache_fallback": False,
+                "message": (
+                    f"当前无法实时查询 SKU {sku} 的在途物流：本店铺 ERP 账号未配置。"
+                    "请先配置 dbuyerp 后重试；本工具不返回 wf3 旧缓存。"
+                ),
+            }
         if err.get("error") == "erp_login_failed":
-            cache_resp = _query_sku_from_cache(sku, tid)
-            cache_resp["live_query_failed_reason"] = err["message"]
-            return cache_resp
-        return err
+            return {
+                "ok": False,
+                "error": "erp_login_failed_no_cache",
+                "sku": sku,
+                "source": live_source,
+                "fetched_at": fetched_at,
+                "cache_fallback": False,
+                "live_query_failed_reason": err["message"],
+                "message": (
+                    f"ERP 实时查询 SKU {sku} 失败（{err['message']}），"
+                    "无法确认当前在途或近期完成货单；已按实时查询契约 fail closed，"
+                    "不返回 wf3 旧缓存。请稍后重试。"
+                ),
+            }
+        out = dict(err)
+        out.update({"sku": sku, "source": live_source, "fetched_at": fetched_at, "cache_fallback": False})
+        return out
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
         in_transit, completed = _wls.collect_sku_orders(sku, token)
     except Exception as e:
-        return {"ok": False, "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}"}
+        return {
+            "ok": False,
+            "error": f"erp_fetch_error: {type(e).__name__}: {str(e)[:200]}",
+            "sku": sku,
+            "source": live_source,
+            "fetched_at": fetched_at,
+            "cache_fallback": False,
+            "message": "ERP 实时查询失败，无法确认当前在途或近期完成货单；不返回 wf3 旧缓存。",
+        }
     finally:
         _wf0.get_erp_token = _orig
         _wls.get_erp_token = _orig
@@ -1370,6 +1542,9 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
             "ok": False,
             "error": "sku_no_orders_in_erp",
             "sku": sku,
+            "source": live_source,
+            "fetched_at": fetched_at,
+            "cache_fallback": False,
             "message": f"SKU {sku} 在 ERP 中无在途或近期完成货单记录，请核实 SKU 是否正确。",
         }
     in_t_qty = sum((o.get("qty") or 0) for o in in_transit)
@@ -1392,6 +1567,9 @@ def tool_query_sku_live(sku: str, with_nodes: bool = False) -> Dict:
     return {
         "ok": True,
         "sku": sku,
+        "source": live_source,
+        "fetched_at": fetched_at,
+        "cache_fallback": False,
         "fetched_from": ("ERP realtime + 物流站节点抓取" if with_nodes else "ERP realtime"),
         "in_transit_count": len(in_transit),
         "in_transit_total_qty": in_t_qty,
@@ -1427,7 +1605,7 @@ def tool_query_order_live(order_no: str) -> Dict:
         if err.get("error") == "erp_login_failed":
             return {"ok": False, "error": "erp_login_failed_no_cache",
                      "message": f"ERP 实时查失败（{err['message']}），单货单查询没缓存兜底。"
-                                 "请用 query_sku_live(sku) 查整 SKU 的缓存。"}
+                                 "请稍后重试；单 SKU 实时查询也不返回 wf3 旧缓存。"}
         return err
     _wf0, _wls, _orig = _patch_wls_token(token)
     try:
@@ -1620,7 +1798,7 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
     alias = _resolve_entity_alias(store) or ""
 
     rows = _data._fetch(
-        "SELECT yiwu_qty, overseas_total_qty, overseas_breakdown_json, "
+        "SELECT yiwu_qty, dongguan_qty, overseas_total_qty, overseas_breakdown_json, "
         "       noon_total_qty, pending_inbound_qty, total_stock, "
         "       updated_at, imported_at "
         "FROM wf1_stock WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
@@ -1674,40 +1852,110 @@ def tool_query_stock_split(sku: str, store: str = "KSA") -> Dict:
         overseas_saudi_1 = overseas_total
 
     yiwu = r.get("yiwu_qty") or 0
+    dongguan = r.get("dongguan_qty") or 0   # T12: 东莞国内仓，与义乌合计为 domestic
+    domestic = yiwu + dongguan              # T12: 国内仓合计（义乌+东莞）
     noon = r.get("noon_total_qty")
     noon_missing = noon is None
     noon = noon or 0
     inbound = r.get("pending_inbound_qty") or 0
-    total = yiwu + overseas_saudi_1 + noon + inbound
+    # total_stock from DB is authoritative (merge_stock_snapshot_v2 computes it);
+    # fall back to component sum if DB total is NULL.
+    total = r.get("total_stock")
+    if total is None:
+        total = yiwu + dongguan + overseas_total + noon + inbound
+
+    # T12: ERP 在途（国际在途）来自 wf3_logistics_hub_v2，不计入 total_stock。
+    # 带新鲜度门（>3天 → None，不出旧数）。
+    wf3_rows = _data._fetch(
+        "SELECT in_transit_total_qty, updated_at AS wf3_updated_at "
+        "FROM wf3_logistics_hub_v2 WHERE tenant_id=? AND sku=?",
+        (tid, sku),
+    )
+    erp_in_transit: Optional[int] = None
+    erp_in_transit_updated_at: Optional[str] = None
+    erp_in_transit_unavailable: Optional[str] = None
+    if wf3_rows:
+        wf3r = wf3_rows[0]
+        wf3_updated_at = wf3r.get("wf3_updated_at") or ""
+        wf3_stale_days: Optional[int] = None
+        if wf3_updated_at:
+            try:
+                wf3_stale_days = max(0, (
+                    _dt.date.today() - _dt.date.fromisoformat(wf3_updated_at[:10])
+                ).days)
+            except Exception:
+                wf3_stale_days = None
+        if wf3_stale_days is None or wf3_stale_days > _STOCK_SPLIT_MAX_AGE_DAYS:
+            erp_in_transit_unavailable = (
+                f"wf3 在途数据超过 {_STOCK_SPLIT_MAX_AGE_DAYS} 天（"
+                f"{'无时间戳' if wf3_stale_days is None else f'{wf3_stale_days} 天前'}），"
+                "拒绝出数。请先刷新物流（wf3_logistics_v2）。"
+            )
+        else:
+            wf3_in_transit = wf3r.get("in_transit_total_qty")
+            if wf3_in_transit is None:
+                erp_in_transit_unavailable = (
+                    "wf3_logistics_hub_v2.in_transit_total_qty 字段缺失/NULL，"
+                    "在途数据不可用。请先刷新物流（wf3_logistics_v2）。"
+                )
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+            else:
+                erp_in_transit = wf3_in_transit
+                erp_in_transit_updated_at = wf3_updated_at[:10] if wf3_updated_at else None
+    else:
+        erp_in_transit_unavailable = "wf3_logistics_hub_v2 无该 SKU 记录（在途数据未拉取）"
 
     stale_warn = None
     if stale_days and stale_days > 0:
         stale_warn = f"⚠️ 库存数据为 {stale_days} 天前（{updated_at[:10]}），请确认后使用。"
 
-    return {
+    imported_at = r.get("imported_at") or None
+
+    result: Dict = {
         "ok": True,
         "fail_closed": False,
         "sku": sku,
         "store": store,
         "split": {
+            # T11 keys (backward compat)
             "yiwu": yiwu,
             "overseas_saudi_1": overseas_saudi_1,
             "noon": noon,
             "inbound": inbound,
+            # T12 keys: 国内仓 = 义乌 + 东莞
+            "dongguan": dongguan,
+            "domestic": domestic,
         },
         "total": total,
         "noon_missing": noon_missing,
-        "noon_source": "noon FBN live / CSV 导入" if not noon_missing else "noon未拉取（NULL）",
-        "erp_source": "ERP 实时 ingest（wf1_stock_v2）",
+        "noon_source": "noon" if not noon_missing else None,
+        "noon_imported_at": imported_at,
+        "erp_source": "erp",
+        "erp_updated_at": updated_at[:10] if updated_at else None,
         "stale_days": stale_days,
         "updated_at": updated_at[:10] if updated_at else None,
         "stale_warn": stale_warn,
+        # T12: ERP 在途（来自 wf3，国际运输中，不计入 total_stock）
+        "erp_in_transit": erp_in_transit,
+        "erp_in_transit_source": "erp" if erp_in_transit is not None else None,
+        "erp_in_transit_updated_at": erp_in_transit_updated_at,
+        "erp_in_transit_not_in_total": True,   # 明确标注：在途不计入 total_stock
+        "erp_in_transit_unavailable": erp_in_transit_unavailable,
         "references": [
             {"table": "wf1_stock",
              "where": f"tenant_id={tid} AND entity_alias='{alias}' AND partner_sku='{sku}'",
+             "source": "noon+erp",
              "as_of_date": updated_at[:10] if updated_at else None},
         ],
     }
+    if erp_in_transit is not None:
+        result["references"].append({
+            "table": "wf3_logistics_hub_v2",
+            "where": f"tenant_id={tid} AND sku='{sku}'",
+            "source": "erp",
+            "as_of_date": erp_in_transit_updated_at,
+        })
+    return result
 
 
 # T15 — 总库存 TopN（WS-139）
@@ -1785,6 +2033,24 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         }
 
     items = [dict(r) for r in rows]
+    # WS-144 统一证据契约（样板查询工具）：每个出数的数字必须带来源/取数时间/口径。
+    # total_stock 是跨源聚合（noon 官方仓 + ERP 各仓 + pending），故 source=merged，
+    # sub_sources 显式列出 noon/erp，coverage 写清口径——缺任一三要素本调用直接 raise，
+    # 不允许无证据出数。
+    from hipop.scripts.evidence_contract import (
+        build_query_evidence as _build_query_evidence,
+        SOURCE_NOON as _SRC_NOON, SOURCE_ERP as _SRC_ERP, SOURCE_MERGED as _SRC_MERGED,
+    )
+    evidence = _build_query_evidence(
+        source=_SRC_MERGED,
+        fetched_at=latest_ts,
+        coverage=(
+            f"{store} total_stock = noon官方仓 + 海外仓 + 国内仓(义乌/东莞) + 送仓未上架(pending)；"
+            f"Top{limit}（返回 {len(items)} 行）；noon可售(saleable)不含 pending，与 total_stock 不同"
+        ),
+        sub_sources=[_SRC_NOON, _SRC_ERP],
+        context="total_stock_topn",
+    )
     return {
         "fail_closed": False,
         "store": store,
@@ -1799,6 +2065,7 @@ def tool_total_stock_topn(store: str = "KSA", n: int = 10) -> Dict:
         "n_requested": limit,
         "n_returned": len(items),
         "items": items,
+        "evidence": evidence,
         "references": [
             {"table": "wf1_stock",
              "where": (
@@ -1854,6 +2121,20 @@ def _exec_tool(name: str, args: dict, user: dict = None) -> dict:
     smoke_governance.py 会跑 inspect.getsource 检查 provider 没自定义 _exec_tool。
     """
     try:
+        # WS-145 肯定执行意图门:非执行语气（否定/询问/假设/只问影响面）下，
+        # LLM 不许偷偷 run_workflow 落任务 —— 在工具执行入口确定性拦死，不靠 prompt。
+        if name == "run_workflow":
+            _intent = _chat_intent.get()
+            if _intent is not None and getattr(_intent, "blocks_llm_execution", False):
+                return {
+                    "ok": False,
+                    "error": "execution_intent_gate_blocked",
+                    "blocked_by": "execution_intent_gate",
+                    "message": (
+                        "本轮是非执行语气（否定/询问/假设/只问影响面），未创建任何后台任务。"
+                        "需要执行请明确说「帮我刷新/重算…」。"
+                    ),
+                }
         from . import rbac as _rbac
         if user and not _rbac.tool_allowed(user, name):
             return {
@@ -2119,7 +2400,7 @@ scope: {scope}
 - 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
 - 用户问多个 SKU → 对每个分别调 query_sku_live
 - query_sku_live 慢（5-15s）但准（直连 ERP），值得
-- query_sku_live 返回里有 `stale_warn` 或 `live_query_failed_reason` 时：必须明告用户「ERP 实时拉失败，给你的是 wf3 缓存（更新于 X），稍后可重试」，**不许**当作实时数据呈现
+- query_sku_live 返回 `ok=false`（例如 `erp_login_failed_no_cache`，且 `cache_fallback=false`）时：必须明告用户「ERP 实时不可用，无法确认当前在途」，**不许**把 wf3 旧缓存当作实时数据呈现
 
 ## tool 速查
 | 用户问 | 调 |
@@ -2552,8 +2833,11 @@ def _stock_refresh_refusal_reply(question: str) -> Optional[str]:
 
 def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     q = (question or "").lower()
-    if any(x in q for x in ("不用刷新", "不要刷新", "无需刷新", "不用上传 不用刷新",
-                             "不用刷库存", "不要刷库存")):
+    # WS-145 肯定执行意图门:只有「肯定祈使 + 低风险」才进真实执行路由。
+    # 否定/询问/假设/只问影响面的句子（即使含「刷新/重算」）一律不路由（结构判别，
+    # 非逐句关键词黑名单）。高风险动作在 chat() 走 confirm-first，不到这里。
+    from . import _execution_intent_gate as _intent_gate
+    if not _intent_gate.enters_execution(question or ""):
         return None
     # T37 round-15：库存刷新是副作用动作，已检出意图但用户明确拒绝 → 不路由（任意语序）。
     if _has_stock_refresh_intent(q) and _stock_refresh_refused(q):
@@ -2562,8 +2846,8 @@ def _deterministic_workflow_request(question: str) -> Optional[Dict[str, str]]:
     if _STOCK_REFRESH_INTENT_RE.search(q):
         return {"workflow": "wf1_stock_v2", "label": "库存刷新"}
     # T38: 宽口径——"重跑"/"重新计算" 也属于执行意图触发词
-    if not any(v in q for v in ("刷新", "同步", "重算", "跑一下", "拉一下", "扫", "刷一下",
-                                 "重跑", "重新计算")):
+    if not any(v in q for v in ("刷新", "刷库存", "刷库", "同步", "重算", "跑一下", "拉一下",
+                                 "扫", "刷一下", "重跑", "重新计算")):
         return None
     if "物流" in q:
         return {"workflow": "wf3_logistics_v2", "label": "物流刷新"}
@@ -2611,6 +2895,64 @@ def _deterministic_total_stock_topn_request(question: str) -> "Optional[int]":
     return 10
 
 
+def _deterministic_product_sales_topn_request(question: str) -> "Optional[int]":
+    q = question or ""
+    if "销量" not in q:
+        return None
+    if any(x in q for x in ("库存", "补货", "货单", "物流")):
+        return None
+    if any(x in q for x in ("180天", "历史", "总销量")):
+        return None
+    has_subject = any(x in q for x in ("商品", "产品", "SKU", "sku", "Sku", "款"))
+    has_top_intent = any(x in q for x in ("最高", "最多", "排行", "排名", "Top", "top", "TOP", "前"))
+    if not (has_subject and has_top_intent):
+        return None
+    patterns = (
+        r"(?:Top|top|TOP)\s*(\d+)",
+        r"前\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最高的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"最多的\s*(\d+)\s*(?:个|名|款|条|SKU|sku)?",
+        r"(\d+)\s*(?:个|名|款|条)\s*(?:商品|产品|SKU|sku)",
+    )
+    for pat in patterns:
+        m = _re.search(pat, q)
+        if m:
+            return max(1, min(int(m.group(1)), 50))
+    return 10
+
+
+def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return f"{store} 近30天销量 TopN 暂时不可用。"
+    if tool_result.get("error"):
+        return f"{store} 近30天销量 TopN 暂时不可用：{tool_result.get('error')}"
+    items = tool_result.get("items") or []
+    if not items:
+        return f"{store} 暂无可排序的近30天销量商品数据。"
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="list_products_sales_topn_reply")
+    except _ContractViolation as _e:
+        return (
+            f"{store} 近30天销量 TopN 缺少可追溯证据（来源/取数时间/口径），"
+            f"按规则不出数。详情：{_e}"
+        )
+    lines = [f"{store} 近30天销量最高的 {len(items)} 个商品：", ""]
+    for i, item in enumerate(items[:10], 1):
+        sku = item.get("sku") or "?"
+        title = (item.get("title") or "").strip()
+        name = f"{sku}（{title}）" if title else sku
+        sales_30d = item.get("sales_30d")
+        lines.append(f"{i}. **{name}**：近30天销量 {_fmt_int(sales_30d)}")
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
+    return "\n".join(lines)
+
+
 def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if not isinstance(tool_result, dict):
         return f"{store} 库存查询暂不可用，请稍后重试。"
@@ -2622,10 +2964,22 @@ def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if tool_result.get("empty"):
         return tool_result.get("message") or f"{store} 暂无库存数据。"
     items = tool_result.get("items") or []
-    stale_days = tool_result.get("stale_days")
-    age_hint = f"（数据截至 {stale_days} 天前）" if stale_days else ""
+    # WS-144 统一证据契约：出数前强制校验证据三要素（来源/取数时间/口径）。
+    # 无证据 → fail-closed 不出数，不许旁路旧字段直接渲染裸数字。
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="total_stock_topn_reply")
+    except _ContractViolation as _e:
+        return (
+            f"{store} 总库存查询缺少可追溯证据（来源/取数时间/口径），"
+            f"按规则不出数。详情：{_e}"
+        )
     lines = [
-        f"{store} 总库存最高的 {len(items)} 个 SKU{age_hint}，",
+        f"{store} 总库存最高的 {len(items)} 个 SKU，",
         "**口径**：total_stock = noon官方仓 + 海外仓 + 国内仓 + 送仓未上架(pending)，"
         "与 noon 可售数(saleable)不同。",
         "",
@@ -2638,6 +2992,8 @@ def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
         lines.append(
             f"{i}. **{sku}**  总库存 {total:,}（可售 {saleable:,} / 送仓未上架 {pending:,}）"
         )
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
     return "\n".join(lines)
 
 
@@ -2971,7 +3327,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     """
     messages: [{role: 'user'|'assistant', content: '...'}]
     scope: {store, current_user, current_role, tenant_id, user_id, ...}
-    返回: {reply, clean_reply, references, action_id, tag, workflow_task, tools_used, provider, confidence}
+    返回: {reply, clean_reply, references, action_id, tag, workflow_tasks, tools_used, provider, confidence}
 
     走 _provider 抽象层，通过 LLM_PROVIDER env 切换 anthropic / qwen / deepseek / doubao。
     """
@@ -2988,6 +3344,31 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     question = messages[-1].get("content") if messages else ""
     if isinstance(question, list):  # content 可能是 blocks
         question = " ".join(b.get("text", "") for b in question if isinstance(b, dict))
+
+    # WS-145 肯定执行意图门:本轮句式语气 + 风险分层一次求出，注入 contextvar，
+    # 供 _exec_tool 在非执行语气下拒绝 run_workflow（LLM 不许绕）。
+    from . import _execution_intent_gate as _intent_gate
+    _intent_decision = _intent_gate.evaluate(question or "")
+    _chat_intent.set(_intent_decision)
+
+    # 高风险动作（外部通知/交易·采购·订单/不可回滚/跨店批量覆盖）即使肯定句也不自动执行:
+    # 先 confirm，不自动补调。确定性短路，绝不落任务。
+    if _intent_decision.needs_confirm_first:
+        reply = _intent_gate.confirm_first_reply(question or "")
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "确认",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "execution_intent_gate_confirm_first",
+            "hallucination_warnings": None,
+        }
 
     direct_export = _deterministic_export_request(question)
     if direct_export:
@@ -3064,17 +3445,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     if direct_workflow:
         tool_args = {"workflow": direct_workflow["workflow"], "followup_prompt": question}
         tool_result = _exec_tool("run_workflow", tool_args, user=scope)
-        workflow_task = None
+        workflow_tasks = []
         if isinstance(tool_result, dict) and tool_result.get("ok"):
             task_id = tool_result["task_id"]
-            workflow_task = {
+            workflow_tasks.append({
+                "ok": True,
                 "task_id": task_id,
-                "workflow": tool_result["workflow"],
-                "label": tool_result["label"],
-                "total_steps": tool_result["total_steps"],
-                "affected_modules": tool_result["affected_modules"],
+                "workflow": tool_result.get("workflow", direct_workflow["workflow"]),
+                "label": tool_result.get("label", direct_workflow.get("label", direct_workflow["workflow"])),
+                "total_steps": tool_result.get("total_steps", 0),
+                "affected_modules": tool_result.get("affected_modules", []),
                 "followup_prompt": tool_result.get("followup_prompt"),
-            }
+            })
             # T21-SUB-2: 三态受理回执（已排队/已开始/已完成·失败），
             # 直接回答「是否已创建」并附 task_id/workflow/状态，禁止只说「已触发」。
             reply = _workflow_receipt_reply(
@@ -3096,7 +3478,8 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         ):
             existing = _current_workflow_task(direct_workflow["workflow"])
             if existing:
-                workflow_task = {
+                workflow_tasks.append({
+                    "ok": True,
                     "task_id": existing["task_id"],
                     "workflow": existing["workflow"],
                     "label": direct_workflow["label"],
@@ -3105,7 +3488,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     "followup_prompt": question,
                     "state": existing.get("state"),
                     "already_running": True,
-                }
+                })
                 reply = (
                     f"{direct_workflow['label']}已有运行中的后台任务 "
                     f"`{existing['task_id']}`，我不重复触发。"
@@ -3118,14 +3501,15 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                     label, total_steps, affected = _workflow_registry_summary(
                         workflow, direct_workflow["label"]
                     )
-                    workflow_task = {
+                    workflow_tasks.append({
+                        "ok": True,
                         "task_id": extracted_id,
                         "workflow": workflow,
                         "label": label,
                         "total_steps": total_steps,
                         "affected_modules": affected,
                         "followup_prompt": question,
-                    }
+                    })
                     reply = (
                         f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
                         f"任务 ID：{extracted_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
@@ -3140,20 +3524,28 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                 label, total_steps, affected = _workflow_registry_summary(
                     workflow, direct_workflow["label"]
                 )
-                workflow_task = {
+                workflow_tasks.append({
+                    "ok": True,
                     "task_id": existing_task_id,
                     "workflow": workflow,
                     "label": label,
                     "total_steps": total_steps,
                     "affected_modules": affected,
                     "followup_prompt": question,
-                }
+                })
                 reply = (
                     f"{direct_workflow['label']}已有同类后台任务在运行，未新建重复任务。\n"
                     f"任务 ID：{existing_task_id}｜workflow：{workflow}｜当前状态：运行中或排队。\n"
                     "请在工作台任务面板查看进度；任务结束后如仍需刷新，可以再重试。"
                 )
             else:
+                workflow_tasks.append({
+                    "ok": False,
+                    "workflow": direct_workflow["workflow"],
+                    "label": direct_workflow.get("label", direct_workflow["workflow"]),
+                    "error": (tool_result or {}).get("error") or "触发失败",
+                    "task_id": None,
+                })
                 reason = (
                     (tool_result or {}).get("message")
                     or (tool_result or {}).get("error")
@@ -3166,6 +3558,18 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
                              "请稍后在工作台任务面板确认任务状态，或重试。")
                 else:
                     reply = "本轮没有创建后台任务：工作流触发失败，请稍后重试。"
+                # WS-145 自动补调策略:确定性路由这一次触发即「自动补调一次」。
+                # 失败后 policy 判定转 plan→confirm（不无限重试），追加下一步 + 需确认，
+                # 绝不返回「已触发/已完成」假证据。
+                from . import _execution_intent_gate as _intent_gate
+                if (
+                    _intent_gate.decide_recovery(_intent_gate.RiskTier.LOW_AUTO, 1)
+                    == _intent_gate.RecoveryAction.PLAN_CONFIRM
+                ):
+                    reply = reply.rstrip() + (
+                        "\n\n下一步:这步自动补调一次仍未成功，我不再自动重复触发——"
+                        "回「确认」我再试一次，或回「取消」改用上传/手动核对。"
+                    )
         return {
             "reply": reply,
             "clean_reply": reply,
@@ -3173,10 +3577,33 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "action_id": None,
             "tools_used": ["run_workflow"],
             "tag": "执行",
-            "workflow_task": workflow_task,
+            "workflow_tasks": workflow_tasks,
             "provider": _provider.get_provider(),
             "confidence": 1.0,
             "judge_method": "deterministic_workflow_router",
+            "hallucination_warnings": None,
+        }
+
+    direct_sales_topn_n = _deterministic_product_sales_topn_request(question)
+    if direct_sales_topn_n is not None:
+        store = scope.get("store") or "KSA"
+        tool_result = _exec_tool(
+            "list_products",
+            {"store": store, "listing": "all", "limit": direct_sales_topn_n},
+            user=scope,
+        )
+        reply = _format_product_sales_topn_reply(store, tool_result)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": _dedup_refs((tool_result or {}).get("references", [])),
+            "action_id": None,
+            "tools_used": ["list_products"],
+            "tag": "查询",
+            "workflow_task": None,
+            "provider": _provider.get_provider(),
+            "confidence": 1.0 if not (tool_result or {}).get("error") else 0.8,
+            "judge_method": "deterministic_product_sales_topn_router",
             "hallucination_warnings": None,
         }
 
@@ -3345,7 +3772,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     clean_reply  = result["reply"]           # LLM 原文（无 banner）— 用于持久化 + 喂未来历史
     tool_log     = result["tool_log"]
     refs_collected = result["refs_collected"]
-    workflow_task  = result.get("workflow_task")
+    workflow_tasks = result.get("workflow_tasks", [])
     tools_used     = [t["name"] for t in tool_log]
 
     # Layer 3 hallucinate 后处理（上移自 api.py — 一处产生 warnings，既喂 confidence 又 sanitize）
@@ -3424,7 +3851,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
         "action_id": action_id,
         "tools_used": tools_used,
         "tag": ("hallucinate" if hallu_warnings else ("执行" if _safety._is_substantive_action(tool_log) else ("查询" if tool_log else None))),
-        "workflow_task": workflow_task,
+        "workflow_tasks": workflow_tasks,
         "provider": _provider.get_provider(),
         "confidence": round(confidence, 2),
         "judge_method": judge_method,
