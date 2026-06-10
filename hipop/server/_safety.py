@@ -150,6 +150,38 @@ _QTY_RESULT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Rule I: workflow failure false-success claims.
+# Keep the broad "already triggered/started/submitted" claims, but scope
+# "processing" language so honest failure text such as "不会继续处理" or
+# "请到后台处理" does not look like a backend-success promise.
+_WF_FALSE_SUCCESS_CLAIM_RE = re.compile(
+    r"(已触发|已启动|已开始|任务已.{0,5}(创建|提交|启动|运行)|"
+    r"已为.{0,5}(你|您).{0,5}触发|系统已经在.{0,5}后台|后台.{0,5}(跑|运行)了|"
+    r"系统(?![^。；\n!?]{0,6}(?:不|不会|不能|无法|未|没)).{0,10}(会|将).{0,10}(继续|处理)|"
+    r"(?:系统|后台).{0,10}(?:自动|正在).{0,5}处理|已安排.{0,10}处理|"
+    r"将继续.{0,5}处理)"
+)
+_WF_NON_SUCCESS_PROCESSING_RE = re.compile(
+    r"(?:"
+    r"(?:不会|不能|无法|未|没|不再).{0,4}继续.{0,4}处理"
+    r"|不\s*继续.{0,4}处理"
+    r"|请.{0,4}到后台.{0,4}处理"
+    r"|到后台.{0,4}处理"
+    r"|(?:人工|手动).{0,4}处理"
+    r")"
+)
+
+
+def _workflow_failure_claims_success(reply: str) -> bool:
+    """Return True when a failed workflow reply still promises backend success."""
+    for part in re.split(r"[。；\n!?！？]", reply or ""):
+        if not _WF_FALSE_SUCCESS_CLAIM_RE.search(part):
+            continue
+        scrubbed = _WF_NON_SUCCESS_PROCESSING_RE.sub("", part)
+        if _WF_FALSE_SUCCESS_CLAIM_RE.search(scrubbed):
+            return True
+    return False
+
 
 def _check_urls(text: str) -> List[str]:
     """扫文本里所有 URL，返回违规列表"""
@@ -1128,15 +1160,9 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         if t.get("name") == "run_workflow"
         and t.get("result_error")  # ok=False → result dict 有 "error" key
     ]
-    _WF_SUCCESS_CLAIM_RE = re.compile(
-        r"(已触发|已启动|已开始|任务已.{0,5}(创建|提交|启动|运行)|"
-        r"已为.{0,5}(你|您).{0,5}触发|系统已经在.{0,5}后台|后台.{0,5}(跑|运行)了|"
-        r"系统.{0,10}(会|将).{0,10}(继续|处理)|继续.{0,5}处理|已安排.{0,10}处理|"
-        r"会继续|将继续.{0,5}处理|后台.{0,5}处理|帮你.{0,5}处理|自动.{0,5}处理)"
-    )
     # 不设"已说失败"豁免——"虽然刚才失败，但现在已触发"类混淆句 既提失败又宣称成功，
-    # 属于更严重的编造；合法的失败回复（"触发失败，请重试"）不含成功声明词，不匹配此 RE。
-    if wf_failed_entries and _WF_SUCCESS_CLAIM_RE.search(reply):
+    # 属于更严重的编造；合法的失败回复（"触发失败，请重试"）不含成功声明词，不匹配此检查。
+    if wf_failed_entries and _workflow_failure_claims_success(reply):
         wf_names = [_get_tool_arg(t, "workflow") for t in wf_failed_entries]
         wf_str = "、".join(filter(None, wf_names)) or "工作流"
         warnings.append(

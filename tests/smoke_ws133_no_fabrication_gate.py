@@ -763,6 +763,48 @@ def test_rule_i_already_arranged_processing_promise_blocked():
     assert rule_i_warns, f"工作流失败+'已安排处理'应触发 Rule I，但 warns={warns}"
 
 
+def test_rule_i_no_false_positive_failure_will_not_continue_processing():
+    """Round-6 narrow fix: 诚实说明"系统不会继续处理"不是假成功声明。"""
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "ok": False,
+        "result_error": "queue full",
+    }]
+    good_reply = "工作流触发失败，系统不会继续处理，请重试。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "run_workflow" in w or "Rule I" in w or "WS-133 Rule I" in w]
+    assert not rule_i_warns, f"诚实失败说明不应触发 Rule I: {rule_i_warns}"
+
+
+def test_rule_i_no_false_positive_failure_manual_backend_handling():
+    """Round-6 narrow fix: 让用户去后台处理/稍后重试，不是宣称系统后台已处理。"""
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "ok": False,
+        "result_error": "queue full",
+    }]
+    good_reply = "工作流创建失败，请到后台处理或稍后重试。"
+    out, warns = _safety.sanitize_reply(good_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "run_workflow" in w or "Rule I" in w or "WS-133 Rule I" in w]
+    assert not rule_i_warns, f"人工处理建议不应触发 Rule I: {rule_i_warns}"
+
+
+def test_rule_i_failure_but_system_will_continue_processing_still_blocked():
+    """Round-6 guardrail: 失败后仍宣称系统会继续处理，仍是假成功声明。"""
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "ok": False,
+        "result_error": "queue full",
+    }]
+    fake_reply = "工作流触发失败，但系统会继续处理，请稍后查看任务面板。"
+    out, warns = _safety.sanitize_reply(fake_reply, tools_used=["run_workflow"], tool_log=tool_log)
+    rule_i_warns = [w for w in warns if "run_workflow" in w or "Rule I" in w or "WS-133 Rule I" in w]
+    assert rule_i_warns, f"失败后仍宣称系统会继续处理应触发 Rule I，但 warns={warns}"
+
+
 # ─── Round 5 — 结构判别（取代逐句加词黑名单）─────────────────────────────────────
 # 背景：前 4 轮逐句加同义词永不收敛（货代为→货代是→物流商是→走的是…）。
 # Round-5 改为按「失败查询不可能产生的确定结果」的形状+闭集实体判别
@@ -914,6 +956,10 @@ if __name__ == "__main__":
         test_rule_h_suffix_tracking_number_claim_blocked,
         test_rule_i_will_continue_processing_promise_blocked,
         test_rule_i_already_arranged_processing_promise_blocked,
+        # Round 6 narrow — Rule I 误报修复（只修诚实失败提示，不重开同义词红队）
+        test_rule_i_no_false_positive_failure_will_not_continue_processing,
+        test_rule_i_no_false_positive_failure_manual_backend_handling,
+        test_rule_i_failure_but_system_will_continue_processing_still_blocked,
         # Round 5 — 结构判别取代逐句加词黑名单（同义变体收口 + 防误报）
         test_rule_f_carrier_synonym_wuliushang_blocked,
         test_rule_f_carrier_synonym_zoudeshi_blocked,
