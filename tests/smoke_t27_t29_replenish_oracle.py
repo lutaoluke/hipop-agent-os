@@ -130,18 +130,22 @@ def test_authoritative_field_is_weekly_total_replenish():
     """
     agent_path = os.path.join(REPO, "hipop", "server", "agent.py")
     data_path  = os.path.join(REPO, "hipop", "server", "data.py")
+    # WS-166：tool_* 实现已外移到 tools_impl.py；agent.py 仅保留声明/分发投影。
+    impl_path  = os.path.join(REPO, "hipop", "server", "tools_impl.py")
 
     assert os.path.exists(agent_path), f"缺 hipop/server/agent.py: {agent_path}"
     assert os.path.exists(data_path),  f"缺 hipop/server/data.py: {data_path}"
+    assert os.path.exists(impl_path),  f"缺 hipop/server/tools_impl.py: {impl_path}"
 
     agent_src = open(agent_path, encoding="utf-8").read()
     data_src  = open(data_path,  encoding="utf-8").read()
+    impl_src  = open(impl_path,  encoding="utf-8").read()
 
-    # 1) agent.py: compute_replenishment tool 有声明（描述/name 都在）
+    # 1) agent.py: compute_replenishment tool 有声明 + 分发投影（name/再导出都在）
     assert "compute_replenishment" in agent_src, \
         "agent.py 里找不到 compute_replenishment 工具声明"
     assert "tool_compute_replenishment" in agent_src, \
-        "agent.py 里找不到 tool_compute_replenishment 实现引用"
+        "agent.py 里找不到 tool_compute_replenishment 分发投影（TOOL_FUNCS / 再导出）"
 
     # 2) data.py: get_replenishment 查询的是 wf5_sales_cycle，字段是 weekly_total_replenish
     assert "get_replenishment" in data_src, \
@@ -156,8 +160,10 @@ def test_authoritative_field_is_weekly_total_replenish():
         "data.py 的 get_replenishment 查询缺少 ORDER BY weekly_total_replenish DESC"
 
     # 4) tool_compute_replenishment 实现里的 references 指向 wf5_sales_cycle（线上可追溯）
-    assert "wf5_sales_cycle" in agent_src[agent_src.find("tool_compute_replenishment"):
-                                          agent_src.find("tool_compute_replenishment")+2000], \
+    #    WS-166 后实现在 tools_impl.py，故在实现源里审计（定位到 def 起点再切窗口）。
+    _impl_start = impl_src.find("def tool_compute_replenishment")
+    assert _impl_start != -1, "tools_impl.py 里找不到 tool_compute_replenishment 实现"
+    assert "wf5_sales_cycle" in impl_src[_impl_start:_impl_start + 2000], \
         "tool_compute_replenishment 实现附近没有引用 wf5_sales_cycle（references 缺失）"
 
 
