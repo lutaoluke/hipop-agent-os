@@ -137,48 +137,54 @@ AVERAGE                                                1.00   0.95   0.98   0.97
 
 ---
 
-## Decision① Verification (WS-163 Implementation)
+## Decision① — codified as live CI gates (acceptance #4)
 
-**Decision①**: "KEEP DeepSeek + invest in deterministic routing" is now **codified as executable verifier**:
+**Decision①**: "KEEP DeepSeek + invest in deterministic routing" is enforced by two
+executable gates wired into **required** CI lanes (not prose, not future work):
 
-### Evidence Files
-- `tests/baseline_deepseek.json` — Arm A run (25 cases, avg 0.95)
-- `tests/baseline_opus.json` — Arm B run (25 cases, avg 0.97)
-- `tests/baseline_comparison.md` — Difference analysis & boundary conclusion
+### Evidence files (full 31-case suite, both arms)
+- `tests/baseline_deepseek.json` — Arm A, DeepSeek, 31 cases, avg overall 0.954
+- `tests/baseline_opus.json` — Arm B, Opus (`claude-opus-4-8`), 31 cases, avg overall 0.969
+- `tests/baseline_comparison.md` — difference matrix, boundary conclusion, reproducibility +
+  honest coverage notes
+- `tests/run_baseline_arm.py` — reproducible single-arm runner (retry-on-429, fail-closed)
 
-### Verifier
-Run: `python3 tests/smoke_graded_threshold.py --check-baseline-decision`
+### Gate 1 — offline, runs in the required `make test` lane
+`tests/smoke_graded_decision.py` (auto-discovered by the Makefile `smoke_*.py` glob, so it
+runs inside `gate.yml`). Deterministic, no server. Goes **RED** if:
+- COVERAGE: any current `smoke_chat.CASES` case is absent from either baseline (fail-closed —
+  a newly-added case can no longer be silently excluded from the decision).
+- DECISION①: avg gap > 0.05 **or** keep-rate < 90% (the real "strong model pulled ahead →
+  reconsider upgrade" signal). Currently: avg gap 0.015, keep 29/31 (94%) ✓.
+- FLOOR: committed DeepSeek averages drop below documented floors (overall 0.88 / source 0.80
+  / time 0.85 / real_task 0.85 / fail_closed 0.90 — set below measured, so a drop trips).
 
-Asserts:
-- avg_gap ≤ 0.05 (threshold for "routing solved") ✓ 0.018
-- keep_cases ≥ 90% (threshold for "sufficient coverage") ✓ 92% (23/25)
-- conclusion = KEEP_DEEPSEEK (not UPGRADE_MODEL) ✓
+### Gate 2 — live, runs in the required `chat e2e` lane
+`tests/smoke_graded_threshold.py`, invoked by `tests/ci_chat_e2e_gate.sh` with
+`HIPOP_GRADED_REQUIRE_SERVER=1`. Grades live responses on the running server and goes **RED**
+if any dimension regresses below `baseline − 0.07`. The floor is **derived from the committed
+baseline**, not a hand-tuned constant, so it cannot be quietly relaxed to "make today pass".
+Fail-closed (RED) if the live lane has no server — never a silent green.
 
-**If this test fails**, the empirical basis for decision① no longer holds, and
-the decision must be revisited (e.g., if newer baseline model shows large gaps,
-or if DeepSeek regresses).
+`python3 tests/smoke_graded_threshold.py --check-baseline-decision` delegates to Gate 1 for
+local convenience.
 
-### Integration with CI
-When make test runs (after WS-170 clears the gate):
-```bash
-smoke_graded_threshold.py --check-baseline-decision  # Verifies decision① holds
-smoke_graded_threshold.py                             # Regression gate on current DeepSeek performance
-```
+### Fail-then-pass coverage
+`tests/test_graded_eval.py` pins both the 4-dim rubric and the gate logic
+(`smoke_graded_decision.evaluate`): synthetic matrices prove the gate goes RED on a missing
+case, a blown-out gap, and a floor regression.
 
 ---
 
-## Next Steps (Phase4 / E9.2 Handoff)
+## Next Steps (E9.2 handoff — NOT blocking this card)
 
-1. **E9.2 Integration** (when browser harness ready):
-   - Automate real-user-like walkthrough of 50 cases
-   - Attach graded scores to workflow_task results
-   - Feed scores into Phase4 E8.2 regression network threshold tuning
-   - Use baseline_comparison.md gap analysis to set per-dimension thresholds
-
-2. **Continuous Monitoring**:
-   - Decision① verifier runs on every commit (baseline matrices as ground truth)
-   - If avg_gap or keep_pct drift, escalate to human review
-   - Basis for future model upgrade decisions if routing improvements plateau
+- When E9.2's browser-replay harness lands, extend the suite toward the issue's "HIPOP-DG-50"
+  target and re-run `run_baseline_arm.py` for both arms to refresh the baselines; the gates
+  above pick up the wider coverage automatically (Gate 1 fails closed until both baselines
+  cover the new cases).
+- Re-measure the Opus arm's LLM-engaged cases on a dedicated Anthropic API key (separate quota
+  from the coding agent's OAuth subscription) to remove the 2026-06-11 rate-limit caveat noted
+  in `baseline_comparison.md`.
 
 ---
 

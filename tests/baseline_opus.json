@@ -1,6 +1,7 @@
 {
-  "model": "unknown",
-  "timestamp": "2026-06-10T16:11:44Z",
+  "model": "claude-opus-4-8",
+  "timestamp": "2026-06-10T22:26:54Z",
+  "case_count": 31,
   "cases": [
     {
       "name": "数据更新时间问答（不能假说今天）",
@@ -301,13 +302,85 @@
         "fail_closed": 1.0,
         "overall": 0.975
       }
+    },
+    {
+      "name": "T36: 刷新 ERP 商品库和销量价格（task_id 必须可回读）",
+      "question": "run_id=HIPOP-DG-50-20260605-230000; case=T36. 请帮我刷新 ERP 商品库和销量价格，并返回后台任务号。",
+      "pass": true,
+      "grades": {
+        "correct_source": 1.0,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 0.5,
+        "overall": 0.875
+      }
+    },
+    {
+      "name": "T36 负控：询问 ERP 商品库和销量价格上次刷新时间（不得创建 wf2 任务）",
+      "question": "请问 ERP 商品库和销量价格上次是什么时候刷新过？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控4：无问号『上次什么时候刷新过』只读时间（不得创建 wf2 任务）",
+      "question": "ERP 商品库和销量价格上次什么时候刷新过",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控5：无问号『多久前刷的』只读时间（不得创建 wf2 任务）",
+      "question": "ERP 商品库和销量价格多久前刷的",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控2：询问句『能不能帮我刷新 ERP 商品库和销量价格?』（结构门干净回复，零工具）",
+      "question": "能不能帮我刷新 ERP 商品库和销量价格？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
+    },
+    {
+      "name": "T36 负控3：假设句『如果刷新 ERP 商品库和销量价格会怎样?』（只说明影响，零工具）",
+      "question": "如果刷新 ERP 商品库和销量价格会怎样？",
+      "pass": true,
+      "grades": {
+        "correct_source": 0.9,
+        "correct_time_window": 1.0,
+        "real_task": 1.0,
+        "fail_closed": 1.0,
+        "overall": 0.975
+      }
     }
   ],
   "averages": {
-    "correct_source": 0.924,
+    "correct_source": 0.923,
     "correct_time_window": 1.0,
-    "real_task": 0.96,
-    "fail_closed": 1.0,
-    "overall": 0.971
+    "real_task": 0.968,
+    "fail_closed": 0.984,
+    "overall": 0.969
   }
 }

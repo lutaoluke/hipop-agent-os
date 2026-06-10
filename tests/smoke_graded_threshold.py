@@ -1,29 +1,36 @@
-"""smoke_graded_threshold — WS-163 graded eval regression gate
+"""smoke_graded_threshold — WS-163 LIVE graded-eval regression gate (server lane).
 
-Runs the 50-case chat smoke suite and enforces graded eval thresholds.
-If overall average score drops below threshold, CI fails.
+Runs the current chat smoke suite against a LIVE server and fails if the live graded
+averages regress below the committed DeepSeek baseline (baseline_deepseek.json) by more
+than a tolerance. This is the live-lane half of acceptance #4 ("graded 分数接进回归网当阈值"):
 
-This test REQUIRES a running server (uvicorn on :8765).
-It is designed to run alongside make test-chat, not as part of make test.
+  * Offline half  → tests/smoke_graded_decision.py  (runs in `make test` / gate.yml,
+                    no server: coverage + decision① + committed-baseline floors).
+  * Live half     → THIS file (runs in the chat-e2e live lane via ci_chat_e2e_gate.sh,
+                    has a real server: live responses must not regress vs baseline).
+
+Because it needs uvicorn it is EXCLUDED from `make test` autodiscovery (see Makefile and
+smoke_makefile_autodiscover.py) and is invoked explicitly by tests/ci_chat_e2e_gate.sh.
+
+fail-closed: the live lane is supposed to have a server. If HIPOP_GRADED_REQUIRE_SERVER=1
+(set by ci_chat_e2e_gate.sh) and the server is unreachable, this EXITS 1 (RED) — it must
+never report a silent green when it could not actually measure anything. Only when the
+gate is invoked OUTSIDE the live lane with no server and no REQUIRE flag does it skip(0).
+
+Thresholds: live_avg[dim] must be ≥ baseline_avg[dim] − HIPOP_GRADED_REGRESS_TOL (0.07).
+The floor is DERIVED from the committed baseline, not a hand-tuned constant — so it tracks
+the real measured level and cannot be quietly relaxed to "make today pass".
 
 Usage:
-  python3 tests/smoke_graded_threshold.py [--url http://localhost:8765]
-
-If server is not available, this test safely skips (returns 0).
-
-Thresholds (customizable via env):
-- HIPOP_GRADED_OVERALL_MIN: Minimum overall average (default 0.80)
-- HIPOP_GRADED_SOURCE_MIN: Minimum correct_source average (default 0.80)
-- HIPOP_GRADED_REAL_TASK_MIN: Minimum real_task average (default 0.85)
-- HIPOP_GRADED_FAIL_CLOSED_MIN: Minimum fail_closed average (default 0.80)
-
-WS-163: When chat server is available, this gate ensures graded scores don't regress.
+  python3 tests/smoke_graded_threshold.py [--url http://127.0.0.1:8765]
+  python3 tests/smoke_graded_threshold.py --check-baseline-decision  # delegates offline gate
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
-import argparse
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,182 +38,92 @@ REPO = os.path.dirname(HERE)
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-# Import smoke_chat functions and cases
 from tests import smoke_chat
 
-
-def get_thresholds():
-    """Load threshold requirements from env (or defaults).
-
-    Thresholds are calibrated for eventual 50-case suite (E9.2 deliverable).
-    Current 31-case smoke suite may not reach all thresholds; that is expected.
-    This gate is targeted at the live chat e2e lane with server.
-    """
-    return {
-        "overall": float(os.environ.get("HIPOP_GRADED_OVERALL_MIN", "0.80")),
-        "correct_source": float(os.environ.get("HIPOP_GRADED_SOURCE_MIN", "0.80")),
-        "correct_time_window": float(os.environ.get("HIPOP_GRADED_TIME_MIN", "0.75")),
-        "real_task": float(os.environ.get("HIPOP_GRADED_REAL_TASK_MIN", "0.85")),
-        "fail_closed": float(os.environ.get("HIPOP_GRADED_FAIL_CLOSED_MIN", "0.80")),
-    }
+DEEPSEEK_BASELINE = os.path.join(HERE, "baseline_deepseek.json")
+REGRESS_TOL = float(os.environ.get("HIPOP_GRADED_REGRESS_TOL", "0.07"))
+DIMS = ["correct_source", "correct_time_window", "real_task", "fail_closed", "overall"]
 
 
-def check_baseline_decision():
-    """WS-163: Verify decision① (KEEP DeepSeek) is supported by baseline data.
-
-    Reads baseline_deepseek.json and baseline_opus.json, verifies:
-    - avg_gap ≤ 0.05 (routing already solved most cases)
-    - keep_cases ≥ 90% (high proportion solved)
-    - decision① = KEEP DeepSeek (not UPGRADE)
-
-    Returns 0 (PASS) or 1 (FAIL).
-    """
-    import json
-    from pathlib import Path
-
-    baseline_deepseek = Path("tests/baseline_deepseek.json")
-    baseline_opus = Path("tests/baseline_opus.json")
-
-    if not baseline_deepseek.exists() or not baseline_opus.exists():
-        print("✗ Baseline JSON files missing (needed for decision① verification)")
-        return 1
-
-    with open(baseline_deepseek) as f:
-        arm_a = json.load(f)
-    with open(baseline_opus) as f:
-        arm_b = json.load(f)
-
-    # Compute gap statistics
-    gaps = []
-    for case_a in arm_a.get("cases", []):
-        name = case_a["name"]
-        case_b = next((c for c in arm_b.get("cases", []) if c["name"] == name), None)
-        if not case_b:
-            continue
-        gap = abs(case_b["grades"]["overall"] - case_a["grades"]["overall"])
-        gaps.append(gap)
-
-    if not gaps:
-        print("✗ No cases found in baseline matrices")
-        return 1
-
-    avg_gap = sum(gaps) / len(gaps)
-    keep_count = sum(1 for g in gaps if g <= 0.05)
-    keep_pct = (keep_count / len(gaps)) * 100 if gaps else 0
-
-    print(f"\n=== WS-163 Decision① Verification (KEEP DeepSeek) ===")
-    print(f"Cases analyzed: {len(gaps)}")
-    print(f"Average gap: {avg_gap:.3f} (threshold ≤ 0.05)")
-    print(f"Keep DeepSeek: {keep_count}/{len(gaps)} ({keep_pct:.0f}%) — threshold ≥ 90%")
-
-    # Verdict
-    ok_gap = avg_gap <= 0.05
-    ok_keep_pct = keep_pct >= 90
-
-    if ok_gap and ok_keep_pct:
-        print(f"✓ DECISION① VERIFIED: KEEP DeepSeek (routing sufficient)")
-        return 0
-    else:
-        print(f"✗ DECISION① FAILED:")
-        if not ok_gap:
-            print(f"  - Gap {avg_gap:.3f} exceeds threshold 0.05")
-        if not ok_keep_pct:
-            print(f"  - Keep rate {keep_pct:.0f}% below threshold 90%")
-        return 1
+def baseline_floors() -> dict:
+    """Regression floors = committed DeepSeek baseline averages − tolerance."""
+    with open(DEEPSEEK_BASELINE, encoding="utf-8") as f:
+        base = json.load(f)
+    avgs = base.get("averages", {})
+    return {d: round(avgs.get(d, 0.0) - REGRESS_TOL, 3) for d in DIMS}
 
 
-def main():
-    ap = argparse.ArgumentParser(description="WS-163 graded eval threshold gate")
-    ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
-    ap.add_argument("--filter", help="Only run cases matching this keyword")
-    ap.add_argument("--verbose", "-v", action="store_true")
+def check_baseline_decision() -> int:
+    """Backward-compatible alias — the decision①/coverage logic now lives in the offline gate."""
+    from tests import smoke_graded_decision
+    return smoke_graded_decision.main()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="WS-163 live graded eval regression gate")
+    ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://127.0.0.1:8765"))
+    ap.add_argument("--filter", help="only run cases matching this keyword")
     ap.add_argument("--check-baseline-decision", action="store_true",
-                    help="Verify decision① (KEEP DeepSeek) from baseline matrices")
+                    help="run the OFFLINE decision①/coverage gate (no server) and exit")
     args = ap.parse_args()
 
-    # Baseline decision verification mode (offline, no server needed)
     if args.check_baseline_decision:
         return check_baseline_decision()
 
-    print(f"=== WS-163 Graded Eval Threshold Gate ===")
+    floors = baseline_floors()
+    print("=== WS-163 live graded-eval regression gate ===")
     print(f"URL: {args.url}")
+    print(f"regression floors (baseline − {REGRESS_TOL}): {floors}")
 
-    thresholds = get_thresholds()
-    print(f"Thresholds: {thresholds}")
-
-    # Set up smoke test authentication
+    require_server = os.environ.get("HIPOP_GRADED_REQUIRE_SERVER") == "1"
     try:
         smoke_chat.ensure_smoke_user_tenant1()
         opener = smoke_chat.build_authenticated_opener(args.url)
     except Exception as e:
-        print(f"\n⚠️  Server not available: {type(e).__name__}")
-        print("   Graded eval threshold gate requires running uvicorn server.")
-        print("   This gate is targeted for 'chat e2e (live)' lane (has server).")
-        print("   Skipping in 'make test' lane (no server) with signal.")
-        print(f"   To run graded checks: use 'make test-chat' or re-test in live lane.")
-        sys.exit(0)  # Skip with explicit signal — lane doesn't have server
-    global _AUTH_OPENER
+        if require_server:
+            print(f"\n✗ server unreachable but HIPOP_GRADED_REQUIRE_SERVER=1 → FAIL-CLOSED (RED): "
+                  f"{type(e).__name__}: {e}")
+            return 1
+        print(f"\n⚠️  server not available ({type(e).__name__}); this gate needs a live server.")
+        print("   Not in live lane (HIPOP_GRADED_REQUIRE_SERVER unset) → skip(0).")
+        print("   In CI the live lane sets HIPOP_GRADED_REQUIRE_SERVER=1 so a missing server is RED.")
+        return 0
     smoke_chat._AUTH_OPENER = opener
 
-    # Prepare expectations and cases
     cases = [c for c in smoke_chat.CASES if (not args.filter) or args.filter in c.name]
     try:
         smoke_chat._bind_runtime_expectations(cases)
         smoke_chat._prepare_dynamic_expectations(args.url, opener)
     except Exception as e:
-        print(f"\n✗ Fixture prep failed: {e}")
-        sys.exit(1)
+        print(f"\n✗ fixture prep failed: {e}")
+        return 1
 
-    print(f"Running {len(cases)} cases...")
-    graded_results = []
+    print(f"Running {len(cases)} cases...\n")
+    graded = []
     t0 = time.time()
-
     for i, c in enumerate(cases, 1):
-        print(f"[{i}/{len(cases)}] {c.name[:50]} ", end="", flush=True)
-        t = time.time()
         resp = smoke_chat.post_chat(opener, args.url, c.question, c.store, c.timeout)
-        ok, reasons = smoke_chat.check(c, resp)
-        grades = smoke_chat.grade_case(c, resp)
-        elapsed = time.time() - t
+        g = smoke_chat.grade_case(c, resp)
+        graded.append(g)
+        print(f"[{i}/{len(cases)}] {c.name[:48]:<48} {g['overall']:.2f}")
 
-        graded_results.append({"name": c.name, "grades": grades})
-        status = "✓" if ok else "✗"
-        print(f"{status} {grades['overall']:.2f} ({elapsed:.1f}s)")
-
-    total = time.time() - t0
-
-    # Compute averages
-    avg_by_dim = {}
-    for dim in ["correct_source", "correct_time_window", "real_task", "fail_closed", "overall"]:
-        scores = [r["grades"][dim] for r in graded_results]
-        avg_by_dim[dim] = sum(scores) / len(scores) if scores else 0
-
-    print(f"\n=== Results ===")
-    print(f"Cases: {len(graded_results)}, Time: {total:.1f}s")
-    print(f"\nAverage Scores:")
-    print(f"  correct_source:     {avg_by_dim['correct_source']:.3f} (threshold: {thresholds['correct_source']:.2f})")
-    print(f"  correct_time_window: {avg_by_dim['correct_time_window']:.3f} (threshold: {thresholds['correct_time_window']:.2f})")
-    print(f"  real_task:          {avg_by_dim['real_task']:.3f} (threshold: {thresholds['real_task']:.2f})")
-    print(f"  fail_closed:        {avg_by_dim['fail_closed']:.3f} (threshold: {thresholds['fail_closed']:.2f})")
-    print(f"  overall:            {avg_by_dim['overall']:.3f} (threshold: {thresholds['overall']:.2f})")
-
-    # Check against thresholds
+    avg = {d: sum(x[d] for x in graded) / len(graded) for d in DIMS}
+    print(f"\n--- live averages ({len(graded)} cases, {time.time()-t0:.1f}s) ---")
     failures = []
-    for dim in thresholds.keys():
-        if avg_by_dim[dim] < thresholds[dim]:
-            failures.append(
-                f"{dim}: {avg_by_dim[dim]:.3f} < {thresholds[dim]:.2f}"
-            )
+    for d in DIMS:
+        mark = "✓" if avg[d] >= floors[d] else "✗"
+        print(f"  {d:<20} live {avg[d]:.3f}  floor {floors[d]:.3f}  {mark}")
+        if avg[d] < floors[d]:
+            failures.append(f"{d}: live {avg[d]:.3f} < floor {floors[d]:.3f} (regression vs baseline)")
 
     if failures:
-        print(f"\n✗ Threshold violations (CI FAIL):")
+        print("\n✗ LIVE GRADED REGRESSION (CI RED):")
         for f in failures:
             print(f"  - {f}")
-        sys.exit(1)
-    else:
-        print(f"\n✓ All thresholds met (CI PASS)")
-        sys.exit(0)
+        return 1
+    print("\n✓ live graded averages within tolerance of baseline (no regression).")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

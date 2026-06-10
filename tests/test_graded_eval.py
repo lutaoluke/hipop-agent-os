@@ -268,6 +268,70 @@ def test_no_tool_case_with_warning_drops_source():
     print(f"✓ {test_no_tool_case_with_warning_drops_source.__name__}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WS-163: fail-then-pass for the offline decision/coverage/floor gate (evaluate()).
+# These pin the RED behaviour of smoke_graded_decision.evaluate on synthetic matrices,
+# so a regression that lets a missing case / blown-out gap / floor drop slip through
+# would flip a green test to red. (The real committed matrices are checked live by
+# smoke_graded_decision.py inside `make test`.)
+# ─────────────────────────────────────────────────────────────────────────────
+from tests.smoke_graded_decision import evaluate as _gate_evaluate
+
+_CLEAN_FLOORS = {"overall": 0.88, "correct_source": 0.80, "correct_time_window": 0.85,
+                 "real_task": 0.85, "fail_closed": 0.90}
+
+
+def _matrix(scores, averages=None):
+    """scores: {question: overall}. averages defaults to all-passing floors."""
+    averages = averages or {"overall": 0.95, "correct_source": 0.90,
+                            "correct_time_window": 1.0, "real_task": 0.95, "fail_closed": 0.99}
+    return {"averages": averages,
+            "cases": [{"question": q, "grades": {"overall": s}} for q, s in scores.items()]}
+
+
+def test_gate_green_on_clean_symmetric_matrices():
+    qs = ["a", "b", "c"]
+    a = _matrix({q: 0.95 for q in qs})
+    b = _matrix({q: 0.96 for q in qs})
+    failures, report = _gate_evaluate(a, b, qs, floors=_CLEAN_FLOORS)
+    assert failures == [], f"expected green, got {failures}"
+    assert report["keep_pct"] == 100.0
+
+
+def test_gate_red_when_smoke_case_missing_from_deepseek():
+    qs = ["a", "b", "c"]
+    a = _matrix({"a": 0.95, "b": 0.95})           # 'c' missing → must fail closed
+    b = _matrix({q: 0.95 for q in qs})
+    failures, _ = _gate_evaluate(a, b, qs, floors=_CLEAN_FLOORS)
+    assert any("COVERAGE" in f and "DeepSeek" in f for f in failures), failures
+
+
+def test_gate_red_when_smoke_case_missing_from_strong_model():
+    qs = ["a", "b", "c"]
+    a = _matrix({q: 0.95 for q in qs})
+    b = _matrix({"a": 0.95, "b": 0.95})           # 'c' missing on strong arm → symmetry fail
+    failures, _ = _gate_evaluate(a, b, qs, floors=_CLEAN_FLOORS)
+    assert any("COVERAGE" in f and "strong-model" in f for f in failures), failures
+
+
+def test_gate_red_on_decision_flip_large_gap():
+    qs = ["a", "b", "c"]
+    a = _matrix({q: 0.50 for q in qs})            # production weak
+    b = _matrix({q: 0.95 for q in qs})            # strong model far ahead → gap 0.45
+    failures, _ = _gate_evaluate(a, b, qs, floors={"overall": 0.0})
+    assert any("DECISION" in f for f in failures), failures
+
+
+def test_gate_red_on_baseline_floor_regression():
+    qs = ["a", "b", "c"]
+    a = _matrix({q: 0.95 for q in qs},
+                averages={"overall": 0.70, "correct_source": 0.90,   # overall below floor 0.88
+                          "correct_time_window": 1.0, "real_task": 0.95, "fail_closed": 0.99})
+    b = _matrix({q: 0.95 for q in qs})
+    failures, _ = _gate_evaluate(a, b, qs, floors=_CLEAN_FLOORS)
+    assert any("FLOOR" in f and "overall" in f for f in failures), failures
+
+
 if __name__ == "__main__":
     tests = [
         test_correct_source_full_score_with_tools,
@@ -283,6 +347,11 @@ if __name__ == "__main__":
         test_rubric_weights_respected,
         test_no_tool_case_fake_data_penalized,
         test_no_tool_case_with_warning_drops_source,
+        test_gate_green_on_clean_symmetric_matrices,
+        test_gate_red_when_smoke_case_missing_from_deepseek,
+        test_gate_red_when_smoke_case_missing_from_strong_model,
+        test_gate_red_on_decision_flip_large_gap,
+        test_gate_red_on_baseline_floor_regression,
     ]
 
     failed = 0
