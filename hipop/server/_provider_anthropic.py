@@ -18,10 +18,24 @@ def _stale_skus_from_sku_result(tool_name: str, result: Any) -> "list | None":
     抽成函数避免 provider 各自重写逻辑；smoke 可直接 import 测试而不复制。"""
     if tool_name != "query_sku" or not isinstance(result, dict):
         return None
-    stale = [
-        item["sku"] for item in (result.get("items") or [])
-        if item.get("live_sales_failed") and item.get("sku")
-    ]
+    stale = []
+    for item in result.get("items") or []:
+        if not isinstance(item, dict) or not item.get("sku"):
+            continue
+        freshness = item.get("sales_freshness_decision") or {}
+        freshness_present = isinstance(freshness, dict) and bool(freshness)
+        freshness_allows_number = freshness_present and freshness.get("can_output_number") is True
+        freshness_blocks_number = (
+            freshness_present
+            and freshness.get("status") in {"ask_cache_consent", "blocked"}
+            and freshness.get("can_output_number") is False
+        )
+        if (
+            item.get("live_sales_failed")
+            or freshness_blocks_number
+            or (item.get("data_stale") and not freshness_allows_number)
+        ):
+            stale.append(item["sku"])
     return stale or None
 
 
