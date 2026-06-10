@@ -371,6 +371,16 @@ _STARTED_SENTENCE_PAT = re.compile(
     + _SENT + r"[。!?！？；;]?"
 )
 
+# (a3) 「已开始 + 执行动作」(执行主语在前)：任务已开始执行 / 工作流已开始执行 /
+#      销量已开始重算 —— _PW_SENTENCE_PAT 要求"已开始"后紧跟执行类名词(库存/物流/刷新…)
+#      才命中，"已开始执行/重算"这类**动词在后**的会漏切(验门人 round-2 漏切点)。本式与
+#      promise_workflow 的"已开始"锚定口径一致：只锚执行动词，趋势词(改善/回升/下滑)不命中。
+_STARTED_EXEC_VERB_PAT = re.compile(
+    _SENT + r"已开始[^。\n!?！？；;]{0,6}"
+    r"(?:刷新|同步|重算|重新计算|执行|跑|拉取|扫描|计算|处理|更新|生成|采集|抓取|入库)"
+    + _SENT + r"[。!?！？；;]?"
+)
+
 # (b) 完成态假成功（与 _DONE_CLAIM_RE 同口径 + "刷新/更新**已完成**"），整句替换。
 #     刷新/更新类必须带"完成"框（已完成/完毕/跑完），不命中"数据已更新到 2026-06-09"这种
 #     合法的时效陈述 —— 那是 freshness 事实，不是假任务声明。
@@ -426,6 +436,7 @@ def _hard_cut_fake_activity(reply: str, tool_log: Optional[list]) -> str:
     out = reply
     out = _PW_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
     out = _STARTED_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
+    out = _STARTED_EXEC_VERB_PAT.sub(_HARD_CUT_MARKER + " ", out)
     out = _DONE_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
     out = _ACCEPTED_SENTENCE_PAT.sub(_HARD_CUT_MARKER + " ", out)
 

@@ -82,6 +82,33 @@ def test_hardcut_started_claim_no_task_evidence():
     assert "前端会推送进度" not in body, f"假前端进度应被硬切: {body!r}"
 
 
+def test_hardcut_started_exec_verb_subject_first():
+    """验门人 round-2 漏切点：『<执行主语>已开始执行/重算』(动词在后)无真实任务 → 必须硬切。
+    `任务已开始执行` / `工作流已开始执行` / `销量已开始重算` 改前只贴 banner、正文保留。"""
+    for r in (
+        "任务已开始执行，请稍候。",
+        "工作流已开始执行，请稍候。",
+        "销量已开始重算，请稍候。",
+        "库存已开始刷新，请稍候。",  # 既有口径(动词在前)同样回归
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"假执行声明应报警告: {r!r}"
+        body = _body(out)
+        assert ("未创建" in body or "未执行" in body or "未启动" in body), \
+            f"『已开始执行/重算』假启动应被硬切,正文却保留: {body!r}"
+
+
+def test_real_receipt_started_exec_not_cut():
+    """边界:真实任务回执(ok=True+task_id)里的『已开始执行』不被误删。"""
+    tool_log = [{"name": "run_workflow", "args": {"workflow": "wf5_sales_cycle_v2"},
+                 "ok": True, "task_id": "ef345678", "error": None}]
+    reply = "销量重算任务已开始执行，任务号 ef345678，请在工作台任务面板查看进度。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["run_workflow"], tool_log=tool_log)
+    assert "已开始执行" in out, f"真实回执的『已开始执行』不应被删: {out!r}"
+    assert "ef345678" in out, f"真实 task_id 不应被删: {out!r}"
+    assert "未创建刷新任务" not in out, f"有真实任务不应注入『未创建』标注: {out!r}"
+
+
 def test_hardcut_failed_run_workflow_claimed_success():
     """run_workflow 真调但失败(ok=False)却宣称已启动 → 无真实任务 → 正文硬切假启动。"""
     tool_log = [{"name": "run_workflow", "args": {"workflow": "wf1_stock_v2"},
@@ -231,6 +258,8 @@ if __name__ == "__main__":
         test_hardcut_done_claim_no_task_evidence,
         test_hardcut_accepted_and_sse_no_task_evidence,
         test_hardcut_started_claim_no_task_evidence,
+        test_hardcut_started_exec_verb_subject_first,
+        test_real_receipt_started_exec_not_cut,
         test_hardcut_failed_run_workflow_claimed_success,
         test_real_run_workflow_task_not_cut,
         test_plain_query_reply_not_touched,
