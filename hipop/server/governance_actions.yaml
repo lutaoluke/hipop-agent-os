@@ -6,20 +6,16 @@
 #   Agentic Misalignment    — irreversible action 必须 OOB approval（不靠 prompt）
 #   MSCL（Palantir AIP）     — ActionProposal → Decision → ExecToken → ExecutionRecord
 #
-# risk_level:
-#   read       — 只读，不走 pipeline
-#   medium     — 可逆，Decision Agent 单独 OK 即可（auto + Haiku 校验）
-#   high       — 可逆但影响业务链，必须 user 二次确认（Explore→Plan→Implement）
-#   critical   — 不可逆 / 跨 tenant / 大额，必须 OOB approval 推 manager IM 审批
+# access/risk/role/scope metadata lives in tools_registry.yaml. This file keeps
+# execution details for governed actions only.
 
 update_alert_status:
   description: 改 wf6_logistics_alerts_v2 状态（"已确认丢货" 会触发补货 +N）
-  risk_level: high
   target_object_class: LogisticsAlert
   target_table: wf6_logistics_alerts_v2
   required_fields: [order_no, status]
   # 这些状态是 hipop 自己定义的（非 ERP 内置），ops_status 是 TEXT free text，可任意扩展
-  # 加新状态：本列表加一行 + agent.py update_alert_status schema enum 加一项即可，无需 DB migration
+  # 加新状态：本列表加一行 + tools_registry.yaml update_alert_status input_schema enum 加一项即可，无需 DB migration
   # 终态（resolved）判定在 wf_logistics_alerts.py TERMINAL_STATUSES（不含"延迟"/"处理中"）
   allowed_statuses:
     - 已确认推进
@@ -42,7 +38,6 @@ update_alert_status:
 
 run_workflow:
   description: 触发后台 v2 workflow（拉 ERP / 写业务表）
-  risk_level: medium
   target_object_class: BackgroundTask
   target_table: tasks
   required_fields: [workflow]
@@ -66,7 +61,5 @@ run_workflow:
   irreversible: false   # 跑完不喜欢可以再跑覆盖
 
 # 未来扩展（占位，未启用）：
-# send_inquiry_1688:    # 询盘 — critical（外部副作用 + 不可撤回）
-#   risk_level: critical
-# delete_sales_entity:  # 删 entity — critical
-#   risk_level: critical
+# send_inquiry_1688:    # 询盘 — 外部副作用 + 不可撤回
+# delete_sales_entity:  # 删 entity

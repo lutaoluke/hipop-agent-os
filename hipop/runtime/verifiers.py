@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import ast
 from typing import Callable, Optional
 
 
@@ -48,6 +49,153 @@ def run_verifier(workflow: str, task_id: str, tenant_id: int, started_at: float)
 def _started_at_iso(epoch: float) -> str:
     """epoch → 'YYYY-MM-DD HH:MM:SS'（PG 比较用）"""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def verify_tools_registry_manifest_contract() -> dict:
+    """WS-162: tools_registry.yaml is the single source of truth for tool metadata."""
+    from pathlib import Path
+
+    try:
+        import yaml
+    except Exception as exc:
+        return {
+            "ok": False,
+            "evidence": {"error": f"yaml unavailable: {type(exc).__name__}: {exc}"},
+            "verdict": "PyYAML is required to verify tools_registry.yaml",
+        }
+
+    repo_root = Path(__file__).resolve().parents[2]
+    server_dir = repo_root / "hipop" / "server"
+    registry_path = server_dir / "tools_registry.yaml"
+    actions_path = server_dir / "governance_actions.yaml"
+    agent_path = server_dir / "agent.py"
+    governance_path = server_dir / "governance.py"
+
+    failures = []
+    evidence: dict = {}
+
+    if not registry_path.exists():
+        failures.append("hipop/server/tools_registry.yaml missing")
+        registry = {}
+    else:
+        registry = yaml.safe_load(registry_path.read_text()) or {}
+
+    tools = registry.get("tools") if isinstance(registry, dict) else None
+    if not isinstance(tools, dict):
+        failures.append("tools_registry.yaml must contain a top-level tools mapping")
+        tools = {}
+
+    expected_fields = {
+        "description", "input_schema", "access", "risk_level",
+        "required_role", "data_scope", "impl", "smoke",
+    }
+    for name, spec in tools.items():
+        missing = sorted(expected_fields - set((spec or {}).keys()))
+        if missing:
+            failures.append(f"{name}: missing registry fields {missing}")
+
+    expected_tool_names = {
+        "query_sku", "query_order", "update_alert_status", "scope_overview",
+        "compute_replenishment", "query_replenishment_sku",
+        "compute_air_freight_roi", "data_health_check", "list_products",
+        "export_table", "navigate_user_to", "notify_via_feishu",
+        "run_workflow", "query_sku_live", "query_order_live",
+        "tenant_notes_get", "tenant_notes_append", "confirm_proposal",
+        "query_1688_similar", "capture_feedback", "explain_status_enum",
+        "query_stock_split", "total_stock_topn",
+    }
+    actual_tool_names = set(tools.keys())
+    if actual_tool_names != expected_tool_names:
+        failures.append(
+            "tools_registry.yaml tool set drift: "
+            f"missing={sorted(expected_tool_names - actual_tool_names)}, "
+            f"extra={sorted(actual_tool_names - expected_tool_names)}"
+        )
+
+    expected_risk = {
+        name: ("high" if name == "update_alert_status" else "medium" if name == "run_workflow" else "low")
+        for name in expected_tool_names
+    }
+    expected_access = {
+        name: ("write" if name in {"update_alert_status", "run_workflow"} else "read")
+        for name in expected_tool_names
+    }
+    for name in expected_tool_names & actual_tool_names:
+        spec = tools[name] or {}
+        if spec.get("risk_level") != expected_risk[name]:
+            failures.append(f"{name}: risk_level {spec.get('risk_level')!r} != {expected_risk[name]!r}")
+        if spec.get("access") != expected_access[name]:
+            failures.append(f"{name}: access {spec.get('access')!r} != {expected_access[name]!r}")
+
+    action_specs = yaml.safe_load(actions_path.read_text()) or {}
+    action_risk_keys = [
+        name for name, spec in action_specs.items()
+        if isinstance(spec, dict) and "risk_level" in spec
+    ]
+    if action_risk_keys:
+        failures.append(
+            "governance_actions.yaml must not duplicate risk_level: "
+            f"{sorted(action_risk_keys)}"
+        )
+
+    agent_src = agent_path.read_text()
+    module = ast.parse(agent_src)
+    literal_tools = False
+    for node in module.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "TOOLS"
+            for target in node.targets
+        ):
+            literal_tools = isinstance(node.value, (ast.List, ast.Tuple))
+            break
+    if literal_tools:
+        failures.append("agent.py still defines TOOLS as an inline literal instead of a manifest projection")
+
+    governance_src = governance_path.read_text()
+    if '"update_alert_status": {"risk_level": "high"}' in governance_src:
+        failures.append("governance.py still has hard-coded update_alert_status risk fallback")
+    if '"run_workflow": {"risk_level": "medium"}' in governance_src:
+        failures.append("governance.py still has hard-coded run_workflow risk fallback")
+
+    try:
+        from hipop.server import agent, tools_registry
+
+        projected_tools = tools_registry.load_tools_from_yaml()
+        projected_by_name = {tool["name"]: tool for tool in projected_tools}
+        if agent.TOOLS != projected_tools:
+            failures.append("agent.TOOLS is not equal to tools_registry.load_tools_from_yaml()")
+        if set(projected_by_name) != expected_tool_names:
+            failures.append("projected Anthropic tool names do not match the expected 23-tool set")
+        for name in expected_tool_names & set(projected_by_name):
+            projected = projected_by_name[name]
+            manifest_spec = tools.get(name) or {}
+            if projected.get("description") != manifest_spec.get("description"):
+                failures.append(f"{name}: projected description does not match manifest")
+            if projected.get("input_schema") != manifest_spec.get("input_schema"):
+                failures.append(f"{name}: projected input_schema does not match manifest")
+        if tools_registry.get_tool_spec("update_alert_status").get("risk_level") != "high":
+            failures.append("tools_registry update_alert_status risk_level must be high")
+        if tools_registry.get_tool_spec("run_workflow").get("risk_level") != "medium":
+            failures.append("tools_registry run_workflow risk_level must be medium")
+        if tools_registry.get_tool_spec("query_sku").get("access") != "read":
+            failures.append("tools_registry query_sku access must be read")
+    except Exception as exc:
+        failures.append(f"registry projection import failed: {type(exc).__name__}: {exc}")
+
+    evidence.update({
+        "registry_path": str(registry_path),
+        "tool_count": len(tools),
+        "action_risk_keys": sorted(action_risk_keys),
+    })
+    return {
+        "ok": not failures,
+        "evidence": evidence,
+        "verdict": (
+            "tools registry manifest is the single source of truth"
+            if not failures else
+            "；".join(failures)
+        ),
+    }
 
 
 # noon live ingest 数据新鲜度阈值（小时）。仓库此前无 noon 新鲜度先例，给默认

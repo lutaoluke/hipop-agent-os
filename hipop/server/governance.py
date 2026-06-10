@@ -47,14 +47,19 @@ def _load_registry() -> dict:
     if _REGISTRY:
         return _REGISTRY
     if not yaml:
-        # 极简 fallback：硬编码 2 个
-        _REGISTRY = {
-            "update_alert_status": {"risk_level": "high"},
-            "run_workflow": {"risk_level": "medium"},
-        }
-        return _REGISTRY
+        raise RuntimeError("PyYAML is required to load governance registry")
     with open(_ACTIONS_YAML) as f:
-        _REGISTRY = yaml.safe_load(f) or {}
+        action_specs = yaml.safe_load(f) or {}
+    from . import tools_registry as _tools_registry
+
+    registry = {}
+    for tool_name, tool_spec in _tools_registry.load_tool_registry().items():
+        action_spec = action_specs.get(tool_name) or {}
+        merged = dict(action_spec)
+        for key in ("access", "risk_level", "required_role", "data_scope", "impl", "smoke"):
+            merged[key] = tool_spec.get(key)
+        registry[tool_name] = merged
+    _REGISTRY = registry
     return _REGISTRY
 
 
@@ -64,7 +69,7 @@ def is_destructive(tool_name: str) -> bool:
     spec = reg.get(tool_name)
     if not spec:
         return False
-    return spec.get("risk_level") in ("medium", "high", "critical")
+    return spec.get("access") == "write" or spec.get("risk_level") in ("medium", "high", "critical")
 
 
 def get_action_spec(tool_name: str) -> Optional[dict]:
