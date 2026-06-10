@@ -171,6 +171,13 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
         fc = forecast(merged)
         item_nrs = _order_item_nrs(conn, tenant_id, entity_alias, partner_sku)
 
+        # T07 fix: advance as_of_date to the noon latest_order_date when it's more recent
+        # than the current as_of_date (preserves ERP's as_of_date if it's fresher).
+        # This ensures get_data_health.erp_sales.latest reflects the true data coverage date.
+        current_as_of = rec.get("as_of_date") or ""
+        noon_order_date = noon_v.get("latest_order_date") if noon_v else None
+        new_as_of_date = noon_order_date if (noon_order_date and noon_order_date > current_as_of) else None
+
         conn.execute(
             """
             UPDATE wf2_sku SET
@@ -191,12 +198,8 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
               forecast_30d        = ?,
               anomalies_json      = ?,
               order_item_nrs_json = ?,
-              -- WS-21：本次评级/预测刷新必须推进 wf2_sku 写入时间，否则
-              -- data_health.erp_sales（读 MAX(imported_at)）与「刷新后数据变新」
-              -- 的口径不动 = 假新鲜（验门人打回点 2）。用 Python 本地时刻字符串绑参，
-              -- 与 verifiers._started_at_iso / data._date10 同口径（localtime），
-              -- 不用 CURRENT_TIMESTAMP（SQLite 返 UTC，跨 UTC+8 会比 started_at 还旧）。
-              imported_at         = ?
+              imported_at         = ?,
+              as_of_date          = COALESCE(?, as_of_date)
             WHERE tenant_id = ? AND entity_alias = ? AND partner_sku = ?
             """,
             (
@@ -211,6 +214,7 @@ def merge_entity_v2(tenant_id: int, entity_alias: str, conn) -> int:
                 json.dumps(anomalies, ensure_ascii=False) if anomalies else None,
                 json.dumps(item_nrs, ensure_ascii=False) if item_nrs else None,
                 refreshed_at,
+                new_as_of_date,
                 tenant_id, entity_alias, partner_sku,
             ),
         )

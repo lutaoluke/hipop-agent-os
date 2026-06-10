@@ -2,9 +2,9 @@
 
 验收（WS-122）：
   当用户查询某 SKU 近 30/180 天销量时，工作台 Agent 必须：
-  1. 从 wf2_sku 返回数据新鲜度证据（as_of_date / imported_at / data_stale / stale_days）。
+  1. 从 wf2_sku 返回数据新鲜度证据（as_of_date / imported_at；过期时 data_stale / stale_days）。
   2. 数据陈旧（as_of_date 超过 3 天）时：数值 REDACT 为 null，data_stale=True。
-  3. 数据新鲜时：返回真实数值，data_stale=False。
+  3. 数据新鲜时：返回真实数值，且不注入 data_stale/stale_days。
   4. references 含 imported_at 字段（取数来源证据）。
   5. _provider 将陈旧 SKU 写入 tool_log[result_stale_skus]，供 _safety 验门。
   6. _safety._check_stale_sales_claim：检测陈旧数据 + 回复含具体销量数字 → 警告。
@@ -187,7 +187,7 @@ def test_tool_stale_data() -> None:
 
 
 def test_tool_fresh_data() -> None:
-    """新鲜数据：data_stale=False；sales_30d 来自 live 源（T03 后：snapshot 新鲜度不再决定销量取数）"""
+    """新鲜数据：省略 data_stale/stale_days；sales_30d 来自 live 源（T03 后：snapshot 新鲜度不再决定销量取数）"""
     print("\n── test_tool_fresh_data ─────────────────────────────────────")
     import hipop.server.data as _data
     import hipop.server.agent as _agent
@@ -224,8 +224,8 @@ def test_tool_fresh_data() -> None:
     assert items
     item = items[0]
 
-    check("新鲜数据 → data_stale=False",
-          item.get("data_stale") is False,
+    check("新鲜数据 → data_stale 字段不存在（新鲜时省略）",
+          "data_stale" not in item,
           f"data_stale={item.get('data_stale')!r}, as_of_date={item.get('as_of_date')!r}")
     check("新鲜数据 → sales_30d 来自 live（非 null）",
           item.get("sales_30d") is not None,
@@ -233,8 +233,8 @@ def test_tool_fresh_data() -> None:
     check("新鲜数据 → 有 live_evidence（取数证据）",
           isinstance(item.get("live_evidence"), dict),
           f"live_evidence={item.get('live_evidence')!r}")
-    check("新鲜数据 → stale_days == 0",
-          item.get("stale_days") == 0,
+    check("新鲜数据 → stale_days 字段不存在（新鲜时省略）",
+          "stale_days" not in item,
           f"stale_days={item.get('stale_days')!r}")
 
 

@@ -28,10 +28,8 @@ elif _GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" && \
 fi
 
 URL="${HIPOP_URL:-http://localhost:8765}"
-PYTHON_BIN="${PYTHON:-/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python}"
-if [ ! -x "$PYTHON_BIN" ]; then
-  PYTHON_BIN=python3
-fi
+# Ensure urllib bypasses any system proxy for loopback connections
+export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 echo "→ smoke test 目标 URL: $URL"
 if ! curl -sS -m 5 "$URL/health" > /dev/null; then
   echo "✗ server 不可达 ($URL)"; exit 2

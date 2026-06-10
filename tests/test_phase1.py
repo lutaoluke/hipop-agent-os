@@ -67,6 +67,14 @@ def test_chat_t27_replenishment_live_failure_blocks_cached_zero():
     _load_t27_replenishment_smoke().test_t27_live_unavailable_blocks_cached_zero_answer()
 
 
+def test_ws131_freshness_gate_contract():
+    """WS-131: live-first, <=3 day cache consent, and fail-closed freshness rules."""
+    from hipop.runtime.verifiers import verify_freshness_gate_matrix
+
+    result = verify_freshness_gate_matrix(now="2026-06-09T12:00:00")
+    assert result["ok"], result
+
+
 def _get(path: str, timeout: int = 15):
     r = _client.get(f"{BASE}{path}", timeout=timeout)
     return r.status_code, r.text

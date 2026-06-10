@@ -104,6 +104,18 @@ def _seed_wf2_sku(conn, imported_at) -> None:
     conn.commit()
 
 
+def _seed_wf2_orders(conn) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO wf2_orders "
+        "(tenant_id, entity_alias, partner_sku, item_nr, order_date, status, "
+        " is_cancelled, is_return, seller_price, customer_paid, currency, imported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (TENANT_ID, ENTITY_ALIAS, SKU, "T29-ORDER-001", TODAY,
+         "delivered", 0, 0, 50.0, 50.0, "SAR", TODAY + "T08:30:00"),
+    )
+    conn.commit()
+
+
 def _seed_wf5(conn, updated_at) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO wf5_sales_cycle "
@@ -180,6 +192,7 @@ def test_null_wf3_updated_at_fails_closed() -> None:
     conn = _data.conn()
     _seed_entity(conn)
     _seed_wf2_sku(conn, TODAY + "T08:00:00")
+    _seed_wf2_orders(conn)
     _seed_wf5(conn, TODAY + "T08:00:00")
     _seed_wf3(conn, None)  # wf3.updated_at=NULL — 红队条件
 
@@ -214,6 +227,7 @@ def test_null_wf5_updated_at_fails_closed() -> None:
     conn = _data.conn()
     _seed_entity(conn)
     _seed_wf2_sku(conn, TODAY + "T08:00:00")
+    _seed_wf2_orders(conn)
     _seed_wf5(conn, None)  # wf5.updated_at=NULL — 红队条件
     _seed_wf3(conn, TODAY + "T08:00:00")
 
@@ -248,6 +262,7 @@ def test_null_wf2_imported_at_fails_closed() -> None:
     conn = _data.conn()
     _seed_entity(conn)
     _seed_wf2_sku(conn, None)  # imported_at=NULL — 红队条件
+    _seed_wf2_orders(conn)
     _seed_wf5(conn, TODAY + "T08:00:00")
     _seed_wf3(conn, TODAY + "T08:00:00")
 
@@ -282,6 +297,7 @@ def test_all_timestamps_present_passes() -> None:
     conn = _data.conn()
     _seed_entity(conn)
     _seed_wf2_sku(conn, TODAY + "T08:00:00")
+    _seed_wf2_orders(conn)
     _seed_wf5(conn, TODAY + "T08:00:00")
     _seed_wf3(conn, TODAY + "T09:00:00")
     _seed_fresh_order_source(conn)
