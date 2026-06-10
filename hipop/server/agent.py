@@ -3279,9 +3279,14 @@ def _format_sku_metric_reply(sku: str, tool_result: dict) -> str:
             as_of = item.get("as_of_date") or "未知"
             stale_days = item.get("stale_days")
             age = f"{stale_days} 天" if stale_days is not None else "过期"
+            # WS-131 口径对齐：快照超 3 天即不能使用缓存数（与 freshness 门同语）。
+            over3 = (
+                "数据已超过 3 天，不能使用缓存。"
+                if (stale_days is not None and stale_days > 3) else ""
+            )
             return (
                 f"查不到 {sku} 的有效近期数据（快照截至 {as_of}，"
-                f"已超期 {age}），需先刷新 ERP 数据后重新查询。"
+                f"已超期 {age}）。{over3}需先刷新 ERP 数据后重新查询。"
             )
         return f"未找到 SKU {sku} 的记录，请核实 SKU 是否正确。"
     decision = item.get("sales_freshness_decision")
