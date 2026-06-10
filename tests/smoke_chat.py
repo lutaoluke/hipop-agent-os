@@ -536,6 +536,33 @@ CASES: List[Case] = [
         ],
         must_not_warn=True,
     ),
+    # T36 Round-2 负控（验门人红队洞）：非执行语气的「刷新 ERP 商品库和销量价格」必须
+    # 由 WS-145 结构门确定性短路给干净解释——tools_used=[]、不试 run_workflow、不渲染
+    # 「启动失败」、不被 _safety 标假活 banner。旧 PR(c5bad07) 关键词路由会渲染「启动
+    # 失败」；rebase 后的中间态会落到 LLM 去试 run_workflow（被拦但污染 tools_used + 触发
+    # _safety 警告）。这两条在 live server 上把整条端到端路径钉死，不靠 mock provider。
+    Case(
+        name="T36 负控2：询问句『能不能帮我刷新 ERP 商品库和销量价格?』（结构门干净回复，零工具）",
+        question="能不能帮我刷新 ERP 商品库和销量价格？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[r"本轮我先不动手|本轮不执行"],
+        must_not_contain=[
+            r"启动失败|run_workflow|已触发|已刷新|后台任务号",
+        ],
+        must_not_warn=True,
+    ),
+    Case(
+        name="T36 负控3：假设句『如果刷新 ERP 商品库和销量价格会怎样?』（只说明影响，零工具）",
+        question="如果刷新 ERP 商品库和销量价格会怎样？",
+        expected_tools=[],
+        must_not_workflow_prefixes=["wf2_"],
+        must_contain=[r"本轮不执行|本轮我先不动手|影响面"],
+        must_not_contain=[
+            r"启动失败|run_workflow|已触发|已刷新|后台任务号",
+        ],
+        must_not_warn=True,
+    ),
     # ─── 刷新物流（必须用 wf3_logistics_v2，不能选老 wf3_logistics）───
     # WS-55：旧断言用 reply 正则 `wf3_logistics(?!_v2)` 拦"散文里提旧表名"，
     # 但 Agent 在解释时提一句旧名、实际 tool 真跑的是 v2 → 误报。改成判定**真触发的

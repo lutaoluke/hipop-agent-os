@@ -364,19 +364,28 @@ def test_chat_interrogative_creates_no_task():
 
 
 def test_chat_multi_workflow_non_executory_has_clean_reply_no_tool():
-    """WS-98 Round-2 红队:多 workflow 非执行语气不得渲染「启动失败」或记录 run_workflow。"""
+    """WS-98 Round-2 红队:多 workflow 非执行语气不得渲染「启动失败」或记录 run_workflow。
+
+    关键:provider mock 一旦被调用就 raise —— 钉死「非执行刷新意图必须在确定性结构门
+    短路、绝不落 LLM」。验门人 Round-2 实测的回归正是 chat() 落到 LLM、LLM 去试
+    run_workflow（被 _exec_tool 拦下不落任务，却污染 tools_used + 触发 _safety 假活
+    banner，把「能不能帮我刷新…?」误渲染成带警告的回复）。旧 mock 返回干净 reply 把这条
+    路径藏住了——provider 该被调用却假装没事。改成 side_effect=raise 后,只有真短路才过。
+    """
+    def _boom(*a, **k):
+        raise AssertionError("provider.chat_with_tools 不应被调用:非执行刷新意图必须确定性短路,不落 LLM")
+
     for q in (
         "能不能帮我刷新 ERP 商品库和销量价格？",
         "如果刷新 ERP 商品库和销量价格会怎样？",
     ):
-        with patch.object(_prov, "chat_with_tools",
-                          return_value={"reply": "可以执行。本轮我先不动手。",
-                                        "tool_log": [], "refs_collected": [],
-                                        "workflow_tasks": []}), \
+        with patch.object(_prov, "chat_with_tools", side_effect=_boom), \
              patch.object(_prov, "get_provider", return_value="smoke"):
             result = _agent.chat([{"role": "user", "content": q}], _SCOPE)
         assert not (result.get("workflow_tasks") or result.get("workflow_task")), result
         assert result.get("tools_used") == [], result
+        assert result.get("judge_method") == "execution_intent_gate_explain_non_executory", result
+        assert result.get("hallucination_warnings") in (None, [], {}), result
         reply = result.get("reply") or ""
         assert "启动失败" not in reply and "run_workflow" not in reply, reply
         assert "本轮我先不动手" in reply or "本轮不执行" in reply, reply

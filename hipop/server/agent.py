@@ -4402,6 +4402,36 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    # WS-98 Round-2：非执行语气的刷新/重算意图（询问/假设/只问影响面）确定性短路，
+    # 交回 WS-145 结构门的干净解释，绝不落 LLM。否则 LLM 会去试 run_workflow——
+    # 虽被 _exec_tool 拦下不落任务，却会污染 tools_used 且触发 _safety 假活 banner，
+    # 把「能不能帮我刷新…?」误渲染成带警告/「启动失败」的回复（验门人 Round-2 红队洞）。
+    # NEGATED 不在此短路：它常是「不用刷新，但告诉我哪些要补」这类仍要数据答案的句子，
+    # 留给 LLM 给陈旧警示 + 答案（smoke「用户拒绝刷新」）。
+    if (
+        _intent_decision.has_refresh_trigger
+        and _intent_decision.mood in (
+            _intent_gate.IntentMood.INTERROGATIVE,
+            _intent_gate.IntentMood.HYPOTHETICAL,
+            _intent_gate.IntentMood.IMPACT_QUERY,
+        )
+    ):
+        reply = _intent_gate.explain_reply(_intent_decision.mood, question)
+        return {
+            "reply": reply,
+            "clean_reply": reply,
+            "references": [],
+            "action_id": None,
+            "tools_used": [],
+            "tag": "查询",
+            "workflow_task": None,
+            "workflow_tasks": [],
+            "provider": _provider.get_provider(),
+            "confidence": 1.0,
+            "judge_method": "execution_intent_gate_explain_non_executory",
+            "hallucination_warnings": None,
+        }
+
     direct_workflows = _deterministic_multi_workflow_request(question)
     if direct_workflows:
         workflow_tasks = []
