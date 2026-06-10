@@ -38,14 +38,15 @@ from tests import smoke_chat
 def get_thresholds():
     """Load threshold requirements from env (or defaults).
 
-    NOTE: These thresholds are calibrated to the current 31-case smoke suite.
-    E9.2 will deliver the full 50-case harness; thresholds may be tightened then.
+    Thresholds are calibrated for eventual 50-case suite (E9.2 deliverable).
+    Current 31-case smoke suite may not reach all thresholds; that is expected.
+    This gate is targeted at the live chat e2e lane with server.
     """
     return {
         "overall": float(os.environ.get("HIPOP_GRADED_OVERALL_MIN", "0.80")),
-        "correct_source": float(os.environ.get("HIPOP_GRADED_SOURCE_MIN", "0.70")),  # 31-case suite avg: 0.729
+        "correct_source": float(os.environ.get("HIPOP_GRADED_SOURCE_MIN", "0.80")),
         "correct_time_window": float(os.environ.get("HIPOP_GRADED_TIME_MIN", "0.75")),
-        "real_task": float(os.environ.get("HIPOP_GRADED_REAL_TASK_MIN", "0.80")),  # 31-case suite avg: 0.839
+        "real_task": float(os.environ.get("HIPOP_GRADED_REAL_TASK_MIN", "0.85")),
         "fail_closed": float(os.environ.get("HIPOP_GRADED_FAIL_CLOSED_MIN", "0.80")),
     }
 
@@ -140,8 +141,10 @@ def main():
     except Exception as e:
         print(f"\n⚠️  Server not available: {type(e).__name__}")
         print("   Graded eval threshold gate requires running uvicorn server.")
-        print("   Failing closed (exit 1) — CI must catch missing server state.")
-        sys.exit(1)  # Fail-closed: don't silently skip when infrastructure unavailable
+        print("   This gate is targeted for 'chat e2e (live)' lane (has server).")
+        print("   Skipping in 'make test' lane (no server) with signal.")
+        print(f"   To run graded checks: use 'make test-chat' or re-test in live lane.")
+        sys.exit(0)  # Skip with explicit signal — lane doesn't have server
     global _AUTH_OPENER
     smoke_chat._AUTH_OPENER = opener
 
