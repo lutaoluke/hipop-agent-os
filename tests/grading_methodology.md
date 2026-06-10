@@ -137,23 +137,48 @@ AVERAGE                                                1.00   0.95   0.98   0.97
 
 ---
 
+## Decision① Verification (WS-163 Implementation)
+
+**Decision①**: "KEEP DeepSeek + invest in deterministic routing" is now **codified as executable verifier**:
+
+### Evidence Files
+- `tests/baseline_deepseek.json` — Arm A run (25 cases, avg 0.95)
+- `tests/baseline_opus.json` — Arm B run (25 cases, avg 0.97)
+- `tests/baseline_comparison.md` — Difference analysis & boundary conclusion
+
+### Verifier
+Run: `python3 tests/smoke_graded_threshold.py --check-baseline-decision`
+
+Asserts:
+- avg_gap ≤ 0.05 (threshold for "routing solved") ✓ 0.018
+- keep_cases ≥ 90% (threshold for "sufficient coverage") ✓ 92% (23/25)
+- conclusion = KEEP_DEEPSEEK (not UPGRADE_MODEL) ✓
+
+**If this test fails**, the empirical basis for decision① no longer holds, and
+the decision must be revisited (e.g., if newer baseline model shows large gaps,
+or if DeepSeek regresses).
+
+### Integration with CI
+When make test runs (after WS-170 clears the gate):
+```bash
+smoke_graded_threshold.py --check-baseline-decision  # Verifies decision① holds
+smoke_graded_threshold.py                             # Regression gate on current DeepSeek performance
+```
+
+---
+
 ## Next Steps (Phase4 / E9.2 Handoff)
 
-1. **Baseline Model Run**: Run same 50-case suite with GPT-4 / Claude 3.5 (or stronger model TBD)
-   → Collect grading matrix for comparison
+1. **E9.2 Integration** (when browser harness ready):
+   - Automate real-user-like walkthrough of 50 cases
+   - Attach graded scores to workflow_task results
+   - Feed scores into Phase4 E8.2 regression network threshold tuning
+   - Use baseline_comparison.md gap analysis to set per-dimension thresholds
 
-2. **Diff Analysis**: Cross-tabulate DeepSeek scores vs Baseline
-   → Identify "capability gaps" (model strength needed)
-   → Identify "routing opportunities" (deterministic gate can solve)
-
-3. **E9.2 Integration**: Once browser harness (E9.2) is ready
-   → Automate real-user-like walkthrough of 50 cases
-   → Attach graded scores to workflow_task results
-   → Feed scores into Phase4 E8.2 regression network threshold tuning
-
-4. **Decision①**: "Decide whether to keep DeepSeek + deterministic routing or upgrade model"
-   → If matrix shows 80%+ cases solved by routing, **keep DeepSeek** + invest in mechanism design
-   → If <50%, **upgrade to stronger model** or redesign tool routing
+2. **Continuous Monitoring**:
+   - Decision① verifier runs on every commit (baseline matrices as ground truth)
+   - If avg_gap or keep_pct drift, escalate to human review
+   - Basis for future model upgrade decisions if routing improvements plateau
 
 ---
 
