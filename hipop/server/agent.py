@@ -3185,6 +3185,25 @@ _FRESHNESS_GATE_SALES_RE = _re.compile(
 _FRESHNESS_GATE_SKIP_RE = _re.compile(
     r"(?:不用|不要|无需|先别).{0,8}(?:刷新|更新|同步)|就用现在的|先告诉我|不用等",
 )
+# WS-119: 库存类批量/榜单/约束查询（排行、可售、缺货、积压…）需 freshness gate 路由。
+# 只匹配「批量/排序/数量约束」意图；单 SKU 实时问题由编码排除（见 _SKU_OR_ORDER_CODE_RE）。
+_FRESHNESS_GATE_STOCK_RE = _re.compile(
+    r"(?:库存|可售|缺货|断货|积压|备货).*?(?:排行|排名|榜|最多|最高|最大|最低|最少|多少|够不够|不够|缺口|清单|哪[些个]|top\s*\d|前\s*\d)"
+    r"|(?:哪[些个]|多少).*?(?:库存|可售|缺货|断货|积压)"
+    r"|(?:库存|可售|积压).*?(?:排行|排名|top\s*\d|前\s*\d)",
+    _re.IGNORECASE | _re.DOTALL,
+)
+# WS-119: 物流类批量/榜单查询（在途/卡单/滞留排行、汇总）需 freshness gate 路由。
+# 单 SKU/单货单实时问题继续优先走 query_sku_live/query_order_live（编码排除 + 既有 order_live 路由）。
+_FRESHNESS_GATE_LOGISTICS_RE = _re.compile(
+    r"(?:在途|卡单|滞留|压货|物流|货单|发货).*?(?:排行|排名|榜|最多|最高|多少|总量|汇总|清单|哪[些个]|top\s*\d|前\s*\d)"
+    r"|(?:哪[些个]|多少).*?(?:在途|卡单|滞留|货单)"
+    r"|(?:卡单|滞留).*?(?:货单|批次|sku|SKU)",
+    _re.IGNORECASE | _re.DOTALL,
+)
+# WS-119 验收③：带明确 SKU/货单编码的单点实时问题 → 不当批量榜单 gate，交既有 live 工具（防退化成旧缓存）。
+# 复用 _extract_live_order_no 的编码形态（2+ 字母 + 5+ 位字母数字/连字符），避免误吞 "top5"/"SKU" 这类非编码词。
+_SKU_OR_ORDER_CODE_RE = _re.compile(r"\b[A-Z]{2,}[A-Z0-9-]{5,}\b")
 _FRESHNESS_TARGET_ISO_DATE_RE = _re.compile(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b")
 _FRESHNESS_TARGET_CN_DATE_RE = _re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日?")
 
@@ -3211,7 +3230,9 @@ def _detect_operational_domain(question: str) -> Optional[str]:
     返回值:
       'sales'      — 销量类查询，需要 freshness gate 路由
       'sales_skip' — 用户明确说不用刷新，但仍在问销量排名；gate 跳过但需注入陈旧提示
-      None         — 无需 gate（非销量查询，或明确说不刷但问的不是销量）
+      'stock'      — 库存类批量/榜单/约束查询（WS-119）
+      'logistics'  — 物流类批量/榜单查询（WS-119）
+      None         — 无需 gate（非运营查询、明确说不刷、或带 SKU/货单编码的单点实时问题）
     """
     q = question or ""
     skip = bool(_FRESHNESS_GATE_SKIP_RE.search(q))
@@ -3222,6 +3243,15 @@ def _detect_operational_domain(question: str) -> Optional[str]:
         return None
     if sales:
         return "sales"
+    # WS-119：库存/物流批量榜单查询接入同一 freshness gate。
+    # 验收③：带明确 SKU/货单编码的单点实时问题不被批量 gate 捕获——交既有
+    # query_sku_live / query_order_live（防退化成旧缓存）。
+    has_code = bool(_SKU_OR_ORDER_CODE_RE.search(q.upper()))
+    if not has_code:
+        if _FRESHNESS_GATE_STOCK_RE.search(q):
+            return "stock"
+        if _FRESHNESS_GATE_LOGISTICS_RE.search(q):
+            return "logistics"
     return None
 
 
@@ -3255,8 +3285,10 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
 
     freshness = _data.check_freshness_coverage(store, domain, target_date)
     if freshness.get("covered"):
-        return None  # 数据新鲜 → 继续走 LLM（LLM 会调查询工具直接答）
+        return None  # 数据新鲜 → 继续走 LLM/既有确定性路由（用最新业务日算）
 
+    # WS-119：文案按域走，库存/物流不串"销量"措辞。
+    domain_label = {"sales": "销量", "stock": "库存", "logistics": "物流"}.get(domain, domain)
     action = freshness.get("action") or "unavailable"
     latest = freshness.get("latest_date") or ""
     target = freshness.get("target_date") or ""
@@ -3276,12 +3308,12 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
                 "followup_prompt": tool_result.get("followup_prompt"),
             }
             reply = (
-                f"销量数据{when_s}，目标日期 {target} 暂未覆盖，"
+                f"{domain_label}数据{when_s}，目标日期 {target} 暂未覆盖，"
                 f"已触发更新（{wf}）。跑完后我会接着告诉你。"
             )
         else:
             err = (tool_result or {}).get("error") or ""
-            reply = f"销量数据{when_s}，目标日期 {target} 暂未覆盖，更新触发失败：{err}"
+            reply = f"{domain_label}数据{when_s}，目标日期 {target} 暂未覆盖，更新触发失败：{err}"
         return {
             "reply": reply, "clean_reply": reply,
             "references": _dedup_refs((tool_result or {}).get("references", [])),
@@ -3295,7 +3327,7 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
     if action == "upload_csv":
         csv_hint = freshness.get("csv_hint") or {}
         reply = (
-            f"销量数据{when_s}，目标日期 {target} 暂未覆盖，无法自动刷新此部分。\n\n"
+            f"{domain_label}数据{when_s}，目标日期 {target} 暂未覆盖，无法自动刷新此部分。\n\n"
             f"👉 请到{csv_hint.get('where', '紫鸟 noon 后台')}导出 CSV，"
             f"文件名形如 `{csv_hint.get('csv_pattern', 'sales_noon_*.csv')}`，"
             "拖到工作台 📤 上传区。上传后我会接着告诉你。"
@@ -3310,7 +3342,7 @@ def _freshness_gate_route(store: str, question: str, scope: Dict) -> Optional[Di
         }
 
     # fallback: 数据不足，无 workflow 可跑
-    reply = f"数据不足：{domain} {when_s}，无法提供 {target} 的查询结果。"
+    reply = f"数据不足：{domain_label}{when_s}，无法提供 {target} 的查询结果。"
     return {
         "reply": reply, "clean_reply": reply, "references": [],
         "action_id": None, "tools_used": [], "tag": "信息",
