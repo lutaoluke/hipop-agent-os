@@ -42,6 +42,15 @@ def _load_ws149_sku_query_paths_smoke():
     return mod
 
 
+def _load_t48_procurement_rate_smoke():
+    path = REPO_ROOT / "tests" / "smoke_t48_procurement_rate.py"
+    spec = importlib.util.spec_from_file_location("smoke_t48_procurement_rate", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _load_ws134_operational_numeric_tools_smoke():
     path = REPO_ROOT / "tests" / "smoke_ws134_operational_numeric_tools.py"
     spec = importlib.util.spec_from_file_location("smoke_ws134_operational_numeric_tools", path)
@@ -1528,6 +1537,74 @@ def test_t26_safety_passes_when_reply_already_says_not_found():
     out, warns = sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
     t26_warns = [w for w in warns if "T26" in w]
     assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
+
+
+def _t48_scope():
+    return {
+        "store": "KSA",
+        "current_user": "phase1_t48",
+        "current_role": "owner",
+        "tenant_id": 1,
+        "user_id": 1,
+    }
+
+
+def test_t48_procurement_rate_chat_uses_rule_source_before_llm():
+    """T48: 采购议价率/plus 口径问题必须由规则源确定性回答，不走 LLM 猜公式。"""
+    import unittest.mock
+    from hipop.server import _provider, agent
+
+    t48 = _load_t48_procurement_rate_smoke()
+
+    with unittest.mock.patch.object(
+        _provider,
+        "chat_with_tools",
+        side_effect=AssertionError("T48 procurement-rate rule question should not call LLM provider"),
+    ):
+        result = agent.chat(
+            [{"role": "user", "content": "请说明采购议价率怎么计算，plus 折扣是否计入绩效？"}],
+            _t48_scope(),
+        )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    passed, fails = t48._t48_content_oracle(reply)
+    assert passed, f"T48 规则源回答应通过 oracle，fails={fails}\nreply={reply}"
+    assert "规则来源：hipop/rules/procurement_rate.py" in reply
+    assert result.get("hallucination_warnings") in (None, [], {})
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
+
+
+def test_t48_procurement_rate_chat_fails_closed_when_rule_source_unreadable():
+    """T48 negative control: 规则源不可读时不得编公式，必须明说缺规则源。"""
+    import importlib
+    import unittest.mock
+    from hipop.server import _provider, agent
+
+    real_import_module = importlib.import_module
+
+    def fail_procurement_rate_import(name, package=None):
+        if name == "hipop.rules.procurement_rate":
+            raise ImportError("simulated missing procurement rule source")
+        return real_import_module(name, package)
+
+    with unittest.mock.patch("importlib.import_module", side_effect=fail_procurement_rate_import):
+        with unittest.mock.patch.object(
+            _provider,
+            "chat_with_tools",
+            side_effect=AssertionError("T48 procurement-rate fail-closed path should not call LLM provider"),
+        ):
+            result = agent.chat(
+                [{"role": "user", "content": "采购议价率怎么计算？plus 折扣算不算采购绩效？"}],
+                _t48_scope(),
+            )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    assert "无法读取采购议价率权威规则源" in reply or "缺规则源" in reply
+    assert "hipop/rules/procurement_rate.py" in reply
+    assert "议价差额 ÷" not in reply
+    assert "1688采购标准价 + 头程运费分摊" not in reply
+    assert result.get("hallucination_warnings") in (None, [], {})
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
 
 
 if __name__ == "__main__":

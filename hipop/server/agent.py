@@ -331,29 +331,6 @@ def _utc_now_iso() -> str:
     import datetime as _dt
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Tool 派发 ─────────────────────────────────────────
 # ── 工具实现已外移到 tools_impl（WS-166）。agent.py 仅保留注册/分发/治理入口。
 # 重新导出工具实现名，保持 `agent.tool_*` 外部契约（api.py / 测试 / TOOL_FUNCS 投影）不变。
@@ -1105,6 +1082,7 @@ from ._deterministic_routes import (  # WS-167: 确定性路由/formatter 外移
     _format_stock_split_reply,
     _format_total_stock_topn_reply,
     _has_stock_refresh_intent,
+    _procurement_rate_rule_response,
     _stock_refresh_refusal_reply,
     _stock_refresh_refused,
 )
@@ -1819,6 +1797,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "judge_method": "deterministic_stock_refusal_router",
             "hallucination_warnings": None,
         }
+
+    if r := _procurement_rate_rule_response(question, _provider.get_provider()):
+        return r
 
     if _deterministic_erp_refresh_time_request(question):
         store = (scope.get("store") or "KSA").upper()

@@ -1305,7 +1305,7 @@ def test_agent_wires_verifier_for_wrong_procurement_formula():
 
     with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
         result = agent.chat(
-            [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+            [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
             scope={
                 "store": "KSA",
                 "current_user": "smoke_t48",
@@ -1356,7 +1356,7 @@ def test_agent_round12_wires_procurement_specific_warning_for_real_bypasses():
 
         with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
             result = agent.chat(
-                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
                 scope={
                     "store": "KSA",
                     "current_user": "smoke_t48",
@@ -1480,7 +1480,7 @@ def test_agent_round13_wires_procurement_specific_warning_for_natural_bypasses()
 
         with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
             result = agent.chat(
-                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
                 scope={
                     "store": "KSA",
                     "current_user": "smoke_t48",
@@ -2218,7 +2218,7 @@ def test_agent_round16_wires_procurement_specific_warning_for_new_bypasses():
 
         with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
             result = agent.chat(
-                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
                 scope={
                     "store": "KSA",
                     "current_user": "smoke_t48",
@@ -2375,7 +2375,7 @@ def test_agent_round17_wires_procurement_specific_warning_for_new_bypasses():
 
         with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
             result = agent.chat(
-                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
                 scope={
                     "store": "KSA",
                     "current_user": "smoke_t48",
@@ -2605,7 +2605,7 @@ def test_agent_round18_wires_procurement_specific_warning_for_new_bypasses():
 
         with unittest.mock.patch.object(_provider, "chat_with_tools", return_value=mock_result):
             result = agent.chat(
-                [{"role": "user", "content": "请说明采购议价率怎么计算？"}],
+                [{"role": "user", "content": "请帮我检查这段业务规则草稿有没有口径问题"}],
                 scope={
                     "store": "KSA",
                     "current_user": "smoke_t48",
@@ -2728,6 +2728,72 @@ def test_agent_t48_answer_oracle():
         f"mocked chat() 回复经后处理后应通过 T48 oracle，实际 fails={fails}\n"
         f"reply（前 400 字）: {reply[:400]}"
     )
+
+
+def _t48_chat_scope():
+    return {
+        "store": "KSA",
+        "current_user": "smoke_t48",
+        "current_role": "owner",
+        "tenant_id": 1,
+        "user_id": 1,
+    }
+
+
+def test_agent_t48_rule_question_bypasses_llm_and_uses_rule_source():
+    """WS-182: T48 真实题面应确定性读规则源回答，不依赖 LLM 临场生成。"""
+    from hipop.server import _provider, agent
+
+    with unittest.mock.patch.object(
+        _provider,
+        "chat_with_tools",
+        side_effect=AssertionError("T48 procurement-rate rule question should not call LLM provider"),
+    ):
+        result = agent.chat(
+            [{"role": "user", "content": "请说明采购议价率怎么计算，plus 折扣是否计入绩效？"}],
+            scope=_t48_chat_scope(),
+        )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    passed, fails = _t48_content_oracle(reply)
+    assert passed, (
+        f"T48 规则源确定性回答应通过 oracle，实际 fails={fails}\nreply={reply}"
+    )
+    assert "规则来源：hipop/rules/procurement_rate.py" in reply
+    assert result.get("hallucination_warnings") in (None, [], {}), result
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
+
+
+def test_agent_t48_rule_source_missing_fails_closed():
+    """WS-182 negative control: 规则源不可读时不得由 LLM 编公式，必须 fail closed。"""
+    import importlib
+    from hipop.server import _provider, agent
+
+    real_import_module = importlib.import_module
+
+    def fail_procurement_rate_import(name, package=None):
+        if name == "hipop.rules.procurement_rate":
+            raise ImportError("simulated missing procurement rule source")
+        return real_import_module(name, package)
+
+    with unittest.mock.patch("importlib.import_module", side_effect=fail_procurement_rate_import):
+        with unittest.mock.patch.object(
+            _provider,
+            "chat_with_tools",
+            side_effect=AssertionError("T48 procurement-rate fail-closed path should not call LLM provider"),
+        ):
+            result = agent.chat(
+                [{"role": "user", "content": "采购议价率怎么计算？plus 折扣算不算采购绩效？"}],
+                scope=_t48_chat_scope(),
+            )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    assert "无法读取采购议价率权威规则源" in reply or "缺规则源" in reply
+    assert "hipop/rules/procurement_rate.py" in reply
+    assert "议价差额 ÷" not in reply, reply
+    assert "1688采购标准价 + 头程运费分摊" not in reply, reply
+    assert result.get("hallucination_warnings") in (None, [], {}), result
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -2895,6 +2961,10 @@ if __name__ == "__main__":
          test_rules_file_procurement_rate_spec),
         ("test_agent_t48_answer_oracle",
          test_agent_t48_answer_oracle),
+        ("test_agent_t48_rule_question_bypasses_llm_and_uses_rule_source",
+         test_agent_t48_rule_question_bypasses_llm_and_uses_rule_source),
+        ("test_agent_t48_rule_source_missing_fails_closed",
+         test_agent_t48_rule_source_missing_fails_closed),
     ]
 
     failed = 0
