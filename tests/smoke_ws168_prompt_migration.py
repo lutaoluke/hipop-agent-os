@@ -117,30 +117,57 @@ def test_reexport_contract():
 
 
 def test_system_prompt_key_content_intact():
-    """文本 parity：SYSTEM_PROMPT 关键语义条目未在迁移中丢失。"""
+    """文本 parity（SHA-256 fixture）：迁移后 prompt 字节级不变。
+
+    Fixture 来源：`git show e10090f5:hipop/server/agent.py`（WS-168 合入点的前一个 commit）
+    里的 `SYSTEM_PROMPT` / `_JUDGE_SYSTEM_PROMPT` / `SYSTEM_PROMPT_LEGACY`，
+    用 `hashlib.sha256(text.encode('utf-8')).hexdigest()` 生成。
+
+    迁移只搬承载位置，不修改任何字节，所以哈希必须完全相同。
+    哈希不匹配 → 内容漂移 → 本断言 FAIL（"三种死法"之行为漂移）。
+    """
+    import hashlib
     from hipop.server import _prompts
 
-    sp = _prompts.SYSTEM_PROMPT
-    # 这些是 prompt 中明确的工具路由条目，迁移不应删除
-    expected_tokens = [
-        "data_health_check",
-        "query_sku_live",
-        "run_workflow",
-        "export_table",
-        "total_stock_topn",
-        "capture_feedback",
-        "scope",          # {scope} 占位符
-    ]
-    missing = [tok for tok in expected_tokens if tok not in sp]
-    assert not missing, (
-        f"SYSTEM_PROMPT 关键条目在迁移中丢失：{missing} —— "
-        f"只许搬承载位置，不许修改内容。")
+    # ── 从 e10090f5 (agent.py 原文件) 计算的 SHA-256 基线 ──────────────────────────
+    FIXTURES = {
+        "SYSTEM_PROMPT": (
+            "5c28036bd011f39dcbb6eccc4b52db5011a54df346b3d4ea70fe99f38258ca5d",
+            2494,
+        ),
+        "_JUDGE_SYSTEM_PROMPT": (
+            "914d6f6679aa38d559b23eb2cebbd685847e74e99718db802a1d842a37e020aa",
+            198,
+        ),
+        "SYSTEM_PROMPT_LEGACY": (
+            "3fa5dec4769650afb5f50537440f4f05b9c7944261b5bd660b1ccaf008780c1a",
+            8958,
+        ),
+    }
 
-    judge = _prompts._JUDGE_SYSTEM_PROMPT
-    assert "confidence" in judge and "verdict" in judge, (
-        f"_JUDGE_SYSTEM_PROMPT 关键字段（confidence/verdict）丢失 —— 内容漂移")
+    mismatches = []
+    for name, (expected_hash, expected_len) in FIXTURES.items():
+        if not hasattr(_prompts, name):
+            mismatches.append(f"{name}: 不存在于 _prompts（外移漏搬）")
+            continue
+        text = getattr(_prompts, name)
+        actual_len = len(text)
+        actual_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if actual_hash != expected_hash:
+            mismatches.append(
+                f"{name}: SHA-256 不匹配\n"
+                f"    期望（e10090f5）: {expected_hash}（{expected_len} chars）\n"
+                f"    实际（_prompts）:  {actual_hash}（{actual_len} chars）\n"
+                f"    → 内容在迁移中被修改——只许搬承载位置，不许改内容"
+            )
 
-    print("  ✓ 文本 parity：SYSTEM_PROMPT 路由条目 + _JUDGE_SYSTEM_PROMPT 字段完整")
+    assert not mismatches, (
+        "文本 parity 校验失败（SHA-256 fixture 不匹配）：\n" + "\n".join(mismatches)
+    )
+    print(
+        "  ✓ 文本 parity（SHA-256）：SYSTEM_PROMPT / _JUDGE_SYSTEM_PROMPT / "
+        "SYSTEM_PROMPT_LEGACY 三个 prompt 字节级与 e10090f5 原文件完全一致"
+    )
 
 
 def test_chat_uses_system_prompt():
