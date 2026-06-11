@@ -59,6 +59,29 @@ def test_must_block_started_exec_claims():
         assert _scrubbed(_body(out)), f"假执行声明应被结构化删除，正文却保留: {_body(out)!r}"
 
 
+def test_must_block_word_order_variants():
+    """验门人 route-b round-2 打回点：反方向语序（执行动词在前 + 体 / 完成体 + 对象 + 动词）
+    无证据也必硬切，不能只贴 banner 把假成功正文留给用户。
+
+    覆盖 `<动词>已开始`、`<动词>已完成`、`已完成<对象><动词>` 等自然中文语序。
+    """
+    for r in (
+        "库存刷新已开始，请稍候。",
+        "销量重算已开始，请稍候。",
+        "库存刷新已完成，请查看。",
+        "已完成库存刷新，请查看。",
+        "销量重算已完成，请查看结果。",
+        "数据同步已开始，稍后刷新。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"反语序假执行声明应报警告: {r!r}"
+        body = _body(out)
+        assert _scrubbed(body), f"反语序假成功段应被硬切，正文却原样保留: {body!r}"
+        for leak in ("已开始", "已完成"):
+            # 假成功的「已开始/已完成」分句必须被替换掉（允许模板里的解释词，不允许原句残留）
+            assert "刷新已开始" not in body and "重算已开始" not in body, f"假启动段未删: {body!r}"
+
+
 def test_must_block_fake_task_id_and_evidence():
     """伪造任务号（8 hex）/ accepted / SSE 进度 无真实任务 → 删除 + 告警。"""
     for r in (
@@ -197,6 +220,7 @@ def test_chat_high_risk_confirm_first():
 if __name__ == "__main__":
     tests = [
         test_must_block_started_exec_claims,
+        test_must_block_word_order_variants,
         test_must_block_fake_task_id_and_evidence,
         test_must_pass_trend_and_advice,
         test_must_pass_no_comma_trend_plus_advice,
