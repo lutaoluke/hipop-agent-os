@@ -787,32 +787,8 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     if promise_notify and "notify_via_feishu" not in tools_used:
         warnings.append("⚠️ Agent 宣称已通知/发飞书，但没调 notify_via_feishu — 这是 hallucinate")
 
-    # "已触发 / 已启动 / 再次触发 wf*" → 检查是否真调了 run_workflow
-    promise_workflow = re.search(
-        r"(已触发|已启动|已开始|再次触发|已经在.{0,5}(后台|跑)|"
-        r"任务.{0,10}(提交|启动)|已让.{0,5}系统|系统已经在.{0,5}后台|后台跑了)",
-        reply,
-    )
-    if promise_workflow and "run_workflow" not in tools_used:
-        warnings.append(
-            "⚠️ Agent 宣称已触发/启动工作流，但本轮没真调 run_workflow tool — "
-            "这是 hallucinate（实际没创建后台任务，请重发"
-            "『帮我扫一下 ERP 物流』之类更明确的指令）"
-        )
-        # 结构性清除：假任务号 / 假成功段 / 假前端进度 → 替换为真相标注
-        _pw_sentence_pat = re.compile(
-            r'[^。\n!？]*(?:'
-            r'[0-9a-f]{8}|前端会推送进度|'
-            r'(?:已触发|已启动|已开始|再次触发).{0,30}(?:工作流|库存|物流|刷新|任务|后台)|'
-            r'任务.{0,10}(?:提交|启动|在后台)'
-            r')[^。\n!？]*[。!？]?'
-        )
-        reply = _pw_sentence_pat.sub("[本轮未创建刷新任务 / 未启动后台流程] ", reply)
-        if "本轮未创建刷新任务" not in reply and "未启动后台流程" not in reply:
-            reply += "\n[本轮未创建刷新任务 / 未启动后台流程]"
-
-    # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据
-    # "状态为 accepted" / "任务 accepted" 以及 SSE 推送进度都是假启动的特征词
+    # T38: 假任务状态证据 — accepted / SSE 进度 单独出现但无 run_workflow 证据（仅告警；正文的
+    # 结构化删除交给文末 WS-146 执行声明承重墙 _exec_slot_contract，统一在 hallu 告警生成后做）。
     fake_task_evidence = re.search(
         r"((?:状态|status)[^。\n!?]{0,12}\baccepted\b"
         r"|任务[^。\n!?]{0,20}\baccepted\b"
@@ -1174,6 +1150,17 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     # 让上面各规则先按既有口径告警/补前缀（不破坏 WS-133 等回归），再由本层做 B-1 做不到的事——
     # 把答案正文里"工具没返回过"的承运商/运单号/库存数量/状态（包含关系判别）就地删掉，
     # 并对 B-1 未覆盖的失败模式（库存 fail_closed / 空返回）补确定性错误模板。
+    # WS-146 执行声明假活承重墙（结构判别，取代逐句正则的 promise_workflow 黑名单）：
+    # 「已启动/已刷新/已开始重算/任务号/accepted/SSE 进度」等**执行声明槽**，以「本轮有无真实
+    # 后台任务证据」的证据契约为源头——无证据 → 证成空 → 就地删执行声明 + 前置确定性「未执行」
+    # 模板；真实回执（run_workflow 返回 task_id）放行、只删伪造任务号。闭集执行动作 + 分句边界含
+    # 中文逗号 + 时效日期豁免 = 结构收敛，不再相位打地鼠（熔断 3 轮根因）。与 WS-161 同根不同槽。
+    # 放在所有 hallu 告警生成之后（与 factslot 承重墙并列）：上面各检测器先按原文告警，再由本层
+    # 做正文的结构化删除。
+    from . import _exec_slot_contract
+    reply, exec_warnings = _exec_slot_contract.apply(reply, tool_log or [], question, tools_used)
+    warnings.extend(exec_warnings)
+
     from . import _factslot_contract
     reply, factslot_warnings = _factslot_contract.apply(reply, tool_log or [], question)
     warnings.extend(factslot_warnings)
