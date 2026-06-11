@@ -60,10 +60,13 @@ AGENT_PY = os.path.join(REPO, "hipop", "server", "agent.py")
 # WS-166（S2）：23 个 tool_* / _tool_* 业务实现整体外移到 hipop/server/tools_impl.py，
 # agent.py 仅保留 TOOLS 注册 / TOOL_FUNCS 分发投影 / _exec_tool 治理入口 / chat 编排。
 # 故 4463→2898、tool/_tool 计数→0，基线随之下压（只下压，不回调）。
-LINE_BUDGET = 2898                 # agent.py 总行数上限（WS-166 外移后）
+# WS-167（S3）：15 个 _deterministic_* 确定性路由 + 配套 _format_* formatter 整体外移到
+# hipop/server/_deterministic_routes.py，agent.py 仅保留 chat() 对它们的调用接线（再导出投影）。
+# 故 2898→2304、_deterministic_ 计数 15→0，基线随之再下压（只下压，不回调）。
+LINE_BUDGET = 2304                 # agent.py 总行数上限（WS-167 外移后）
 TOOL_DEF_BUDGET = 0                # `def tool_*` —— 业务 tool 实现（已全部外移到 tools_impl）
 UNDERSCORE_TOOL_DEF_BUDGET = 0     # `def _tool_*` —— 下划线前缀 tool 实现（已全部外移）
-DETERMINISTIC_DEF_BUDGET = 15      # `def _deterministic_*` —— 确定性路由 / readonly formatter（留 agent.py）
+DETERMINISTIC_DEF_BUDGET = 0       # `def _deterministic_*` —— 确定性路由 / formatter（已全部外移到 _deterministic_routes）
 PROMPT_CONST_COUNT_BUDGET = 5      # 模块级字符串常量个数（prompt / 口径常量）
 PROMPT_CONST_BYTES_BUDGET = 11735  # 模块级字符串常量源码字节总量（撑大已有 prompt 也算回潮）
 
