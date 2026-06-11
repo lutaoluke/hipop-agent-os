@@ -57,10 +57,13 @@ AGENT_PY = os.path.join(REPO, "hipop", "server", "agent.py")
 # ── 基线（棘轮口径：只许降不许涨）─────────────────────────────
 # 起点 = WS-162 / PR #101 合并后主干 agent.py 的真实计量（2026-06-10）。
 # S2–S5 把实现外移、行数/函数数下降后，可手动把对应基线调小再收紧；绝不许调大。
-LINE_BUDGET = 4463                 # agent.py 总行数上限
-TOOL_DEF_BUDGET = 20               # `def tool_*` —— 业务 tool 实现
-UNDERSCORE_TOOL_DEF_BUDGET = 3     # `def _tool_*` —— 下划线前缀 tool 实现
-DETERMINISTIC_DEF_BUDGET = 15      # `def _deterministic_*` —— 确定性路由 / readonly formatter
+# WS-166（S2）：23 个 tool_* / _tool_* 业务实现整体外移到 hipop/server/tools_impl.py，
+# agent.py 仅保留 TOOLS 注册 / TOOL_FUNCS 分发投影 / _exec_tool 治理入口 / chat 编排。
+# 故 4463→2898、tool/_tool 计数→0，基线随之下压（只下压，不回调）。
+LINE_BUDGET = 2898                 # agent.py 总行数上限（WS-166 外移后）
+TOOL_DEF_BUDGET = 0                # `def tool_*` —— 业务 tool 实现（已全部外移到 tools_impl）
+UNDERSCORE_TOOL_DEF_BUDGET = 0     # `def _tool_*` —— 下划线前缀 tool 实现（已全部外移）
+DETERMINISTIC_DEF_BUDGET = 15      # `def _deterministic_*` —— 确定性路由 / readonly formatter（留 agent.py）
 PROMPT_CONST_COUNT_BUDGET = 5      # 模块级字符串常量个数（prompt / 口径常量）
 PROMPT_CONST_BYTES_BUDGET = 11735  # 模块级字符串常量源码字节总量（撑大已有 prompt 也算回潮）
 
@@ -157,9 +160,13 @@ def _destructive_tool_impls():
 def find_bypass_calls(src: str, filename: str, impl_names):
     """在一份源码里找「直接按名调 destructive 实现」的越权点。
 
-    允许（funnel 内的合法出现，仅限 agent.py）：
-      - `def <impl>(`           —— 实现定义本身
-      - `"<...>": <impl>,`/`}`  —— TOOL_FUNCS 字典登记（值就是函数对象，非调用）
+    允许的合法出现（非「直调绕过治理」）：
+      - `def <impl>(`           —— 实现定义本身（WS-166 后实现外移到 tools_impl.py，
+                                   故 def 豁免不再限于 agent.py；def 永远不是直调）。
+      - 仅 agent.py 内的两类接线：
+          · `"<...>": <impl>,`/`}`  —— TOOL_FUNCS 字典登记（值就是函数对象，非调用）
+          · `<impl>,`（在 `from .tools_impl import (...)` 块里）—— WS-166 再导出投影，
+            只把实现名投影成 `agent.<impl>` 供 TOOL_FUNCS / api.py / 测试引用，非调用。
     其余任何对 impl 名的文本引用都视为绕过 funnel（直调实现，跳过 governance）。
 
     返回 [(lineno, line, impl_name), ...]。
@@ -174,12 +181,17 @@ def find_bypass_calls(src: str, filename: str, impl_names):
             if not name_re.search(line):
                 continue
             stripped = line.strip()
+            # 定义行：实现本身，落在哪个模块都豁免（WS-166 外移到 tools_impl 后必须如此）。
+            if re.match(r'^def\s+' + re.escape(impl) + r'\s*\(', stripped):
+                continue
             if is_agent_py:
-                # 定义行
-                if re.match(r'^def\s+' + re.escape(impl) + r'\s*\(', stripped):
-                    continue
                 # TOOL_FUNCS 字典登记行：值是裸函数对象，行内不应有调用括号 `impl(`
                 if re.search(r':\s*' + re.escape(impl) + r'\s*,?\s*$', stripped) \
+                        and not re.search(re.escape(impl) + r'\s*\(', stripped):
+                    continue
+                # WS-166 再导出投影行（`from .tools_impl import (... impl, ...)`）：
+                # 裸名引用、行内无 `impl(` 调用括号 —— 只投影名字，不执行 destructive。
+                if re.match(r'^' + re.escape(impl) + r',?$', stripped) \
                         and not re.search(re.escape(impl) + r'\s*\(', stripped):
                     continue
             violations.append((i, stripped, impl))
