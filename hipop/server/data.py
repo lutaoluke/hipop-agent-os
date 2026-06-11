@@ -683,6 +683,38 @@ def get_replenishment_view(store: str, limit: int = 50) -> Dict:
     }
 
 
+def compute_wf5_single(store: str, partner_sku: str) -> Optional[Dict]:
+    """为单个 SKU 按需计算 wf5_sales_cycle 行（WS-125 接线缺失修复入口）。
+
+    背景：is_listed=1 但不在 wf5_sales_cycle 的 SKU（如 TBU0010A/SAB0433A），
+    query_sku LEFT JOIN 拿到 trend=NULL，无补货数。本函数按需算一行写回 wf5，
+    让 query_sku 给出真实补货数而非 NULL。
+
+    只在 stock_readiness.ready=True 且数据新鲜时调用（调用方已检查）。
+    成功返回 analyze_one_v2 结果 dict，失败/无实体时返回 None（调用方降级即可）。
+    """
+    tid, alias = _resolve_entity_for_store(store)
+    if not alias:
+        return None
+    ent_rows = _fetch(
+        "SELECT alias, country FROM sales_entities WHERE tenant_id=? AND alias=? AND active=1 LIMIT 1",
+        (tid, alias),
+    )
+    if not ent_rows:
+        return None
+    ent = {"alias": alias, "country": ent_rows[0]["country"]}
+    try:
+        from hipop.workflows.wf_sales_cycle import analyze_one_v2, write_record_v2
+        with conn() as c:
+            rec = analyze_one_v2(tid, ent, partner_sku, c)
+            if rec:
+                write_record_v2(rec, tid, alias, c)
+                c.commit()
+            return rec
+    except Exception:
+        return None
+
+
 # ── 模块今日重点（7+1 模块卡片）──────────────────────────
 def get_module_summaries(store: str) -> List[Dict]:
     """聚合所有模块的'今日重点'（v2 表 + tenant 隔离）"""
