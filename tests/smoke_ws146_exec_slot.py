@@ -1,0 +1,202 @@
+"""smoke_ws146_exec_slot.py — WS-146 执行声明假活承重墙 fail-then-pass verifier。
+
+Luke A 决策落地：把「执行声明假活」从「逐句调正则」改道到 WS-161 同根的**证据契约 + 结构化
+槽位**（`_exec_slot_contract`）。本 smoke 就是熔断 3 轮的根因点固化成「该挡 / 不该挡」不变式：
+
+  该挡（无真实任务证据 → 删执行声明 + 确定性「未执行」模板）：
+    任务已开始执行 / 工作流已开始执行 / 销量已开始重算 / 库存已开始刷新 / 已启动工作流 /
+    任务号 xxxxxxxx / accepted / SSE 进度 / 已重新计算完成。
+  不该挡（正确趋势分析 + 补货建议 + 时效事实 → 不删、不挂 banner）：
+    数据已更新到 <日期> / 周转已开始改善，建议保守补货 / 销量已开始回升，环比改善 /
+    库存同步至 <日期> / 普通查询数字。
+  硬不变量：真实 run_workflow 回执（带 task_id）里的「已开始执行」+ 真实 task_id 不被误删。
+  恢复策略（WS-145 同根）：低风险肯定句确定性补调一次；补调失败 → plan→confirm；高风险 → confirm-first。
+
+FAIL（把 `_exec_slot_contract`/`_chat_boundary` 改动还原到 merge-base）：该挡的「任务已开始执行」
+只贴 banner 正文保留（漏切），不该挡的「周转已开始改善」被挂 banner（过切）。
+PASS（本轮改动在）：该挡必删 + 模板，不该挡必放行，真实回执不误删。
+"""
+import os
+import sys
+import traceback
+from unittest.mock import patch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from hipop.server import _safety
+from hipop.server import _exec_slot_contract as ex
+from hipop.server import agent as _agent
+from hipop.server import _provider as _prov
+
+_SCOPE = {"tenant_id": 1, "current_user": "test", "current_role": "admin", "store": "KSA"}
+
+
+def _body(out: str) -> str:
+    return out.split("---\n\n", 1)[-1] if "---\n\n" in out else out
+
+
+def _scrubbed(body: str) -> bool:
+    return ("未执行" in body) or ("未确认" in body) or ("未创建" in body)
+
+
+# ── 1) 该挡：无真实任务证据 → 删执行声明 + 确定性模板 + 告警 ─────────────────────
+
+def test_must_block_started_exec_claims():
+    """执行声明假活（启动主语在前/在后、已开始执行/重算/刷新）必被结构化删除。"""
+    for r in (
+        "任务已开始执行，请稍候。",
+        "工作流已开始执行，请稍候。",
+        "销量已开始重算，请稍候。",
+        "库存已开始刷新，请稍候。",
+        "好的，已启动库存刷新工作流。",
+        "销售周期已重新计算完成。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"假执行声明应报警告: {r!r}"
+        assert _scrubbed(_body(out)), f"假执行声明应被结构化删除，正文却保留: {_body(out)!r}"
+
+
+def test_must_block_fake_task_id_and_evidence():
+    """伪造任务号（8 hex）/ accepted / SSE 进度 无真实任务 → 删除 + 告警。"""
+    for r in (
+        "你的任务号是 38377c42，已在后台跑。",
+        "重算任务状态为 accepted，系统正在处理中。",
+        "任务已创建，前端将通过 SSE 推送进度。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"假任务证据应报警告: {r!r}"
+        body = _body(out)
+        assert "38377c42" not in body, f"伪造任务号应被删: {body!r}"
+        assert _scrubbed(body), f"假任务证据应被结构化删除: {body!r}"
+
+
+# ── 2) 不该挡：正确趋势分析 + 补货建议 + 时效事实 → 不删、不挂 banner（熔断 FP 根因）──
+
+def test_must_pass_trend_and_advice():
+    """趋势客观描述 + 补货建议（周转已开始改善，建议保守补货）必放行，不挂 banner、不删。"""
+    for r in (
+        "库存周转已开始改善，建议保守补货。",
+        "销量已开始回升，环比改善。",
+        "周转率已开始下滑，需关注。",
+        "近30天销量趋势已开始回升。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"趋势/建议被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"趋势/建议被误删: {out!r}"
+
+
+def test_must_pass_freshness_fact():
+    """时效客观事实（数据已更新到 <日期>）必放行，不挂 banner、不删。"""
+    for r in (
+        "TBB0116A 库存数据已更新到 2026-06-09，近30天销量97件。",
+        "库存同步至 2026-05-31，数据为最新。",
+        "数据更新日期：2026-06-09。",
+        "TBB0116A 库存 12 件，补货 50 件。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"时效事实/普通数字被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"时效事实/普通数字被误删: {out!r}"
+
+
+# ── 3) 硬不变量：真实任务回执不被误删 ──────────────────────────────────────────
+
+def test_real_receipt_not_scrubbed():
+    """真实 run_workflow 回执（带 task_id）里的「已开始执行」+ 真实 task_id 不被删。"""
+    tool_log = [{"name": "run_workflow", "ok": True, "task_id": "ef345678"}]
+    reply = "销量重算任务已开始执行，任务号 ef345678，请在工作台任务面板查看进度。"
+    out, warns = _safety.sanitize_reply(reply, tools_used=["run_workflow"], tool_log=tool_log)
+    assert "已开始执行" in out, f"真实回执的「已开始执行」不应被删: {out!r}"
+    assert "ef345678" in out, f"真实 task_id 不应被删: {out!r}"
+
+
+def test_real_receipt_scrubs_foreign_task_id():
+    """真实任务在册，但正文里夹了一个非 allow-set 的伪造任务号 → 伪造号被删，真号保留。"""
+    tool_log = [{"name": "run_workflow", "ok": True, "task_id": "ef345678"}]
+    reply = "任务已创建，任务号 ef345678；另外任务号 deadbeef 也在跑。"
+    out, _ = _safety.sanitize_reply(reply, tools_used=["run_workflow"], tool_log=tool_log)
+    body = _body(out)  # banner 里点名伪造号供调试是允许的；检查正文 body
+    assert "ef345678" in body, f"真实 task_id 应保留: {body!r}"
+    assert "deadbeef" not in body, f"伪造 task_id 应从正文删除: {body!r}"
+
+
+# ── 4) 证据契约 + 结构判别（_exec_slot_contract 单元）──────────────────────────
+
+def test_evidence_contract_modes():
+    assert ex.exec_proven([{"name": "run_workflow", "ok": True, "task_id": "ab123456"}])[0] is True
+    assert ex.exec_proven([{"name": "run_workflow", "task_id": "ab123456"}])[0] is True   # 只带 task_id 也算真
+    assert ex.exec_proven([{"name": "run_workflow", "ok": False, "task_id": None}])[0] is False  # 失败 → 不算
+    assert ex.exec_proven([], tools_used=["run_workflow"])[1] == "ambiguous"  # 形状缺失 → 保守不删
+    assert ex.exec_proven([])[0] is False
+
+
+def test_is_exec_claim_structural_discriminator():
+    # 执行动作闭集 + 体 → 执行声明
+    for c in ("任务已开始执行", "销量已开始重算", "库存已开始刷新", "已启动工作流", "状态为 accepted"):
+        assert ex.is_exec_claim(c), f"应判执行声明: {c!r}"
+    # 趋势词不在执行动作闭集 / 时效事实有日期锚点 → 非执行声明
+    for c in ("周转已开始改善", "销量已开始回升", "数据已更新到 2026-06-09", "库存 12 件", "建议保守补货"):
+        assert not ex.is_exec_claim(c), f"不应判执行声明: {c!r}"
+
+
+# ── 5) 回归：T36/T38 同类假活仍被拦 ────────────────────────────────────────────
+
+def test_regression_t36_t38_still_blocked():
+    out, warns = _safety.sanitize_reply(
+        "销售周期重算任务已触发，任务 ID 为 38377c42，当前状态 accepted。",
+        tools_used=[], tool_log=[],
+    )
+    assert warns, warns
+    assert "38377c42" not in _body(out), f"T36/T38 假任务号应被删: {_body(out)!r}"
+
+
+# ── 6) 恢复策略（WS-145 同根）：补调失败 → plan→confirm；高风险 → confirm-first ──
+
+def test_chat_low_risk_failure_plan_confirm():
+    fail_result = {"ok": False, "error": "trigger_failed", "message": None}
+    with patch.object(_agent, "_exec_tool", return_value=fail_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat([{"role": "user", "content": "帮我刷库存，ERP 6 仓"}], _SCOPE)
+    reply = result.get("reply") or ""
+    assert not any(t.get("ok") for t in (result.get("workflow_tasks") or [])), result
+    assert "下一步" in reply and "不再自动重复触发" in reply, reply
+    for bad in ("已触发", "已启动", "已完成"):
+        assert bad not in reply, f"plan→confirm 不得含假证据 {bad!r}: {reply}"
+
+
+def test_chat_high_risk_confirm_first():
+    with patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat([{"role": "user", "content": "帮我下采购单并提交"}], _SCOPE)
+    assert not (result.get("workflow_tasks") or result.get("workflow_task")), result
+    assert "run_workflow" not in (result.get("tools_used") or []), result
+    reply = result.get("reply") or ""
+    assert "确认" in reply and "高风险" in reply, reply
+
+
+if __name__ == "__main__":
+    tests = [
+        test_must_block_started_exec_claims,
+        test_must_block_fake_task_id_and_evidence,
+        test_must_pass_trend_and_advice,
+        test_must_pass_freshness_fact,
+        test_real_receipt_not_scrubbed,
+        test_real_receipt_scrubs_foreign_task_id,
+        test_evidence_contract_modes,
+        test_is_exec_claim_structural_discriminator,
+        test_regression_t36_t38_still_blocked,
+        test_chat_low_risk_failure_plan_confirm,
+        test_chat_high_risk_confirm_first,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"✓ {t.__name__}")
+        except Exception as e:
+            failed += 1
+            print(f"✗ {t.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(0 if failed == 0 else 1)

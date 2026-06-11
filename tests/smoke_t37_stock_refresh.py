@@ -534,12 +534,16 @@ def test_safety_removes_yi_qi_dong_segment():
 
 
 def test_safety_shows_no_task_created_message():
-    """删除假成功段后，reply 中应有'本轮未创建刷新任务'提示。"""
+    """删除假成功段后，reply 中应有'未执行/未创建后台任务'提示。
+
+    WS-146：promise_workflow 旧正则块已被结构化执行声明承重墙（_exec_slot_contract）取代，
+    确定性「未执行」模板/标注的措辞更新为「本轮未执行 / 未创建后台任务」。语义不变（仍删假成功段
+    + 明示本轮没创建任务），只是承重墙换骨架后的标注措辞。"""
     reply = "库存刷新已启动，任务 a5333a45 已经在后台跑了，前端会推送进度。"
     sanitized, warns = sanitize_reply(reply, [])
     assert warns, "应报告幻觉警告"
-    assert "本轮未创建刷新任务" in sanitized or "未启动后台流程" in sanitized, (
-        f"reply 应含'本轮未创建刷新任务/未启动后台流程'，实际: {sanitized!r}"
+    assert "未执行" in sanitized or "未创建后台任务" in sanitized, (
+        f"reply 应含'本轮未执行/未创建后台任务'提示，实际: {sanitized!r}"
     )
 
 

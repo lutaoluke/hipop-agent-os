@@ -147,6 +147,21 @@ _QUERY_ACTION_SAFE_RE = re.compile(
 # only exempts its own span; it cannot wash out a later result claim.
 _QUERY_STATUS_SAFE_RE = re.compile(r"(?P<claim>一切正常)")
 
+# WS-146：客观时效事实（freshness fact），不是「本轮执行了某动作」的完成声明：
+#   「数据已更新到 2026-06-09」「库存同步至 2026-05-31」「更新日期：2026-06-09」。
+# 判别锚点 =（更新/刷新/同步/截至）+（到/至/于）+ **具体日期**，且不带完成态「了/完成/完毕/
+# 生效」。这样既放过 freshness 客观陈述（熔断 round-1 误删的根因点），又不放过「数据更新到
+# 最新了 / 库存同步到最新了」这类带「了」无具体日期的完成声明（仍被结构门拦）。
+_FRESHNESS_DATE_RE = r"(?:\d{4}-\d{2}-\d{2}|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}月\d{1,2}[日号])"
+_FRESHNESS_FACT_SAFE_RE = re.compile(
+    r"(?P<claim>"
+    + r"[^\s，。！？!?；;\n]{0,8}?"                       # 可选主语前缀（库存数据/最新销量…）
+    + r"(?:已|已经)?(?:更新|刷新|同步|截至)"
+    + r"[^，。！？!?；;\n]{0,4}?(?:到|至|于|为|是)?\s*" + _FRESHNESS_DATE_RE
+    + r"|(?:更新|数据|库存|销量|订单)(?:日期|时间)[:：]?\s*" + _FRESHNESS_DATE_RE
+    + r")"
+)
+
 
 def _span_within(span: tuple, candidates: list) -> bool:
     start, end = span
@@ -166,6 +181,8 @@ def _match_span(match) -> tuple:
 
 def _query_safe_spans(reply: str, include_status: bool) -> list:
     spans = [_match_span(m) for m in _QUERY_ACTION_SAFE_RE.finditer(reply)]
+    # WS-146：时效客观事实（更新/同步 到 <具体日期>）任何时候都豁免（不依赖查询证据）。
+    spans.extend(_match_span(m) for m in _FRESHNESS_FACT_SAFE_RE.finditer(reply))
     if include_status:
         spans.extend(_match_span(m) for m in _QUERY_STATUS_SAFE_RE.finditer(reply))
     return spans
