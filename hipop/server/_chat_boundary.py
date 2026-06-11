@@ -162,6 +162,20 @@ _FRESHNESS_FACT_SAFE_RE = re.compile(
     + r")"
 )
 
+# WS-146 B方案：fake-friend —— 完成/启动体黏在**非任务词**上（趋势词 / 非任务技术名词），不是
+# 「本轮执行了后台任务」的完成声明（验门人 route-b 点名：完成度已开始改善 / 拉取中文字段已完成映射）。
+# 用**闭集语义类**（趋势词闭集 + 非任务技术名词闭集，领域建模而非穷举措辞）做安全 span，避免真实
+# 路径上这些句子被结构完成门误挂 banner。趋势词闭集与 _exec_slot_contract 的执行动作闭集互斥，
+# 真实「数据已刷新/任务已完成」不在此集、仍被拦。
+_TREND_WORDS = r"向好|好转|改善|回升|回暖|提升|走高|向上|提高|增长|下滑|走低|下降"
+_NONTASK_TECH = r"映射|字段|结构|索引|分析|统计|建模|分类|聚类|解析|归一|画像"
+_FAKE_FRIEND_SAFE_RE = re.compile(
+    r"(?P<claim>"
+    + r"(?:趋势|环比|同比|整体|持续|逐渐)?(?:" + _TREND_WORDS + r")"
+    + r"|(?:已经?|刚刚?)?(?:开始|完成|完毕)(?:" + _TREND_WORDS + r"|" + _NONTASK_TECH + r")"
+    + r")"
+)
+
 
 def _span_within(span: tuple, candidates: list) -> bool:
     start, end = span
@@ -183,6 +197,8 @@ def _query_safe_spans(reply: str, include_status: bool) -> list:
     spans = [_match_span(m) for m in _QUERY_ACTION_SAFE_RE.finditer(reply)]
     # WS-146：时效客观事实（更新/同步 到 <具体日期>）任何时候都豁免（不依赖查询证据）。
     spans.extend(_match_span(m) for m in _FRESHNESS_FACT_SAFE_RE.finditer(reply))
+    # WS-146 B方案：fake-friend（完成/启动体黏在趋势词/非任务技术名词上）也豁免。
+    spans.extend(_match_span(m) for m in _FAKE_FRIEND_SAFE_RE.finditer(reply))
     if include_status:
         spans.extend(_match_span(m) for m in _QUERY_STATUS_SAFE_RE.finditer(reply))
     return spans

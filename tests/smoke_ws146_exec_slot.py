@@ -82,6 +82,57 @@ def test_must_block_word_order_variants():
             assert "刷新已开始" not in body and "重算已开始" not in body, f"假启动段未删: {body!r}"
 
 
+def test_no_evidence_blocks_all_exec_claims():
+    """B 方案（Luke 拍板）：判别基点 = 本轮**有没有真实任务证据**，不靠枚举短语。无证据时
+    所有执行类断言（含口语 已经开始/已经完成 各语序）一律硬切为「未执行」，不只贴 banner。
+
+    覆盖验门人 route-b round-3 点名的全部漏网口语形（已经开始/已经完成 × 双向语序）。
+    """
+    for r in (
+        "库存刷新已经开始，请稍候。",
+        "销量重算已经开始，请稍候。",
+        "库存刷新已经完成，请查看。",
+        "已经完成库存刷新，请查看。",
+        "数据同步已经开始，稍后刷新。",
+        "刚刚完成数据同步。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"无证据执行类断言应报警告: {r!r}"
+        body = _body(out)
+        assert _scrubbed(body), f"无证据假成功段应被硬切，正文却原样保留: {body!r}"
+        assert "已经开始" not in body.replace("未执行", ""), f"假启动口语段未删: {body!r}"
+
+
+def test_full_path_fake_friends_not_bannered():
+    """验门人提醒：判别单元过了、真实 sanitize_reply 路径仍挂 banner。这些 fake-friend
+    （aspect 黏在非执行词上、执行动词未带 aspect）必须在**完整后处理路径**上不挂 banner、不删。"""
+    for r in (
+        "完成度已开始改善，趋势向好。",
+        "成功率已开始提升，环比走高。",
+        "拉取中文字段已完成映射，结构正常。",
+        "刷新完成度达到80%。",
+        "执行成功率为90%。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"fake-friend 在完整路径被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"fake-friend 被误删: {out!r}"
+
+
+def test_readonly_question_hypothetical_not_cut():
+    """只读/询问/假设句 = 零执行断言，不得被误判成假执行而切（B 方案回归承重）。"""
+    for r in (
+        "能不能帮我刷新库存？",
+        "上次什么时候刷过库存？",
+        "如果刷新库存会影响什么？",
+        "要不要重算一下销量？",
+        "刷新库存有什么影响。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        exec_warns = [w for w in warns if "执行声明承重墙" in w]
+        assert not exec_warns, f"只读/询问/假设句被误判执行声明: {r!r} -> {exec_warns}"
+        assert "未执行 / 未创建后台任务" not in out, f"只读/询问/假设句被硬切: {out!r}"
+
+
 def test_must_block_fake_task_id_and_evidence():
     """伪造任务号（8 hex）/ accepted / SSE 进度 无真实任务 → 删除 + 告警。"""
     for r in (
@@ -221,6 +272,9 @@ if __name__ == "__main__":
     tests = [
         test_must_block_started_exec_claims,
         test_must_block_word_order_variants,
+        test_no_evidence_blocks_all_exec_claims,
+        test_full_path_fake_friends_not_bannered,
+        test_readonly_question_hypothetical_not_cut,
         test_must_block_fake_task_id_and_evidence,
         test_must_pass_trend_and_advice,
         test_must_pass_no_comma_trend_plus_advice,
