@@ -166,6 +166,58 @@ def test_extractor_returns_none_uses_structural_floor():
     assert "200" not in _prose(out), f"None 抽取应回退结构门: {_prose(out)!r}"
 
 
+# ── 验门人 round-1 打回：extractor=None 时 floor 必须 fail-closed（不弱于 B）──────────
+#    None = 语义抽取器超时/异常/无凭据/被关闭 → 走结构门 floor。下面三条钉死 floor 不再 fail-open。
+
+_NONE = (lambda r, h: None)
+
+
+def _stock_fail_result():
+    return {"ok": False, "fail_closed": True, "sku": "TBC0168A", "store": "KSA",
+            "error": "erp_login_failed_no_cache", "message": "快照不可用"}
+
+
+def test_floor_mixed_query_no_stock_value_residue():
+    """① 混合 query：stock + sku_live 同轮成功，extractor=None 时正文不得残留库存值↔仓位。"""
+    tl = [_ev("query_stock_split", _stock_result(total=509, yiwu=200, noon=309)),
+          _ev("query_sku_live", _sku_live_result())]
+    reply = "总库存 509 件，义乌 200，noon 仓 309；货单 PD2026001 由 Aramex 承运，运单号 AB123456789012。"
+    out, warns = _with_extractor(_NONE, lambda: _sanitize(reply, ["query_stock_split", "query_sku_live"], tl))
+    prose = _prose(out)
+    for n in ("509", "200", "309"):
+        assert n not in prose, f"混合 query 库存值仍残留（{n}）: {prose!r}"
+    assert "Aramex" not in prose and "AB123456789012" not in prose, f"物流值也应移: {prose!r}"
+    assert "PD2026001" in prose, "货单号本身保留"
+
+
+def test_floor_unreturned_noncloseset_carrier_no_residue():
+    """② 成功物流里未返回的非闭集承运商（Naqel 三种写法）extractor=None 时不得残留。"""
+    tl = [_ev("query_sku_live", _sku_live_result((("PD2026001", "Aramex", "AB123456789012", 30),)))]
+    for reply in ("货单 PD2026001 由 Naqel 承运。", "承运商：Naqel。", "该单物流商 Naqel 负责。"):
+        out, warns = _with_extractor(_NONE, lambda r=reply: _sanitize(r, ["query_sku_live"], tl))
+        assert "Naqel" not in _prose(out), f"未返回承运商 Naqel 仍残留: {reply} -> {_prose(out)!r}"
+
+
+def test_floor_stock_fail_logistics_success_error_template():
+    """③ stock 失败 + logistics 成功，extractor=None 时库存数字走错误模板/未确认，不残留、不指物流块。"""
+    tl = [_ev("query_stock_split", _stock_fail_result()),
+          _ev("query_sku_live", _sku_live_result())]
+    reply = "总库存 509 件；货单 PD2026001 由 Aramex 承运。"
+    out, warns = _with_extractor(_NONE, lambda: _sanitize(reply, ["query_stock_split", "query_sku_live"], tl))
+    import re as _re
+    assert "509" not in _prose(out), f"stock 失败时库存数字应移: {_prose(out)!r}"
+    assert _re.search(r"无法确认|不能确认|未确认|拒绝出数", out), f"应走确定性错误模板: {out[:160]}"
+
+
+def test_floor_does_not_overdelete_advice():
+    """负控：floor 路径下补货建议/趋势/占比不误删。"""
+    tl = [_ev("query_stock_split", _stock_result(total=509, yiwu=200, noon=309))]
+    out, warns = _with_extractor(_NONE, lambda: _sanitize(
+        "近 30 天动销良好，建议补货 50 件，退货率 3.06%。", ["query_stock_split"], tl))
+    prose = _prose(out)
+    assert "30 天" in prose and "补货 50 件" in prose and "3.06%" in prose, f"非库存数字不应误删: {prose!r}"
+
+
 # ── 注入接线：抽取器可注入/可复位（确定性验证前提）─────────────────────────────────
 
 def test_extractor_is_injectable_and_resettable():
@@ -185,6 +237,10 @@ TESTS = [
     test_non_factslot_not_extracted_not_moved,
     test_extractor_failure_falls_back_to_structural_floor,
     test_extractor_returns_none_uses_structural_floor,
+    test_floor_mixed_query_no_stock_value_residue,
+    test_floor_unreturned_noncloseset_carrier_no_residue,
+    test_floor_stock_fail_logistics_success_error_template,
+    test_floor_does_not_overdelete_advice,
     test_extractor_is_injectable_and_resettable,
 ]
 

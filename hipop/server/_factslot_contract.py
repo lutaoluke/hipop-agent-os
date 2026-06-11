@@ -121,6 +121,18 @@ _NONSTOCK_RIGHT_RE = re.compile(r"^\s*(?:秒|%|％|‰|天|日(?![用])|号|月|
 # "总库存:200" 的冒号是"标签:值"连接符。
 _CLAUSE_DELIM_RE = re.compile(r"[。！？!?，,、；;\n]")
 
+# 承运商**上下文锚点**（结构门 floor 用，语义抽取不可用时的 fail-closed 兜底）：
+# "由 X 承运/配送""承运商[:：] X""物流商 X""货代 X""走的是 X" —— 锚定的是"承运商断言结构"，
+# 抓里面的名字 X（任意承运商，不靠预置闭集）。X 若不是工具本轮返回的 forwarder = ungrounded，
+# 同样移块（route 甲：正文不出现承运商↔货单事实绑定）。这样 Naqel 这种非闭集承运商在 floor 也不漏。
+_CARRIER_CTX_RE = re.compile(
+    r"由\s*([A-Za-z一-鿿][^\s，,。、；;：:（）()]{0,14}?)\s*(?:承运|配送|派送|运送|负责)"
+    r"|(?:承运商|物流商|货代|快递公司|物流公司|承运方|配送商|快递)\s*[:：是为]?\s*([A-Za-z一-鿿][^\s，,。、；;：:（）()]{0,14})"
+    r"|走的是\s*([A-Za-z一-鿿][^\s，,。、；;：:（）()]{0,14})"
+)
+# 防误捕：捕到的"名字"含这些 meta/输出词（如"承运商信息见上方明细"）→ 不是承运商名，跳过。
+_CARRIER_CTX_STOP = ("见", "上方", "明细", "信息", "如下", "未知", "暂无", "详见", "权威", "稍后", "待确认", "未确认")
+
 
 def _safety_detectors():
     """惰性引用 _safety 的 WS-133 Round-5 领域检测器，避免模块级循环导入。"""
@@ -420,8 +432,22 @@ def scrub_fabricated_slots(
             reply = re.sub(re.escape(fv), lambda m: _carrier_remove(m.group(0)), reply, flags=re.IGNORECASE)
 
         # ② 闭集承运商名（_CARRIER_RE）作第二层纵深，兜住"模型编了个工具没返回的已知承运商"。
-        #    主判据是 ① 的工具返回值，这里只是 defense-in-depth、不当唯一源。
         reply = carrier_re.sub(lambda m: _carrier_remove(m.group(0)), reply)
+
+        # ③ **承运商上下文锚点**（结构门 floor 的 fail-closed 兜底，覆盖语义抽取不可用时的洞）：
+        #    锚定"承运商断言结构"抓里面的名字（任意承运商，不靠闭集），ungrounded（工具没返回它）
+        #    一样移块。这样 `由 Naqel 承运 / 承运商:Naqel / 物流商 Naqel` 在 extractor=None 也不残留。
+        def _ctx_carrier_sub(m: re.Match) -> str:
+            name = next((g for g in m.groups() if g), None)
+            if not name:
+                return m.group(0)
+            nn = _norm(name)
+            if nn in order_set or nn in qids:
+                return m.group(0)               # 货单号/被查实体不当承运商
+            if any(w in name for w in _CARRIER_CTX_STOP):
+                return m.group(0)               # meta/输出词，非承运商名
+            return m.group(0).replace(name, _carrier_remove(name), 1)
+        reply = _CARRIER_CTX_RE.sub(_ctx_carrier_sub, reply)
 
         def _id_sub(m: re.Match) -> str:
             tok = m.group(0)
@@ -449,12 +475,15 @@ def scrub_fabricated_slots(
     #       （含 generic 库存/现货）——以"工具返回了哪些值"为准，generic 语境靠真值锚定不误删。
     # 非槽数字（右侧明确非库存单位 秒/%/天/小数/日期，或同句无任何库存标签）→ 放行（趋势/补货建议）。
     # 失败/空分支（stock_bind 无真值）：用全部库存标签做存在性判定，fail-closed 移除。
+    # 注意：**不再加 `and not logistics_proven` 短路**——那是验门人 round-1 打回的混合查询 fail-open
+    #   根因（stock + logistics 同轮成功时库存值残留 / stock 失败+logistics 成功时不走错误模板）。
+    #   每个库存数字都走同一条判定，与有没有物流成功无关。
     _stock_vals = {
         int(v) for e in evs
         if e.get("tool") in _STOCK_TOOLS and e.get("ok") and e.get("has_stock_value")
         for v in (e.get("stock_values") or []) if isinstance(v, int)
     }
-    if stock_called and not logistics_proven:
+    if stock_called:
         def _clause_around(full: str, s: int, e: int) -> str:
             before = list(_CLAUSE_DELIM_RE.finditer(full, 0, s))
             cstart = before[-1].end() if before else 0
