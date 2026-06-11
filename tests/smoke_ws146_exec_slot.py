@@ -88,6 +88,25 @@ def test_must_pass_trend_and_advice():
         assert out.strip() == r, f"趋势/建议被误删: {out!r}"
 
 
+def test_must_pass_no_comma_trend_plus_advice():
+    """验门人 route-b round-1 打回点：**无逗号**的「趋势事实 + 建议执行…」不得被误当执行声明。
+
+    `库存周转已开始改善并建议执行保守补货策略。` —— 同一分句内「已开始」修饰趋势词「改善」，
+    「执行」属建议语气（建议执行），两者不绑定。修前（aspect 与 exec 同句共现即删）会整句误删；
+    修后（aspect 必须直接绑定执行动词）放行。加逗号版本同样必须放行（回归）。
+    """
+    for r in (
+        "库存周转已开始改善并建议执行保守补货策略。",
+        "库存周转已开始改善，建议执行保守补货策略。",
+        "销量已开始回升并建议执行补货。",
+        "周转已开始改善，可执行保守补货。",
+        "毛利已开始改善，应执行降本。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
+        assert not warns, f"无逗号趋势+建议被误挂 banner: {r!r} -> {warns}"
+        assert out.strip() == r, f"无逗号趋势+建议被误删: {out!r}"
+
+
 def test_must_pass_freshness_fact():
     """时效客观事实（数据已更新到 <日期>）必放行，不挂 banner、不删。"""
     for r in (
@@ -180,6 +199,7 @@ if __name__ == "__main__":
         test_must_block_started_exec_claims,
         test_must_block_fake_task_id_and_evidence,
         test_must_pass_trend_and_advice,
+        test_must_pass_no_comma_trend_plus_advice,
         test_must_pass_freshness_fact,
         test_real_receipt_not_scrubbed,
         test_real_receipt_scrubs_foreign_task_id,
