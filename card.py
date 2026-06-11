@@ -61,6 +61,19 @@ def _metadata_object(raw: Dict[str, Any]) -> Dict[str, Any]:
     return dict(raw)
 
 
+def _decode_json_container(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        return value
+    return decoded
+
+
 def _load_issue(issue: str, runner: Optional[MulticaRunner] = None) -> Dict[str, Any]:
     runner = runner or MulticaRunner()
     return runner.json(["issue", "get", issue])
@@ -178,14 +191,10 @@ def _persistent_view(metadata: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "attempt_count": int(metadata.get("attempt_count") or 0),
         "escalation_level": int(metadata.get("escalation_level") or 0),
-        "pool_frozen": metadata.get("pool_frozen") if isinstance(metadata.get("pool_frozen"), dict) else {},
-        "pool_paused_until": (
-            metadata.get("pool_paused_until")
-            if isinstance(metadata.get("pool_paused_until"), dict)
-            else {}
-        ),
+        "pool_frozen": _pool_map(metadata.get("pool_frozen")),
+        "pool_paused_until": _pool_map(metadata.get("pool_paused_until")),
         "last_fail_reason": metadata.get("last_fail_reason"),
-        DEDUPE_KEY: list(metadata.get(DEDUPE_KEY) or []),
+        DEDUPE_KEY: _dedupe_keys(metadata),
     }
 
 
@@ -217,7 +226,7 @@ def show_card(issue: str, runner: Optional[MulticaRunner] = None) -> Dict[str, A
 
 
 def _dedupe_keys(metadata: Dict[str, Any]) -> List[str]:
-    raw = metadata.get(DEDUPE_KEY) or []
+    raw = _decode_json_container(metadata.get(DEDUPE_KEY) or [])
     if isinstance(raw, list):
         return [str(v) for v in raw]
     if isinstance(raw, str):
@@ -265,6 +274,7 @@ def bump_card(
 
 
 def _pool_map(value: Any) -> Dict[str, Any]:
+    value = _decode_json_container(value)
     return dict(value) if isinstance(value, dict) else {}
 
 

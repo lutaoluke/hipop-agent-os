@@ -114,10 +114,9 @@ class _FakeRouteCardRunner:
         elif value_type == "string":
             parsed = value
         else:
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                parsed = value
+            # Mirror real `multica issue metadata set`: untyped JSON-looking
+            # objects/lists are stored and read back as strings.
+            parsed = value
         self.metadata.setdefault(issue, {})[key] = parsed
         self.set_calls.append((issue, key, parsed))
         return ""
@@ -158,7 +157,7 @@ def test_ws175_route_card_bump_dedupe_and_new_events():
     assert explicit_new["attempt_count"] == 3 and explicit_new["deduped"] is False
     assert runner.metadata["WS-999"]["attempt_count"] == 3
     assert runner.metadata["WS-999"]["last_fail_reason"] == "quota"
-    assert runner.metadata["WS-999"]["route_card_dedupe_keys"] == ["review-1", "review-2"]
+    assert json.loads(runner.metadata["WS-999"]["route_card_dedupe_keys"]) == ["review-1", "review-2"]
 
 
 def test_ws175_route_card_pool_state_writes_only_persistent_fields():
@@ -167,12 +166,16 @@ def test_ws175_route_card_pool_state_writes_only_persistent_fields():
     runner = _FakeRouteCardRunner()
 
     card.freeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
+    card.freeze_pool("Opus", state_issue="POOL-CARD", runner=runner)
     card.pause_pool("Sonnet", until="2026-06-12T10:00:00+08:00", state_issue="POOL-CARD", runner=runner)
     card.unfreeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
 
-    assert runner.metadata["POOL-CARD"] == {
-        "pool_frozen": {"Sonnet": False},
-        "pool_paused_until": {"Sonnet": "2026-06-12T10:00:00+08:00"},
+    shown = card.show_card("POOL-CARD", runner=runner)
+    assert shown["persistent"]["pool_frozen"] == {"Sonnet": False, "Opus": True}
+    assert shown["persistent"]["pool_paused_until"] == {"Sonnet": "2026-06-12T10:00:00+08:00"}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_frozen"]) == {"Sonnet": False, "Opus": True}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_paused_until"]) == {
+        "Sonnet": "2026-06-12T10:00:00+08:00"
     }
     written_keys = {key for _, key, _ in runner.set_calls}
     assert written_keys <= {"pool_frozen", "pool_paused_until"}
