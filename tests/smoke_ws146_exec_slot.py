@@ -259,6 +259,22 @@ def test_chat_low_risk_failure_plan_confirm():
         assert bad not in reply, f"plan→confirm 不得含假证据 {bad!r}: {reply}"
 
 
+def test_chat_low_risk_autocall_success_real_task():
+    """假活硬切的正路（码长强调点）：低风险肯定句 → 确定性**自动补跑一次**工作流成功 →
+    本轮有真实任务证据（ok=True+task_id），回执正常展示、不被硬切成「未执行」。"""
+    ok_result = {"ok": True, "task_id": "cd789012", "workflow": "wf1_stock_v2",
+                 "label": "库存刷新", "total_steps": 3, "affected_modules": ["stock"],
+                 "followup_prompt": "帮我刷库存"}
+    with patch.object(_agent, "_exec_tool", return_value=ok_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat([{"role": "user", "content": "帮我刷库存，ERP 6 仓"}], _SCOPE)
+    wt = result.get("workflow_tasks") or []
+    assert wt and wt[0].get("task_id") == "cd789012", result
+    assert "run_workflow" in (result.get("tools_used") or []), result
+    reply = result.get("reply") or ""
+    assert "未执行 / 未创建后台任务" not in reply, f"真实补跑成功不应被硬切: {reply}"
+
+
 def test_chat_high_risk_confirm_first():
     with patch.object(_prov, "get_provider", return_value="smoke"):
         result = _agent.chat([{"role": "user", "content": "帮我下采购单并提交"}], _SCOPE)
@@ -285,6 +301,7 @@ if __name__ == "__main__":
         test_is_exec_claim_structural_discriminator,
         test_regression_t36_t38_still_blocked,
         test_chat_low_risk_failure_plan_confirm,
+        test_chat_low_risk_autocall_success_real_task,
         test_chat_high_risk_confirm_first,
     ]
     failed = 0
