@@ -639,16 +639,25 @@ def render_factslot_block(tool_log: list) -> List[str]:
 # ── 统一入口（供 _safety.sanitize_reply 调用） ────────────────────────────────────
 
 def apply(reply: str, tool_log: list, question: Optional[str] = None) -> Tuple[str, List[str]]:
-    """承重墙总入口（路线 b：源头结构化槽位渲染 + slot-aware 绑定校验）：
-      1. scrub_fabricated_slots：删模型正文里编造/跨槽搬运的承运商/运单号/库存/状态值；
+    """承重墙总入口：
+      0. 语义 grounding（路线 B）：语义抽取正文事实槽断言 + 确定性 grounding，移到权威块；
+         抽取不可用/失败 → fail-closed 回退到下面的确定性结构门（仍兜底）。
+      1. scrub_fabricated_slots：确定性结构门 floor（始终跑，语义未启用时是唯一防线）；
       2. render_factslot_block：成功调用按槽位渲染工具结构化权威明细，前置为事实来源；
       3. enforce_failure_template：失败/空调用前置确定性错误模板。
     """
     warnings: List[str] = []
-    reply, w1 = scrub_fabricated_slots(reply, tool_log or [], question)
+    tl = tool_log or []
+    # 0) 语义 grounding（每条断言走同一条确定性 grounding，不因有没有物流成功而特判）
+    from . import _factslot_grounding as _g
+    any_proven = any(ev.get("ok") and ev.get("slots_proven") for ev in _all_evidence(tl))
+    reply, wg, _used = _g.ground_and_move(reply, tl, question, success=any_proven)
+    warnings.extend(wg)
+    # 1) 确定性结构门兜底（fail-closed floor）
+    reply, w1 = scrub_fabricated_slots(reply, tl, question)
     warnings.extend(w1)
-    blocks = render_factslot_block(tool_log or [])
-    reply, w2 = enforce_failure_template(reply, tool_log or [])
+    blocks = render_factslot_block(tl)
+    reply, w2 = enforce_failure_template(reply, tl)
     warnings.extend(w2)
     if blocks:
         reply = "\n\n".join(blocks) + "\n\n" + reply
