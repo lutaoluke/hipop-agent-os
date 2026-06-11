@@ -419,13 +419,18 @@ def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
         return None
     if not any(x in q for x in ("补货", "pipeline", "Pipeline")):
         return None
-    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up)
-    return m.group(0) if m else None
+    for _m in _re.finditer(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up):
+        if not _re.fullmatch(r"TOP\d+", _m.group(0)):
+            return _m.group(0)
+    return None
 
 
 def _deterministic_replenishment_list_request(question: str) -> "Optional[int]":
     q = question or ""
-    if _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper()):
+    # Exclude TOP\d+ (e.g. "Top5", "Top10") which are TopN ordinals, not business SKU codes.
+    # Real business SKUs (TBS0228A, TBU0010A) end in a letter; "TOP5" ends in a digit.
+    _sku_toks = _re.findall(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper())
+    if any(not _re.fullmatch(r"TOP\d+", tok) for tok in _sku_toks):
         return None
     triggers = ("补货建议", "本周必补", "该补货", "要补货", "哪些要补", "哪些货要补", "补多少")
     if not any(t in q for t in triggers):
