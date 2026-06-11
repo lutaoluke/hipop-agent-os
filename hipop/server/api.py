@@ -812,6 +812,13 @@ WORKFLOW_REGISTRY = {
           "scripts.ingest_noon_csv_v2:run_live")],
         ["sales", "replenish"],
     ),
+    # WS-176：预算守卫 dry-run — 只输出本轮 R0-R8 判定 + rollup + incidents，不改路由。
+    "budget_guard_dry_run": (
+        "预算守卫 dry-run（Anthropic usage → R0-R8 判定 + agent/tier rollup，不改路由）",
+        [(1, "读取 usage fixture/current dump + budget_guard 配置，输出冻结/解冻/break-glass 决策",
+          "hipop.runtime.budget_guard:run_budget_guard_dry_run")],
+        ["governance"],
+    ),
     # WS-11：ASN 送仓未上架 → wf1_stock.pending_inbound_qty（确定性状态规则）
     "wf1_pending_inbound_v2": (
         "送仓未上架（ASN 状态规则 → wf1_stock.pending_inbound_qty，供销售周期）",

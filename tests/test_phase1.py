@@ -117,6 +117,215 @@ def test_ws131_freshness_gate_contract():
     assert result["ok"], result
 
 
+def test_ws176_budget_guard_r1_r2_agent_tier_rollup():
+    """WS-176: R1 yellow and R2 freeze must be computed from Opus shared-pool output."""
+    from hipop.runtime import budget_guard
+
+    config = {"monthly_cap_output_tokens": 100_000_000}
+    yellow = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {
+                    "agent_id": "coder-std-1",
+                    "agent_name": "Coder1",
+                    "tier": "standard",
+                    "model": "claude-opus-4-8",
+                    "input_tokens": 100_000,
+                    "output_tokens": 1_600_000,
+                    "cache_read_tokens": 20_000,
+                    "cache_write_tokens": 5_000,
+                },
+                {
+                    "agent_id": "runtime-rollup",
+                    "model": "claude-opus-4-8",
+                    "output_tokens": 500_000,
+                },
+                {
+                    "agent_id": "coder-std-2",
+                    "tier": "standard",
+                    "model": "claude-sonnet-4",
+                    "output_tokens": 2_600_000,
+                },
+            ],
+            "opus_output_last_1h": 10_000,
+            "monthly_output_tokens": 10_000_000,
+        },
+        config=config,
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R1_DAILY_YELLOW" in yellow["triggered_rules"], yellow
+    assert "R2_DAILY_FREEZE" not in yellow["triggered_rules"], yellow
+    assert yellow["routing"]["standard_to_opus"] == "blocked_without_hard_or_retry_escalated", yellow
+    assert yellow["routing"]["standard_default_pools"] == ["sonnet", "gpt5.5"], yellow
+    assert yellow["routing"]["auto_hard"] is False, yellow
+    assert yellow["routing"]["hard_upgrade_scope"] == "task_attempt_only", yellow
+    assert yellow["rollup"]["totals"]["cache_tokens"] == 25_000, yellow
+    assert yellow["rollup"]["by_tier"]["standard"]["opus_output_tokens"] == 1_600_000, yellow
+    assert yellow["rollup"]["runtime_aggregate"]["opus_output_tokens"] == 500_000, yellow
+
+    projected_yellow = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {"agent_id": "coder-std", "tier": "standard", "model": "claude-sonnet-4", "output_tokens": 2_000_000},
+            ],
+            "opus_output_today": 100_000,
+            "opus_output_last_1h": 125_000,
+            "monthly_output_tokens": 10_000_000,
+        },
+        config=config,
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R1_DAILY_YELLOW" in projected_yellow["triggered_rules"], projected_yellow
+    assert "R2_DAILY_FREEZE" not in projected_yellow["triggered_rules"], projected_yellow
+
+    frozen = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {
+                    "agent_id": "coder-std-1",
+                    "tier": "standard",
+                    "model": "claude-opus-4-8",
+                    "output_tokens": 3_100_000,
+                },
+                {
+                    "agent_id": "coder-std-2",
+                    "tier": "standard",
+                    "model": "claude-sonnet-4",
+                    "output_tokens": 3_000_000,
+                },
+            ],
+            "opus_output_last_1h": 10_000,
+            "monthly_output_tokens": 10_000_000,
+        },
+        config=config,
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R2_DAILY_FREEZE" in frozen["triggered_rules"], frozen
+    assert frozen["routing"]["standard_to_opus"] == "frozen", frozen
+    assert frozen["routing"]["standard_task_action"] == "cheap_pool_or_queue", frozen
+    freeze_incidents = [i for i in frozen["incidents"] if i["action"] == "freeze"]
+    assert freeze_incidents and freeze_incidents[0]["incident_id"].startswith("bg-"), frozen
+    assert freeze_incidents[0]["detection_time_cst"].endswith("+08:00"), frozen
+
+
+def test_ws176_budget_guard_monthly_session_concentration_rules():
+    """WS-176: monthly cap, post-reset session probe, and Opus concentration are fail-closed."""
+    from hipop.runtime import budget_guard
+
+    monthly_unset = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 90_000_000},
+        config={},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert monthly_unset["monthly"]["status"] == "monthly_cap_unset", monthly_unset
+    assert "monthly_cap_unset" in monthly_unset["rollup"]["warnings"], monthly_unset
+
+    monthly_70 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 70_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R3_MONTHLY_70_WARNING" in monthly_70["triggered_rules"], monthly_70
+    assert monthly_70["monthly"]["action"] == "warn_monthly_budget", monthly_70
+
+    monthly_85 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 85_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R4_MONTHLY_85_FREEZE" in monthly_85["triggered_rules"], monthly_85
+    assert monthly_85["monthly"]["action"] == "freeze_non_blocking_standard_high_tier", monthly_85
+
+    monthly_95 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 95_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R4_MONTHLY_95_BREAK_GLASS" in monthly_95["triggered_rules"], monthly_95
+    assert monthly_95["monthly"]["action"] == "p0_p1_break_glass_only", monthly_95
+    assert any(i["action"] == "break_glass" for i in monthly_95["incidents"]), monthly_95
+
+    session = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [],
+            "session": {"limited": True, "reset_at": "2026-06-11T00:00:00Z"},
+        },
+        config={},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert session["session"]["status"] == "probe_required", session
+    assert session["session"]["probe_attempted"] is True, session
+    assert session["routing"]["standard_to_opus"] == "frozen", session
+
+    probed = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [],
+            "session": {
+                "limited": True,
+                "reset_at": "2026-06-11T00:00:00Z",
+                "probe_ok": True,
+            },
+        },
+        config={},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert probed["session"]["status"] == "probed_ok", probed
+    assert "R5_SESSION_LIMIT" not in probed["triggered_rules"], probed
+
+    concentrated = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {"agent_id": "coder-std", "tier": "standard", "model": "claude-opus-4-8", "output_tokens": 1_600_000},
+                {"agent_id": "coder-cheap", "tier": "standard", "model": "gpt-5.5", "output_tokens": 900_000},
+            ],
+        },
+        config={},
+        now="2026-06-11T02:00:00Z",
+    )
+    assert "R6_OPUS_CONCENTRATION" in concentrated["triggered_rules"], concentrated
+    assert concentrated["rollup"]["opus_share"] >= 0.60, concentrated
+    assert concentrated["routing"]["opus_overflow_allowed"] is False, concentrated
+
+
+def test_ws176_budget_guard_dry_run_smoke_and_workflow_wiring():
+    """WS-176: dry-run reports decisions/rollup only and is wired as a real workflow."""
+    from hipop.runtime import budget_guard, verifiers, workflow_runners
+    from hipop.server import api
+
+    out = budget_guard.run_budget_guard_dry_run(
+        spec={
+            "usage": {
+                "records": [
+                    {"agent_id": "coder-a", "tier": "standard", "model": "claude-sonnet-4", "output_tokens": 800_000},
+                    {"agent_id": "coder-b", "tier": "hard", "model": "claude-opus-4-8", "output_tokens": 1_700_000},
+                    {"agent_id": "runtime-rollup", "model": "claude-opus-4-8", "output_tokens": 200_000},
+                ],
+                "monthly_output_tokens": 10_000_000,
+            },
+            "config": {"monthly_cap_output_tokens": 100_000_000},
+            "now": "2026-06-11T02:00:00Z",
+        }
+    )
+    assert out["dry_run"] is True, out
+    assert out["route_changes_applied"] is False, out
+    assert out["side_effects"] == [], out
+    assert out["routing"]["standard_default_pools"] == ["sonnet", "gpt5.5"], out
+    assert out["routing"]["opus_overflow_allowed"] is False, out
+    assert out["rollup"]["by_agent_tier"], out
+    assert out["rollup"]["by_tier"]["hard"]["opus_output_tokens"] == 1_700_000, out
+    assert out["rollup"]["runtime_aggregate"]["opus_output_tokens"] == 200_000, out
+
+    assert "budget_guard_dry_run" in api.WORKFLOW_REGISTRY
+    assert "budget_guard_dry_run" in workflow_runners.list_runners()
+    runner = workflow_runners.get_runner("budget_guard_dry_run")
+    assert callable(runner)
+    assert "anthropic_shared_pool_usage" in getattr(runner, "reads", ()), runner
+    assert getattr(runner, "writes", None) == (), runner
+    assert "budget_guard_dry_run" in verifiers._VERIFIERS
+    verification = verifiers.verify_budget_guard_contract()
+    assert verification["ok"], verification
+
+
 def _get(path: str, timeout: int = 15):
     r = _client.get(f"{BASE}{path}", timeout=timeout)
     return r.status_code, r.text
