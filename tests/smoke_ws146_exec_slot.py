@@ -121,6 +121,29 @@ def test_no_evidence_blocks_progress_aspect_family():
         assert _scrubbed(_body(out)), f"进度体假成功段应被硬切: {_body(out)!r}"
 
 
+def test_no_evidence_blocks_progress_processing_running():
+    """验门人 route-b round-5 打回点：`处理中 / 运行中 / 后台正在处理X` 进度断言无证据也必硬切。
+
+    根因：`处理 / 运行` 原只在 `_BACKEND` 短语里，未进执行动词主闭集，所以「正在处理 / 正在运行 /
+    后台正在处理库存刷新」没被结构槽接住。修后并入主闭集 + 新增「<执行动词>中」进度规则（词边界守卫），
+    把整个 `<执行动词>中` 家族（刷新中/处理中/运行中/同步中/重算中）一次性闭合，不再逐个补短语。
+    """
+    for r in (
+        # 验门人 round-5 点名的精确漏网形
+        "库存刷新正在处理中，请稍候。",
+        "库存刷新正在运行中，请稍候。",
+        "后台正在处理库存刷新，请稍候。",
+        # 同族裸进度（无前缀）—— 结构槽一次闭合，前瞻覆盖
+        "库存刷新中，请稍候。",
+        "数据同步中，请稍候。",
+        "销量重算中，请稍候。",
+        "库存刷新处理中，请稍候。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"处理/运行进度体执行断言应报警告: {r!r}"
+        assert _scrubbed(_body(out)), f"处理/运行进度体假成功段应被硬切: {_body(out)!r}"
+
+
 def test_full_path_fake_friends_not_bannered():
     """验门人提醒：判别单元过了、真实 sanitize_reply 路径仍挂 banner。这些 fake-friend
     （aspect 黏在非执行词上、执行动词未带 aspect、指标名词 完成度/成功率）必须在**完整后处理路径**
@@ -133,6 +156,8 @@ def test_full_path_fake_friends_not_bannered():
         "执行成功率为90%。",
         "库存刷新完成度已开始改善。",      # round-4：带业务前缀
         "库存同步成功率正在提升。",        # round-4：带业务前缀
+        "扫描中间结果正常，数据一致。",    # round-5：`中`-guard 假友（中间 ≠ 进度中）
+        "拉取中文字段映射正常。",          # round-5：`中`-guard 假友（中文 ≠ 进度中）
     ):
         out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
         assert not warns, f"fake-friend 在完整路径被误挂 banner: {r!r} -> {warns}"
@@ -311,6 +336,7 @@ if __name__ == "__main__":
         test_must_block_word_order_variants,
         test_no_evidence_blocks_all_exec_claims,
         test_no_evidence_blocks_progress_aspect_family,
+        test_no_evidence_blocks_progress_processing_running,
         test_full_path_fake_friends_not_bannered,
         test_readonly_question_hypothetical_not_cut,
         test_must_block_fake_task_id_and_evidence,
