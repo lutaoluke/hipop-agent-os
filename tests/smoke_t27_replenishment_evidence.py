@@ -289,11 +289,81 @@ def test_replenishment_safety_blocks_blocked_numeric_claim():
     assert any("补货" in w and SKU in w for w in warns), warns
 
 
+def test_t27_prod_path_wires_erp_live_source():
+    """Production path: tool_query_replenishment_sku must wire the ERP live
+    source itself — without any test calling set_replenishment_live_source().
+
+    Simulates wf1 having run (real Noon/Dongguan stock in wf1_stock) while the
+    logistics/replenishment aggregates are still all-zero, so the live source is
+    required. The in-transit/pending split and ETA come from the live ERP tool
+    (query_sku_live), proving the prod adapter is wired, not a test fixture."""
+
+    def run(db_path: str):
+        _data, ev, agent = _reload_modules(db_path)
+
+        # wf1 already ran: real Noon (1) + Dongguan (5) stock present. Logistics
+        # and replenishment aggregates remain all-zero -> live source required.
+        con = sqlite3.connect(db_path)
+        con.execute(
+            "UPDATE wf1_stock SET noon_saleable_qty=1, dongguan_qty=5 "
+            "WHERE tenant_id=1 AND entity_alias='hipop_ksa' AND partner_sku=?",
+            (SKU,),
+        )
+        con.commit()
+        con.close()
+
+        # No global fixture injection — prod path must wire ERP itself.
+        assert ev.get_replenishment_live_source() is None
+
+        # Stub ERP token so query_sku_live proceeds past auth.
+        orig_token = agent._erp_token_or_error
+        agent._erp_token_or_error = lambda tid: ("fake-token", None)
+
+        # Stub the ERP order fetch with a realistic in-transit/pending split:
+        # PO-001/PO-002 = 10 pending (no tracking), PO-003 = 7 in-transit (tracking + ETA).
+        hipop_dir = REPO / "hipop"
+        if str(hipop_dir) not in sys.path:
+            sys.path.insert(0, str(hipop_dir))
+        from workflows import wf_logistics_status as wls
+        orig_collect = wls.collect_sku_orders
+
+        def fake_collect(sku, token):
+            in_transit = [
+                {"order_no": "PO-001", "qty": 5, "tracking_no": "", "delivery_at": ""},
+                {"order_no": "PO-002", "qty": 5, "tracking_no": "", "delivery_at": ""},
+                {"order_no": "PO-003", "qty": 7, "tracking_no": "YT123456",
+                 "delivery_at": "2026-06-14"},
+            ]
+            return in_transit, []
+
+        wls.collect_sku_orders = fake_collect
+        try:
+            result = agent.chat(
+                [{"role": "user", "content": QUESTION}],
+                {"store": "KSA", "current_user": "tester", "current_role": "运营", "tenant_id": 1},
+            )
+        finally:
+            agent._erp_token_or_error = orig_token
+            wls.collect_sku_orders = orig_collect
+
+        reply = result["reply"]
+        assert result.get("judge_method") == "deterministic_replenishment_sku_router", result
+        assert result.get("tools_used") == ["query_replenishment_sku"], result
+        assert re.search(r"待发[^0-9]{0,6}10", reply), reply
+        assert re.search(r"在途[^0-9]{0,6}7", reply), reply
+        assert ("2026-06-14" in reply) or ("6.14" in reply), reply
+        assert re.search(r"Noon[^0-9]{0,6}1", reply, re.IGNORECASE), reply
+        assert re.search(r"东莞[^0-9]{0,6}5", reply), reply
+
+    return _with_temp_db(run)
+
+
 if __name__ == "__main__":
     tests = [
         test_t27_cache_zero_uses_live_authoritative_evidence,
         test_t27_live_unavailable_blocks_cached_zero_answer,
         test_replenishment_safety_blocks_blocked_numeric_claim,
+        test_t27_prod_path_wires_erp_live_source,
     ]
     failed = 0
     for test in tests:
