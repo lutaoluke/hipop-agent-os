@@ -55,8 +55,12 @@ TASK_DONE_TOOLS: frozenset = frozenset({
     "api_task_status",
 })
 
+# 注意：done_unverified 故意**不在**此集合里。done_unverified = verifier 没通过
+# （结果未达校验阈值，多半上游缺数据 / 写入 0 行），它不是「已完成」证据。把它当
+# done 会让「数据已刷新完成 / 任务已完成」这类声明在任务实际未验证时被放行 —— 正是
+# T38 的 UI 报成功而业务失败的假活。只有真正 verified done / success 才算完成证据。
 _TASK_DONE_STATUSES: frozenset = frozenset({
-    "done", "done_unverified", "success", "complete", "completed",
+    "done", "success", "complete", "completed",
 })
 
 # Structural result/completion claims that require task-done evidence.
@@ -272,6 +276,31 @@ def _iter_status_values(entry: dict):
             yield text
 
 
+# 任务级（非子步骤）非成功终态。一旦某条 readback 的 task/result 级状态落在这里，
+# 该条 readback 就不算「完成证据」——哪怕它的 events 列表里有子步骤 status=done
+# （如 get_task_with_events 会带「初始化 done」那一步）。done_unverified = verifier
+# 没过，绝不能当完成；这是 T38「UI 报成功而业务失败」在 boundary 门一侧的堵口。
+_TASK_NONSUCCESS_TERMINAL: frozenset = frozenset({
+    "done_unverified", "error", "failed", "cancelled",
+})
+
+
+def _entry_task_terminal_is_nonsuccess(entry: dict) -> bool:
+    """只看 task/result 级（不看子步骤 events）的状态是否落在非成功终态。"""
+    candidates = [entry.get("state"), entry.get("status")]
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    candidates.extend([result.get("state"), result.get("status")])
+    for source in (entry, result):
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        candidates.extend([task.get("state"), task.get("status")])
+    for value in candidates:
+        if value is None:
+            continue
+        if str(value).strip().lower() in _TASK_NONSUCCESS_TERMINAL:
+            return True
+    return False
+
+
 def _has_task_done_evidence(tool_log: list) -> bool:
     """Return True if tool_log contains explicit task-completion evidence.
 
@@ -281,9 +310,13 @@ def _has_task_done_evidence(tool_log: list) -> bool:
 
     run_workflow alone is NOT sufficient — it only proves task creation/trigger.
     Provider summaries that only contain result_keys are also NOT sufficient.
+    A readback whose TASK-level terminal state is done_unverified/error/failed is
+    NOT done-evidence, even if its events list carries a sub-step status=done.
     """
     for t in (tool_log or []):
         if t.get("name") not in TASK_DONE_TOOLS:
+            continue
+        if _entry_task_terminal_is_nonsuccess(t):
             continue
         if any(status in _TASK_DONE_STATUSES for status in _iter_status_values(t)):
             return True
