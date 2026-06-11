@@ -62,6 +62,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from . import data as _data
 from ._workflow_reply import _workflow_receipt_reply
+from ._inventory_constraint_rule import handle_inventory_constraint_rule_chat as _handle_icr_chat
 
 import anthropic
 from . import _auth
@@ -163,12 +164,6 @@ def _erp_sku_stats_live(sku: str, nation_id: int, token) -> dict:
         "source": "ERP /product-order-statistics (realtime)",
         "window_days": 30,
     }
-
-
-
-
-
-
 
 
 
@@ -835,6 +830,7 @@ _SAFETY_BANNER_RE = _re.compile(
     r"以下是原始回复（已标记可疑部分）：\s*---\s*"
 )
 _LOWCONF_TIP_RE = _re.compile(r"⚠️ 我对这个回答的置信度较低（\d+%）[^\n]*\n\n---\n\n")
+_INTENT_EXPLAIN_RE = _re.compile(r"\*{0,2}本轮我先不动手\*{0,2}[（(]你是在问能不能[）)]|[（(]\*{0,2}本轮不执行\*{0,2}[）)]|按你说的\*{0,2}不执行\*{0,2}这步刷新|本轮未执行。需要执行请明确说")
 
 
 def _strip_safety_banner(text):
@@ -851,7 +847,8 @@ def _clean_history(messages: List[Dict]) -> List[Dict]:
     out = []
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), str):
-            out.append({**m, "content": _strip_safety_banner(m["content"])})
+            c = _strip_safety_banner(m["content"])
+            out.append({**m, "content": "[上轮：询问/假设/影响面，未执行操作]" if _INTENT_EXPLAIN_RE.search(c) else c})
         else:
             out.append(m)
     return out
@@ -2179,6 +2176,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "judge_method": "deterministic_total_stock_topn_router",
             "hallucination_warnings": None,
         }
+
+    if r := _handle_icr_chat(question, _provider.get_provider()):
+        return r
 
     # T07: freshness gate — 运营查询（TopN 销量等）在 LLM 前先检业务日覆盖
     store = scope.get("store", "KSA")
