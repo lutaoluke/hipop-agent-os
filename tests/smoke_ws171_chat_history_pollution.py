@@ -1,4 +1,4 @@
-"""smoke_ws171_chat_history_pollution.py — WS-171 fail-then-pass smoke
+"""smoke_ws171_chat_history_pollution.py — WS-171 fail-then-pass smoke (round-2)
 
 验收（WS-171）：
   1. chat 长历史污染（T03/T29）：
@@ -31,6 +31,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -275,6 +276,107 @@ def test_t45_router_fires_for_rule_source_query():
         )
 
 
+# ── 4. 真实 chat() 路径:长历史污染 + T03 原题 ─────────────────────────────────
+
+def test_t03_chat_full_path_with_polluted_history():
+    """fail-then-pass: chat() + 污染历史 + T03 原题 → 必须走 query_sku，不被意图门短路。
+
+    验收根因(WS-171 round-2 验门人红队洞):
+      「更新时间」被 _REFRESH_TIME_FIELD_RE 误判为刷新时间查询 → has_refresh_trigger=True
+      + classify_mood=INTERROGATIVE → 非执行短路提前返回 tools_used=[]，
+      _deterministic_sku_metric_request 没机会执行。
+
+    FAIL（修前）：judge_method='execution_intent_gate_explain_non_executory'，tools_used=[]。
+    PASS（修后）：judge_method='deterministic_sku_metric_router'，tools_used=['query_sku']。
+    """
+    from hipop.server import agent as _agent
+    from hipop.server import _provider as _prov
+
+    interrogative_reply = (
+        "可以执行。这类刷新/重算是工作台内部的低风险动作，由我直接触发后台任务、"
+        "前端看进度，你不用进终端跑脚本。**本轮我先不动手**（你是在问能不能）；"
+        "确认要跑就说「帮我刷新…」，我立刻执行。"
+    )
+    messages = [
+        {"role": "user", "content": "能不能帮我刷新库存？"},
+        {"role": "assistant", "content": interrogative_reply},
+        {"role": "user", "content": "请查询 TBS0228A 近30天销量，回答必须给来源和更新时间。"},
+    ]
+    scope = {"tenant_id": 1, "current_user": "test", "current_role": "admin", "store": "KSA"}
+
+    fake_sku_result = {
+        "ok": True,
+        "items": [{
+            "sku": "TBS0228A",
+            "found": True,
+            "sales_30d": 120,
+            "total_orders_30d": 95,
+            "history_total": 1200,
+            "return_rate_30d": 0.02,
+            "cancel_rate_30d": 0.03,
+            "as_of_date": "2026-06-10",
+            "data_stale": False,
+        }],
+        "references": [],
+    }
+
+    with patch.object(_agent, "_exec_tool", return_value=fake_sku_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat(messages, scope)
+
+    judge = result.get("judge_method", "")
+    tools = result.get("tools_used") or []
+    assert judge == "deterministic_sku_metric_router", (
+        f"T03 长历史 chat() 应走 deterministic_sku_metric_router，"
+        f"实际 judge_method={judge!r}。"
+        f"根因：「更新时间」被意图门误判为刷新时间查询，短路了 SKU 确定性路由。"
+        f" reply={result.get('reply', '')[:100]}"
+    )
+    assert "query_sku" in tools, (
+        f"T03 长历史 chat() 必须调用 query_sku，实际 tools_used={tools}"
+    )
+
+
+def test_t03_chat_without_polluted_history():
+    """回归保护: 无污染历史时 T03 同样走 query_sku，不被意图门短路。"""
+    from hipop.server import agent as _agent
+    from hipop.server import _provider as _prov
+
+    messages = [
+        {"role": "user", "content": "请查询 TBS0228A 近30天销量，回答必须给来源和更新时间。"},
+    ]
+    scope = {"tenant_id": 1, "current_user": "test", "current_role": "admin", "store": "KSA"}
+
+    fake_sku_result = {
+        "ok": True,
+        "items": [{
+            "sku": "TBS0228A",
+            "found": True,
+            "sales_30d": 120,
+            "total_orders_30d": 95,
+            "history_total": 1200,
+            "return_rate_30d": 0.02,
+            "cancel_rate_30d": 0.03,
+            "as_of_date": "2026-06-10",
+            "data_stale": False,
+        }],
+        "references": [],
+    }
+
+    with patch.object(_agent, "_exec_tool", return_value=fake_sku_result), \
+         patch.object(_prov, "get_provider", return_value="smoke"):
+        result = _agent.chat(messages, scope)
+
+    judge = result.get("judge_method", "")
+    tools = result.get("tools_used") or []
+    assert judge == "deterministic_sku_metric_router", (
+        f"T03 无污染历史 chat() 应走 deterministic_sku_metric_router，实际={judge!r}"
+    )
+    assert "query_sku" in tools, (
+        f"T03 无污染历史 chat() 必须调用 query_sku，实际={tools}"
+    )
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -305,6 +407,10 @@ if __name__ == "__main__":
          test_t45_router_does_not_fire_for_normal_replenishment_query),
         ("test_t45_router_fires_for_rule_source_query",
          test_t45_router_fires_for_rule_source_query),
+        ("test_t03_chat_full_path_with_polluted_history",
+         test_t03_chat_full_path_with_polluted_history),
+        ("test_t03_chat_without_polluted_history",
+         test_t03_chat_without_polluted_history),
     ]
 
     failed = 0

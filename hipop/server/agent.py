@@ -832,7 +832,6 @@ _SAFETY_BANNER_RE = _re.compile(
 _LOWCONF_TIP_RE = _re.compile(r"⚠️ 我对这个回答的置信度较低（\d+%）[^\n]*\n\n---\n\n")
 _INTENT_EXPLAIN_RE = _re.compile(r"\*{0,2}本轮我先不动手\*{0,2}[（(]你是在问能不能[）)]|[（(]\*{0,2}本轮不执行\*{0,2}[）)]|按你说的\*{0,2}不执行\*{0,2}这步刷新|本轮未执行。需要执行请明确说")
 
-
 def _strip_safety_banner(text):
     """剥掉 _safety banner + 低置信 tip，拿回干净正文（用于持久化 + 喂 LLM 历史）。"""
     if not text or not isinstance(text, str):
@@ -1870,6 +1869,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             _intent_gate.IntentMood.HYPOTHETICAL,
             _intent_gate.IntentMood.IMPACT_QUERY,
         )
+        and not _deterministic_sku_metric_request(question)
     ):
         reply = _intent_gate.explain_reply(_intent_decision.mood, question)
         return {
