@@ -60,6 +60,149 @@ def _load_ws147_daily_scheduler_smoke():
     return mod
 
 
+def _load_ws175_route_card():
+    path = REPO_ROOT / "card.py"
+    spec = importlib.util.spec_from_file_location("route_card_cli", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeRouteCardRunner:
+    def __init__(self):
+        self.issues = {
+            "WS-999": {
+                "id": "issue-999",
+                "identifier": "WS-999",
+                "title": "[tooling][标准] 实现路由记录卡",
+                "assignee_type": "agent",
+                "assignee_id": "agent-author",
+                "reviewer_agent_id": "agent-reviewer",
+            },
+            "POOL-CARD": {
+                "id": "pool-card",
+                "identifier": "POOL-CARD",
+                "title": "[tooling][标准] pool state card",
+            },
+        }
+        self.agents = {
+            "agent-author": {"id": "agent-author", "name": "Coder1", "model": "claude-sonnet-4.5"},
+            "agent-reviewer": {"id": "agent-reviewer", "name": "Verifier-O", "model": "claude-opus-4.1"},
+        }
+        self.metadata = {"WS-999": {}, "POOL-CARD": {}}
+        self.set_calls = []
+
+    def json(self, args):
+        if args[:2] == ["issue", "get"]:
+            return dict(self.issues[args[2]])
+        if args[:3] == ["issue", "metadata", "list"]:
+            return dict(self.metadata[args[3]])
+        if args[:2] == ["agent", "get"]:
+            return dict(self.agents[args[2]])
+        raise AssertionError(f"unexpected json call: {args}")
+
+    def run(self, args):
+        if args[:3] != ["issue", "metadata", "set"]:
+            raise AssertionError(f"unexpected run call: {args}")
+        issue = args[3]
+        key = args[args.index("--key") + 1]
+        value = args[args.index("--value") + 1]
+        value_type = args[args.index("--type") + 1] if "--type" in args else None
+        if value_type == "number":
+            parsed = int(value)
+        elif value_type == "string":
+            parsed = value
+        else:
+            # Mirror real `multica issue metadata set`: untyped JSON-looking
+            # objects/lists are stored and read back as strings.
+            parsed = value
+        self.metadata.setdefault(issue, {})[key] = parsed
+        self.set_calls.append((issue, key, parsed))
+        return ""
+
+
+def test_ws175_route_card_show_derives_fields_without_persisting_metadata():
+    """WS-175: show derives author/reviewer/tier/pool from issue+agents, not metadata."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    shown = card.show_card("WS-999", runner=runner)
+
+    assert shown["derived"] == {
+        "author_model": "claude-sonnet-4.5",
+        "reviewer_model": "claude-opus-4.1",
+        "current_tier": "标准",
+        "route_pool": "Sonnet",
+    }
+    assert shown["persistent"]["attempt_count"] == 0
+    assert shown["persistent"]["last_fail_reason"] is None
+    assert runner.metadata["WS-999"] == {}
+    assert runner.set_calls == []
+
+
+def test_ws175_route_card_bump_dedupe_and_new_events():
+    """WS-175: bump increments deterministically and dedupes repeated events."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    first = card.bump_card("WS-999", reason="transient", dedupe_key="review-1", runner=runner)
+    duplicate = card.bump_card("WS-999", reason="transient", dedupe_key="review-1", runner=runner)
+    second = card.bump_card("WS-999", reason="review_reject", dedupe_key="review-2", runner=runner)
+    explicit_new = card.bump_card("WS-999", reason="quota", runner=runner)
+
+    assert first["attempt_count"] == 1 and first["deduped"] is False
+    assert duplicate["attempt_count"] == 1 and duplicate["deduped"] is True
+    assert second["attempt_count"] == 2 and second["deduped"] is False
+    assert explicit_new["attempt_count"] == 3 and explicit_new["deduped"] is False
+    assert runner.metadata["WS-999"]["attempt_count"] == 3
+    assert runner.metadata["WS-999"]["last_fail_reason"] == "quota"
+    assert json.loads(runner.metadata["WS-999"]["route_card_dedupe_keys"]) == ["review-1", "review-2"]
+
+
+def test_ws175_route_card_pool_state_writes_only_persistent_fields():
+    """WS-175: freeze/unfreeze/pause write only persistent route-card state fields."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    card.freeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
+    card.freeze_pool("Opus", state_issue="POOL-CARD", runner=runner)
+    card.pause_pool("Sonnet", until="2026-06-12T10:00:00+08:00", state_issue="POOL-CARD", runner=runner)
+    card.unfreeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
+
+    shown = card.show_card("POOL-CARD", runner=runner)
+    assert shown["persistent"]["pool_frozen"] == {"Sonnet": False, "Opus": True}
+    assert shown["persistent"]["pool_paused_until"] == {"Sonnet": "2026-06-12T10:00:00+08:00"}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_frozen"]) == {"Sonnet": False, "Opus": True}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_paused_until"]) == {
+        "Sonnet": "2026-06-12T10:00:00+08:00"
+    }
+    written_keys = {key for _, key, _ in runner.set_calls}
+    assert written_keys <= {"pool_frozen", "pool_paused_until"}
+    assert not (written_keys & {"author_model", "reviewer_model", "current_tier", "route_pool"})
+
+
+def test_ws175_route_card_metadata_writes_are_centralized():
+    """WS-175: route-card metadata writes stay centralized in card.py."""
+    guarded = ("attempt_count", "pool_frozen", "pool_paused_until", "last_fail_reason")
+    offenders = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.is_dir() or path.name == "card.py" or ".git" in path.parts:
+            continue
+        if path.suffix not in {".py", ".md", ".yaml", ".yml", ".sh"}:
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith("tests/"):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "multica issue metadata set" not in text:
+            continue
+        for key in guarded:
+            if f"--key {key}" in text or f"--key={key}" in text:
+                offenders.append(f"{rel}:{key}")
+    assert not offenders, f"route-card metadata must be written through card.py only: {offenders}"
+
+
 def test_ws147_daily_refresh_noon_yesterday_contract():
     """WS-147: daily scheduler runs at noon and refresh_all snapshots yesterday only."""
     smoke = _load_ws147_daily_scheduler_smoke()
