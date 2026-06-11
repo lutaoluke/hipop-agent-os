@@ -109,6 +109,44 @@ def tool_query_sku(
             out.append({"sku": sku, "found": False})
             continue
         r = rows[0]
+        # ── WS-125：wf5 行缺失（接线缺失）按需计算 ──────────────────────────────
+        # is_listed=1 但不在 wf5_sales_cycle 的 SKU（trend=NULL）原本只能拿到 NULL 补货数。
+        # 仅在「数据新鲜（noon_orders 不陈旧）+ 库存就绪」时按需算一行写回 wf5，再重读。
+        # 关键（WS-142 Luke B 裁定）：noon_orders 陈旧或库存未就绪时**不在此短路**，
+        # 一律落到下方常规路径，让 data_stale/noon_orders_stale 优先浮出，
+        # 不得被「库存为空」分支吞掉陈旧信号。
+        if r.get("trend") is None and not noon_orders_stale:
+            _wf5_as_of = r.get("as_of_date")
+            _wf5_fresh = bool(_wf5_as_of)
+            if _wf5_as_of:
+                try:
+                    _wf5_fresh = (_dt.date.today() - _dt.date.fromisoformat(str(_wf5_as_of)[:10])).days <= 3
+                except Exception:
+                    _wf5_fresh = False
+            if _wf5_fresh and agent._data.stock_readiness(tid, alias).get("ready"):
+                try:
+                    if agent._data.compute_wf5_single(store, sku):
+                        rows2 = agent._data._fetch("""
+                            SELECT w2.partner_sku, w2.title, w2.sales_grade, w2.latest_profit_rate,
+                                   w2.sales_30d, w2.sales_10d, w2.latest_price,
+                                   w2.total_orders, w2.as_of_date, w2.imported_at,
+                                   w5.trend, w5.daily_rate, w5.urgency, w5.ops_advice, w5.risk_label,
+                                   w5.current_pipeline, w5.weekly_total_replenish,
+                                   w5.updated_at AS wf5_updated_at,
+                                   h.in_transit_total_qty, h.has_stuck_batch, h.needs_ops_input,
+                                   h.updated_at AS wf3_updated_at
+                            FROM wf2_sku w2
+                            LEFT JOIN wf5_sales_cycle w5
+                              ON w2.tenant_id=w5.tenant_id AND w2.entity_alias=w5.entity_alias
+                              AND w2.partner_sku=w5.partner_sku
+                            LEFT JOIN wf3_logistics_hub_v2 h
+                              ON w2.tenant_id=h.tenant_id AND w2.partner_sku=h.sku
+                            WHERE w2.tenant_id=? AND w2.entity_alias=? AND w2.partner_sku=?
+                        """, (tid, alias, sku))
+                        if rows2:
+                            r = rows2[0]
+                except Exception:
+                    pass  # 计算失败 → 落常规路径（trend 仍 NULL，字段 REDACT/NULL）
         as_of = r.get("as_of_date")
         # 事实源契约（WS-129）：每个来源的时间戳门，NULL → fail-closed
         wf3_updated_at = r.get("wf3_updated_at") or None
