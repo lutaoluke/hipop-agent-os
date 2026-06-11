@@ -7,6 +7,12 @@ import asyncio
 import json
 import os
 import sys
+
+# WS-161 路线(B)：server 进程默认启用语义 fact-slot grounding judge（确定性 grounding，
+# 接进 _factslot_contract.apply）。单测 make test 不导入 main → 不设此 flag → judge 关、
+# 走确定性结构门 floor，保证单测可复现。运维可用 HIPOP_FACTSLOT_SEMANTIC=0 关。
+os.environ.setdefault("HIPOP_FACTSLOT_SEMANTIC", "1")
+
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
