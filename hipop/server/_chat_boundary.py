@@ -204,12 +204,28 @@ def _query_safe_spans(reply: str, include_status: bool) -> list:
     return spans
 
 
+# WS-146 B方案：指标名词后缀 —— 「完成度 / 成功率 / 完成率 / 达成率 / 完成量」里的「完成/成功/
+# 达成」是**指标名词的一部分**，不是任务完成态。带业务前缀时（库存刷新完成度…）结构完成门会把
+# 「库存刷新完成」整段当完成声明误报（claim span 从主语起，安全 span 盖不住），故在匹配层用
+# 「完成/成功/达成 紧跟 度/率/比/值/量/数/分」做守卫跳过。
+_METRIC_SUFFIX = "度率比值量数分点位额次"
+_METRIC_TAIL = ("完成", "成功", "达成", "完毕")
+
+
 def _has_structural_result_claim(reply: str, safe_spans: list) -> bool:
     """Return True when reply contains a non-query-safe result/completion claim."""
+    n = len(reply)
     for pattern in _STRUCTURAL_RESULT_CLAIM_RES:
         for match in pattern.finditer(reply):
-            if not _span_within(_match_span(match), safe_spans):
-                return True
+            span = _match_span(match)
+            if _span_within(span, safe_spans):
+                continue
+            end = span[1]
+            # 指标名词守卫：匹配末尾是「完成/成功/达成」且紧跟指标后缀（度/率/…）→ 是
+            # 「完成度/成功率」名词成分，非完成态，跳过。
+            if end < n and reply[end] in _METRIC_SUFFIX and reply[max(0, end - 2):end] in _METRIC_TAIL:
+                continue
+            return True
     return False
 
 

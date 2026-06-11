@@ -103,15 +103,36 @@ def test_no_evidence_blocks_all_exec_claims():
         assert "已经开始" not in body.replace("未执行", ""), f"假启动口语段未删: {body!r}"
 
 
+def test_no_evidence_blocks_progress_aspect_family():
+    """验门人 route-b round-4 打回点：`正在/进行中/正在后台` 体放在执行动词后或后台语序时也必硬切。
+    aspect 是**完整 compositional 词法类**（前缀+体+中/了 / 进行中 / 正在后台处理），双向语序覆盖。"""
+    for r in (
+        "库存刷新正在进行中，请稍候。",
+        "销量重算正在进行中，请稍候。",
+        "库存同步正在进行，请稍候。",
+        "库存刷新进行中，请稍候。",
+        "正在进行库存刷新，请稍候。",
+        "库存刷新正在后台处理，请稍候。",
+        "正在后台刷新库存，请稍候。",
+        "数据拉取正在后台执行，请稍候。",
+    ):
+        out, warns = _safety.sanitize_reply(r, tools_used=[], tool_log=[])
+        assert warns, f"进度体执行断言应报警告: {r!r}"
+        assert _scrubbed(_body(out)), f"进度体假成功段应被硬切: {_body(out)!r}"
+
+
 def test_full_path_fake_friends_not_bannered():
     """验门人提醒：判别单元过了、真实 sanitize_reply 路径仍挂 banner。这些 fake-friend
-    （aspect 黏在非执行词上、执行动词未带 aspect）必须在**完整后处理路径**上不挂 banner、不删。"""
+    （aspect 黏在非执行词上、执行动词未带 aspect、指标名词 完成度/成功率）必须在**完整后处理路径**
+    上不挂 banner、不删 —— 含**带业务前缀**的 fake-friend（round-4 点名）。"""
     for r in (
         "完成度已开始改善，趋势向好。",
         "成功率已开始提升，环比走高。",
         "拉取中文字段已完成映射，结构正常。",
         "刷新完成度达到80%。",
         "执行成功率为90%。",
+        "库存刷新完成度已开始改善。",      # round-4：带业务前缀
+        "库存同步成功率正在提升。",        # round-4：带业务前缀
     ):
         out, warns = _safety.sanitize_reply(r, tools_used=["query_sku"], tool_log=[{"name": "query_sku"}])
         assert not warns, f"fake-friend 在完整路径被误挂 banner: {r!r} -> {warns}"
@@ -289,6 +310,7 @@ if __name__ == "__main__":
         test_must_block_started_exec_claims,
         test_must_block_word_order_variants,
         test_no_evidence_blocks_all_exec_claims,
+        test_no_evidence_blocks_progress_aspect_family,
         test_full_path_fake_friends_not_bannered,
         test_readonly_question_hypothetical_not_cut,
         test_must_block_fake_task_id_and_evidence,
