@@ -927,10 +927,13 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
         )
 
     # ── T26-ext 物流负控扩展：SKU / 跟踪号 ────────────────────────────────────────
-    # Rule C: 没调 query_sku_live 却说"我来查 SKU 物流/在途" — 假称在查，直接删句
+    # Rule C: 没调 query_sku_live 却说"我来查/我可以查 SKU 物流/在途" — 假称在查，直接删句
     # re.IGNORECASE 覆盖 sku/SKU/Sku 等大小写变体
+    # 覆盖黄项 A 原文："不要说'我可以查'然后不调 tool"（含'我来查'/'我可以查'两类话术）
     pretend_sku_query = re.search(
         r"(我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+        r"|我可以查.{0,20}SKU"
+        r"|SKU.{0,20}我可以查"
         r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
         r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
         r"|让我.{0,5}查.{0,10}SKU)",
@@ -939,12 +942,14 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     )
     if pretend_sku_query and "query_sku_live" not in tools_used:
         warnings.append(
-            "⚠️ Agent 说'我来查 SKU 物流/在途'但本轮没真调 query_sku_live — "
+            "⚠️ Agent 说'我来查/我可以查 SKU 物流/在途'但本轮没真调 query_sku_live — "
             "禁止假称在查（T26-ext SKU 负控）"
         )
         sentence_pat_sku = re.compile(
             r"[^。\n!?]*("
             r"我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
+            r"|我可以查.{0,20}SKU"
+            r"|SKU.{0,20}我可以查"
             r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
             r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
             r"|让我.{0,5}查.{0,10}SKU"

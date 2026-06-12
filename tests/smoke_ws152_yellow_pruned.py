@@ -53,6 +53,33 @@ def test_ws152_yellow_a_pretend_query_still_blocked_by_rule_c():
     )
 
 
+def test_ws152_yellow_a_exact_phrase_我可以查_blocked():
+    """FAIL 若 Rule C 未覆盖被删黄项的原句'我可以查'。
+
+    黄项 A 原文：'不要说「我可以查」然后不调 tool'。
+    删掉 prompt 后代码门必须拦截 '我可以查...SKU...' 这类话术，不只是'我来查'。
+    """
+    from hipop.server._safety import sanitize_reply
+
+    probes = [
+        "我可以查这个 SKU 的在途物流，请稍等。",
+        "这个 SKU 我可以查一下当前在途。",
+        "我可以查一下 SKU 的在途实时状态。",
+    ]
+    for phrase in probes:
+        out, warns = sanitize_reply(phrase, tools_used=[], tool_log=[])
+        assert warns, (
+            f"Rule C 必须拦截'我可以查' pretend-query（黄项 A 原句），"
+            f"但 phrase={phrase!r} 未产生警告"
+        )
+        assert any("T26-ext SKU" in w for w in warns), (
+            f"警告应含 T26-ext SKU，phrase={phrase!r}, warns={warns}"
+        )
+        assert "被 _safety 拦掉" in out, (
+            f"Rule C 应替换假查话术，phrase={phrase!r}, out={out[:200]!r}"
+        )
+
+
 def test_ws152_yellow_a_false_positive_absent_when_tool_called():
     """正向验证：真调了工具时 Rule C 不应误报。"""
     from hipop.server._safety import sanitize_reply
@@ -156,6 +183,7 @@ def test_ws152_yellow_b_gate2_factslot_prepends_failure_template_on_login_failed
 def run():
     tests = [
         test_ws152_yellow_a_pretend_query_still_blocked_by_rule_c,
+        test_ws152_yellow_a_exact_phrase_我可以查_blocked,
         test_ws152_yellow_a_false_positive_absent_when_tool_called,
         test_ws152_yellow_b_gate1_query_sku_live_fails_closed_on_erp_failure,
         test_ws152_yellow_b_gate2_factslot_prepends_failure_template_on_login_failed,
