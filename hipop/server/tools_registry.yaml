@@ -216,8 +216,9 @@ tools:
     - tests/smoke_governance.py::test_tools_registry_manifest_is_single_source_of_truth
   list_products:
     description: 列出店铺商品。返回两个维度的统计：summary_products（product 维度，与 ERP 后台数字一致）+ summary_skus（SKU 维度，含变体）。用户问『商品/产品总数』时优先报 summary_products.total（这是
-      ERP 后台筛店铺看到的数字）。用户问『SKU 总数』或『变体』时报 summary_skus.total。用户问『近30天销量最高/销量排行/销量 TopN』时必须调用本工具并设置 limit=N；items 已按 wf2_sku.sales_30d
-      DESC、sales_180d DESC 排序，limit=N 即近30天销量 TopN，不要由模型自行排序或补数字。is_listed=1 = 已绑定 noon 平台 SKU id（在线上能搜到/可下单）；is_listed=0
+      ERP 后台筛店铺看到的数字）。用户问『SKU 总数』或『变体』时报 summary_skus.total。**仅当**用户问『无时间窗的裸销量排行』(如『销量最高的3个商品』『最畅销的SKU』，句中不含任何时间窗)时才用本工具并设
+      limit=N，items 按 wf2_sku.sales_30d 固定桶排序。**凡句中带任何时间窗**——『近N天/最近N天/过去N天/这N天/近三十天/近30日』或显式起止日期（如 2026-05-07 到 2026-06-05）——一律改用
+      top_sales_by_window（按 wf2_orders 逐单现算 + 最新订单业务日倒推），**不要**用本工具的 sales_30d 固定桶冒充任意时间窗。is_listed=1 = 已绑定 noon 平台 SKU id（在线上能搜到/可下单）；is_listed=0
       = 草稿/未挂平台。listing='listed'/'unlisted'/'all' 控制示例返回；sales_only=true 仅含 sales_180d>0；limit=0 时不返示例。
     input_schema:
       type: object
@@ -241,7 +242,7 @@ tools:
         limit:
           type: integer
           default: 0
-          description: 返回示例 SKU 行数；0=只要聚合。问近30天销量 TopN 时传 N，items 即按 sales_30d DESC 的 TopN。
+          description: 返回示例 SKU 行数；0=只要聚合。问**无时间窗**的裸销量排行时传 N，items 即按 sales_30d 固定桶 DESC 的 TopN；带时间窗的排行改用 top_sales_by_window。
       required:
       - store
     access: read

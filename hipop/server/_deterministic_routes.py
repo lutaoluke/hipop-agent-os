@@ -363,13 +363,53 @@ def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
 _WINDOW_ISO_DATE_RE = _re.compile(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b")
 _WINDOW_CN_DATE_RE = _re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日?")
 
+# 相对「近N天」的**结构化**识别（不靠逐句穷举写法）：
+#   前缀（近/最近/过去/过往/这/前）+ 数字（阿拉伯或中文）+ 单位（天/日），或裸「N天」。
+# 「日」只在带前缀时认（裸「N日」会和「6月30日」这种月内日撞），裸窗只认「天」。
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_NUM_CHARS = "0-9零〇一二两三四五六七八九十百千"
+_REL_WINDOW_RE = _re.compile(
+    rf"(?:最近|近|过去|过往|这|前)的?\s*([{_NUM_CHARS}]+)\s*[天日]"
+    rf"|(?<![0-9年月])([{_NUM_CHARS}]+)\s*天"
+)
+
+
+def _cn_to_int(s: str):
+    """中文数字 → int（支持 十/百/千，覆盖天数量级）；非法字符返回 None。"""
+    total, current = 0, 0
+    for ch in s:
+        if ch in _CN_DIGITS:
+            current = _CN_DIGITS[ch]
+        elif ch == "十":
+            total += (current or 1) * 10; current = 0
+        elif ch == "百":
+            total += (current or 1) * 100; current = 0
+        elif ch == "千":
+            total += (current or 1) * 1000; current = 0
+        else:
+            return None
+    return total + current
+
+
+def _window_days_token(tok: str):
+    """窗口天数 token（阿拉伯或中文）→ int；非法返回 None。"""
+    tok = (tok or "").strip()
+    if not tok:
+        return None
+    if tok.isdigit():
+        return int(tok)
+    return _cn_to_int(tok)
+
 
 def _deterministic_window_sales_topn_request(question: str) -> "Optional[Dict]":
     """WS-120 [T07]：识别『指定日期窗口 / 近N天』销量 TopN —— 与 WS-148 裸 TopN 互斥且优先。
 
-    显式起止日期窗口、以及『近/最近 N 天』(含 N=30) 都走 top_sales_by_window，按 wf2_orders
-    逐单现算并以最新订单业务日倒推；无时间窗的裸 TopN（如『销量最高的3个商品』）仍由
-    _deterministic_product_sales_topn_request 走 list_products/sales_30d 固定桶。
+    显式起止日期窗口、以及『近/最近/过去/过往/这/前 N 天(日)』(N 可阿拉伯或中文、含 N=30)
+    都走 top_sales_by_window，按 wf2_orders 逐单现算并以最新订单业务日倒推；无**时间窗**的
+    裸 TopN（如『销量最高的3个商品』）才由 _deterministic_product_sales_topn_request 走
+    list_products/sales_30d 固定桶。结构化识别 N天，避免红队换同义写法（过去30天/近三十天/
+    近30日）把口径带回固定桶。
 
     返回 {"start_date","end_date","limit"} | {"relative_days":N,"limit":L} | None。
     """
@@ -391,7 +431,7 @@ def _deterministic_window_sales_topn_request(question: str) -> "Optional[Dict]":
     limit = 10
     for pat in (
         r"(?:Top|top|TOP)\s*(\d+)",
-        r"前\s*(\d+)",
+        r"前\s*(\d+)(?!\s*[天日])",   # 「前N天」是窗口、不是 TopN 个数；只认「前N(个/名…)」为 limit
         r"最高的?\s*(\d+)",
         r"最多的?\s*(\d+)",
         r"(\d+)\s*(?:个|名|款|条)\s*(?:商品|产品|SKU|sku)?",
@@ -412,10 +452,10 @@ def _deterministic_window_sales_topn_request(question: str) -> "Optional[Dict]":
     if dates:
         return {"start_date": dates[0], "end_date": dates[-1], "limit": limit}
 
-    m = _re.search(r"(?:近|最近)\s*(\d+)\s*天", q)
+    m = _REL_WINDOW_RE.search(q)
     if m:
-        n = int(m.group(1))
-        if 1 <= n <= 3650:
+        n = _window_days_token(m.group(1) or m.group(2))
+        if n and 1 <= n <= 3650:
             return {"relative_days": n, "limit": limit}
     return None
 

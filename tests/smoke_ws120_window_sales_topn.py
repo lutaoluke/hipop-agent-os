@@ -209,6 +209,44 @@ def test_chat_relative_30d_stale_fails_closed() -> None:
     print("    最近30天(陈旧 >3天) → fail-closed, no stale ranking (WS-134 wall kept)")
 
 
+def test_router_parses_paraphrased_windows() -> None:
+    """验门人 round-2 红队：『近30天』的自然同义写法都必须被结构化识别为窗口（relative_days），
+    不能只钉住『最近30天』一种写法（否则换说法就落回 sales_30d 固定桶）。"""
+    from hipop.server._deterministic_routes import _deterministic_window_sales_topn_request as R
+    cases = {
+        "过去30天 KSA 销量最高 3 个 SKU": (30, 3),
+        "近三十天 KSA 销量最高 3 个 SKU": (30, 3),
+        "近30日 KSA 销量最高 3 个 SKU": (30, 3),
+        "这30天 KSA 销量最高 5 个 SKU": (30, 5),
+        "过往7天 KSA 销量最高的商品": (7, 10),
+        "前30天 KSA 销量最高 3 个 SKU": (30, 3),   # 「前30天」=窗口；limit 来自「3 个」非 30
+        "最近九十天 KSA 卖得最好的 SKU": (90, 10),
+    }
+    for q, (days, lim) in cases.items():
+        r = R(q)
+        assert r and r.get("relative_days") == days and r.get("limit") == lim, \
+            f"{q!r} → {r!r}, 期望 relative_days={days}, limit={lim}"
+    # 反例：无时间窗的裸 TopN 不能被窗口路由抢走（仍归 list_products）
+    assert R("KSA 销量最高的3个商品") is None, "无时间窗裸 TopN 不应进窗口路由"
+    assert R("KSA 销量最高的3个商品") is None
+    print("    paraphrased windows (过去/近三十/30日/这/过往/前N天/九十天) all → relative_days")
+
+
+def test_chat_paraphrased_30d_routes_to_window_tool() -> None:
+    """端到端复现红队两条打回 case：换同义写法仍必须走 top_sales_by_window，不落 list_products。"""
+    for q in ("过去30天 KSA 销量最高 3 个 SKU", "近三十天 KSA 销量最高 3 个 SKU"):
+        with patch.object(_provider, "get_provider", return_value="smoke"), \
+             patch.object(_provider, "chat_with_tools",
+                          side_effect=AssertionError("must not call provider")):
+            result = _agent.chat([{"role": "user", "content": q}], SCOPE)
+        assert result.get("tools_used") == ["top_sales_by_window"], f"{q!r} → {result.get('tools_used')}"
+        assert result.get("judge_method") == "deterministic_window_sales_topn_router", f"{q!r}"
+        reply = result.get("reply") or ""
+        assert _d(0) in reply and _d(29) in reply and "窗口销量" in reply, f"{q!r} → {reply!r}"
+        assert "wf2_sku.sales_30d" not in reply, f"{q!r} 仍回退到固定桶口径: {reply!r}"
+    print("    过去30天 / 近三十天 → top_sales_by_window（不落 sales_30d 固定桶）")
+
+
 def main() -> None:
     _setup_db()
     test_tool_window_topn_recomputable()
@@ -218,7 +256,9 @@ def main() -> None:
     test_chat_explicit_window_routes_to_tool()
     test_chat_relative_30d_routes_to_window_tool_fresh()
     test_chat_relative_30d_stale_fails_closed()
-    print("\n7/7 passed (WS-120 window sales TopN)")
+    test_router_parses_paraphrased_windows()
+    test_chat_paraphrased_30d_routes_to_window_tool()
+    print("\n9/9 passed (WS-120 window sales TopN)")
 
 
 if __name__ == "__main__":
