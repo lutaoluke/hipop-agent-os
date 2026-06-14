@@ -1131,6 +1131,145 @@ def check_freshness_coverage(store: str, domain: str, target_date: Optional[str]
     }
 
 
+# ── WS-120 [T07]：指定日期窗口销量 TopN（从 wf2_orders 逐单现算）─────────────
+def latest_order_business_date(store: str) -> str:
+    """wf2_orders 里该 store 最新订单业务日（YYYY-MM-DD），无数据返 ""。
+
+    『近N天』口径用它做锚点倒推（按最新已覆盖业务日，而非系统当前日期硬算）。
+    """
+    tid, alias = _resolve_entity_for_store(store)
+    if not alias:
+        return ""
+    v = _scalar(
+        "SELECT MAX(order_date) FROM wf2_orders WHERE tenant_id=? AND entity_alias=?",
+        (tid, alias),
+    )
+    return str(v)[:10] if v else ""
+
+
+def top_sales_by_window(
+    store: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 10,
+    listing: str = "all",
+) -> Dict:
+    """WS-120 [T07]：从 wf2_orders 按 order_date 窗口现算 SKU 销量 TopN（确定性，无 LLM）。
+
+    为什么不用 wf2_sku.sales_30d：那是固定 30 天桶（aggregate_sales_v2 以 ingest 当天
+    系统日 as_of=None 倒推算），拿它冒充任意指定日期窗口就是占位假数据。这里按调用方
+    给的真实 [start_date, end_date] 现算，销量口径与 aggregate_sales_v2 完全一致：
+
+        window_sales = COUNT(*) FROM wf2_orders
+            WHERE is_cancelled=0 AND order_date 在 [start_date, end_date]
+
+    覆盖判定（fail-closed，防"窗口缺数仍返回排名"死法）：窗口**两端**都必须落在订单
+    数据区间内 —— 终点缺 → window_end_not_covered；起点缺 → window_start_not_covered；
+    任一端缺即 available=False，不返回任何排名。
+
+    listing: "all"|"listed"|"unlisted"。默认 "all"，实际 filter 在返回值 filter 字段回传。
+    无业务写。SQL 用 ? 占位（PG 包装层 ? → %s），不含 SQLite 专有函数。
+    """
+    tid, alias = _resolve_entity_for_store(store)
+    limit = max(1, min(int(limit or 10), 50))
+    listing = (listing or "all").lower()
+    if listing not in ("all", "listed", "unlisted"):
+        listing = "all"
+
+    base = {
+        "store": (store or "").upper(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "limit": limit,
+        "filter": f"listing={listing}",
+        "items": [],
+    }
+
+    def _valid(d):
+        try:
+            datetime.date.fromisoformat(str(d)[:10]); return True
+        except Exception:
+            return False
+    if not (_valid(start_date) and _valid(end_date)) or str(start_date)[:10] > str(end_date)[:10]:
+        return {**base, "available": False, "reason": "bad_window",
+                "coverage": {"min_order_date": "", "max_order_date": "", "order_rows": 0}}
+
+    if not alias:
+        return {**base, "available": False, "reason": "no_order_data",
+                "coverage": {"min_order_date": "", "max_order_date": "", "order_rows": 0}}
+
+    cov = _fetch(
+        "SELECT MIN(order_date) AS mn, MAX(order_date) AS mx, COUNT(*) AS n "
+        "FROM wf2_orders WHERE tenant_id=? AND entity_alias=? AND order_date IS NOT NULL",
+        (tid, alias),
+    )[0]
+    min_od = (str(cov.get("mn"))[:10] if cov.get("mn") else "")
+    max_od = (str(cov.get("mx"))[:10] if cov.get("mx") else "")
+    coverage = {"min_order_date": min_od, "max_order_date": max_od, "order_rows": cov.get("n") or 0}
+
+    if not max_od or not min_od:
+        return {**base, "available": False, "reason": "no_order_data", "coverage": coverage}
+    s10, e10 = str(start_date)[:10], str(end_date)[:10]
+    if max_od < e10:
+        return {**base, "available": False, "reason": "window_end_not_covered", "coverage": coverage}
+    if min_od > s10:
+        return {**base, "available": False, "reason": "window_start_not_covered", "coverage": coverage}
+
+    where = ["o.tenant_id=?", "o.entity_alias=?", "o.is_cancelled=0",
+             "o.order_date >= ?", "o.order_date <= ?"]
+    params = [tid, alias, s10, e10]
+    if listing == "listed":
+        where.append("s.is_listed=1")
+    elif listing == "unlisted":
+        where.append("(s.is_listed=0 OR s.is_listed IS NULL)")
+    where_sql = " AND ".join(where)
+
+    rows = _fetch(
+        f"""
+        SELECT o.partner_sku AS partner_sku,
+               COALESCE(s.title, '') AS title,
+               s.is_listed AS is_listed,
+               COUNT(*) AS window_sales
+        FROM wf2_orders o
+        LEFT JOIN wf2_sku s
+          ON s.tenant_id = o.tenant_id
+         AND s.entity_alias = o.entity_alias
+         AND s.partner_sku = o.partner_sku
+        WHERE {where_sql}
+        GROUP BY o.partner_sku, s.title, s.is_listed
+        ORDER BY window_sales DESC, o.partner_sku ASC
+        LIMIT ?
+        """,
+        tuple(params) + (limit,),
+    )
+    items = [{
+        "partner_sku": r["partner_sku"],
+        "title": r["title"] or "",
+        "is_listed": bool(r["is_listed"]),
+        "window_sales": int(r["window_sales"] or 0),
+    } for r in rows]
+
+    evidence = None
+    if items:
+        from hipop.scripts.evidence_contract import (
+            build_query_evidence as _build_query_evidence,
+            SOURCE_CACHE as _SRC_CACHE,
+        )
+        evidence = _build_query_evidence(
+            source=_SRC_CACHE,
+            fetched_at=max_od,
+            coverage=(
+                f"{base['store']} wf2_orders 按 order_date 现算窗口 {s10}~{e10} 销量 "
+                f"COUNT(is_cancelled=0) DESC Top{limit}；listing={listing}；"
+                f"订单覆盖 {min_od}~{max_od}"
+            ),
+            context="top_sales_by_window",
+        )
+
+    return {**base, "available": True, "reason": None,
+            "coverage": coverage, "items": items, "evidence": evidence}
+
+
 # ── 今日总览（顶部数据）──────────────────────────────────
 def get_today(store: str) -> Dict:
     tid, alias = _resolve_entity_for_store(store)

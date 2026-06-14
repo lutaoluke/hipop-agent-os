@@ -360,6 +360,142 @@ def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
     return "\n".join(lines)
 
 
+_WINDOW_ISO_DATE_RE = _re.compile(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b")
+_WINDOW_CN_DATE_RE = _re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日?")
+
+
+def _deterministic_window_sales_topn_request(question: str) -> "Optional[Dict]":
+    """WS-120 [T07]：识别『指定日期窗口 / 近N天』销量 TopN —— 与 WS-148 裸 TopN 互斥且优先。
+
+    显式起止日期窗口、以及『近/最近 N 天』(含 N=30) 都走 top_sales_by_window，按 wf2_orders
+    逐单现算并以最新订单业务日倒推；无时间窗的裸 TopN（如『销量最高的3个商品』）仍由
+    _deterministic_product_sales_topn_request 走 list_products/sales_30d 固定桶。
+
+    返回 {"start_date","end_date","limit"} | {"relative_days":N,"limit":L} | None。
+    """
+    import datetime as _dt
+    q = question or ""
+    if not any(k in q for k in ("销量", "卖", "热销", "畅销")):
+        return None
+    if any(x in q for x in ("库存", "补货", "货单", "物流")):
+        return None
+    if any(x in q for x in ("180天", "历史", "总销量")):
+        return None
+    has_top_intent = any(x in q for x in (
+        "最高", "最多", "排行", "排名", "Top", "top", "TOP", "前",
+        "热销", "畅销", "最好卖", "卖得最好", "卖得最多",
+    ))
+    if not has_top_intent:
+        return None
+
+    limit = 10
+    for pat in (
+        r"(?:Top|top|TOP)\s*(\d+)",
+        r"前\s*(\d+)",
+        r"最高的?\s*(\d+)",
+        r"最多的?\s*(\d+)",
+        r"(\d+)\s*(?:个|名|款|条)\s*(?:商品|产品|SKU|sku)?",
+    ):
+        m = _re.search(pat, q)
+        if m:
+            limit = max(1, min(int(m.group(1)), 50))
+            break
+
+    dates = []
+    for rx in (_WINDOW_ISO_DATE_RE, _WINDOW_CN_DATE_RE):
+        for mm in rx.finditer(q):
+            try:
+                dates.append(_dt.date(int(mm.group(1)), int(mm.group(2)), int(mm.group(3))).isoformat())
+            except ValueError:
+                continue
+    dates = sorted(set(dates))
+    if dates:
+        return {"start_date": dates[0], "end_date": dates[-1], "limit": limit}
+
+    m = _re.search(r"(?:近|最近)\s*(\d+)\s*天", q)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 3650:
+            return {"relative_days": n, "limit": limit}
+    return None
+
+
+def _format_window_sales_topn_reply(store: str, tool_result: dict) -> str:
+    """WS-120：渲染窗口 TopN 结果。缺数/陈旧 fail-closed 明确报，不返排名（承重墙）。"""
+    if not isinstance(tool_result, dict):
+        return f"{store} 指定窗口销量 TopN 暂时不可用。"
+    if tool_result.get("error"):
+        return f"{store} 指定窗口销量 TopN 暂时不可用：{tool_result.get('error')}"
+    # 近N天时效门 fail-closed（最新订单 >3 天）—— 复用 WS-134 message 口径
+    if tool_result.get("fail_closed"):
+        return tool_result.get("message") or (
+            f"{store} 近N天销量 TopN 数据超过 3 天未更新，不能出数。请先刷新销量后重问。")
+    start = tool_result.get("start_date") or "?"
+    end = tool_result.get("end_date") or "?"
+    if not tool_result.get("available"):
+        reason = tool_result.get("reason")
+        cov = tool_result.get("coverage") or {}
+        latest = cov.get("max_order_date") or ""
+        earliest = cov.get("min_order_date") or ""
+        if reason == "bad_window":
+            return f"{store} 销量窗口 {start}~{end} 不合法（请用 YYYY-MM-DD 且起始 ≤ 结束）。"
+        if reason == "no_order_data":
+            return f"{store} 暂无订单数据，无法计算 {start}~{end} 的窗口销量 TopN。"
+        if reason == "window_start_not_covered":
+            tail = f"（订单数据从 {earliest} 起）" if earliest else ""
+            return (f"数据不足：{store} 销量窗口起点 {start} 早于已有订单数据{tail}，前半段缺数，"
+                    f"按规则不出排名。请缩小窗口起点或补齐更早订单后重问。")
+        tail = f"，当前订单最新到 {latest}" if latest else ""
+        return (f"数据不足：{store} 销量窗口终点 {end} 暂未被订单数据覆盖{tail}，按规则不出排名。"
+                f"如需该窗口请先刷新/补齐订单数据后重问。")
+    items = tool_result.get("items") or []
+    if not items:
+        return f"{store} 销量窗口 {start}~{end} 内暂无成交 SKU。"
+    from hipop.scripts.evidence_contract import (
+        assert_query_evidence as _assert_query_evidence,
+        render_evidence_suffix as _render_evidence_suffix,
+        ContractViolation as _ContractViolation,
+    )
+    try:
+        evidence = _assert_query_evidence(tool_result.get("evidence"), context="top_sales_by_window_reply")
+    except _ContractViolation as _e:
+        return (f"{store} 销量窗口 {start}~{end} TopN 缺少可追溯证据（来源/取数时间/口径），"
+                f"按规则不出数。详情：{_e}")
+    lines = [f"{store} {start} ~ {end} 销量最高的 {len(items)} 个 SKU：", ""]
+    for i, item in enumerate(items[:50], 1):
+        sku = item.get("partner_sku") or "?"
+        title = (item.get("title") or "").strip()
+        name = f"{sku}（{title}）" if title else sku
+        lines.append(f"{i}. **{name}**：窗口销量 {_fmt_int(item.get('window_sales'))}")
+    lines.append("")
+    lines.append(_render_evidence_suffix(evidence))
+    return "\n".join(lines)
+
+
+def _window_sales_topn_route(question: str, scope: dict, exec_tool, provider_name: str = "?"):
+    """WS-120：指定日期窗口 / 近N天 销量 TopN 的完整确定性路由（返回 chat 响应 dict 或 None）。
+
+    放在本非锁模块里、agent.py 只留一行接线 —— 遵守 agent.py 防回潮行数棘轮（WS-165/167）。
+    top_sales_by_window 结果无 references 键，故 references 固定 []。
+    """
+    win_req = _deterministic_window_sales_topn_request(question)
+    if win_req is None:
+        return None
+    store = (scope.get("store") or "KSA").upper()
+    tool_args = {"store": store, "limit": win_req["limit"], "listing": "all"}
+    tool_args.update({k: v for k, v in win_req.items() if k != "limit"})
+    tool_result = exec_tool("top_sales_by_window", tool_args, user=scope)
+    reply = _format_window_sales_topn_reply(store, tool_result)
+    return {
+        "reply": reply, "clean_reply": reply, "references": [],
+        "action_id": None, "tools_used": ["top_sales_by_window"], "tag": "查询",
+        "workflow_task": None, "provider": provider_name,
+        "confidence": 1.0 if not (tool_result or {}).get("error") else 0.8,
+        "judge_method": "deterministic_window_sales_topn_router",
+        "hallucination_warnings": None,
+    }
+
+
 def _format_total_stock_topn_reply(store: str, tool_result: dict) -> str:
     if not isinstance(tool_result, dict):
         return f"{store} 库存查询暂不可用，请稍后重试。"

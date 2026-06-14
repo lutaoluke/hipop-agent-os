@@ -50,6 +50,7 @@ TOOL_PERMISSION = {
     "compute_air_freight_roi":"view_replenish",
     "data_health_check":      "view_dashboard",
     "list_products":          "view_sku",
+    "top_sales_by_window":    "view_sku",
     "update_alert_status":    "update_alert",
     "run_workflow":           "trigger_workflow",
     "export_table":           "view_dashboard",

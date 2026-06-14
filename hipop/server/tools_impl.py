@@ -578,6 +578,61 @@ def tool_data_health_check(store: str) -> Dict:
             {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} MAX(updated_at)"},
         ],
     }
+
+
+def tool_top_sales_by_window(store: str, start_date: Optional[str] = None,
+                             end_date: Optional[str] = None, limit: int = 10,
+                             listing: str = "all",
+                             relative_days: Optional[int] = None) -> Dict:
+    """WS-120 [T07]：指定日期窗口销量 TopN（从 wf2_orders 逐单现算，非 sales_30d 固定桶）。
+
+    - 显式窗口（start_date/end_date）：按该历史窗口现算，只做两端覆盖判定，不加时效门
+      （历史窗口只要数据齐就答）。
+    - 相对窗口（relative_days，如『近30天』）：以 wf2_orders 最新订单业务日倒推
+      end=latest、start=latest-(N-1)，并复用 WS-134 同一时效门 decide_freshness——
+      最新订单日距今 >3 天即 fail_closed 不出数（不拿陈旧名次糊弄）。
+    确定性 SQL/口径全在 data.top_sales_by_window；这里只做相对解析 + 时效门 + 透传。
+    """
+    import datetime as _dt
+    freshness_decision = None
+    if relative_days is not None:
+        n = max(1, int(relative_days))
+        latest = agent._data.latest_order_business_date(store)
+        if not latest:
+            return {"store": (store or "").upper(), "available": False,
+                    "reason": "no_order_data", "items": [], "relative_days": n,
+                    "filter": f"listing={listing}",
+                    "coverage": {"min_order_date": "", "max_order_date": "", "order_rows": 0}}
+        end_date = latest
+        start_date = (_dt.date.fromisoformat(latest) - _dt.timedelta(days=n - 1)).isoformat()
+        from hipop.scripts.freshness_gate import decide_freshness
+        freshness_decision = decide_freshness(
+            live_ok=False,
+            live_error="窗口销量 TopN 使用最近一次成功的统一销量快照",
+            cache_available=True,
+            cache_fetched_at=latest,
+            operator_cache_consent=True,
+            cache_requires_consent=False,
+            subject=f"{(store or '').upper()} 近{n}天销量 TopN",
+        )
+        if not freshness_decision.get("can_output_number"):
+            return {"store": (store or "").upper(), "available": False,
+                    "reason": "stale_snapshot", "fail_closed": True,
+                    "message": freshness_decision.get("message"),
+                    "freshness_decision": freshness_decision,
+                    "start_date": start_date, "end_date": end_date,
+                    "relative_days": n, "filter": f"listing={listing}", "items": [],
+                    "coverage": {"min_order_date": "", "max_order_date": latest, "order_rows": 0}}
+
+    result = agent._data.top_sales_by_window(
+        store, start_date, end_date, limit=limit, listing=listing)
+    if relative_days is not None:
+        result["relative_days"] = int(relative_days)
+        if freshness_decision is not None:
+            result["freshness_decision"] = freshness_decision
+    return result
+
+
 def tool_list_products(store: str, listing: str = "all",
                        sales_only: bool = False, limit: int = 0) -> Dict:
     tid = agent._get_tenant()

@@ -102,7 +102,7 @@ def verify_tools_registry_manifest_contract() -> dict:
         "run_workflow", "query_sku_live", "query_order_live",
         "tenant_notes_get", "tenant_notes_append", "confirm_proposal",
         "query_1688_similar", "capture_feedback", "explain_status_enum",
-        "query_stock_split", "total_stock_topn",
+        "query_stock_split", "total_stock_topn", "top_sales_by_window",
     }
     actual_tool_names = set(tools.keys())
     if actual_tool_names != expected_tool_names:
@@ -165,7 +165,7 @@ def verify_tools_registry_manifest_contract() -> dict:
         if agent.TOOLS != projected_tools:
             failures.append("agent.TOOLS is not equal to tools_registry.load_tools_from_yaml()")
         if set(projected_by_name) != expected_tool_names:
-            failures.append("projected Anthropic tool names do not match the expected 23-tool set")
+            failures.append("projected Anthropic tool names do not match the expected 24-tool set")
         for name in expected_tool_names & set(projected_by_name):
             projected = projected_by_name[name]
             manifest_spec = tools.get(name) or {}

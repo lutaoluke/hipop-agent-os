@@ -255,6 +255,55 @@ tools:
     impl: tool_list_products
     smoke:
     - tests/smoke_governance.py::test_tools_registry_manifest_is_single_source_of_truth
+  top_sales_by_window:
+    description: |
+      指定日期窗口销量 TopN：从 wf2_orders 按 order_date 逐单现算（COUNT，is_cancelled=0），不是
+      wf2_sku.sales_30d 固定桶。用户问『某段时间/具体起止日期/近N天 的销量最高 N 个 SKU』时必须调本工具
+      （如『2026-05-07 到 2026-06-05 销量最高 3 个』『最近30天销量前10』）。start_date/end_date 用
+      YYYY-MM-DD；relative_days 传 N 表示『近N天』（按最新订单业务日倒推，且最新订单距今 >3 天则拒答）。
+      窗口任一端未被订单数据覆盖时返 available=false + reason，按缺数明确告知，禁止补数或返回排名。
+      items 已按 window_sales DESC 排好，不要由模型自排或补数字。
+    input_schema:
+      type: object
+      properties:
+        store:
+          type: string
+          enum:
+          - KSA
+          - UAE
+        start_date:
+          type: string
+          description: 窗口起始业务日 YYYY-MM-DD（与 end_date 成对；relative_days 模式可省）
+        end_date:
+          type: string
+          description: 窗口结束业务日 YYYY-MM-DD（含）
+        relative_days:
+          type: integer
+          description: 『近N天』相对窗口；给定则忽略 start/end，按最新订单业务日倒推 N 天
+        limit:
+          type: integer
+          default: 10
+          description: 返回 TopN 行数
+        listing:
+          type: string
+          enum:
+          - all
+          - listed
+          - unlisted
+          default: all
+      required:
+      - store
+    access: read
+    risk_level: low
+    required_role:
+    - owner
+    - manager
+    - ops
+    - forwarder
+    data_scope: tenant
+    impl: tool_top_sales_by_window
+    smoke:
+    - tests/smoke_ws120_window_sales_topn.py
   export_table:
     description: "用户要求『导出/下载/给我表格/打成表格/Excel』时调本工具。**真生成 xlsx 文件** 到 ~/hipop/exports/，返 {download_url, row_count, filename}。返完后用\
       \ markdown 链接 `[文件名](download_url)` 给用户。\n**禁** 自己编『下载链接』；**禁** 说『系统只能返 X 个示例』(filtered_count 才是真总数，items 由 limit 控制)。\n\

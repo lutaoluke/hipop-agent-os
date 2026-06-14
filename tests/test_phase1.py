@@ -396,17 +396,18 @@ def test_chat_query_sku():
 
 
 def test_chat_list_products_sales_topn():
-    """WS-148: 近30天销量 TopN 必须走 list_products，且回复带来源/时间/口径。"""
+    """WS-148/WS-120：**裸**销量 TopN（无时间窗）走 list_products/sales_30d 固定桶；
+    带时间窗的『近30天/近N天』已由 WS-120 改走 top_sales_by_window（见 smoke_chat e2e）。"""
     s, b = _post("/api/chat", {
-        "messages": [{"role": "user", "content": "KSA 近30天销量最高的3个商品"}],
+        "messages": [{"role": "user", "content": "KSA 销量最高的3个商品"}],
         "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营"},
     }, timeout=90)
     d = json.loads(b)
     assert s == 200 and d["reply"]
     assert d.get("tools_used") == ["list_products"], \
-        f"TopN 销量问题必须确定性调用 list_products，实际 tools_used={d.get('tools_used')}"
+        f"裸 TopN（无时间窗）必须确定性调用 list_products，实际 tools_used={d.get('tools_used')}"
     assert d.get("judge_method") == "deterministic_product_sales_topn_router", \
-        f"TopN 销量问题不应走 LLM 自由排序，judge_method={d.get('judge_method')}"
+        f"裸 TopN 不应走 LLM 自由排序，judge_method={d.get('judge_method')}"
     reply = d["reply"]
     assert "来源" in reply and "wf2_sku.sales_30d" in reply, \
         f"TopN 回复必须含来源/口径证据: {reply[:300]}"
