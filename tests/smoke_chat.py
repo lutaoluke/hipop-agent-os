@@ -385,8 +385,19 @@ CASES: List[Case] = [
         must_contain=[_PRODUCT_TOTAL_RE, _PRODUCT_SPLIT_RE],
     ),
     Case(
-        name="WS-148 近30天销量 TopN（list_products 确定性路由 + 证据）",
+        # WS-120 choice A：带时间窗的 TopN（含『近30天』）改走 top_sales_by_window，按 wf2_orders
+        # 逐单现算 + 最新订单业务日倒推（不再用 sales_30d 固定桶冒充）。
+        name="WS-120 近30天销量 TopN（top_sales_by_window 倒推现算）",
         question="KSA 近30天销量最高的3个商品",
+        must_use_tools=["top_sales_by_window"],
+        # 路由是关键断言（证明 choice A 在真服务器生效）；出数/缺数依 live 订单新鲜度而定，
+        # 两条路径都含「销量」。逐单现算 vs 陈旧 fail-closed 的严格双路覆盖见 smoke_ws120（离线确定性）。
+        must_contain=[r"销量"],
+    ),
+    Case(
+        # 裸 TopN（无时间窗）仍走 list_products/sales_30d 固定桶 —— WS-148 本职。
+        name="WS-148 裸销量 TopN（无时间窗 → list_products 固定桶 + 证据）",
+        question="KSA 销量最高的3个商品",
         must_use_tools=["list_products"],
         must_contain=[r"近\s*30\s*天销量", r"来源", r"202\d-\d{2}-\d{2}", r"wf2_sku\.sales_30d"],
     ),

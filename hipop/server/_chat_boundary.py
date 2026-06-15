@@ -55,8 +55,12 @@ TASK_DONE_TOOLS: frozenset = frozenset({
     "api_task_status",
 })
 
+# 注意：done_unverified 故意**不在**此集合里。done_unverified = verifier 没通过
+# （结果未达校验阈值，多半上游缺数据 / 写入 0 行），它不是「已完成」证据。把它当
+# done 会让「数据已刷新完成 / 任务已完成」这类声明在任务实际未验证时被放行 —— 正是
+# T38 的 UI 报成功而业务失败的假活。只有真正 verified done / success 才算完成证据。
 _TASK_DONE_STATUSES: frozenset = frozenset({
-    "done", "done_unverified", "success", "complete", "completed",
+    "done", "success", "complete", "completed",
 })
 
 # Structural result/completion claims that require task-done evidence.
@@ -147,6 +151,35 @@ _QUERY_ACTION_SAFE_RE = re.compile(
 # only exempts its own span; it cannot wash out a later result claim.
 _QUERY_STATUS_SAFE_RE = re.compile(r"(?P<claim>一切正常)")
 
+# WS-146：客观时效事实（freshness fact），不是「本轮执行了某动作」的完成声明：
+#   「数据已更新到 2026-06-09」「库存同步至 2026-05-31」「更新日期：2026-06-09」。
+# 判别锚点 =（更新/刷新/同步/截至）+（到/至/于）+ **具体日期**，且不带完成态「了/完成/完毕/
+# 生效」。这样既放过 freshness 客观陈述（熔断 round-1 误删的根因点），又不放过「数据更新到
+# 最新了 / 库存同步到最新了」这类带「了」无具体日期的完成声明（仍被结构门拦）。
+_FRESHNESS_DATE_RE = r"(?:\d{4}-\d{2}-\d{2}|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}月\d{1,2}[日号])"
+_FRESHNESS_FACT_SAFE_RE = re.compile(
+    r"(?P<claim>"
+    + r"[^\s，。！？!?；;\n]{0,8}?"                       # 可选主语前缀（库存数据/最新销量…）
+    + r"(?:已|已经)?(?:更新|刷新|同步|截至)"
+    + r"[^，。！？!?；;\n]{0,4}?(?:到|至|于|为|是)?\s*" + _FRESHNESS_DATE_RE
+    + r"|(?:更新|数据|库存|销量|订单)(?:日期|时间)[:：]?\s*" + _FRESHNESS_DATE_RE
+    + r")"
+)
+
+# WS-146 B方案：fake-friend —— 完成/启动体黏在**非任务词**上（趋势词 / 非任务技术名词），不是
+# 「本轮执行了后台任务」的完成声明（验门人 route-b 点名：完成度已开始改善 / 拉取中文字段已完成映射）。
+# 用**闭集语义类**（趋势词闭集 + 非任务技术名词闭集，领域建模而非穷举措辞）做安全 span，避免真实
+# 路径上这些句子被结构完成门误挂 banner。趋势词闭集与 _exec_slot_contract 的执行动作闭集互斥，
+# 真实「数据已刷新/任务已完成」不在此集、仍被拦。
+_TREND_WORDS = r"向好|好转|改善|回升|回暖|提升|走高|向上|提高|增长|下滑|走低|下降"
+_NONTASK_TECH = r"映射|字段|结构|索引|分析|统计|建模|分类|聚类|解析|归一|画像"
+_FAKE_FRIEND_SAFE_RE = re.compile(
+    r"(?P<claim>"
+    + r"(?:趋势|环比|同比|整体|持续|逐渐)?(?:" + _TREND_WORDS + r")"
+    + r"|(?:已经?|刚刚?)?(?:开始|完成|完毕)(?:" + _TREND_WORDS + r"|" + _NONTASK_TECH + r")"
+    + r")"
+)
+
 
 def _span_within(span: tuple, candidates: list) -> bool:
     start, end = span
@@ -166,17 +199,37 @@ def _match_span(match) -> tuple:
 
 def _query_safe_spans(reply: str, include_status: bool) -> list:
     spans = [_match_span(m) for m in _QUERY_ACTION_SAFE_RE.finditer(reply)]
+    # WS-146：时效客观事实（更新/同步 到 <具体日期>）任何时候都豁免（不依赖查询证据）。
+    spans.extend(_match_span(m) for m in _FRESHNESS_FACT_SAFE_RE.finditer(reply))
+    # WS-146 B方案：fake-friend（完成/启动体黏在趋势词/非任务技术名词上）也豁免。
+    spans.extend(_match_span(m) for m in _FAKE_FRIEND_SAFE_RE.finditer(reply))
     if include_status:
         spans.extend(_match_span(m) for m in _QUERY_STATUS_SAFE_RE.finditer(reply))
     return spans
 
 
+# WS-146 B方案：指标名词后缀 —— 「完成度 / 成功率 / 完成率 / 达成率 / 完成量」里的「完成/成功/
+# 达成」是**指标名词的一部分**，不是任务完成态。带业务前缀时（库存刷新完成度…）结构完成门会把
+# 「库存刷新完成」整段当完成声明误报（claim span 从主语起，安全 span 盖不住），故在匹配层用
+# 「完成/成功/达成 紧跟 度/率/比/值/量/数/分」做守卫跳过。
+_METRIC_SUFFIX = "度率比值量数分点位额次"
+_METRIC_TAIL = ("完成", "成功", "达成", "完毕")
+
+
 def _has_structural_result_claim(reply: str, safe_spans: list) -> bool:
     """Return True when reply contains a non-query-safe result/completion claim."""
+    n = len(reply)
     for pattern in _STRUCTURAL_RESULT_CLAIM_RES:
         for match in pattern.finditer(reply):
-            if not _span_within(_match_span(match), safe_spans):
-                return True
+            span = _match_span(match)
+            if _span_within(span, safe_spans):
+                continue
+            end = span[1]
+            # 指标名词守卫：匹配末尾是「完成/成功/达成」且紧跟指标后缀（度/率/…）→ 是
+            # 「完成度/成功率」名词成分，非完成态，跳过。
+            if end < n and reply[end] in _METRIC_SUFFIX and reply[max(0, end - 2):end] in _METRIC_TAIL:
+                continue
+            return True
     return False
 
 
@@ -223,6 +276,31 @@ def _iter_status_values(entry: dict):
             yield text
 
 
+# 任务级（非子步骤）非成功终态。一旦某条 readback 的 task/result 级状态落在这里，
+# 该条 readback 就不算「完成证据」——哪怕它的 events 列表里有子步骤 status=done
+# （如 get_task_with_events 会带「初始化 done」那一步）。done_unverified = verifier
+# 没过，绝不能当完成；这是 T38「UI 报成功而业务失败」在 boundary 门一侧的堵口。
+_TASK_NONSUCCESS_TERMINAL: frozenset = frozenset({
+    "done_unverified", "error", "failed", "cancelled",
+})
+
+
+def _entry_task_terminal_is_nonsuccess(entry: dict) -> bool:
+    """只看 task/result 级（不看子步骤 events）的状态是否落在非成功终态。"""
+    candidates = [entry.get("state"), entry.get("status")]
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    candidates.extend([result.get("state"), result.get("status")])
+    for source in (entry, result):
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        candidates.extend([task.get("state"), task.get("status")])
+    for value in candidates:
+        if value is None:
+            continue
+        if str(value).strip().lower() in _TASK_NONSUCCESS_TERMINAL:
+            return True
+    return False
+
+
 def _has_task_done_evidence(tool_log: list) -> bool:
     """Return True if tool_log contains explicit task-completion evidence.
 
@@ -232,9 +310,13 @@ def _has_task_done_evidence(tool_log: list) -> bool:
 
     run_workflow alone is NOT sufficient — it only proves task creation/trigger.
     Provider summaries that only contain result_keys are also NOT sufficient.
+    A readback whose TASK-level terminal state is done_unverified/error/failed is
+    NOT done-evidence, even if its events list carries a sub-step status=done.
     """
     for t in (tool_log or []):
         if t.get("name") not in TASK_DONE_TOOLS:
+            continue
+        if _entry_task_terminal_is_nonsuccess(t):
             continue
         if any(status in _TASK_DONE_STATUSES for status in _iter_status_values(t)):
             return True

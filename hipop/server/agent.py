@@ -331,29 +331,6 @@ def _utc_now_iso() -> str:
     import datetime as _dt
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Tool 派发 ─────────────────────────────────────────
 # ── 工具实现已外移到 tools_impl（WS-166）。agent.py 仅保留注册/分发/治理入口。
 # 重新导出工具实现名，保持 `agent.tool_*` 外部契约（api.py / 测试 / TOOL_FUNCS 投影）不变。
@@ -367,6 +344,7 @@ from .tools_impl import (
     tool_compute_air_freight_roi,
     tool_data_health_check,
     tool_list_products,
+    tool_top_sales_by_window,
     tool_export_table,
     tool_navigate_user_to,
     tool_notify_via_feishu,
@@ -393,6 +371,7 @@ TOOL_FUNCS = {
     "compute_air_freight_roi": tool_compute_air_freight_roi,
     "data_health_check": tool_data_health_check,
     "list_products": tool_list_products,
+    "top_sales_by_window": tool_top_sales_by_window,
     "export_table": tool_export_table,
     "navigate_user_to": tool_navigate_user_to,
     "notify_via_feishu": tool_notify_via_feishu,
@@ -1080,6 +1059,7 @@ from ._deterministic_routes import (  # WS-167: 确定性路由/formatter 外移
     _deterministic_export_request,
     _deterministic_multi_workflow_request,
     _deterministic_product_sales_topn_request,
+    _deterministic_window_sales_topn_request,
     _deterministic_products_count_request,
     _deterministic_readonly_reply,
     _deterministic_readonly_request,
@@ -1098,6 +1078,7 @@ from ._deterministic_routes import (  # WS-167: 确定性路由/formatter 外移
     _format_order_live_reply,
     _format_pct,
     _format_product_sales_topn_reply,
+    _format_window_sales_topn_reply,
     _format_products_count_reply,
     _format_replenishment_list_reply,
     _format_scope_overview_reply,
@@ -1105,8 +1086,10 @@ from ._deterministic_routes import (  # WS-167: 确定性路由/formatter 外移
     _format_stock_split_reply,
     _format_total_stock_topn_reply,
     _has_stock_refresh_intent,
+    _procurement_rate_rule_response,
     _stock_refresh_refusal_reply,
     _stock_refresh_refused,
+    _window_sales_topn_route,
 )
 
 
@@ -1820,6 +1803,9 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             "hallucination_warnings": None,
         }
 
+    if r := _procurement_rate_rule_response(question, _provider.get_provider()):
+        return r
+
     if _deterministic_erp_refresh_time_request(question):
         store = (scope.get("store") or "KSA").upper()
         reply = _format_erp_refresh_time_reply(store, _data.get_data_health(store))
@@ -1990,6 +1976,10 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
     direct_workflow = _deterministic_workflow_request(question)
     if direct_workflow:
         return _execute_workflow_route(direct_workflow, question, scope)
+
+    win_resp = _window_sales_topn_route(question, scope, _exec_tool, _provider.get_provider())
+    if win_resp is not None:  # WS-120：指定日期窗口 / 近N天 → top_sales_by_window（先于 WS-148 裸 TopN）
+        return win_resp
 
     direct_sales_topn_n = _deterministic_product_sales_topn_request(question)
     if direct_sales_topn_n is not None:

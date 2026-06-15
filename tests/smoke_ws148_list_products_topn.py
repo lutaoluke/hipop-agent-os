@@ -1,12 +1,11 @@
-"""WS-148 smoke: list_products is the deterministic 30d sales TopN path.
+"""WS-148 smoke: list_products is the deterministic **windowless** sales TopN path.
 
-FAIL before fix:
-  - chat("近30天销量最高的3个商品") falls through to the LLM/provider path.
-  - list_products returns sorted rows but does not declare the sales_30d TopN
-    sort/evidence contract.
+WS-120 choice A 后边界：带时间窗的 TopN（『近30天/近N天/指定日期窗口』）改走
+top_sales_by_window 逐单现算；list_products/sales_30d 固定桶只服务**无时间窗的裸
+TopN**（如『销量最高的3个商品』）。故本用例用裸 TopN 验证 list_products 路由仍在。
 
-PASS after fix:
-  - chat routes directly to list_products with limit=N.
+PASS:
+  - chat("销量最高的3个商品") routes directly to list_products with limit=N.
   - limit=N means TopN by sales_30d DESC.
   - rendered reply carries source/time/coverage evidence before showing numbers.
 """
@@ -17,7 +16,7 @@ import re
 import sqlite3
 import sys
 import tempfile
-from datetime import date, timedelta
+import datetime as _dt
 from unittest.mock import patch
 
 
@@ -40,7 +39,7 @@ TENANT = 1
 ALIAS = "hipop_ksa"
 SCOPE = {"tenant_id": TENANT, "current_user": "test", "current_role": "admin", "store": "KSA"}
 SCHEMA_V2 = os.path.join(REPO, "db", "schema_v2.sql")
-FRESH_AS_OF = (date.today() - timedelta(days=1)).isoformat()
+FIXTURE_AS_OF = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
 
 
 def _extract_create(table: str) -> str:
@@ -61,17 +60,17 @@ def _setup_db() -> None:
         (TENANT, ALIAS, "SA", "Noon", "HIPOP-NOON-KSA", 1),
     )
     rows = [
-        ("SKU-A", "PROD-A", "低销量商品", 1, 7, 90, 19.0, FRESH_AS_OF),
-        ("SKU-B", "PROD-B", "最高销量商品", 1, 30, 120, 29.0, FRESH_AS_OF),
-        ("SKU-C", "PROD-C", "第二销量商品", 1, 18, 180, 39.0, FRESH_AS_OF),
-        ("SKU-D", "PROD-D", "无销量商品", 0, None, 300, 49.0, FRESH_AS_OF),
+        ("SKU-A", "PROD-A", "低销量商品", 1, 7, 90, 19.0, FIXTURE_AS_OF),
+        ("SKU-B", "PROD-B", "最高销量商品", 1, 30, 120, 29.0, FIXTURE_AS_OF),
+        ("SKU-C", "PROD-C", "第二销量商品", 1, 18, 180, 39.0, FIXTURE_AS_OF),
+        ("SKU-D", "PROD-D", "无销量商品", 0, None, 300, 49.0, FIXTURE_AS_OF),
     ]
     conn.executemany(
         "INSERT INTO wf2_sku "
         "(tenant_id, entity_alias, partner_sku, product_id, title, is_listed, "
         "sales_30d, sales_180d, latest_price, as_of_date, imported_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        [(TENANT, ALIAS, *r, "2026-06-08T09:00:00") for r in rows],
+        [(TENANT, ALIAS, *r, f"{FIXTURE_AS_OF}T09:00:00") for r in rows],
     )
     conn.commit()
     conn.close()
@@ -89,7 +88,7 @@ def test_tool_limit_means_sales_30d_topn() -> None:
         f"limit=3 should return sales_30d Top3, got {result.get('items')!r}"
     )
     evidence = result.get("evidence") or {}
-    assert evidence.get("fetched_at") == FRESH_AS_OF, f"missing TopN evidence time: {evidence!r}"
+    assert evidence.get("fetched_at") == FIXTURE_AS_OF, f"missing TopN evidence time: {evidence!r}"
     assert "sales_30d" in evidence.get("coverage", ""), f"coverage must name sales_30d: {evidence!r}"
     print("    list_products limit=3 => sales_30d DESC Top3 with evidence")
 
@@ -98,19 +97,19 @@ def test_chat_sales_topn_routes_to_list_products() -> None:
     with patch.object(_provider, "get_provider", return_value="smoke"), \
          patch.object(_provider, "chat_with_tools", side_effect=AssertionError("WS-148 must not call provider")):
         result = _agent.chat(
-            [{"role": "user", "content": "KSA 近30天销量最高的3个商品"}],
+            [{"role": "user", "content": "KSA 销量最高的3个商品"}],
             SCOPE,
         )
 
     tools = result.get("tools_used") or []
     reply = result.get("reply") or ""
-    assert tools == ["list_products"], f"TopN sales query must use list_products only, got {tools}"
+    assert tools == ["list_products"], f"裸 TopN（无时间窗）must use list_products only, got {tools}"
     assert result.get("judge_method") == "deterministic_product_sales_topn_router", (
         f"wrong judge_method: {result.get('judge_method')!r}"
     )
     assert "SKU-B" in reply and "30" in reply, f"reply should include Top1 SKU-B sales_30d=30: {reply!r}"
     assert "SKU-D" not in reply, f"null-sales SKU-D must not appear in Top3: {reply!r}"
-    assert "来源" in reply and FRESH_AS_OF in reply and "sales_30d" in reply, (
+    assert "来源" in reply and FIXTURE_AS_OF in reply and "sales_30d" in reply, (
         f"reply must carry source/time/coverage evidence: {reply!r}"
     )
     print("    chat TopN sales query routes deterministically to list_products with evidence")

@@ -523,11 +523,76 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
         "stale_warning": None if stock_status.get("ready") else "库存数据未更新或不完整，当前补货结论偏保守",
         "references": base_refs,
     }
+def _erp_replenishment_live_source(sku: str, store: str, tenant_id: int,
+                                   entity_alias: str) -> Dict:
+    """Production authoritative source for T27 replenishment evidence.
+
+    Pulls the in-transit / pending-shipment split + ETA from the live ERP tool
+    (query_sku_live, never wf3 cache), and Noon/Dongguan stock + forecast from
+    the wf1/wf5/wf2 tables. ERP failures are propagated verbatim so the caller
+    blocks instead of turning cached zeros into a business conclusion.
+    """
+    erp = tool_query_sku_live(sku)
+    if not erp.get("ok"):
+        # Propagate the ERP failure (no_credentials / login_failed / fetch_error
+        # / no_orders) — replenishment_evidence treats !ok as blocked.
+        return erp
+
+    orders = erp.get("in_transit_orders") or []
+    # 待发: purchased but not yet shipped (no tracking_no).
+    pending_qty = sum((o.get("qty") or 0) for o in orders if not o.get("tracking_no"))
+    # 在途: shipped, has a tracking_no.
+    in_transit_qty = sum((o.get("qty") or 0) for o in orders if o.get("tracking_no"))
+    etas = [str(o.get("delivery_at"))[:10] for o in orders
+            if o.get("tracking_no") and o.get("delivery_at")]
+    eta = min(etas) if etas else None
+
+    stock = agent._data._fetch(
+        "SELECT noon_saleable_qty, dongguan_qty FROM wf1_stock "
+        "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (tenant_id, entity_alias, sku),
+    )
+    stock_row = stock[0] if stock else {}
+
+    forecast_daily = None
+    wf5 = agent._data._fetch(
+        "SELECT daily_rate FROM wf5_sales_cycle "
+        "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (tenant_id, entity_alias, sku),
+    )
+    if wf5 and wf5[0].get("daily_rate"):
+        forecast_daily = wf5[0].get("daily_rate")
+    else:
+        wf2 = agent._data._fetch(
+            "SELECT forecast_30d FROM wf2_sku "
+            "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+            (tenant_id, entity_alias, sku),
+        )
+        if wf2 and wf2[0].get("forecast_30d"):
+            forecast_daily = wf2[0].get("forecast_30d") / 30.0
+
+    return {
+        "ok": True,
+        "source": "ERP realtime + DB stock/forecast",
+        "fetched_at": erp.get("fetched_at") or "now",
+        "pending_shipment_qty": pending_qty,
+        "in_transit_qty": in_transit_qty,
+        "eta": eta,
+        "noon_saleable_qty": stock_row.get("noon_saleable_qty"),
+        "dongguan_qty": stock_row.get("dongguan_qty"),
+        "forecast_daily": forecast_daily,
+    }
+
+
 def tool_query_replenishment_sku(sku: str, store: str = "KSA") -> Dict:
     tid = agent._get_tenant()
     alias = agent._resolve_entity_alias(store) or ""
     from . import replenishment_evidence as _rep
-    return _rep.query_replenishment_sku(sku, store, tid, alias)
+    # Prefer a test-injected global source (set_replenishment_live_source) when
+    # present; otherwise wire the production ERP adapter so the live-required
+    # path never silently blocks for lack of a source.
+    live = _rep.get_replenishment_live_source() or _erp_replenishment_live_source
+    return _rep.query_replenishment_sku(sku, store, tid, alias, live_source=live)
 def tool_compute_air_freight_roi(sku: str, store: str, qty: int = 100) -> Dict:
     """简化模型: 海运 0.4 / 件, 空运 2.5 / 件, 海运 25d, 空运 5d."""
     tid = agent._get_tenant()
@@ -578,6 +643,61 @@ def tool_data_health_check(store: str) -> Dict:
             {"table": "wf3_logistics_hub_v2", "where": f"tenant_id={tid} MAX(updated_at)"},
         ],
     }
+
+
+def tool_top_sales_by_window(store: str, start_date: Optional[str] = None,
+                             end_date: Optional[str] = None, limit: int = 10,
+                             listing: str = "all",
+                             relative_days: Optional[int] = None) -> Dict:
+    """WS-120 [T07]：指定日期窗口销量 TopN（从 wf2_orders 逐单现算，非 sales_30d 固定桶）。
+
+    - 显式窗口（start_date/end_date）：按该历史窗口现算，只做两端覆盖判定，不加时效门
+      （历史窗口只要数据齐就答）。
+    - 相对窗口（relative_days，如『近30天』）：以 wf2_orders 最新订单业务日倒推
+      end=latest、start=latest-(N-1)，并复用 WS-134 同一时效门 decide_freshness——
+      最新订单日距今 >3 天即 fail_closed 不出数（不拿陈旧名次糊弄）。
+    确定性 SQL/口径全在 data.top_sales_by_window；这里只做相对解析 + 时效门 + 透传。
+    """
+    import datetime as _dt
+    freshness_decision = None
+    if relative_days is not None:
+        n = max(1, int(relative_days))
+        latest = agent._data.latest_order_business_date(store)
+        if not latest:
+            return {"store": (store or "").upper(), "available": False,
+                    "reason": "no_order_data", "items": [], "relative_days": n,
+                    "filter": f"listing={listing}",
+                    "coverage": {"min_order_date": "", "max_order_date": "", "order_rows": 0}}
+        end_date = latest
+        start_date = (_dt.date.fromisoformat(latest) - _dt.timedelta(days=n - 1)).isoformat()
+        from hipop.scripts.freshness_gate import decide_freshness
+        freshness_decision = decide_freshness(
+            live_ok=False,
+            live_error="窗口销量 TopN 使用最近一次成功的统一销量快照",
+            cache_available=True,
+            cache_fetched_at=latest,
+            operator_cache_consent=True,
+            cache_requires_consent=False,
+            subject=f"{(store or '').upper()} 近{n}天销量 TopN",
+        )
+        if not freshness_decision.get("can_output_number"):
+            return {"store": (store or "").upper(), "available": False,
+                    "reason": "stale_snapshot", "fail_closed": True,
+                    "message": freshness_decision.get("message"),
+                    "freshness_decision": freshness_decision,
+                    "start_date": start_date, "end_date": end_date,
+                    "relative_days": n, "filter": f"listing={listing}", "items": [],
+                    "coverage": {"min_order_date": "", "max_order_date": latest, "order_rows": 0}}
+
+    result = agent._data.top_sales_by_window(
+        store, start_date, end_date, limit=limit, listing=listing)
+    if relative_days is not None:
+        result["relative_days"] = int(relative_days)
+        if freshness_decision is not None:
+            result["freshness_decision"] = freshness_decision
+    return result
+
+
 def tool_list_products(store: str, listing: str = "all",
                        sales_only: bool = False, limit: int = 0) -> Dict:
     tid = agent._get_tenant()

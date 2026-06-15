@@ -42,6 +42,15 @@ def _load_ws149_sku_query_paths_smoke():
     return mod
 
 
+def _load_t48_procurement_rate_smoke():
+    path = REPO_ROOT / "tests" / "smoke_t48_procurement_rate.py"
+    spec = importlib.util.spec_from_file_location("smoke_t48_procurement_rate", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _load_ws134_operational_numeric_tools_smoke():
     path = REPO_ROOT / "tests" / "smoke_ws134_operational_numeric_tools.py"
     spec = importlib.util.spec_from_file_location("smoke_ws134_operational_numeric_tools", path)
@@ -58,6 +67,149 @@ def _load_ws147_daily_scheduler_smoke():
     assert spec and spec.loader
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_ws175_route_card():
+    path = REPO_ROOT / "card.py"
+    spec = importlib.util.spec_from_file_location("route_card_cli", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeRouteCardRunner:
+    def __init__(self):
+        self.issues = {
+            "WS-999": {
+                "id": "issue-999",
+                "identifier": "WS-999",
+                "title": "[tooling][标准] 实现路由记录卡",
+                "assignee_type": "agent",
+                "assignee_id": "agent-author",
+                "reviewer_agent_id": "agent-reviewer",
+            },
+            "POOL-CARD": {
+                "id": "pool-card",
+                "identifier": "POOL-CARD",
+                "title": "[tooling][标准] pool state card",
+            },
+        }
+        self.agents = {
+            "agent-author": {"id": "agent-author", "name": "Coder1", "model": "claude-sonnet-4.5"},
+            "agent-reviewer": {"id": "agent-reviewer", "name": "Verifier-O", "model": "claude-opus-4.1"},
+        }
+        self.metadata = {"WS-999": {}, "POOL-CARD": {}}
+        self.set_calls = []
+
+    def json(self, args):
+        if args[:2] == ["issue", "get"]:
+            return dict(self.issues[args[2]])
+        if args[:3] == ["issue", "metadata", "list"]:
+            return dict(self.metadata[args[3]])
+        if args[:2] == ["agent", "get"]:
+            return dict(self.agents[args[2]])
+        raise AssertionError(f"unexpected json call: {args}")
+
+    def run(self, args):
+        if args[:3] != ["issue", "metadata", "set"]:
+            raise AssertionError(f"unexpected run call: {args}")
+        issue = args[3]
+        key = args[args.index("--key") + 1]
+        value = args[args.index("--value") + 1]
+        value_type = args[args.index("--type") + 1] if "--type" in args else None
+        if value_type == "number":
+            parsed = int(value)
+        elif value_type == "string":
+            parsed = value
+        else:
+            # Mirror real `multica issue metadata set`: untyped JSON-looking
+            # objects/lists are stored and read back as strings.
+            parsed = value
+        self.metadata.setdefault(issue, {})[key] = parsed
+        self.set_calls.append((issue, key, parsed))
+        return ""
+
+
+def test_ws175_route_card_show_derives_fields_without_persisting_metadata():
+    """WS-175: show derives author/reviewer/tier/pool from issue+agents, not metadata."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    shown = card.show_card("WS-999", runner=runner)
+
+    assert shown["derived"] == {
+        "author_model": "claude-sonnet-4.5",
+        "reviewer_model": "claude-opus-4.1",
+        "current_tier": "标准",
+        "route_pool": "Sonnet",
+    }
+    assert shown["persistent"]["attempt_count"] == 0
+    assert shown["persistent"]["last_fail_reason"] is None
+    assert runner.metadata["WS-999"] == {}
+    assert runner.set_calls == []
+
+
+def test_ws175_route_card_bump_dedupe_and_new_events():
+    """WS-175: bump increments deterministically and dedupes repeated events."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    first = card.bump_card("WS-999", reason="transient", dedupe_key="review-1", runner=runner)
+    duplicate = card.bump_card("WS-999", reason="transient", dedupe_key="review-1", runner=runner)
+    second = card.bump_card("WS-999", reason="review_reject", dedupe_key="review-2", runner=runner)
+    explicit_new = card.bump_card("WS-999", reason="quota", runner=runner)
+
+    assert first["attempt_count"] == 1 and first["deduped"] is False
+    assert duplicate["attempt_count"] == 1 and duplicate["deduped"] is True
+    assert second["attempt_count"] == 2 and second["deduped"] is False
+    assert explicit_new["attempt_count"] == 3 and explicit_new["deduped"] is False
+    assert runner.metadata["WS-999"]["attempt_count"] == 3
+    assert runner.metadata["WS-999"]["last_fail_reason"] == "quota"
+    assert json.loads(runner.metadata["WS-999"]["route_card_dedupe_keys"]) == ["review-1", "review-2"]
+
+
+def test_ws175_route_card_pool_state_writes_only_persistent_fields():
+    """WS-175: freeze/unfreeze/pause write only persistent route-card state fields."""
+    card = _load_ws175_route_card()
+    runner = _FakeRouteCardRunner()
+
+    card.freeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
+    card.freeze_pool("Opus", state_issue="POOL-CARD", runner=runner)
+    card.pause_pool("Sonnet", until="2026-06-12T10:00:00+08:00", state_issue="POOL-CARD", runner=runner)
+    card.unfreeze_pool("Sonnet", state_issue="POOL-CARD", runner=runner)
+
+    shown = card.show_card("POOL-CARD", runner=runner)
+    assert shown["persistent"]["pool_frozen"] == {"Sonnet": False, "Opus": True}
+    assert shown["persistent"]["pool_paused_until"] == {"Sonnet": "2026-06-12T10:00:00+08:00"}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_frozen"]) == {"Sonnet": False, "Opus": True}
+    assert json.loads(runner.metadata["POOL-CARD"]["pool_paused_until"]) == {
+        "Sonnet": "2026-06-12T10:00:00+08:00"
+    }
+    written_keys = {key for _, key, _ in runner.set_calls}
+    assert written_keys <= {"pool_frozen", "pool_paused_until"}
+    assert not (written_keys & {"author_model", "reviewer_model", "current_tier", "route_pool"})
+
+
+def test_ws175_route_card_metadata_writes_are_centralized():
+    """WS-175: route-card metadata writes stay centralized in card.py."""
+    guarded = ("attempt_count", "pool_frozen", "pool_paused_until", "last_fail_reason")
+    offenders = []
+    for path in REPO_ROOT.rglob("*"):
+        if path.is_dir() or path.name == "card.py" or ".git" in path.parts:
+            continue
+        if path.suffix not in {".py", ".md", ".yaml", ".yml", ".sh"}:
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith("tests/"):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "multica issue metadata set" not in text:
+            continue
+        for key in guarded:
+            if f"--key {key}" in text or f"--key={key}" in text:
+                offenders.append(f"{rel}:{key}")
+    assert not offenders, f"route-card metadata must be written through card.py only: {offenders}"
 
 
 def test_ws147_daily_refresh_noon_yesterday_contract():
@@ -453,17 +605,18 @@ def test_chat_query_sku():
 
 
 def test_chat_list_products_sales_topn():
-    """WS-148: 近30天销量 TopN 必须走 list_products，且回复带来源/时间/口径。"""
+    """WS-148/WS-120：**裸**销量 TopN（无时间窗）走 list_products/sales_30d 固定桶；
+    带时间窗的『近30天/近N天』已由 WS-120 改走 top_sales_by_window（见 smoke_chat e2e）。"""
     s, b = _post("/api/chat", {
-        "messages": [{"role": "user", "content": "KSA 近30天销量最高的3个商品"}],
+        "messages": [{"role": "user", "content": "KSA 销量最高的3个商品"}],
         "scope": {"store": "KSA", "current_user": "tester", "current_role": "运营"},
     }, timeout=90)
     d = json.loads(b)
     assert s == 200 and d["reply"]
     assert d.get("tools_used") == ["list_products"], \
-        f"TopN 销量问题必须确定性调用 list_products，实际 tools_used={d.get('tools_used')}"
+        f"裸 TopN（无时间窗）必须确定性调用 list_products，实际 tools_used={d.get('tools_used')}"
     assert d.get("judge_method") == "deterministic_product_sales_topn_router", \
-        f"TopN 销量问题不应走 LLM 自由排序，judge_method={d.get('judge_method')}"
+        f"裸 TopN 不应走 LLM 自由排序，judge_method={d.get('judge_method')}"
     reply = d["reply"]
     assert "来源" in reply and "wf2_sku.sales_30d" in reply, \
         f"TopN 回复必须含来源/口径证据: {reply[:300]}"
@@ -1594,6 +1747,74 @@ def test_t26_safety_passes_when_reply_already_says_not_found():
     out, warns = sanitize_reply(good_reply, tools_used=["query_order_live"], tool_log=tool_log)
     t26_warns = [w for w in warns if "T26" in w]
     assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
+
+
+def _t48_scope():
+    return {
+        "store": "KSA",
+        "current_user": "phase1_t48",
+        "current_role": "owner",
+        "tenant_id": 1,
+        "user_id": 1,
+    }
+
+
+def test_t48_procurement_rate_chat_uses_rule_source_before_llm():
+    """T48: 采购议价率/plus 口径问题必须由规则源确定性回答，不走 LLM 猜公式。"""
+    import unittest.mock
+    from hipop.server import _provider, agent
+
+    t48 = _load_t48_procurement_rate_smoke()
+
+    with unittest.mock.patch.object(
+        _provider,
+        "chat_with_tools",
+        side_effect=AssertionError("T48 procurement-rate rule question should not call LLM provider"),
+    ):
+        result = agent.chat(
+            [{"role": "user", "content": "请说明采购议价率怎么计算，plus 折扣是否计入绩效？"}],
+            _t48_scope(),
+        )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    passed, fails = t48._t48_content_oracle(reply)
+    assert passed, f"T48 规则源回答应通过 oracle，fails={fails}\nreply={reply}"
+    assert "规则来源：hipop/rules/procurement_rate.py" in reply
+    assert result.get("hallucination_warnings") in (None, [], {})
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
+
+
+def test_t48_procurement_rate_chat_fails_closed_when_rule_source_unreadable():
+    """T48 negative control: 规则源不可读时不得编公式，必须明说缺规则源。"""
+    import importlib
+    import unittest.mock
+    from hipop.server import _provider, agent
+
+    real_import_module = importlib.import_module
+
+    def fail_procurement_rate_import(name, package=None):
+        if name == "hipop.rules.procurement_rate":
+            raise ImportError("simulated missing procurement rule source")
+        return real_import_module(name, package)
+
+    with unittest.mock.patch("importlib.import_module", side_effect=fail_procurement_rate_import):
+        with unittest.mock.patch.object(
+            _provider,
+            "chat_with_tools",
+            side_effect=AssertionError("T48 procurement-rate fail-closed path should not call LLM provider"),
+        ):
+            result = agent.chat(
+                [{"role": "user", "content": "采购议价率怎么计算？plus 折扣算不算采购绩效？"}],
+                _t48_scope(),
+            )
+
+    reply = result.get("clean_reply") or result.get("reply") or ""
+    assert "无法读取采购议价率权威规则源" in reply or "缺规则源" in reply
+    assert "hipop/rules/procurement_rate.py" in reply
+    assert "议价差额 ÷" not in reply
+    assert "1688采购标准价 + 头程运费分摊" not in reply
+    assert result.get("hallucination_warnings") in (None, [], {})
+    assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
 
 
 if __name__ == "__main__":

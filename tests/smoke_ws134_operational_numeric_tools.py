@@ -3,8 +3,10 @@
 This covers the S6 aggregate contract across the existing T03/T04/T07/T11/T12/
 T15/T27/T29 slices:
 
-- sales TopN must use list_products but fail closed when the unified sales
-  snapshot is stale, instead of leaking old ranked numbers.
+- sales TopN（『近30天』含时间窗）must route to top_sales_by_window（WS-120 choice A：
+  逐单现算 + 按最新订单业务日倒推）but fail closed when the latest order date is stale
+  (>3 days), instead of leaking old ranked numbers. （WS-120 前是 list_products/sales_30d
+  固定桶；choice A 改走窗口工具，时效门 >3 天 fail-closed 这道承重墙保持不变。）
 - general replenishment advice must route deterministically to
   compute_replenishment and must not use stale wf5 recommendations as facts.
 """
@@ -68,9 +70,10 @@ def _cleanup(path: str) -> None:
 
 
 def test_sales_topn_stale_snapshot_fails_closed() -> None:
-    """TopN must not expose stale wf2_sku ranks just because list_products exists."""
-    path, conn = _fresh_db("sales_entities", "wf2_sku")
-    stale = (_dt.date.today() - _dt.timedelta(days=5)).isoformat()
+    """近30天 TopN must not expose stale ranks. WS-120 choice A：改走 top_sales_by_window，
+    最新订单业务日 >3 天即 fail-closed（时效承重墙不变），不泄陈旧名次。"""
+    path, conn = _fresh_db("sales_entities", "wf2_sku", "wf2_orders")
+    stale = (_dt.date.today() - _dt.timedelta(days=5)).isoformat()   # 最新订单日 5 天前 > 3 天
     try:
         rows = [
             ("SKU-A", "PROD-A", "old low", 7, 90),
@@ -85,6 +88,13 @@ def test_sales_topn_stale_snapshot_fails_closed() -> None:
             [(TENANT, ALIAS, r[0], r[1], r[2], 1, r[3], r[4], 10.0, stale, stale + "T09:00:00")
              for r in rows],
         )
+        # wf2_orders：每个 SKU 一笔陈旧订单（最新订单日 = stale = today-5），制造「>3 天」陈旧态。
+        conn.executemany(
+            "INSERT INTO wf2_orders "
+            "(tenant_id, entity_alias, partner_sku, item_nr, order_date, is_cancelled) "
+            "VALUES (?,?,?,?,?,?)",
+            [(TENANT, ALIAS, r[0], f"{r[0]}-1", stale, 0) for r in rows],
+        )
         conn.commit()
 
         from hipop.server import agent as _agent
@@ -98,8 +108,8 @@ def test_sales_topn_stale_snapshot_fails_closed() -> None:
                 SCOPE,
             )
 
-        assert result.get("tools_used") == ["list_products"], result
-        assert result.get("judge_method") == "deterministic_product_sales_topn_router", result
+        assert result.get("tools_used") == ["top_sales_by_window"], result
+        assert result.get("judge_method") == "deterministic_window_sales_topn_router", result
         reply = result.get("reply") or ""
         assert "不能出数" in reply or "刷新" in reply or "超过 3 天" in reply, reply
         assert "SKU-B" not in reply, "stale ranked SKU leaked into reply: {}".format(reply)
