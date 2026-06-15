@@ -1749,6 +1749,173 @@ def test_t26_safety_passes_when_reply_already_says_not_found():
     assert not t26_warns, f"回复已说明未找到，不应触发 T26 告警: {t26_warns}"
 
 
+# ── WS-121 运营事实证据门（销量窗口 / 库存排序 / 物流状态）──────────────────────────
+def _ws121_warnings(warns):
+    return [w for w in (warns or []) if "WS-121" in w]
+
+
+def test_ws121_blocks_window_sales_topn_without_top_sales_tool():
+    """指定日期窗口销量 TopN 不能用 export/list_products 等旁路工具编排名。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = (
+        "KSA 近30天销量最高的 3 个 SKU：\n"
+        "1. TBS0228A：近30天销量 581 件\n"
+        "2. TBB0116A：近30天销量 239 件\n"
+        "3. TBS0153A：近30天销量 177 件"
+    )
+    tool_log = [{"name": "export_table", "args": {"view": "sales"}, "result_keys": ["download_url"]}]
+    out, warns = sanitize_reply(
+        reply,
+        tools_used=["export_table"],
+        tool_log=tool_log,
+        question="KSA 近30天销量最高的 3 个 SKU 是哪些",
+    )
+    ws121 = _ws121_warnings(warns)
+    assert ws121, f"缺 top_sales_by_window 证据的窗口销量 TopN 应触发 WS-121: {warns}"
+    assert "top_sales_by_window" in ws121[0]
+    assert out.startswith("⚠️"), out[:200]
+
+
+def test_ws121_allows_window_sales_topn_with_top_sales_tool():
+    """top_sales_by_window 是指定窗口 TopN 的合法确定性证据。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = (
+        "KSA 2026-05-01 ~ 2026-05-30 销量最高的 3 个 SKU：\n"
+        "1. TBS0228A：窗口销量 581\n"
+        "2. TBB0116A：窗口销量 239\n"
+        "3. TBS0153A：窗口销量 177\n"
+        "来源：wf2_orders 按 order_date 现算窗口销量。"
+    )
+    tool_log = [{
+        "name": "top_sales_by_window",
+        "args": {"store": "KSA", "start_date": "2026-05-01", "end_date": "2026-05-30", "limit": 3},
+        "result_keys": ["items", "evidence"],
+    }]
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=["top_sales_by_window"],
+        tool_log=tool_log,
+        question="KSA 2026-05-01 到 2026-05-30 销量最高的 3 个 SKU",
+    )
+    assert not _ws121_warnings(warns), f"合法 top_sales_by_window 证据不应触发 WS-121: {warns}"
+
+
+def test_ws121_today_sales_topn_is_window_route_not_bare_bucket():
+    """今天/今日销量 TopN 也属于指定日期窗口，不得落回 list_products 固定桶。"""
+    import datetime as _dt
+    from hipop.server._deterministic_routes import _deterministic_window_sales_topn_request
+
+    req = _deterministic_window_sales_topn_request("今天 KSA 销量最好的前5个 SKU 是哪些")
+    today = _dt.date.today().isoformat()
+    assert req == {"start_date": today, "end_date": today, "limit": 5}, req
+
+
+def test_ws121_blocks_stock_ranking_without_total_stock_tool():
+    """库存排序/排名出数必须有 total_stock_topn 或等价库存查询证据。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = (
+        "KSA 库存最多的 3 个 SKU：\n"
+        "1. TBB0116A：总库存 809 件\n"
+        "2. TBS0228A：总库存 650 件\n"
+        "3. TBS0153A：总库存 412 件"
+    )
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=[],
+        tool_log=[],
+        question="KSA 库存最多的前 3 个 SKU 是哪些",
+    )
+    ws121 = _ws121_warnings(warns)
+    assert ws121, f"缺库存查询证据的库存排序应触发 WS-121: {warns}"
+    assert "total_stock_topn" in ws121[0]
+
+
+def test_ws121_allows_stock_ranking_with_total_stock_tool():
+    """total_stock_topn 是库存排序出数的合法确定性证据。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = "KSA 总库存最高的 1 个 SKU：\n1. TBB0116A  总库存 809（可售 100 / 送仓未上架 20）"
+    tool_log = [{
+        "name": "total_stock_topn",
+        "args": {"store": "KSA", "n": 1},
+        "result_keys": ["items", "evidence"],
+    }]
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=["total_stock_topn"],
+        tool_log=tool_log,
+        question="KSA 库存最多的前 1 个 SKU",
+    )
+    assert not _ws121_warnings(warns), f"合法 total_stock_topn 证据不应触发 WS-121: {warns}"
+
+
+def test_ws121_blocks_logistics_status_without_live_tool():
+    """物流状态/承运商/ETA 等运营事实必须有 live logistics tool 证据。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = "货单 PDZ0027158 当前在途，承运商 DHL，预计 2026-06-18 到仓。"
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=[],
+        tool_log=[],
+        question="请查询货单 PDZ0027158 当前物流状态",
+    )
+    ws121 = _ws121_warnings(warns)
+    assert ws121, f"缺 live 证据的物流状态应触发 WS-121: {warns}"
+    assert "query_order_live" in ws121[0] and "query_sku_live" in ws121[0]
+
+
+def test_ws121_allows_logistics_status_with_live_tool():
+    """query_order_live/query_sku_live 是物流状态事实的合法 live 证据。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = "货单 PDZ0027158 当前在途，承运商 DHL，预计 2026-06-18 到仓。"
+    tool_log = [{
+        "name": "query_order_live",
+        "args": {"order_no": "PDZ0027158"},
+        "result_keys": ["status", "carrier", "eta"],
+    }]
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=["query_order_live"],
+        tool_log=tool_log,
+        question="请查询货单 PDZ0027158 当前物流状态",
+    )
+    assert not _ws121_warnings(warns), f"合法 query_order_live 证据不应触发 WS-121: {warns}"
+
+
+def test_ws121_allows_workflow_or_unavailable_without_fake_facts():
+    """workflow 接管或结构化 unavailable 不应被误拦，只拦无证据出数/状态。"""
+    from hipop.server._safety import sanitize_reply
+
+    reply = "物流数据最新到 2026-06-01，目标日期暂未覆盖，已触发更新（wf3_logistics_v2）。"
+    tool_log = [{
+        "name": "run_workflow",
+        "args": {"workflow": "wf3_logistics_v2"},
+        "task_id": "abc12345",
+        "result_keys": ["task_id", "workflow"],
+    }]
+    _out, warns = sanitize_reply(
+        reply,
+        tools_used=["run_workflow"],
+        tool_log=tool_log,
+        question="在途数量最多的前 5 个 SKU 是哪些",
+    )
+    assert not _ws121_warnings(warns), f"真实 workflow 接管文案不应触发 WS-121: {warns}"
+
+    unavailable = "数据不足：KSA 物流最新到 2026-06-01，无法提供目标日期的查询结果。"
+    _out2, warns2 = sanitize_reply(
+        unavailable,
+        tools_used=[],
+        tool_log=[],
+        question="在途数量最多的前 5 个 SKU 是哪些",
+    )
+    assert not _ws121_warnings(warns2), f"结构化 unavailable 不应触发 WS-121: {warns2}"
+
+
 def _t48_scope():
     return {
         "store": "KSA",

@@ -1111,14 +1111,13 @@ def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] =
     if c.t07_guard:
         # T07 结构不变量：对运营销量查询，回复必须由真实数据支撑，禁模拟数。
         # 合法路径 A: workflow_task 非空（gate 触发了真实 workflow）
-        # 合法路径 B: query 工具被调用（LLM 用真实查询数据回答）
+        # 合法路径 B: top_sales_by_window 被调用（指定日期/窗口 TopN 的确定性工具证据）
         # 合法路径 C: reply 含结构化缺数说明（"最新到X"/"数据不足"）
         # 违规路径: 上面三者均无 + reply 含类似"xx SKU 销量 nn 件"等具体数字组合
         wt = resp.get("workflow_task")
-        query_tools = {"query_sku", "list_products", "scope_overview", "data_health_check",
-                       "compute_replenishment", "query_sku_live"}
-        has_workflow = bool(wt)
-        has_query_tool = bool(set(tools) & query_tools)
+        wf_tasks = resp.get("workflow_tasks") or []
+        has_workflow = bool(wt or wf_tasks)
+        has_query_tool = "top_sales_by_window" in tools
         has_stale_indicator = bool(re.search(
             r"最新到|数据不足|暂未覆盖|暂无数据|缺数|数据.{0,8}(最新|只到|截止到)",
             reply,
@@ -1127,11 +1126,11 @@ def check(c: Case, resp: dict, opener: Optional[urllib.request.OpenerDirector] =
         if not anchored:
             # 进一步检查是否有"模拟数"特征：具体数字+SKU+单位组合
             fake_num_re = re.compile(
-                r"(?:[A-Z]{2,}[0-9]{4,}[A-Z]?).{0,20}?(?:销量|卖了|共?\s*[0-9]+\s*(?:件|单|个|次))",
+                r"(?:[A-Z]{2,}[A-Z0-9-]{3,}).{0,60}?(?:销量|卖了|窗口销量|共?\s*[0-9,，]+\s*(?:件|单|个|次)|[0-9,，]+\s*(?:件|单|个|次))",
             )
             if fake_num_re.search(reply):
                 reasons.append(
-                    "T07 guard: workflow_task=null + 无查询工具 + 含模拟数字组合（旧 T07 失败形态）"
+                    "T07 guard: workflow_task=null + 无 top_sales_by_window + 含模拟数字组合（旧 T07 失败形态）"
                 )
             else:
                 # 没有模拟数字，但也没有任何数据支撑 — 空答/不知
@@ -1292,6 +1291,14 @@ def _prepare_dynamic_expectations(base_url: str,
         pass  # endpoint unavailable — T04 stale case uses static expectations
 
 
+def _bind_base_url_expectations(base_url: str) -> None:
+    parsed = urllib.parse.urlparse(base_url)
+    netloc = parsed.netloc
+    c = _find_case("打开页面")
+    if c and netloc:
+        c.must_contain = [re.escape(netloc)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
@@ -1327,6 +1334,7 @@ def main():
     # _bind_runtime_expectations 先写 must_contain；
     # _prepare_dynamic_expectations 随后用服务端 /api/sku-metrics 真实值覆盖，让动态值赢。
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
+    _bind_base_url_expectations(args.url)
     try:
         t04_exp = _bind_runtime_expectations(cases)
     except Exception as e:

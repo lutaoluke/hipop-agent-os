@@ -965,7 +965,8 @@ def tool_navigate_user_to(module: str, store: str = "KSA") -> Dict:
         path = "/role/liuhe"
     else:
         path = f"/module/{module}?store={store.lower()}"
-    full_url = f"http://localhost:8765{path}"
+    base_url = (os.environ.get("HIPOP_PUBLIC_BASE_URL") or os.environ.get("HIPOP_URL") or "http://localhost:8765").rstrip("/")
+    full_url = f"{base_url}{path}"
     return {
         "ok": True,
         "module": module,

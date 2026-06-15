@@ -137,6 +137,7 @@ def main() -> int:
     smoke_chat._AUTH_OPENER = opener
 
     cases = [c for c in smoke_chat.CASES if (not args.filter) or args.filter in c.name]
+    smoke_chat._bind_base_url_expectations(args.url)
     try:
         smoke_chat._bind_runtime_expectations(cases)
         smoke_chat._prepare_dynamic_expectations(args.url, opener)
