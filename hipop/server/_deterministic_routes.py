@@ -452,6 +452,17 @@ def _deterministic_window_sales_topn_request(question: str) -> "Optional[Dict]":
     if dates:
         return {"start_date": dates[0], "end_date": dates[-1], "limit": limit}
 
+    # "今天/今日" 是明确业务日窗口，必须先走 top_sales_by_window 两端覆盖判定；
+    # 否则会被后面的裸 TopN list_products 固定桶接走，重现 T07 假排名事故。
+    if any(tok in q for tok in ("今天", "今日")):
+        today = _dt.date.today().isoformat()
+        return {"start_date": today, "end_date": today, "limit": limit}
+
+    # "最新" TopN 不是裸 sales_30d 固定桶，也应走窗口工具；以最新订单业务日倒推单日，
+    # 由 tool_top_sales_by_window 的 freshness gate 决定能否出数。
+    if "最新" in q:
+        return {"relative_days": 1, "limit": limit}
+
     m = _REL_WINDOW_RE.search(q)
     if m:
         n = _window_days_token(m.group(1) or m.group(2))

@@ -668,6 +668,137 @@ def _check_inventory_selection_evidence(
     ]
 
 
+# WS-121: 运营事实证据门。只在"回答已经给出排名/状态/数字事实"时拦；
+# 结构化 unavailable / workflow 接管文案不含事实，放行。
+_OPS_UNAVAILABLE_RE = re.compile(
+    r"无法|不能|不可用|暂无|未返回|未提供|缺数|数据不足|暂未覆盖|未覆盖|"
+    r"请先刷新|请刷新|请补齐|请上传|查询失败|触发更新|已触发更新"
+)
+_OPS_SKU_TOKEN = r"\b[A-Z]{2,}[A-Z0-9-]{3,}\b"
+_OPS_SKU_NUM_RE = re.compile(
+    rf"{_OPS_SKU_TOKEN}.{{0,80}}\d[\d,，]*\s*(?:件|单|个|次|pcs)?",
+    re.IGNORECASE | re.DOTALL,
+)
+_OPS_RANK_RE = re.compile(
+    r"(?:^|\n|\|)\s*(?:\d+[\.\、)]|第\s*[一二三四五六七八九十\d]+|排名|Top|TOP|top|前\s*\d)",
+    re.IGNORECASE,
+)
+_WINDOW_TOKEN_RE = re.compile(
+    r"今天|今日|最新|本周|这周|近\s*[0-9一二两三四五六七八九十百]+\s*[天日]|"
+    r"最近\s*[0-9一二两三四五六七八九十百]+\s*[天日]|"
+    r"过去\s*[0-9一二两三四五六七八九十百]+\s*[天日]|"
+    r"过往\s*[0-9一二两三四五六七八九十百]+\s*[天日]|"
+    r"20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}"
+)
+_SALES_TOPN_CONTEXT_RE = re.compile(
+    r"(?:销量|销售|卖|热销|畅销).{0,40}(?:最高|最多|排行|排名|榜|Top|TOP|top|前\s*\d|最好卖|卖得最好)"
+    r"|(?:最高|最多|排行|排名|榜|Top|TOP|top|前\s*\d).{0,40}(?:销量|销售|卖|热销|畅销)",
+    re.IGNORECASE | re.DOTALL,
+)
+_STOCK_RANK_CONTEXT_RE = re.compile(
+    r"(?:库存|可售|现货|在库|缺货|断货|积压).{0,40}(?:最高|最多|最大|最低|最少|排行|排名|榜|Top|TOP|top|前\s*\d)"
+    r"|(?:最高|最多|最大|最低|最少|排行|排名|榜|Top|TOP|top|前\s*\d).{0,40}(?:库存|可售|现货|在库|缺货|断货|积压)",
+    re.IGNORECASE | re.DOTALL,
+)
+_STOCK_FACT_RE = re.compile(
+    rf"{_OPS_SKU_TOKEN}.{{0,80}}(?:总库存|库存|可售|现货|在库|缺货|断货|积压).{{0,30}}\d[\d,，]*"
+    rf"|{_OPS_SKU_TOKEN}.{{0,80}}\d[\d,，]*\s*(?:件|个).{{0,30}}(?:库存|可售|现货|在库)",
+    re.IGNORECASE | re.DOTALL,
+)
+_LOGISTICS_CONTEXT_RE = re.compile(
+    r"(?:物流|在途|货单|卡单|滞留|发货|跟踪).{0,40}(?:状态|排行|排名|榜|最多|最高|多少|承运|货代|预计|到仓|到货|送达)"
+    r"|(?:状态|排行|排名|榜|最多|最高|多少|承运|货代|预计|到仓|到货|送达).{0,40}(?:物流|在途|货单|卡单|滞留|发货|跟踪)",
+    re.IGNORECASE | re.DOTALL,
+)
+_LOGISTICS_POSITIVE_FACT_RE = re.compile(
+    r"当前.{0,8}在途|目前.{0,8}在途|已在途|在途\s*\d+\s*(?:件|个|箱|pcs)?|"
+    r"已\s*(?:发货|发出|揽收|签收|出库|发运|送达|到仓|到货)|"
+    r"运输中|清关|派送中|状态.{0,8}(?:正常|在途|运输|清关|签收|发货)|"
+    r"承运商.{0,8}(?:为|是)|货代.{0,8}(?:为|是)|物流商.{0,8}(?:为|是)|"
+    r"跟踪号.{0,8}(?:为|是)|运单号.{0,8}(?:为|是)|预计.{0,12}(?:到仓|到货|送达|签收|抵达)|ETA",
+    re.IGNORECASE,
+)
+
+
+def _tool_names(tools_used: List[str], tool_log: Optional[list]) -> set:
+    names = set(t for t in (tools_used or []) if t)
+    for entry in (tool_log or []):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if name:
+            names.add(name)
+    return names
+
+
+def _non_unavailable_parts(text: str) -> List[str]:
+    parts = [p.strip() for p in re.split(r"[。；\n!?！？]+", text or "") if p.strip()]
+    return [p for p in parts if not _OPS_UNAVAILABLE_RE.search(p)]
+
+
+def _has_ranked_numeric_fact(reply: str) -> bool:
+    if not _OPS_SKU_NUM_RE.search(reply or ""):
+        return False
+    return bool(_OPS_RANK_RE.search(reply or "") or _SALES_TOPN_CONTEXT_RE.search(reply or ""))
+
+
+def _has_stock_rank_fact(reply: str) -> bool:
+    text = "\n".join(_non_unavailable_parts(reply))
+    return bool(text and _STOCK_FACT_RE.search(text) and (_OPS_RANK_RE.search(text) or _STOCK_RANK_CONTEXT_RE.search(text)))
+
+
+def _has_logistics_fact(reply: str) -> bool:
+    for part in _non_unavailable_parts(reply):
+        if _LOGISTICS_POSITIVE_FACT_RE.search(part) or _CARRIER_RE.search(part) or _QTY_RESULT_RE.search(part):
+            return True
+    return False
+
+
+def _check_operational_fact_evidence(
+    reply: str, tools_used: List[str], tool_log: Optional[list], question: Optional[str]
+) -> List[str]:
+    """WS-121: sales-window/stock/logistics operational facts need matching evidence."""
+    warnings: List[str] = []
+    q = question or ""
+    text = "\n".join([q, reply or ""])
+    names = _tool_names(tools_used, tool_log)
+
+    sales_window_topn = (
+        _WINDOW_TOKEN_RE.search(text)
+        and _SALES_TOPN_CONTEXT_RE.search(text)
+        and _has_ranked_numeric_fact(reply or "")
+    )
+    if sales_window_topn and "top_sales_by_window" not in names:
+        warnings.append(
+            "⚠️ WS-121: 指定日期窗口销量 TopN 回复含 SKU 排名/销量数字，"
+            "但本轮没有 top_sales_by_window 工具证据。不能用 export/list_products/"
+            "query_sku 或模型散文冒充窗口 TopN；应返回 unavailable 或先触发/等待合法刷新。"
+        )
+
+    stock_ranking = (
+        _STOCK_RANK_CONTEXT_RE.search(text)
+        and _has_stock_rank_fact(reply or "")
+    )
+    if stock_ranking and "total_stock_topn" not in names:
+        warnings.append(
+            "⚠️ WS-121: 库存排序/排名回复含 SKU 库存数字，"
+            "但本轮没有 total_stock_topn 工具证据。不能编库存排名；"
+            "应返回 unavailable 或先走库存刷新/确定性查询。"
+        )
+
+    logistics_status = (
+        _LOGISTICS_CONTEXT_RE.search(text)
+        and _has_logistics_fact(reply or "")
+    )
+    live_logistics_tools = {"query_order", "query_order_live", "query_sku_live"}
+    if logistics_status and not (names & live_logistics_tools):
+        warnings.append(
+            "⚠️ WS-121: 物流排序/状态回复含在途、承运商、运单或 ETA 等事实，"
+            "但本轮没有 query_order/query_order_live/query_sku_live 的工具证据。"
+            "不能编物流状态或假排名；应返回 unavailable 或先触发/等待合法刷新。"
+        )
+
+    return warnings
+
+
 # T03: 销量数字声明的检测模式
 # 命中：「近30天销量是65」「销量为662件」「卖了25单」「30d销量：25」等
 _STALE_SALES_CLAIM_RE = re.compile(
@@ -772,6 +903,7 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
     reply, stale_query_warnings = _ensure_stale_query_sku_warning(reply, tool_log or [])
     warnings.extend(stale_query_warnings)
     warnings.extend(_check_inventory_selection_evidence(reply, tools_used, tool_log or []))
+    warnings.extend(_check_operational_fact_evidence(reply, tools_used, tool_log or [], question))
     warnings.extend(_check_fake_query_claims(reply, tools_used, tool_log))
     # WS-128: two-phase task completion/refresh bypass gate
     from ._chat_boundary import check_task_completion_bypass
