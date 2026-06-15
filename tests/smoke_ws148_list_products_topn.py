@@ -17,6 +17,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+from datetime import date, timedelta
 from unittest.mock import patch
 
 
@@ -39,6 +40,7 @@ TENANT = 1
 ALIAS = "hipop_ksa"
 SCOPE = {"tenant_id": TENANT, "current_user": "test", "current_role": "admin", "store": "KSA"}
 SCHEMA_V2 = os.path.join(REPO, "db", "schema_v2.sql")
+FRESH_AS_OF = (date.today() - timedelta(days=1)).isoformat()
 
 
 def _extract_create(table: str) -> str:
@@ -59,10 +61,10 @@ def _setup_db() -> None:
         (TENANT, ALIAS, "SA", "Noon", "HIPOP-NOON-KSA", 1),
     )
     rows = [
-        ("SKU-A", "PROD-A", "低销量商品", 1, 7, 90, 19.0, "2026-06-08"),
-        ("SKU-B", "PROD-B", "最高销量商品", 1, 30, 120, 29.0, "2026-06-08"),
-        ("SKU-C", "PROD-C", "第二销量商品", 1, 18, 180, 39.0, "2026-06-08"),
-        ("SKU-D", "PROD-D", "无销量商品", 0, None, 300, 49.0, "2026-06-08"),
+        ("SKU-A", "PROD-A", "低销量商品", 1, 7, 90, 19.0, FRESH_AS_OF),
+        ("SKU-B", "PROD-B", "最高销量商品", 1, 30, 120, 29.0, FRESH_AS_OF),
+        ("SKU-C", "PROD-C", "第二销量商品", 1, 18, 180, 39.0, FRESH_AS_OF),
+        ("SKU-D", "PROD-D", "无销量商品", 0, None, 300, 49.0, FRESH_AS_OF),
     ]
     conn.executemany(
         "INSERT INTO wf2_sku "
@@ -87,7 +89,7 @@ def test_tool_limit_means_sales_30d_topn() -> None:
         f"limit=3 should return sales_30d Top3, got {result.get('items')!r}"
     )
     evidence = result.get("evidence") or {}
-    assert evidence.get("fetched_at") == "2026-06-08", f"missing TopN evidence time: {evidence!r}"
+    assert evidence.get("fetched_at") == FRESH_AS_OF, f"missing TopN evidence time: {evidence!r}"
     assert "sales_30d" in evidence.get("coverage", ""), f"coverage must name sales_30d: {evidence!r}"
     print("    list_products limit=3 => sales_30d DESC Top3 with evidence")
 
@@ -108,7 +110,7 @@ def test_chat_sales_topn_routes_to_list_products() -> None:
     )
     assert "SKU-B" in reply and "30" in reply, f"reply should include Top1 SKU-B sales_30d=30: {reply!r}"
     assert "SKU-D" not in reply, f"null-sales SKU-D must not appear in Top3: {reply!r}"
-    assert "来源" in reply and "2026-06-08" in reply and "sales_30d" in reply, (
+    assert "来源" in reply and FRESH_AS_OF in reply and "sales_30d" in reply, (
         f"reply must carry source/time/coverage evidence: {reply!r}"
     )
     print("    chat TopN sales query routes deterministically to list_products with evidence")
