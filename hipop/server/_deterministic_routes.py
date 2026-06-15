@@ -679,13 +679,21 @@ def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
         return None
     if not any(x in q for x in ("补货", "pipeline", "Pipeline")):
         return None
-    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up)
-    return m.group(0) if m else None
+    # WS-180/T29: 排除 TOP\d+ 序数词（Top5/Top10 → TOP5/TOP10），它们是 TopN 个数、不是业务 SKU。
+    # 真实 SKU（TBS0228A/TBU0010A）末位是字母；TOP5 末位是数字，用 fullmatch 精确区分。
+    for _m in _re.finditer(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up):
+        if not _re.fullmatch(r"TOP\d+", _m.group(0)):
+            return _m.group(0)
+    return None
 
 
 def _deterministic_replenishment_list_request(question: str) -> "Optional[int]":
     q = question or ""
-    if _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper()):
+    # WS-180/T29: 排除 TOP\d+ (Top5/Top10) —— 它们是 TopN 序数词，不是业务 SKU 代码。
+    # 真实业务 SKU（TBS0228A/TBU0010A）末位是字母；"TOP5" 末位是数字。仅当出现真 SKU
+    # 时才让位给单 SKU 路由（返回 None），裸 TopN 补货询问应进确定性补货清单路由。
+    _sku_toks = _re.findall(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper())
+    if any(not _re.fullmatch(r"TOP\d+", tok) for tok in _sku_toks):
         return None
     triggers = ("补货建议", "本周必补", "该补货", "要补货", "哪些要补", "哪些货要补", "补多少")
     if not any(t in q for t in triggers):
