@@ -23,6 +23,7 @@ the real measured level and cannot be quietly relaxed to "make today pass".
 
 Usage:
   python3 tests/smoke_graded_threshold.py [--url http://127.0.0.1:8765]
+  python3 tests/smoke_graded_threshold.py --from-json /tmp/chat-smoke.json
   python3 tests/smoke_graded_threshold.py --check-baseline-decision  # delegates offline gate
 """
 from __future__ import annotations
@@ -32,6 +33,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -59,9 +61,43 @@ def check_baseline_decision() -> int:
     return smoke_graded_decision.main()
 
 
+def averages_from_json(path: str) -> Tuple[dict, int]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    avgs = data.get("averages") or {}
+    if all(d in avgs for d in DIMS):
+        count = len(data.get("cases") or [])
+        return {d: float(avgs[d]) for d in DIMS}, count
+    cases = data.get("cases") or []
+    if not cases:
+        raise ValueError("graded JSON has no averages or cases")
+    grades = [c.get("grades") or {} for c in cases]
+    return {d: sum(float(g.get(d, 0.0)) for g in grades) / len(grades) for d in DIMS}, len(grades)
+
+
+def report_averages(avg: dict, floors: dict, *, count: int, elapsed: Optional[float] = None) -> int:
+    suffix = f", {elapsed:.1f}s" if elapsed is not None else ""
+    print(f"\n--- live averages ({count} cases{suffix}) ---")
+    failures = []
+    for d in DIMS:
+        mark = "✓" if avg[d] >= floors[d] else "✗"
+        print(f"  {d:<20} live {avg[d]:.3f}  floor {floors[d]:.3f}  {mark}")
+        if avg[d] < floors[d]:
+            failures.append(f"{d}: live {avg[d]:.3f} < floor {floors[d]:.3f} (regression vs baseline)")
+
+    if failures:
+        print("\n✗ LIVE GRADED REGRESSION (CI RED):")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("\n✓ live graded averages within tolerance of baseline (no regression).")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="WS-163 live graded eval regression gate")
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://127.0.0.1:8765"))
+    ap.add_argument("--from-json", help="grade the JSON matrix emitted by smoke_chat.py --json-output")
     ap.add_argument("--filter", help="only run cases matching this keyword")
     ap.add_argument("--check-baseline-decision", action="store_true",
                     help="run the OFFLINE decision①/coverage gate (no server) and exit")
@@ -72,8 +108,18 @@ def main() -> int:
 
     floors = baseline_floors()
     print("=== WS-163 live graded-eval regression gate ===")
-    print(f"URL: {args.url}")
     print(f"regression floors (baseline − {REGRESS_TOL}): {floors}")
+
+    if args.from_json:
+        print(f"source JSON: {args.from_json}")
+        try:
+            avg, count = averages_from_json(args.from_json)
+        except Exception as e:
+            print(f"\n✗ graded JSON unreadable: {type(e).__name__}: {e}")
+            return 1
+        return report_averages(avg, floors, count=count)
+
+    print(f"URL: {args.url}")
 
     require_server = os.environ.get("HIPOP_GRADED_REQUIRE_SERVER") == "1"
     try:
@@ -109,21 +155,7 @@ def main() -> int:
         print(f"[{i}/{len(cases)}] {c.name[:48]:<48} {g['overall']:.2f}")
 
     avg = {d: sum(x[d] for x in graded) / len(graded) for d in DIMS}
-    print(f"\n--- live averages ({len(graded)} cases, {time.time()-t0:.1f}s) ---")
-    failures = []
-    for d in DIMS:
-        mark = "✓" if avg[d] >= floors[d] else "✗"
-        print(f"  {d:<20} live {avg[d]:.3f}  floor {floors[d]:.3f}  {mark}")
-        if avg[d] < floors[d]:
-            failures.append(f"{d}: live {avg[d]:.3f} < floor {floors[d]:.3f} (regression vs baseline)")
-
-    if failures:
-        print("\n✗ LIVE GRADED REGRESSION (CI RED):")
-        for f in failures:
-            print(f"  - {f}")
-        return 1
-    print("\n✓ live graded averages within tolerance of baseline (no regression).")
-    return 0
+    return report_averages(avg, floors, count=len(graded), elapsed=time.time() - t0)
 
 
 if __name__ == "__main__":

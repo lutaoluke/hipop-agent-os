@@ -177,6 +177,37 @@ _run_noon_orders_live_ingest.writes = (
 )
 
 
+@register("budget_guard_dry_run")
+def _run_budget_guard_dry_run(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
+    """预算守卫 dry-run（WS-176）。
+
+    只读 Anthropic shared-pool usage fixture/current dump + budget_guard 配置，输出本轮
+    R0-R8 判定、agent/tier rollup、incident/recovery 条件；不真实改路由。
+    """
+    from hipop.runtime import budget_guard
+    heartbeat()
+    out = budget_guard.run_budget_guard_dry_run(spec=spec or {}, tenant_id=tenant_id)
+    save_progress({
+        "done": True,
+        "route_changes_applied": False,
+        "decision": out.get("decision"),
+        "rollup": out.get("rollup"),
+        "incidents": out.get("incidents"),
+    })
+    rules = out.get("decision", {}).get("triggered_rules") or []
+    return {
+        "summary": f"budget_guard dry-run: {len(rules)} rules triggered; route_changes_applied=False",
+        "budget_guard": out,
+    }
+
+
+_run_budget_guard_dry_run.reads = (
+    "anthropic_shared_pool_usage",
+    "hipop.config.budget_guard",
+)
+_run_budget_guard_dry_run.writes = ()
+
+
 @register("wf1_inbound_staging_v2")
 def _run_wf1_inbound_staging(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress):
     """ERP 送仓/拣货 + Noon ASN → wf1_asn_lines_staging（供 WS-11，WS-10）。

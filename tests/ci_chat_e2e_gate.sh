@@ -21,9 +21,23 @@
 set -uo pipefail
 
 ENV_FILE="${HIPOP_ENV_FILE:-/Users/luke/code/hipop/.env.local}"
-URL="${HIPOP_URL:-http://127.0.0.1:8765}"
+REQUESTED_URL="${HIPOP_URL:-http://127.0.0.1:8765}"
+URL="$REQUESTED_URL"
 PY="${PYTHON:-python3}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+OWN_SERVER="${HIPOP_CHAT_GATE_OWN_SERVER:-}"
+if [ -z "$OWN_SERVER" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+  OWN_SERVER=1
+fi
+if [ "$OWN_SERVER" = "1" ]; then
+  URL="${HIPOP_CHAT_GATE_URL:-http://127.0.0.1:${HIPOP_CHAT_GATE_PORT:-18765}}"
+  if [ "$URL" != "$REQUESTED_URL" ]; then
+    echo "[server] GitHub Actions isolation: using checkout server $URL (requested HIPOP_URL=$REQUESTED_URL)"
+  else
+    echo "[server] GitHub Actions isolation: using checkout server $URL"
+  fi
+fi
+export HIPOP_URL="$URL"
 
 # ── 1) preflight:缺 live 凭据直接红,拒绝空跑 ──────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
@@ -40,6 +54,9 @@ if [ -n "$missing" ]; then
   exit 3
 fi
 echo "[preflight] live 凭据就绪 (provider=${LLM_PROVIDER:-deepseek})"
+
+# chat smoke 命令;仅本机自测时用 WS154_SMOKE_CMD 覆盖成 true/false 验 retry 行为。
+SMOKE_CMD_OVERRIDE="${WS154_SMOKE_CMD:-}"
 
 # ── 2) 起当前 checkout 的 server(自测模式跳过——假 smoke 不需要 server)─────
 STARTED_SERVER=""
@@ -66,6 +83,11 @@ stop_existing_server() {
 
   pids="$(lsof -tiTCP:"$URL_PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
   [ -z "$pids" ] && return 0
+
+  if [ "$OWN_SERVER" = "1" ]; then
+    echo "::warning::[server] isolation URL $URL 已有监听进程，拒绝复用旧代码: $(echo "$pids" | tr '\n' ' ')"
+    return 1
+  fi
 
   echo "[server] $URL 已有监听进程，先停止以避免测试旧代码: $(echo "$pids" | tr '\n' ' ')"
   kill $pids 2>/dev/null || true
@@ -135,14 +157,22 @@ attempts=2
 n=0
 while [ "$n" -lt "$attempts" ]; do
   n=$((n+1))
+  CHAT_JSON=""
+  if [ -n "$SMOKE_CMD_OVERRIDE" ]; then
+    SMOKE_CMD="$SMOKE_CMD_OVERRIDE"
+  else
+    CHAT_JSON="/tmp/ws154_chat_smoke_$$_$n.json"
+    SMOKE_CMD="$PY $REPO/tests/smoke_chat.py --url $URL --json-output $CHAT_JSON"
+  fi
   echo "──── chat e2e 第 $n/$attempts 次(逐 case ✓/✗ 见下)────"
   if $SMOKE_CMD; then
     echo "[gate] chat e2e 第 $n 次通过 ✓"
-    # WS-163: chat smoke 过了 → 在同一台 live server 上再跑 graded 回归门(分数不只 pass/fail)。
+    # WS-163: chat smoke 过了 → 对同一轮 live responses 的 JSON 分数跑 graded 回归门。
+    # 不再二次调用 LLM/实时数据,避免"pass 的那轮"与"graded 的那轮"漂移成两套事实。
     # 自测模式(WS154_SELFTEST)无真 server,跳过——self-test 只验 preflight/retry 行为。
     if [ -z "${WS154_SELFTEST:-}" ]; then
       echo "──── WS-163 graded 回归门(live, fail-closed: 缺 server 即红)────"
-      if HIPOP_GRADED_REQUIRE_SERVER=1 HIPOP_URL="$URL" "$PY" "$REPO/tests/smoke_graded_threshold.py" --url "$URL"; then
+      if HIPOP_GRADED_REQUIRE_SERVER=1 HIPOP_URL="$URL" "$PY" "$REPO/tests/smoke_graded_threshold.py" --from-json "$CHAT_JSON"; then
         echo "[gate] WS-163 graded 回归门通过 ✓"
       else
         echo "::error::[gate] WS-163 graded 回归门红:live 分数回归到 baseline−tol 以下,阻断合并。"

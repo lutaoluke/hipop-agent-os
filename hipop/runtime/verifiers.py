@@ -337,6 +337,148 @@ def verify_daily_refresh_contract(spec=None, progress=None, now=None) -> dict:
     }
 
 
+def verify_budget_guard_contract() -> dict:
+    """WS-176 deterministic budget guard acceptance matrix."""
+    from hipop.runtime import budget_guard
+
+    now = "2026-06-11T02:00:00Z"
+    failures = []
+    evidence = {}
+
+    def require(name: str, condition: bool, detail: str):
+        if not condition:
+            failures.append(f"{name}: {detail}")
+
+    yellow = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {"agent_id": "std", "tier": "standard", "model": "claude-opus-4-8", "output_tokens": 2_100_000},
+                {"agent_id": "cheap", "tier": "standard", "model": "claude-sonnet-4", "output_tokens": 2_000_000},
+            ],
+            "monthly_output_tokens": 1,
+        },
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["r1_yellow"] = yellow
+    require("r1_yellow", "R1_DAILY_YELLOW" in yellow["triggered_rules"], yellow["triggered_rules"])
+    require("r1_not_r2", "R2_DAILY_FREEZE" not in yellow["triggered_rules"], yellow["triggered_rules"])
+
+    projected_yellow = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [{"agent_id": "std", "tier": "standard", "model": "gpt-5.5", "output_tokens": 1_000_000}],
+            "opus_output_today": 100_000,
+            "opus_output_last_1h": 125_000,
+            "monthly_output_tokens": 1,
+        },
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["r1_projected_yellow"] = projected_yellow
+    require(
+        "r1_projected_yellow",
+        "R1_DAILY_YELLOW" in projected_yellow["triggered_rules"]
+        and "R2_DAILY_FREEZE" not in projected_yellow["triggered_rules"],
+        projected_yellow["triggered_rules"],
+    )
+
+    frozen = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {"agent_id": "std", "tier": "standard", "model": "claude-opus-4-8", "output_tokens": 3_100_000},
+                {"agent_id": "cheap", "tier": "standard", "model": "gpt-5.5", "output_tokens": 2_000_000},
+            ],
+            "monthly_output_tokens": 1,
+        },
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["r2_freeze"] = frozen
+    require("r2_freeze", frozen["routing"]["standard_to_opus"] == "frozen", frozen["routing"])
+    require("r2_incident", any(i["action"] == "freeze" for i in frozen["incidents"]), frozen["incidents"])
+
+    monthly_unset = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 50_000_000},
+        config={},
+        now=now,
+    )
+    evidence["monthly_unset"] = monthly_unset
+    require("monthly_unset", monthly_unset["monthly"]["status"] == "monthly_cap_unset", monthly_unset["monthly"])
+
+    monthly_70 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 70_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["monthly_70"] = monthly_70
+    require("monthly_70", monthly_70["monthly"]["action"] == "warn_monthly_budget", monthly_70["monthly"])
+
+    monthly_85 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 85_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["monthly_85"] = monthly_85
+    require(
+        "monthly_85",
+        monthly_85["monthly"]["action"] == "freeze_non_blocking_standard_high_tier",
+        monthly_85["monthly"],
+    )
+
+    monthly_95 = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "monthly_output_tokens": 95_000_000},
+        config={"monthly_cap_output_tokens": 100_000_000},
+        now=now,
+    )
+    evidence["monthly_95"] = monthly_95
+    require(
+        "monthly_95",
+        monthly_95["monthly"]["action"] == "p0_p1_break_glass_only",
+        monthly_95["monthly"],
+    )
+
+    session = budget_guard.evaluate_budget_guard(
+        usage={"records": [], "session": {"limited": True, "reset_at": "2026-06-11T00:00:00Z"}},
+        config={},
+        now=now,
+    )
+    evidence["session_probe_required"] = session
+    require("session_probe", session["session"]["status"] == "probe_required", session["session"])
+    require("session_frozen", session["routing"]["standard_to_opus"] == "frozen", session["routing"])
+
+    concentrated = budget_guard.evaluate_budget_guard(
+        usage={
+            "records": [
+                {"agent_id": "std", "tier": "standard", "model": "claude-opus-4-8", "output_tokens": 1_600_000},
+                {"agent_id": "cheap", "tier": "standard", "model": "claude-sonnet-4", "output_tokens": 900_000},
+            ],
+        },
+        config={},
+        now=now,
+    )
+    evidence["r6_concentration"] = concentrated
+    require("r6", "R6_OPUS_CONCENTRATION" in concentrated["triggered_rules"], concentrated["triggered_rules"])
+
+    dry = budget_guard.run_budget_guard_dry_run(spec={
+        "usage": {
+            "records": [
+                {"agent_id": "std", "tier": "standard", "model": "claude-sonnet-4", "output_tokens": 100_000},
+                {"agent_id": "hard", "tier": "hard", "model": "claude-opus-4-8", "output_tokens": 100_000},
+            ],
+        },
+        "now": now,
+    })
+    evidence["dry_run"] = dry
+    require("dry_run", dry["route_changes_applied"] is False and dry["side_effects"] == [], dry)
+    require("rollup_split", bool(dry["rollup"]["by_agent_tier"]), dry["rollup"])
+
+    return {
+        "ok": not failures,
+        "evidence": evidence,
+        "verdict": "budget guard contract passed" if not failures else "；".join(map(str, failures)),
+    }
+
+
 def _load_task_json(task_id: str, kind: str) -> dict:
     try:
         from hipop.server import runtime as _runtime
@@ -737,6 +879,12 @@ def _v_wf2_sales_refresh(task_id, tenant_id, started_at, **kw):
         },
         "verdict": verdict,
     }
+
+
+@register("budget_guard_dry_run")
+def _v_budget_guard_dry_run(task_id, tenant_id, started_at, **kw):
+    """预算守卫 dry-run verifier: production path must share the acceptance matrix."""
+    return verify_budget_guard_contract()
 
 
 @register("wf3_logistics_v2")
