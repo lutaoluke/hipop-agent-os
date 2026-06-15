@@ -441,13 +441,29 @@ def mapping_precheck(rows, *, sku_index: Optional[dict] = None,
     }
 
 
-def _live_sku_index(tenant_id) -> dict:
-    """live 路径：从 wf2_sku 取 {noon_sku: partner_sku} 绑定索引（只读，用于映射预检）。"""
+def _live_sku_index(tenant_id, country_code: str = "SA") -> dict:
+    """live 路径：取**按国别收口**的 {noon_sku: partner_sku} 绑定索引（只读，用于映射预检）。
+
+    必须按 country_code（KSA=SA）对应的 sales entity 过滤，**绝不用 tenant-wide 索引**：
+    否则别国 entity 的 noon_sku→partner_sku 绑定会被 `mapping_precheck(country_code="SA")`
+    误算成 KSA covered，高估覆盖率（三审红队点：把别国绑定算进「那约 307 条」，让补货/库存
+    判断被假覆盖率带偏）。一个国别可能有多个 entity（多店），取其并集；无该国别 entity →
+    空索引（保守：宁可全判 gap，绝不用别国绑定冒充 KSA 覆盖）。
+    """
     try:
-        from sales_entity_v2 import noon_sku_map  # scripts 目录在 sys.path
+        from sales_entity_v2 import list_entities_for_tenant, noon_sku_map  # scripts 在 sys.path
     except ModuleNotFoundError:  # pragma: no cover - 包路径回落
-        from hipop.scripts.sales_entity_v2 import noon_sku_map  # type: ignore
-    return noon_sku_map(tenant_id)
+        from hipop.scripts.sales_entity_v2 import (  # type: ignore
+            list_entities_for_tenant, noon_sku_map)
+    cc = (country_code or "").strip().upper()
+    idx: dict = {}
+    for e in list_entities_for_tenant(tenant_id):
+        if (str(e.get("country") or "").strip().upper()) != cc:
+            continue  # 别国 entity 的绑定绝不进 KSA 索引
+        alias = e.get("alias")
+        if alias:
+            idx.update(noon_sku_map(tenant_id, entity_alias=alias))
+    return idx
 
 
 if __name__ == "__main__":  # pragma: no cover - 真 live 手动入口
@@ -471,7 +487,8 @@ if __name__ == "__main__":  # pragma: no cover - 真 live 手动入口
     for r in rows[:10]:
         print("  ", r)
     if args.precheck:
-        idx = _live_sku_index(args.tenant)
+        # 索引与预检同一国别收口：绝不拿 tenant-wide 索引高估 KSA 覆盖（三审红队点）。
+        idx = _live_sku_index(args.tenant, country_code=args.country)
         rep = mapping_precheck(rows, sku_index=idx, country_code=args.country)
         print(f"\n[307 映射预检] country={rep['country_code']}")
         print(json.dumps({k: v for k, v in rep.items() if k != "gap_platform_skus"},

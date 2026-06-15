@@ -340,7 +340,50 @@ def main():
             F._listings_cfg = _orig_cfg9
         print("✓ 坏 listing_status → 红灯（不当有效在售放过）；normalize 别名/大小写收口；cfg allowed_statuses 显式扩集生效")
 
-        print("\n9/9 passed")
+        # ── 10. KSA 收口（三审打回返工，验收#4 红队点）：live SKU index 必须按国别过滤 ──
+        #   bug：_live_sku_index(tenant) 调 noon_sku_map(tenant) 无 entity 过滤 = tenant-wide，
+        #   mapping_precheck(country_code="SA") 会把别国 entity 的 noon_sku→partner_sku 绑定算成
+        #   KSA covered，高估覆盖率（红队复现：SA listing noon_sku='UAE_ONLY' + UAE 绑定 → 100%）。
+        import sales_entity_v2 as SE
+        _orig_list = SE.list_entities_for_tenant
+        _orig_map = SE.noon_sku_map
+        # 替身：tenant 内 KSA(country=SA) 与 UAE(country=AE) 两 entity，各自绑定不同。
+        _FAKE_ENTITIES = [
+            {"alias": "hipop_ksa", "country": "SA"},
+            {"alias": "hipop_uae", "country": "AE"},
+        ]
+        _FAKE_MAPS = {
+            "hipop_ksa": {"ZSA888": "PKSA888"},
+            "hipop_uae": {"UAE_ONLY": "UAE-PARTNER"},
+        }
+        SE.list_entities_for_tenant = lambda t: [dict(e) for e in _FAKE_ENTITIES]
+        SE.noon_sku_map = lambda t, entity_alias=None: dict(_FAKE_MAPS.get(entity_alias, {}))
+        try:
+            # 10a. live 索引按 country 收口：只含 KSA entity 绑定，UAE 绑定不得混入。
+            ksa_idx = F._live_sku_index(TENANT, country_code="SA")
+            assert ksa_idx == {"ZSA888": "PKSA888"}, f"KSA index 应只含 KSA entity 绑定: {ksa_idx}"
+            assert "UAE_ONLY" not in ksa_idx, "UAE entity 绑定混进 KSA index（高估覆盖，正是打回点）"
+            # 10b. 红队复现路径：SA listing 带 UAE-only 平台 SKU，经 KSA 收口索引必判 gap（不再 100%）。
+            sa_listing = [{"country_code": "SA", "noon_sku": "UAE_ONLY", "listing_status": "active"}]
+            rep_scoped = F.mapping_precheck(sa_listing, sku_index=ksa_idx, country_code="SA")
+            assert rep_scoped["unmapped"] == 1 and rep_scoped["mapped_via_binding"] == 0, \
+                f"非 KSA 绑定不得算 KSA covered: {rep_scoped}"
+            assert "UAE_ONLY" in rep_scoped["gap_platform_skus"], "UAE-only listing 应点名为 gap"
+            assert rep_scoped["coverage_pct"] == 0.0, f"假覆盖必须归零: {rep_scoped}"
+            # 10c. 对照：tenant-wide（旧 bug 形态）确会把 UAE 绑定误算 covered —— 钉死收口前后差异。
+            tenant_wide = {**_FAKE_MAPS["hipop_ksa"], **_FAKE_MAPS["hipop_uae"]}
+            rep_wide = F.mapping_precheck(sa_listing, sku_index=tenant_wide, country_code="SA")
+            assert rep_wide["mapped_via_binding"] == 1, \
+                "（对照）tenant-wide 索引确会高估 —— 故 live 索引必须按国别收口"
+            # 10d. 无该国别 entity → 空索引（宁可全判 gap，绝不用别国绑定冒充 KSA 覆盖）。
+            assert F._live_sku_index(TENANT, country_code="QA") == {}, \
+                "无该国别 entity 应返回空索引（不回落 tenant-wide）"
+        finally:
+            SE.list_entities_for_tenant = _orig_list
+            SE.noon_sku_map = _orig_map
+        print("✓ KSA 收口：_live_sku_index 按 country 过滤，非 KSA entity 绑定不算 KSA covered（防高估那约 307 条）")
+
+        print("\n10/10 passed")
         return 0
     finally:
         F.unregister_live_producer()
