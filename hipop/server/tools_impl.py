@@ -523,11 +523,76 @@ def tool_compute_replenishment(store: str, limit: int = 10) -> Dict:
         "stale_warning": None if stock_status.get("ready") else "库存数据未更新或不完整，当前补货结论偏保守",
         "references": base_refs,
     }
+def _erp_replenishment_live_source(sku: str, store: str, tenant_id: int,
+                                   entity_alias: str) -> Dict:
+    """Production authoritative source for T27 replenishment evidence.
+
+    Pulls the in-transit / pending-shipment split + ETA from the live ERP tool
+    (query_sku_live, never wf3 cache), and Noon/Dongguan stock + forecast from
+    the wf1/wf5/wf2 tables. ERP failures are propagated verbatim so the caller
+    blocks instead of turning cached zeros into a business conclusion.
+    """
+    erp = tool_query_sku_live(sku)
+    if not erp.get("ok"):
+        # Propagate the ERP failure (no_credentials / login_failed / fetch_error
+        # / no_orders) — replenishment_evidence treats !ok as blocked.
+        return erp
+
+    orders = erp.get("in_transit_orders") or []
+    # 待发: purchased but not yet shipped (no tracking_no).
+    pending_qty = sum((o.get("qty") or 0) for o in orders if not o.get("tracking_no"))
+    # 在途: shipped, has a tracking_no.
+    in_transit_qty = sum((o.get("qty") or 0) for o in orders if o.get("tracking_no"))
+    etas = [str(o.get("delivery_at"))[:10] for o in orders
+            if o.get("tracking_no") and o.get("delivery_at")]
+    eta = min(etas) if etas else None
+
+    stock = agent._data._fetch(
+        "SELECT noon_saleable_qty, dongguan_qty FROM wf1_stock "
+        "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (tenant_id, entity_alias, sku),
+    )
+    stock_row = stock[0] if stock else {}
+
+    forecast_daily = None
+    wf5 = agent._data._fetch(
+        "SELECT daily_rate FROM wf5_sales_cycle "
+        "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+        (tenant_id, entity_alias, sku),
+    )
+    if wf5 and wf5[0].get("daily_rate"):
+        forecast_daily = wf5[0].get("daily_rate")
+    else:
+        wf2 = agent._data._fetch(
+            "SELECT forecast_30d FROM wf2_sku "
+            "WHERE tenant_id=? AND entity_alias=? AND partner_sku=?",
+            (tenant_id, entity_alias, sku),
+        )
+        if wf2 and wf2[0].get("forecast_30d"):
+            forecast_daily = wf2[0].get("forecast_30d") / 30.0
+
+    return {
+        "ok": True,
+        "source": "ERP realtime + DB stock/forecast",
+        "fetched_at": erp.get("fetched_at") or "now",
+        "pending_shipment_qty": pending_qty,
+        "in_transit_qty": in_transit_qty,
+        "eta": eta,
+        "noon_saleable_qty": stock_row.get("noon_saleable_qty"),
+        "dongguan_qty": stock_row.get("dongguan_qty"),
+        "forecast_daily": forecast_daily,
+    }
+
+
 def tool_query_replenishment_sku(sku: str, store: str = "KSA") -> Dict:
     tid = agent._get_tenant()
     alias = agent._resolve_entity_alias(store) or ""
     from . import replenishment_evidence as _rep
-    return _rep.query_replenishment_sku(sku, store, tid, alias)
+    # Prefer a test-injected global source (set_replenishment_live_source) when
+    # present; otherwise wire the production ERP adapter so the live-required
+    # path never silently blocks for lack of a source.
+    live = _rep.get_replenishment_live_source() or _erp_replenishment_live_source
+    return _rep.query_replenishment_sku(sku, store, tid, alias, live_source=live)
 def tool_compute_air_freight_roi(sku: str, store: str, qty: int = 100) -> Dict:
     """简化模型: 海运 0.4 / 件, 空运 2.5 / 件, 海运 25d, 空运 5d."""
     tid = agent._get_tenant()
