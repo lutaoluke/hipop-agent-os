@@ -65,6 +65,19 @@
     "web_driver_port": 18080,
     "debug_port_default": 9223
   },
+  "budget_guard": {
+    "r1_yellow_opus_output_daily": 2000000,
+    "r1_yellow_opus_projected_daily": 3000000,
+    "r2_freeze_opus_output_daily": 3000000,
+    "r2_freeze_opus_projected_daily": 4000000,
+    "r2_unfreeze_projected_daily": 2500000,
+    "r3_monthly_warn_ratio": 0.7,
+    "r4_monthly_freeze_ratio": 0.85,
+    "r4_monthly_break_glass_ratio": 0.95,
+    "r6_opus_share": 0.6,
+    "r6_opus_output_daily": 1500000,
+    "standard_default_pools": ["sonnet", "gpt5.5"]
+  },
   "platform_browser": {
     "_NOTE": "平台无关的平台浏览器会话配置（WS-33.3 / WS-47）。session_ttl_seconds=内存 cache TTL；warmup_retries=冷 goto 被紫鸟扩展 abort 时先平台根域 warmup 再重试的次数；renew_before_days=会话 cookie 还剩这么多天到期时进入主动续登窗口（窗口大小，非到期日；各店到期日按实测 cookie 算，绝不写死 29 天/2026-07-02）。platforms 按平台名给登录态检测规则；store_key 含平台名子串即命中（noon / NOON-SA 均落 noon）。login_url_markers/session_cookie 由代码判定登录态，绝不进 prompt。",
     "session_ttl_seconds": 600,
