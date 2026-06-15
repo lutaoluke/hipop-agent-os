@@ -259,7 +259,49 @@ def main():
         assert rep["unmapped"] >= 1, "noon-only 无绑定必须计 gap，绝不静默塞进可映射"
         print(f"✓ 307 映射预检：total=3 direct=1 binding=1 gap=1（ZSA999 点名），覆盖率={rep['coverage_pct']:.1f}%")
 
-        print("\n7/7 passed")
+        # ── 8. store_key 接线（首审打回返工）：默认 fetch path 必须把 store_key 透传 ──
+        #   bug：fetch_listing_rows(store_key='custom-noon') 默认路径调 `_fetch_raw_listings(page)`
+        #   丢了 store_key，下游 _listings_cfg 退化成默认 'noon'，多 noon 平台配置时读错 listing
+        #   配置。这里 spy `_fetch_raw_listings` 钉死：默认路径（不注入 raw_listings_fn）必须把
+        #   同一个 store_key 落到 _fetch_raw_listings；注入 raw_listings_fn 的测试路径仍兼容（§2/§5）。
+        captured: list = []
+        _orig_fetch = F._fetch_raw_listings
+
+        def _spy_fetch(page, *, store_key=F.DEFAULT_STORE_KEY):
+            captured.append(store_key)
+            return list(RAW_RECORDS)
+
+        F._fetch_raw_listings = _spy_fetch
+        try:
+            # 8a. fetch_listing_rows 默认路径 → store_key 原样透传
+            captured.clear()
+            F.fetch_listing_rows(TENANT, store_key="custom-noon", page=FakePage(RAW_RECORDS))
+            assert captured == ["custom-noon"], \
+                f"fetch_listing_rows 默认路径丢了 store_key: {captured}（多平台会读错 listing 配置）"
+            # 8b. make_live_row_producer → store_key 落到 _fetch_raw_listings
+            captured.clear()
+            prod = F.make_live_row_producer(
+                store_key="custom-noon", page_factory=lambda t: FakePage(RAW_RECORDS))
+            list(prod(TENANT))
+            assert captured == ["custom-noon"], \
+                f"make_live_row_producer 丢了 store_key: {captured}"
+            # 8c. register_live_producer 注册的 producer → store_key 同样落到 _fetch_raw_listings
+            captured.clear()
+            reg = F.register_live_producer(
+                store_key="custom-noon", page_factory=lambda t: FakePage(RAW_RECORDS))
+            list(reg(TENANT))
+            assert captured == ["custom-noon"], \
+                f"register_live_producer 丢了 store_key: {captured}"
+        finally:
+            F._fetch_raw_listings = _orig_fetch
+            F.unregister_live_producer()
+        # 注入 raw_listings_fn 的替身路径仍兼容（spy 还原后，default-page 注入 fn 不碰 _fetch_raw_listings）
+        rows_inj = F.fetch_listing_rows(TENANT, store_key="custom-noon", page=object(),
+                                        raw_listings_fn=lambda p: RAW_RECORDS)
+        assert len(rows_inj) == len(LISTING_ROWS), "注入 raw_listings_fn 路径应仍兼容（不受 store_key 接线影响）"
+        print("✓ store_key 接线：默认 fetch path 把 store_key 透传到 _fetch_raw_listings（多平台不读错配置）；注入路径兼容")
+
+        print("\n8/8 passed")
         return 0
     finally:
         F.unregister_live_producer()

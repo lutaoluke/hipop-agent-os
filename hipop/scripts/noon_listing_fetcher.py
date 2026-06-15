@@ -238,8 +238,13 @@ def fetch_listing_rows(tenant_id, *, store_key: str = DEFAULT_STORE_KEY,
     """
     if page is None:
         page = _get_session(tenant_id, store_key, account)
-    fetch = raw_listings_fn or _fetch_raw_listings
-    raw_records = list(fetch(page))
+    # 默认路径必须把 store_key 透传到 _fetch_raw_listings → _listings_cfg，否则多 noon 平台
+    # 配置时 store_key 退化成默认 'noon'、读错 listing 配置（首审打回的接线缺失）。注入
+    # raw_listings_fn 的 smoke 替身路径只收 page，保持兼容（不强加 store_key 关键字）。
+    if raw_listings_fn is not None:
+        raw_records = list(raw_listings_fn(page))
+    else:
+        raw_records = list(_fetch_raw_listings(page, store_key=store_key))
     rows = []
     for raw in raw_records:
         row = to_contract_row(raw)
