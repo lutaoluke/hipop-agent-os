@@ -9,6 +9,7 @@
    (确定性真红不被洗白)。这条**直接跑脚本**验证运行时行为,不只静态搜字符串。
 5. smoke_chat.py 失败 sys.exit(1) 且逐 case 打印(验收 #3 可定位)。
 6. 已上线的 chat 覆盖声明门 + Makefile 自动聚合保持(验收 #4 不回退)。
+7. live gate 每次必须启动当前 checkout 的 server；不能因为 :8765 已 health 就复用旧进程。
 
 确定性、无 DB/server/LLM(脚本自测走 WS154_SELFTEST 跳过 server,用假 smoke 命令),被 make test 自动聚合。
 """
@@ -112,6 +113,19 @@ def run():
             failures.append("ci_chat_e2e_gate.sh 没用 python 真实执行 smoke_chat.py。")
         if "attempts=2" not in st.replace(" ", ""):
             failures.append("脚本没有 attempts=2 的重试。")
+        start_idx = st.find('-m uvicorn hipop.server.main:app')
+        health_gate_idx = st.find('if ! curl -sS -m 3 "$URL/health"')
+        if 0 <= health_gate_idx < start_idx:
+            failures.append(
+                "ci_chat_e2e_gate.sh 只在 :8765 health 失败时才启动 server，"
+                "会复用旧进程测试旧代码。live gate 必须先清理监听端口并启动当前 checkout。"
+            )
+        if "lsof -tiTCP" not in st or "STARTED_SERVER" not in st:
+            failures.append("ci_chat_e2e_gate.sh 缺少端口占用清理 + 自己启动的 server 句柄，无法保证测的是当前 checkout。")
+        if 'kill -0 "$STARTED_SERVER"' not in st:
+            failures.append("ci_chat_e2e_gate.sh 启动后未校验 STARTED_SERVER 仍存活，旧 server 可能抢回端口并用 health 蒙混。")
+        if "pick_free_port" not in st or "HIPOP_PUBLIC_BASE_URL" not in st:
+            failures.append("ci_chat_e2e_gate.sh 缺少 8765 无法释放时的专属端口 fallback，persistent 旧 server 会卡死 live gate。")
         # 运行时验证(比静态搜字符串强):
         fake_env = "/tmp/ws154_smoke_fake_env"
         with open(fake_env, "w") as f:

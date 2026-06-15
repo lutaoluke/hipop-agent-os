@@ -7,7 +7,8 @@
 #
 # 职责:
 #   1. preflight:缺 live 凭据(LLM key / DB / JWT)→ 直接红(exit 3),打印缺什么,拒绝空壳绿。
-#   2. 起 server(若未起)→ 跑 tests/smoke_chat.py(~25 case,逐 case ✓/✗ 输出,验收 #3 可定位)。
+#   2. 清理 :8765 旧监听并启动当前 checkout 的 server → 跑 tests/smoke_chat.py(~25 case,
+#      逐 case ✓/✗ 输出,验收 #3 可定位)。
 #   3. 失败重试 1 次吸收 LLM 抖动;**两次都红才判失败(exit 1)**。
 #      关键不变量:每次都红的确定性 case → 两次都红 → 门照样红(重试绝不洗白真 bug)。
 #
@@ -40,30 +41,94 @@ if [ -n "$missing" ]; then
 fi
 echo "[preflight] live 凭据就绪 (provider=${LLM_PROVIDER:-deepseek})"
 
-# chat smoke 命令;仅本机自测时用 WS154_SMOKE_CMD 覆盖成 true/false 验 retry 行为。
-SMOKE_CMD="${WS154_SMOKE_CMD:-$PY $REPO/tests/smoke_chat.py --url $URL}"
-
-# ── 2) 起 server(自测模式跳过——假 smoke 不需要 server)────────────────────
+# ── 2) 起当前 checkout 的 server(自测模式跳过——假 smoke 不需要 server)─────
 STARTED_SERVER=""
-if [ -z "${WS154_SELFTEST:-}" ]; then
-  if ! curl -sS -m 3 "$URL/health" >/dev/null 2>&1; then
-    echo "[server] $URL 未起,拉起 uvicorn ..."
-    PYTHONPATH="$REPO" "$PY" -m uvicorn hipop.server.main:app --host 127.0.0.1 --port 8765 \
-      > /tmp/ws154_gate_server.log 2>&1 &
-    STARTED_SERVER=$!
-    for i in $(seq 1 30); do
-      curl -sS -m 3 "$URL/health" >/dev/null 2>&1 && break
-      sleep 1
-    done
-    if ! curl -sS -m 3 "$URL/health" >/dev/null 2>&1; then
-      echo "::error::[server] 30s 内没起来"; tail -40 /tmp/ws154_gate_server.log
-      [ -n "$STARTED_SERVER" ] && kill "$STARTED_SERVER" 2>/dev/null
-      exit 3
+
+refresh_url_parts() {
+  URL_HOST="$("$PY" -c 'from urllib.parse import urlparse; import sys; u=urlparse(sys.argv[1]); print(u.hostname or "127.0.0.1")' "$URL")"
+  URL_PORT="$("$PY" -c 'from urllib.parse import urlparse; import sys; u=urlparse(sys.argv[1]); print(u.port or (443 if u.scheme == "https" else 80))' "$URL")"
+}
+
+pick_free_port() {
+  "$PY" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+
+refresh_url_parts
+
+stop_existing_server() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    if curl -sS -m 2 "$URL/health" >/dev/null 2>&1; then
+      echo "::error::[server] $URL 已有响应，但 lsof 不可用，无法确认/清理旧进程；拒绝测试旧代码。"
+      return 1
     fi
+    return 0
+  fi
+
+  pids="$(lsof -tiTCP:"$URL_PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+  [ -z "$pids" ] && return 0
+
+  echo "[server] $URL 已有监听进程，先停止以避免测试旧代码: $(echo "$pids" | tr '\n' ' ')"
+  kill $pids 2>/dev/null || true
+  for _i in $(seq 1 10); do
+    pids="$(lsof -tiTCP:"$URL_PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+    [ -z "$pids" ] && return 0
+    sleep 1
+  done
+
+  echo "::error::[server] 无法停止占用 $URL 的旧进程: $(echo "$pids" | tr '\n' ' ')"
+  return 1
+}
+
+if [ -z "${WS154_SELFTEST:-}" ]; then
+  if ! stop_existing_server; then
+    fallback_port="$(pick_free_port)"
+    echo "::warning::[server] $URL 无法释放，改用当前 checkout 专属端口 127.0.0.1:${fallback_port}，避免复用旧代码。"
+    URL="http://127.0.0.1:${fallback_port}"
+    export HIPOP_URL="$URL"
+    export HIPOP_PUBLIC_BASE_URL="$URL"
+    refresh_url_parts
+  else
+    export HIPOP_URL="$URL"
+    export HIPOP_PUBLIC_BASE_URL="$URL"
+  fi
+  echo "[server] 从当前 checkout 启动 uvicorn: repo=$REPO url=$URL ..."
+  PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m uvicorn hipop.server.main:app \
+    --host "$URL_HOST" --port "$URL_PORT" > /tmp/ws154_gate_server.log 2>&1 &
+  STARTED_SERVER=$!
+  for i in $(seq 1 30); do
+    curl -sS -m 3 "$URL/health" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ! curl -sS -m 3 "$URL/health" >/dev/null 2>&1; then
+    echo "::error::[server] 30s 内没起来"; tail -40 /tmp/ws154_gate_server.log
+    [ -n "$STARTED_SERVER" ] && kill "$STARTED_SERVER" 2>/dev/null
+    exit 3
+  fi
+  if ! kill -0 "$STARTED_SERVER" 2>/dev/null; then
+    echo "::error::[server] 当前 checkout 的 uvicorn 已退出；不能用其它旧 server 的 /health 冒充通过。"
+    tail -40 /tmp/ws154_gate_server.log
+    exit 3
   fi
 fi
-cleanup() { [ -n "$STARTED_SERVER" ] && kill "$STARTED_SERVER" 2>/dev/null || true; }
+cleanup() {
+  if [ -n "$STARTED_SERVER" ]; then
+    kill "$STARTED_SERVER" 2>/dev/null || true
+    for _i in $(seq 1 10); do
+      if ! kill -0 "$STARTED_SERVER" 2>/dev/null; then
+        wait "$STARTED_SERVER" 2>/dev/null || true
+        return
+      fi
+      sleep 1
+    done
+    echo "::warning::[server] 当前 checkout uvicorn 10s 内未退出，强制停止。"
+    kill -9 "$STARTED_SERVER" 2>/dev/null || true
+    wait "$STARTED_SERVER" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
+
+# chat smoke 命令;仅本机自测时用 WS154_SMOKE_CMD 覆盖成 true/false 验 retry 行为。
+SMOKE_CMD="${WS154_SMOKE_CMD:-$PY $REPO/tests/smoke_chat.py --url $URL}"
 
 # ── 3) 跑 chat smoke,失败重试 1 次;两次都红才判失败 ────────────────────────
 attempts=2

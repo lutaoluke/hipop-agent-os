@@ -1291,6 +1291,14 @@ def _prepare_dynamic_expectations(base_url: str,
         pass  # endpoint unavailable — T04 stale case uses static expectations
 
 
+def _bind_base_url_expectations(base_url: str) -> None:
+    parsed = urllib.parse.urlparse(base_url)
+    netloc = parsed.netloc
+    c = _find_case("打开页面")
+    if c and netloc:
+        c.must_contain = [re.escape(netloc)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("HIPOP_URL", "http://localhost:8765"))
@@ -1326,6 +1334,7 @@ def main():
     # _bind_runtime_expectations 先写 must_contain；
     # _prepare_dynamic_expectations 随后用服务端 /api/sku-metrics 真实值覆盖，让动态值赢。
     cases = [c for c in CASES if (not args.filter) or args.filter in c.name]
+    _bind_base_url_expectations(args.url)
     try:
         t04_exp = _bind_runtime_expectations(cases)
     except Exception as e:

@@ -6,6 +6,7 @@ TopN**（如『销量最高的3个商品』）。故本用例用裸 TopN 验证 
 
 PASS:
   - chat("销量最高的3个商品") routes directly to list_products with limit=N.
+  - chat("不用刷新...哪些 SKU 最畅销") also routes directly and gets a deterministic stale hint.
   - limit=N means TopN by sales_30d DESC.
   - rendered reply carries source/time/coverage evidence before showing numbers.
 """
@@ -115,11 +116,34 @@ def test_chat_sales_topn_routes_to_list_products() -> None:
     print("    chat TopN sales query routes deterministically to list_products with evidence")
 
 
+def test_chat_sales_skip_topn_is_deterministic_with_stale_hint() -> None:
+    """T07-2 live flake guard: skip-refresh + 最畅销 must not wait on LLM wording/timeouts."""
+    with patch.object(_provider, "get_provider", return_value="smoke"), \
+         patch.object(_provider, "chat_with_tools", side_effect=AssertionError("T07-2 must not call provider")):
+        result = _agent.chat(
+            [{"role": "user", "content": "不用刷新，就用现在的告诉我哪些 SKU 最畅销"}],
+            SCOPE,
+        )
+
+    tools = result.get("tools_used") or []
+    reply = result.get("reply") or ""
+    assert tools == ["list_products"], f"skip-refresh 最畅销 must use list_products, got {tools}"
+    assert result.get("judge_method") == "deterministic_product_sales_topn_router", (
+        f"wrong judge_method: {result.get('judge_method')!r}"
+    )
+    assert "SKU-B" in reply and "来源" in reply and "sales_30d" in reply, reply
+    assert ("未更新到今天" in reply or "偏保守" in reply or "不新鲜" in reply), (
+        f"reply must carry deterministic T07 stale hint, got {reply!r}"
+    )
+    print("    skip-refresh 最畅销 → deterministic list_products + stale hint, no provider")
+
+
 def main() -> None:
     _setup_db()
     test_tool_limit_means_sales_30d_topn()
     test_chat_sales_topn_routes_to_list_products()
-    print("\n2/2 passed (WS-148 list_products TopN)")
+    test_chat_sales_skip_topn_is_deterministic_with_stale_hint()
+    print("\n3/3 passed (WS-148 list_products TopN)")
 
 
 if __name__ == "__main__":

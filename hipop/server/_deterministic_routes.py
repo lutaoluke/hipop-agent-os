@@ -302,14 +302,17 @@ def _deterministic_total_stock_topn_request(question: str) -> "Optional[int]":
 
 def _deterministic_product_sales_topn_request(question: str) -> "Optional[int]":
     q = question or ""
-    if "销量" not in q:
+    if not any(k in q for k in ("销量", "卖", "热销", "畅销")):
         return None
     if any(x in q for x in ("库存", "补货", "货单", "物流")):
         return None
     if any(x in q for x in ("180天", "历史", "总销量")):
         return None
     has_subject = any(x in q for x in ("商品", "产品", "SKU", "sku", "Sku", "款"))
-    has_top_intent = any(x in q for x in ("最高", "最多", "排行", "排名", "Top", "top", "TOP", "前"))
+    has_top_intent = any(x in q for x in (
+        "最高", "最多", "排行", "排名", "Top", "top", "TOP", "前",
+        "热销", "畅销", "最畅销", "最好卖", "卖得最好", "卖得最多",
+    ))
     if not (has_subject and has_top_intent):
         return None
     patterns = (
@@ -357,6 +360,7 @@ def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
         lines.append(f"{i}. **{name}**：近30天销量 {_fmt_int(sales_30d)}")
     lines.append("")
     lines.append(_render_evidence_suffix(evidence))
+    lines.append("提示：这是当前 sales_30d 销量快照，未在本轮刷新，结果可能偏保守；如需最新数据请先刷新销量后重问。")
     return "\n".join(lines)
 
 
