@@ -1,0 +1,4 @@
+country_code,store_name,noon_sku,partner_sku,sku,listing_status,is_listed,title
+SA,HIPOP-NOON-SA,NOON001,PSA001,ZSA001,active,1,Product A Title SA
+AE,HIPOP-NOON-AE,NOON002,PAE001,ZAE001,active,1,Product B Title AE
+SA,HIPOP-NOON-SA,NOON003,PSA002,ZSA002,inactive,0,Product C Title SA
