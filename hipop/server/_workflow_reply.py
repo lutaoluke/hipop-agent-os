@@ -34,13 +34,20 @@ def _workflow_receipt_reply(task_id: str, workflow: str, label: str) -> str:
     state = task.get("state") or "queued"
     event_statuses = {e.get("status") for e in events}
 
-    # 三态映射（优先级：error > final done > running/started > queued）
-    if "error" in event_statuses:
+    # 状态映射（优先级：error > done_unverified > verified done > running/started > queued）
+    # 以 task.state（权威终态）为准，不把 done_unverified 当 done。
+    if state == "error" or "error" in event_statuses:
         state_label = "执行失败"
         note = "请查看工作台任务面板了解详情，或重试。"
-    elif "done" in event_statuses and state in ("done", "done_unverified"):
+    elif state == "done_unverified" or "done_unverified" in event_statuses:
+        # verifier 没通过：任务跑完了但结果未达校验阈值（多半上游缺数据 / 写入为 0）。
+        # 绝不能说「已完成」——那正是 UI 报成功而业务失败的假活（T38）。
+        state_label = "已执行但未通过校验"
+        note = ("任务已结束，但结果未通过完成校验（结果可能不完整或上游数据缺失），"
+                "**不代表已成功**。请在工作台任务面板查看校验详情后再据此决策。")
+    elif state == "done" and "done" in event_statuses:
         state_label = "已完成"
-        note = "任务已完成；如需最新结论，请重新提问。"
+        note = "任务已完成并通过校验；如需最新结论，请重新提问。"
     elif state == "running" or "started" in event_statuses:
         state_label = "已开始执行"
         note = "请在工作台任务面板查看进度；完成后如需最新结论，请重新提问。"

@@ -69,7 +69,12 @@ def run_v2(tenant_id: int, max_pages: int | None = None,
             "SELECT partner_sku FROM wf2_sku WHERE tenant_id=? AND entity_alias=?",
             (tenant_id, ent["alias"]),
         ).fetchall()
-        known_skus[ent["alias"]] = {r[0] for r in rows}
+        # 用列名取值，别用整数索引 r[0]：PG 走 RealDictCursor 时 row 是 dict，
+        # r[0] 会抛 KeyError: 0（sqlite3.Row 两种都支持，所以 isolated 层是绿的、
+        # 真实浏览器 PG 才崩）。列名访问对两种后端都成立。
+        known_skus[ent["alias"]] = {
+            (r["partner_sku"] if isinstance(r, dict) else r[0]) for r in rows
+        }
     empty_entities = [alias for alias, skus in known_skus.items() if len(skus) == 0]
     if empty_entities:
         conn.close()

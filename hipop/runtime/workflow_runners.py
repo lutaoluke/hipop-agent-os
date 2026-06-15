@@ -325,9 +325,28 @@ def _run_wf5(task_id, tenant_id, actor, spec, progress, heartbeat, save_progress
     """销售周期 + 补货决策 — CPU bound，~30s，整跑。"""
     from hipop.workflows import wf_sales_cycle
     heartbeat()
-    wf_sales_cycle.run_v2(tenant_id=tenant_id)
-    save_progress({"done": True})
-    return {"summary": "wf5_sales_cycle: done"}
+    result = wf_sales_cycle.run_v2(tenant_id=tenant_id)
+    # fail-closed：run_v2 在「全部 entity 上游未就绪」时返回 {"ok": False, ...}。
+    # 绝不能丢掉这个信号 save_progress(done) 后冒充成功——那会让 task 进 done
+    # → verifier 查到 0 行 → done_unverified → chat 误报「已完成」（T38 假活根因）。
+    # 这里直接 raise，让 worker 把 task 终态标 error，并带可读的「缺哪路数据」原因。
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise RuntimeError(
+            f"wf5_sales_cycle fail-closed: {result.get('error') or 'upstream_not_ready'} — "
+            f"{result.get('message') or '上游数据未就绪'}"
+        )
+    # 统计本 run 真写了多少行（兼容部分 entity 被跳的情况）；0 行不算成功。
+    written = 0
+    if isinstance(result, dict):
+        written = sum(v for k, v in result.items()
+                      if k != "_skipped" and isinstance(v, int))
+    if written == 0:
+        raise RuntimeError(
+            "wf5_sales_cycle fail-closed: 0 rows written — "
+            "上游 wf2_sku/wf1_stock 可能为空或未就绪，拒绝把空结果当刷新成功"
+        )
+    save_progress({"done": True, "rows_written": written})
+    return {"summary": f"wf5_sales_cycle: {written} skus written"}
 
 
 @register("wf6_alerts_v2")

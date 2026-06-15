@@ -308,12 +308,16 @@ def test_no_bypass_for_query_result():
 # ── _has_task_done_evidence unit tests ────────────────────────────────────────
 
 def test_has_task_done_evidence_recognizes_done_statuses():
-    """_has_task_done_evidence 识别 done/success/complete 状态。"""
-    for status in ("done", "done_unverified", "success", "complete", "completed"):
+    """_has_task_done_evidence 识别 done/success/complete 状态。
+
+    WS-181: done_unverified（verifier 没过）**不再**算完成证据 —— 它是任务跑完但
+    结果未通过校验，把它当 done 会让「数据已刷新完成」在业务实际失败时被放行（T38）。
+    """
+    for status in ("done", "success", "complete", "completed"):
         tool_log = [{"name": "task_result", "result": {"status": status}}]
         assert _has_task_done_evidence(tool_log), f"status={status} 应识别为 done 证据"
 
-    for status in ("running", "queued", "started", "error", "failed", ""):
+    for status in ("done_unverified", "running", "queued", "started", "error", "failed", "cancelled", ""):
         tool_log = [{"name": "task_result", "result": {"status": status}}]
         assert not _has_task_done_evidence(tool_log), (
             f"status={status} 不应识别为 done 证据"
