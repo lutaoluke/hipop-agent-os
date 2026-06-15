@@ -682,10 +682,8 @@ scope: {scope}
 
 ## 关键：用户问"某 SKU/某货单当前在途 / 物流状态"时，**直接调 query_sku_live / query_order_live**
 - 不要先 data_health_check 然后说"wf3 陈旧，等 ingest 完再答"——这是错的，应该跳过 wf3 缓存直接查 ERP
-- 不要说"我可以查"然后不调 tool —— 必须本轮真调 query_sku_live(sku=...)
 - 用户问多个 SKU → 对每个分别调 query_sku_live
 - query_sku_live 慢（5-15s）但准（直连 ERP），值得
-- query_sku_live 返回 `ok=false`（例如 `erp_login_failed_no_cache`，且 `cache_fallback=false`）时：必须明告用户「ERP 实时不可用，无法确认当前在途」，**不许**把 wf3 旧缓存当作实时数据呈现
 
 ## tool 速查
 | 用户问 | 调 |

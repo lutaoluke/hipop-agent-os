@@ -12,18 +12,19 @@ PASS:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import re
 import sqlite3
 import sys
 import tempfile
-import datetime as _dt
 from unittest.mock import patch
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+FIXTURE_AS_OF = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
 
 os.environ.pop("DB_URL", None)
 os.environ["HIPOP_DB"] = TMP_DB
@@ -40,7 +41,6 @@ TENANT = 1
 ALIAS = "hipop_ksa"
 SCOPE = {"tenant_id": TENANT, "current_user": "test", "current_role": "admin", "store": "KSA"}
 SCHEMA_V2 = os.path.join(REPO, "db", "schema_v2.sql")
-FIXTURE_AS_OF = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
 
 
 def _extract_create(table: str) -> str:
