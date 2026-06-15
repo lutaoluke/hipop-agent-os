@@ -63,7 +63,8 @@ AGENT_PY = os.path.join(REPO, "hipop", "server", "agent.py")
 # WS-167（S3）：15 个 _deterministic_* 确定性路由 + 配套 _format_* formatter 整体外移到
 # hipop/server/_deterministic_routes.py，agent.py 仅保留 chat() 对它们的调用接线（再导出投影）。
 # 故 2898→2304、_deterministic_ 计数 15→0，基线随之再下压（只下压，不回调）。
-LINE_BUDGET = 2304                 # agent.py 总行数上限（WS-167 外移后）
+# WS-180：T29 意图门 bypass 一行（调用已外移的 _deterministic_replenishment_list_request）→ +1。
+LINE_BUDGET = 2305                 # agent.py 总行数上限（WS-180 T29 bypass +1）
 TOOL_DEF_BUDGET = 0                # `def tool_*` —— 业务 tool 实现（已全部外移到 tools_impl）
 UNDERSCORE_TOOL_DEF_BUDGET = 0     # `def _tool_*` —— 下划线前缀 tool 实现（已全部外移）
 DETERMINISTIC_DEF_BUDGET = 0       # `def _deterministic_*` —— 确定性路由 / formatter（已全部外移到 _deterministic_routes）
