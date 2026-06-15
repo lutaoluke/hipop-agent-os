@@ -49,6 +49,7 @@ EXPECTED_TOOLS = {
     "notify_via_feishu", "run_workflow", "confirm_proposal", "tenant_notes_get",
     "tenant_notes_append", "query_sku_live", "query_order_live", "query_1688_similar",
     "explain_status_enum", "capture_feedback", "query_stock_split", "total_stock_topn",
+    "top_sales_by_window",
 }
 
 _TOOL_DEF_RE = re.compile(r'^def (tool_|_tool_)\w+\s*\(', re.MULTILINE)

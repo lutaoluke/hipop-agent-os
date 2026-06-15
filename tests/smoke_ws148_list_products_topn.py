@@ -1,12 +1,11 @@
-"""WS-148 smoke: list_products is the deterministic 30d sales TopN path.
+"""WS-148 smoke: list_products is the deterministic **windowless** sales TopN path.
 
-FAIL before fix:
-  - chat("近30天销量最高的3个商品") falls through to the LLM/provider path.
-  - list_products returns sorted rows but does not declare the sales_30d TopN
-    sort/evidence contract.
+WS-120 choice A 后边界：带时间窗的 TopN（『近30天/近N天/指定日期窗口』）改走
+top_sales_by_window 逐单现算；list_products/sales_30d 固定桶只服务**无时间窗的裸
+TopN**（如『销量最高的3个商品』）。故本用例用裸 TopN 验证 list_products 路由仍在。
 
-PASS after fix:
-  - chat routes directly to list_products with limit=N.
+PASS:
+  - chat("销量最高的3个商品") routes directly to list_products with limit=N.
   - limit=N means TopN by sales_30d DESC.
   - rendered reply carries source/time/coverage evidence before showing numbers.
 """
@@ -98,13 +97,13 @@ def test_chat_sales_topn_routes_to_list_products() -> None:
     with patch.object(_provider, "get_provider", return_value="smoke"), \
          patch.object(_provider, "chat_with_tools", side_effect=AssertionError("WS-148 must not call provider")):
         result = _agent.chat(
-            [{"role": "user", "content": "KSA 近30天销量最高的3个商品"}],
+            [{"role": "user", "content": "KSA 销量最高的3个商品"}],
             SCOPE,
         )
 
     tools = result.get("tools_used") or []
     reply = result.get("reply") or ""
-    assert tools == ["list_products"], f"TopN sales query must use list_products only, got {tools}"
+    assert tools == ["list_products"], f"裸 TopN（无时间窗）must use list_products only, got {tools}"
     assert result.get("judge_method") == "deterministic_product_sales_topn_router", (
         f"wrong judge_method: {result.get('judge_method')!r}"
     )

@@ -55,6 +55,7 @@ EXPECTED_ROUTERS = {
     "_deterministic_data_freshness_request",
     "_deterministic_total_stock_topn_request",
     "_deterministic_product_sales_topn_request",
+    "_deterministic_window_sales_topn_request",
     "_deterministic_scope_overview_request",
     "_deterministic_products_count_request",
     "_deterministic_sku_metric_request",
@@ -69,6 +70,7 @@ EXPECTED_ROUTERS = {
 EXPECTED_FORMATTERS = {
     "_format_erp_refresh_time_reply",
     "_format_product_sales_topn_reply",
+    "_format_window_sales_topn_reply",
     "_format_total_stock_topn_reply",
     "_format_products_count_reply",
     "_format_scope_overview_reply",
@@ -88,6 +90,7 @@ EXPECTED_HELPERS = {
     "_format_pct",
     "_format_metric_value",
     "_extract_live_order_no",
+    "_window_sales_topn_route",
 }
 
 EXPECTED_ALL = EXPECTED_ROUTERS | EXPECTED_FORMATTERS | EXPECTED_HELPERS
