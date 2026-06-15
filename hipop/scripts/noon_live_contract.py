@@ -41,10 +41,14 @@ class LiveSourceUnavailable(Exception):
     """
 
 
-# ── 三类 noon 实时数据 ────────────────────────────────────────────────
+# ── 四类 noon 数据 ────────────────────────────────────────────────────
 ORDERS = "orders"               # noon 订单    → wf2_orders / wf2_sku
 MY_INVENTORY = "my_inventory"   # noon 可售库存 → wf1_stock.noon_*
 ASN = "asn"                     # noon 送仓/ASN → wf1_asn_lines_staging
+LISTINGS = "listings"           # noon listing 在售状态 → 对账用（WS-183）
+
+# KINDS = refresh_all_v2 需要 live producer 的三类(维持不变，不接 listings)。
+# listing 行契约通过 ROW_CONTRACT 校验，不走 live producer 注册表。
 KINDS = (ORDERS, MY_INVENTORY, ASN)
 
 
@@ -79,19 +83,33 @@ ROW_CONTRACT = {
             "country_code", "inbound_date", "warehouse_code",
         ),
     },
+    LISTINGS: {
+        # listing_status: noon 平台 listing 生命周期状态(active/inactive/rejected/pending 等)
+        # 是否在售 = listing_status 语义；is_listed 为可选辅助字段(0/1)。
+        # 缺 country_code 或 listing_status → 不知道「哪国/是否在售」→ 红灯。
+        "required": ("country_code", "listing_status"),
+        "sku_key_one_of": ("noon_sku", "partner_sku", "sku"),
+        "known": (
+            "country_code", "store_name",
+            "noon_sku", "partner_sku", "sku",
+            "listing_status", "is_listed",
+            "title",
+        ),
+    },
 }
 
-# 三类 fixture(行字段唯一来源；my_inventory / asn 复用既有 CSV)。
+# 四类 fixture(行字段唯一来源；my_inventory / asn 复用既有 CSV)。
 FIXTURES = {
     ORDERS: os.path.join(FIXTURE_DIR, "noon_orders.csv"),
     MY_INVENTORY: os.path.join(FIXTURE_DIR, "noon_inventory.csv"),
     ASN: os.path.join(FIXTURE_DIR, "noon_asn.csv"),
+    LISTINGS: os.path.join(FIXTURE_DIR, "noon_listings.csv"),
 }
 
 
 def _check_kind(kind: str) -> None:
-    if kind not in KINDS:
-        raise ValueError(f"未知 noon 数据类型: {kind!r}（应为 {KINDS}）")
+    if kind not in ROW_CONTRACT:
+        raise ValueError(f"未知 noon 数据类型: {kind!r}（已知: {tuple(ROW_CONTRACT)}）")
 
 
 # ── live producer 注册表（WS-N2 抓取器接入点 / WS-38 收口判定入口）──────

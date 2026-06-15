@@ -43,10 +43,15 @@ def main():
     for k in C.KINDS:
         C.set_live_row_producer(k, None)
     try:
-        print("== ① 契约覆盖且仅覆盖三类 ==")
-        assert set(C.ROW_CONTRACT) == set(C.KINDS), "ROW_CONTRACT 必须恰好覆盖 KINDS"
-        assert set(C.FIXTURES) == set(C.KINDS), "FIXTURES 必须恰好覆盖 KINDS"
-        print(f"  ✓ KINDS = {C.KINDS}")
+        print("== ① 契约/fixture 覆盖 KINDS，含 listing kind（WS-183）==")
+        # KINDS = refresh_all_v2 需要 producer 的三类，不变。
+        assert set(C.KINDS) == {C.ORDERS, C.MY_INVENTORY, C.ASN}, \
+            "KINDS(refresh 集) 应恰好为 orders/my_inventory/asn"
+        # ROW_CONTRACT / FIXTURES 覆盖全部已知 kind（含 listings），且互相一致。
+        assert set(C.KINDS) <= set(C.ROW_CONTRACT), "ROW_CONTRACT 必须覆盖全部 KINDS"
+        assert C.LISTINGS in C.ROW_CONTRACT, "LISTINGS kind 必须在 ROW_CONTRACT"
+        assert set(C.FIXTURES) == set(C.ROW_CONTRACT), "FIXTURES 必须与 ROW_CONTRACT 一致"
+        print(f"  ✓ KINDS(refresh) = {C.KINDS}，ROW_CONTRACT = {tuple(sorted(C.ROW_CONTRACT))}")
 
         print("== ② 三类 producer 全未注册 → 红灯并点名缺失 ==")
         assert C.missing_live_producers() == list(C.KINDS), "未注册时应报全部缺失"
@@ -77,8 +82,8 @@ def main():
             C.set_live_row_producer(k, None)
         print("  ✓ 全注册时放行")
 
-        print("== ⑤ 三类 fixture 就位、逐行合契约、列头 ⊆ known（防漂移）==")
-        for kind in C.KINDS:
+        print("== ⑤ 全类 fixture 就位、逐行合契约、列头 ⊆ known（防漂移）==")
+        for kind in C.ROW_CONTRACT:
             path = C.FIXTURES[kind]
             assert os.path.isfile(path), f"{kind} fixture 缺失: {path}"
             rows = C.load_fixture_rows(kind)

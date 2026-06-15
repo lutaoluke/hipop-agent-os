@@ -104,6 +104,11 @@
           "_NOTE": "noon 可售库存实时抓取（WS-N2.2/WS-59）：api_url=已登录 page 同源 fetch 的真实 my inventory 接口，由运营首次 live 时核对后经 NOON_STOCK_API_URL 注入（绝不在仓库写死/猜 URL）；records_path=接口 JSON 走到库存记录 list 的键路径（缺省自动在常见容器键里找 list）。字段名→WS-34 契约键的映射钉在 noon_stock_fetcher._NOON_STOCK_FIELD_MAP。",
           "api_url": "${NOON_STOCK_API_URL}",
           "records_path": null
+        },
+        "listings": {
+          "_NOTE": "noon listing 在售状态抓取占位（WS-183/S1）：在售口径严格等于 noon 当前在售；ERP 绑定只进异常对账。api_url / records_path 待 live 实测后通过 NOON_LISTINGS_API_URL 注入，绝不在仓库写真实 URL 或凭据。字段契约见 noon_live_contract.ROW_CONTRACT['listings']。",
+          "api_url": "${NOON_LISTINGS_API_URL}",
+          "records_path": null
         }
       }
     }
