@@ -46,6 +46,7 @@ refresh_all 编排、schema。故注册落在 contract 的通用 LISTINGS 注册
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import Callable, Iterable, Optional
 
@@ -141,6 +142,63 @@ def to_contract_row(raw: dict) -> dict:
         if v is not None:
             row[key] = v
     return row
+
+
+# ── listing_status 值收口（WS-188 验收 #1「坏状态红灯」）──────────────────────
+# noon listing 生命周期状态全集（规范小写形）。契约 validate_row 只查 listing_status 非空，
+# 不校验状态语义；若不在这里收口，noon 接口改版 / 返回未知状态时「坏的在售状态」会被当成
+# 有效在售状态流入下游补货判断（口径回退）。故未知/非法状态在抓取器层红灯，绝不放过。
+# 真 noon 接口的状态命名首次 live 由运营核对：若发现本集未覆盖的**合法**状态，经
+# platform_browser.platforms.<noon>.listings.allowed_statuses 显式扩集（显式 opt-in，
+# 不静默放过未知状态）；本集 + 配置扩集 = 抓取器认可的允许集。
+_CANONICAL_LISTING_STATUS = {
+    "active", "inactive", "pending", "rejected", "blocked", "deactivated",
+    "out_of_stock", "deleted", "draft", "suspended", "archived", "expired", "paused",
+}
+# 常见接口别名 → 规范状态（大小写/分隔符已先归一，见 _norm_status_token）。
+_LISTING_STATUS_ALIASES = {
+    "enabled": "active", "live": "active", "selling": "active", "in_stock": "active",
+    "disabled": "inactive", "offline": "inactive", "unpublished": "inactive",
+    "pending_review": "pending", "in_review": "pending", "review": "pending",
+    "reject": "rejected", "denied": "rejected",
+    "block": "blocked", "banned": "blocked",
+    "oos": "out_of_stock", "sold_out": "out_of_stock",
+    "removed": "deleted",
+}
+
+
+def _norm_status_token(value) -> str:
+    """状态值归一：strip + 小写 + 把空白/连字符折叠成下划线（'Pending Review' → 'pending_review'）。"""
+    return re.sub(r"[\s\-]+", "_", str(value).strip().lower()).strip("_")
+
+
+def normalize_listing_status(value, *, extra_allowed: Optional[Iterable[str]] = None):
+    """规范化单个 listing_status → 规范形（在允许集内）；空/未知 → None（由调用方红灯）。
+
+    extra_allowed：运营首次 live 经 listings.allowed_statuses 显式扩集的合法状态（同样归一比较）。
+    """
+    tok = _norm_status_token(value)
+    if not tok:
+        return None
+    tok = _LISTING_STATUS_ALIASES.get(tok, tok)
+    allowed = set(_CANONICAL_LISTING_STATUS)
+    allowed.update(_norm_status_token(s) for s in (extra_allowed or []) if _norm_status_token(s))
+    return tok if tok in allowed else None
+
+
+def assert_listing_status_known(row: dict, *, extra_allowed: Optional[Iterable[str]] = None) -> None:
+    """row 的 listing_status 必须落在允许集，否则红灯 LiveSourceUnavailable（验收#1）。
+
+    前置：调用前已过 `validate_row`（缺/空 listing_status 已在那里红灯），故这里只判**值**。
+    未知/非法状态绝不当成有效在售状态放过——noon 改字段/改状态时把异常 listing 拦在下游之外。
+    """
+    raw_status = row.get("listing_status")
+    if normalize_listing_status(raw_status, extra_allowed=extra_allowed) is None:
+        raise LiveSourceUnavailable(
+            f"未知/非法 listing_status {raw_status!r} —— 不在 noon listing 状态允许集 "
+            f"{sorted(_CANONICAL_LISTING_STATUS)}（首次 live 若有新合法状态，经 "
+            "platform_browser.platforms.<noon>.listings.allowed_statuses 显式扩集）；"
+            "绝不当成有效在售状态放过（验收#1 坏状态红灯，防 noon 改版/未知状态混入下游）")
 
 
 # ── 真 page → 真 rows 的唯一外部边界（smoke 注入替身）────────────────────────
@@ -245,10 +303,17 @@ def fetch_listing_rows(tenant_id, *, store_key: str = DEFAULT_STORE_KEY,
         raw_records = list(raw_listings_fn(page))
     else:
         raw_records = list(_fetch_raw_listings(page, store_key=store_key))
+    # 允许集扩展：运营首次 live 经 listings.allowed_statuses 显式扩集的合法状态（缺配置 → 无扩集）。
+    try:
+        extra_allowed = _listings_cfg(store_key).get("allowed_statuses")
+    except Exception:  # noqa: BLE001 — 配置读不到不应阻断已抓到的行校验；退化为无扩集
+        extra_allowed = None
     rows = []
     for raw in raw_records:
         row = to_contract_row(raw)
         _contract.validate_row(_contract.LISTINGS, row)  # 缺字段/契约外字段红灯，不编数
+        # 值收口：坏/未知 listing_status 红灯，绝不当有效在售状态放过（验收#1）。
+        assert_listing_status_known(row, extra_allowed=extra_allowed)
         rows.append(row)
     return rows
 

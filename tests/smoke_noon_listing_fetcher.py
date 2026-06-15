@@ -301,7 +301,46 @@ def main():
         assert len(rows_inj) == len(LISTING_ROWS), "注入 raw_listings_fn 路径应仍兼容（不受 store_key 接线影响）"
         print("✓ store_key 接线：默认 fetch path 把 store_key 透传到 _fetch_raw_listings（多平台不读错配置）；注入路径兼容")
 
-        print("\n8/8 passed")
+        # ── 9. 坏 listing_status 红灯（二审打回返工，验收#1“坏状态红灯”）──────────
+        #   bug：实现只查 listing_status 非空，不校验状态值；noon 接口改版/返回未知状态时
+        #   坏状态被当成有效在售状态流入下游（口径回退）。这里钉死：未知/非法状态必须红灯，
+        #   而非成功返回 contract row。
+        good_raw = {"countryCode": "SA", "noonSku": "N-OK", "listingStatus": "active"}
+        bad_raw = {"countryCode": "SA", "noonSku": "N-BAD",
+                   "listingStatus": "definitely_not_a_noon_status"}
+        # 9a. 好状态正常过；坏状态经 fetch_listing_rows 红灯（reviewer 红队复现的正解）
+        ok_rows = F.fetch_listing_rows(TENANT, page=object(),
+                                       raw_listings_fn=lambda p: [good_raw])
+        assert len(ok_rows) == 1 and ok_rows[0]["listing_status"] == "active", ok_rows
+        _expect_red(
+            lambda: F.fetch_listing_rows(TENANT, page=object(),
+                                         raw_listings_fn=lambda p: [bad_raw]),
+            "listing_status", "坏在售状态红灯")
+        # 9b. normalize：别名 / 大小写 / 分隔符收口进允许集；未知/空 → None（由调用方红灯）
+        assert F.normalize_listing_status("ACTIVE") == "active"
+        assert F.normalize_listing_status("Pending Review") == "pending"   # alias + 空格
+        assert F.normalize_listing_status("out-of-stock") == "out_of_stock"  # 连字符
+        assert F.normalize_listing_status("definitely_not_a_noon_status") is None
+        assert F.normalize_listing_status("") is None
+        # 9c. 运营经 listings.allowed_statuses 显式扩集 → 接受新合法状态（显式 opt-in，非静默放过）
+        assert F.normalize_listing_status("brand_new_noon_state") is None  # 默认仍红
+        assert F.normalize_listing_status(
+            "brand_new_noon_state", extra_allowed=["brand_new_noon_state"]) == "brand_new_noon_state"
+        # 扩集经 cfg 注入也生效：fetch 默认读 _listings_cfg().allowed_statuses
+        _orig_cfg9 = F._listings_cfg
+        F._listings_cfg = lambda store_key=F.DEFAULT_STORE_KEY: {
+            "allowed_statuses": ["brand_new_noon_state"]}
+        try:
+            ext_rows = F.fetch_listing_rows(
+                TENANT, page=object(),
+                raw_listings_fn=lambda p: [{"countryCode": "SA", "noonSku": "N-X",
+                                            "listingStatus": "brand_new_noon_state"}])
+            assert len(ext_rows) == 1, "cfg allowed_statuses 扩集后该状态应被接受"
+        finally:
+            F._listings_cfg = _orig_cfg9
+        print("✓ 坏 listing_status → 红灯（不当有效在售放过）；normalize 别名/大小写收口；cfg allowed_statuses 显式扩集生效")
+
+        print("\n9/9 passed")
         return 0
     finally:
         F.unregister_live_producer()
