@@ -60,6 +60,15 @@ def _load_ws134_operational_numeric_tools_smoke():
     return mod
 
 
+def _load_ws191_sales_replenishment_topn_boundary_smoke():
+    path = REPO_ROOT / "tests" / "smoke_ws191_sales_replenishment_topn_boundary.py"
+    spec = importlib.util.spec_from_file_location("smoke_ws191_sales_replenishment_topn_boundary", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _load_ws147_daily_scheduler_smoke():
     path = REPO_ROOT / "tests" / "smoke_ws147_daily_scheduler.py"
     spec = importlib.util.spec_from_file_location("smoke_ws147_daily_scheduler", path)
@@ -234,6 +243,14 @@ def test_ws134_operational_numeric_tools_use_evidence_gates():
     smoke = _load_ws134_operational_numeric_tools_smoke()
     smoke.test_sales_topn_stale_snapshot_fails_closed()
     smoke.test_replenishment_list_routes_deterministically_and_blocks_stale_wf5()
+
+
+def test_ws191_sales_replenishment_topn_route_boundary():
+    """WS-191: sales-window TopN and replenishment TopN use distinct deterministic tools."""
+    smoke = _load_ws191_sales_replenishment_topn_boundary_smoke()
+    smoke.test_route_classifier_separates_window_sales_and_replenishment_topn()
+    smoke.test_chat_sales_window_topn_uses_window_evidence_not_snapshot()
+    smoke.test_chat_replenishment_topn_uses_replenishment_tool_not_sales()
 
 
 def test_ws149_query_sku_live_boundary_fail_closed():

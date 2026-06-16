@@ -685,6 +685,20 @@ def _deterministic_sku_metric_request(question: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+_SKU_TOKEN_RE = _re.compile(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b")
+_TOPN_TOKEN_RE = _re.compile(r"TOP\d+", _re.IGNORECASE)
+
+
+def _first_business_sku_token(text: str) -> Optional[str]:
+    """Return the first SKU-like business token, excluding TopN ranking words."""
+    for match in _SKU_TOKEN_RE.finditer((text or "").upper()):
+        token = match.group(0)
+        if _TOPN_TOKEN_RE.fullmatch(token):
+            continue
+        return token
+    return None
+
+
 def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
     q = question or ""
     q_up = q.upper()
@@ -694,16 +708,16 @@ def _deterministic_replenishment_sku_request(question: str) -> Optional[str]:
         return None
     if not any(x in q for x in ("补货", "pipeline", "Pipeline")):
         return None
-    m = _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q_up)
-    return m.group(0) if m else None
+    return _first_business_sku_token(q_up)
 
 
 def _deterministic_replenishment_list_request(question: str) -> "Optional[int]":
     q = question or ""
-    if _re.search(r"\b[A-Z]{2,}[A-Z0-9_]*\d[A-Z0-9_]*\b", q.upper()):
+    if _first_business_sku_token(q):
         return None
     triggers = ("补货建议", "本周必补", "该补货", "要补货", "哪些要补", "哪些货要补", "补多少")
-    if not any(t in q for t in triggers):
+    topn_intent = any(t in q for t in ("Top", "top", "TOP", "前", "最高", "最多", "排行", "排名"))
+    if not (any(t in q for t in triggers) or ("补货" in q and ("建议" in q or topn_intent))):
         return None
     if any(t in q for t in ("刷新", "同步", "重算", "跑一下", "重跑", "重新计算")):
         return None
