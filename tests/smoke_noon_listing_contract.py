@@ -125,7 +125,7 @@ def main():
         "listings 不应出现在 missing_live_producers（不走 refresh 注册表）"
     print(f"  ✓ KINDS = {C.KINDS}，missing 不含 listings")
 
-    print("== ⑧ platform_browser.platforms.noon.listings 占位就位，无真实凭据 ==")
+    print("== ⑧ platform_browser.platforms.noon.listings 固定接口就位，无真实凭据 ==")
     config_path = os.path.join(REPO, "hipop", "config", "hipop.json")
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
@@ -133,13 +133,22 @@ def main():
     assert "listings" in noon_cfg, \
         "hipop.json platform_browser.platforms.noon 缺 listings 占位"
     listing_cfg = noon_cfg["listings"]
-    # api_url 必须是 env 占位符（${ 开头），绝不写死真实 URL
+    # S2 已用紫鸟 live network 捕获确认 listing 固定 REST endpoint；它不是凭据，
+    # 对齐 orders.api_url 明文配置。这里守住“固定 noon REST 路径 + 无 env secret”。
     api_url = listing_cfg.get("api_url", "")
-    assert api_url.startswith("${"), \
-        f"listings api_url 应为 env 占位符，got {api_url!r}（禁写真实 URL/凭据）"
-    print(f"  ✓ listings 占位存在，api_url={api_url!r}")
+    assert api_url == "https://noon-catalog.noon.partners/_vs/mp/mp-noon-catalog-api-rocket/offer/list/noon", \
+        f"listings api_url 应为已探明的固定 REST URL，got {api_url!r}"
+    assert listing_cfg.get("method") == "POST", f"listings method 应为 POST: {listing_cfg}"
+    assert listing_cfg.get("records_path") == ["data", "hits"], \
+        f"records_path 应指向 data.hits: {listing_cfg}"
+    assert listing_cfg.get("country_code") == "SA", f"KSA listing country_code 应为 SA: {listing_cfg}"
+    assert listing_cfg.get("noon_store_code") == "STR44158-NSA", \
+        f"KSA noon_store_code 应为 STR44158-NSA: {listing_cfg}"
+    assert "${" not in json.dumps(listing_cfg, ensure_ascii=False), \
+        f"listings 配置不应再含待注入 env 占位: {listing_cfg}"
+    print(f"  ✓ listings 固定 REST endpoint 就位，api_url={api_url!r}")
 
-    print("\n✓ noon listing 行契约 + 配置占位 smoke 全过")
+    print("\n✓ noon listing 行契约 + 固定接口配置 smoke 全过")
 
 
 if __name__ == "__main__":

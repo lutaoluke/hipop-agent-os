@@ -106,9 +106,17 @@
           "records_path": null
         },
         "listings": {
-          "_NOTE": "noon listing 在售状态抓取占位（WS-183/S1）：在售口径严格等于 noon 当前在售；ERP 绑定只进异常对账。api_url / records_path 待 live 实测后通过 NOON_LISTINGS_API_URL 注入，绝不在仓库写真实 URL 或凭据。字段契约见 noon_live_contract.ROW_CONTRACT['listings']。",
-          "api_url": "${NOON_LISTINGS_API_URL}",
-          "records_path": null
+          "_NOTE": "noon listing 在售状态抓取（WS-183/S2/WS-188）：已登录 catalog 页同源 POST 真实 My Catalog offer/list/noon 接口（非凭据，固定 REST 路径）。取数前先导到 report_page_url，再分页 POST api_url；body 含 noon_store_code/page/per_page/filters/sort/direction；records_path=data.hits，total_path=data.total。country_code 按销售主体国别：KSA=SA。字段名→WS-183/S1 契约键映射钉在 noon_listing_fetcher._NOON_LISTING_FIELD_MAP，live_status 在抓取器层收口为 listing_status。",
+          "api_url": "https://noon-catalog.noon.partners/_vs/mp/mp-noon-catalog-api-rocket/offer/list/noon",
+          "method": "POST",
+          "report_page_url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon",
+          "country_code": "SA",
+          "noon_store_code": "STR44158-NSA",
+          "per_page": 100,
+          "max_pages": 50,
+          "page_retries": 3,
+          "records_path": ["data", "hits"],
+          "total_path": ["data", "total"]
         }
       }
     }
