@@ -1568,6 +1568,7 @@ def chat(messages: List[Dict], scope: Dict) -> Dict:
             _intent_gate.IntentMood.IMPACT_QUERY,
         )
         and not _deterministic_sku_metric_request(question)
+        and not _deterministic_replenishment_list_request(question)  # WS-180/T29 bypass
     ):
         reply = _intent_gate.explain_reply(_intent_decision.mood, question)
         return {
