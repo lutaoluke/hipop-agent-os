@@ -1984,6 +1984,208 @@ def test_t48_procurement_rate_chat_fails_closed_when_rule_source_unreadable():
     assert result.get("judge_method") == "deterministic_procurement_rate_rule_router"
 
 
+# ── WS-156: 体验官 harness（浏览器回放 + 第二通道对账 + 证据 bundle + 落 issue）──
+
+def _eh():
+    from hipop.runtime import experience_harness as eh
+    return eh
+
+
+def _real_artifacts(tmp_prefix="ws156"):
+    """造两份真实存在的截图/trace 文件——browser.present() 校验磁盘文件是否存在。"""
+    import tempfile
+    d = tempfile.mkdtemp(prefix=tmp_prefix)
+    shot = os.path.join(d, "screenshot.png")
+    trace = os.path.join(d, "trace.zip")
+    Path(shot).write_bytes(b"\x89PNG fake-shot")
+    Path(trace).write_bytes(b"PK fake-trace")
+    return shot, trace
+
+
+def _complete_case(eh):
+    return eh.ExperienceCase(
+        case_id="overview_ksa",
+        prompt="看 KSA 卡单的几个 SKU",
+        store="ksa",
+        must_contain=[r"TBJ0059A", r"\b2\b"],
+    )
+
+
+class _FakeExperienceRunner:
+    """记录 multica issue create/comment/metadata set，回放 metadata（镜像 _FakeRouteCardRunner）。"""
+
+    def __init__(self):
+        self.metadata = {}
+        self.created = []
+        self.comments = []
+        self._next_id = 1000
+
+    def json(self, args):
+        if args[:3] == ["issue", "metadata", "list"]:
+            return dict(self.metadata.get(args[3], {}))
+        if args[:2] == ["issue", "create"]:
+            self._next_id += 1
+            new_id = f"exp-issue-{self._next_id}"
+            self.created.append({"args": args, "id": new_id})
+            return {"id": new_id, "identifier": f"EXP-{self._next_id}"}
+        raise AssertionError(f"unexpected json call: {args}")
+
+    def run(self, args):
+        if args[:3] == ["issue", "metadata", "set"]:
+            issue = args[3]
+            key = args[args.index("--key") + 1]
+            value = args[args.index("--value") + 1]
+            self.metadata.setdefault(issue, {})[key] = value
+            return ""
+        if args[:3] == ["issue", "comment", "add"]:
+            self.comments.append(args)
+            return ""
+        raise AssertionError(f"unexpected run call: {args}")
+
+
+def test_ws156_conclude_pass_requires_both_channels():
+    """完整双通道证据且对账一致 → PASS，并产出完整证据 bundle。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    shot, trace = _real_artifacts()
+    seen_text = "KSA 卡单 SKU: TBJ0059A 等共 2 个"
+    browser = eh.BrowserEvidence(rendered_text=seen_text, screenshot_path=shot,
+                                 trace_path=trace, url="http://x/?store=ksa")
+    channel = eh.SecondChannel(source="api_chat", reply=seen_text, tools_used=["scope_overview"])
+
+    bundle = eh.conclude(case, browser, channel)
+    assert bundle.conclusion == eh.PASS, bundle.reasons
+    d = bundle.to_dict()
+    # 证据 bundle 必须齐全（截图 + trace + 双通道 + 对账）
+    assert d["browser"]["present"] and d["browser"]["screenshot_path"] and d["browser"]["trace_path"]
+    assert d["second_channel"]["present"]
+    assert d["reconciliation"]["performed"] and d["reconciliation"]["matched"]
+    assert d["mismatch_signature"] is None  # 只有 FAIL 才有签名
+
+
+def test_ws156_missing_browser_evidence_is_invalid_never_pass():
+    """缺浏览器证据（无截图/trace/渲染文本，或文件不存在）→ INVALID，绝不 PASS。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    channel = eh.SecondChannel(source="api_chat", reply="TBJ0059A 共 2 个", tools_used=[])
+
+    # ① 完全没回放
+    empty = eh.BrowserEvidence(error="playwright 不可用")
+    assert eh.conclude(case, empty, channel).conclusion == eh.INVALID
+
+    # ② 有渲染文本但截图/trace 文件不存在（占位假数据：claim 了路径但磁盘上没有）
+    fake = eh.BrowserEvidence(rendered_text="TBJ0059A 共 2 个",
+                              screenshot_path="/tmp/does-not-exist-ws156.png",
+                              trace_path="/tmp/does-not-exist-ws156.zip")
+    assert fake.present() is False
+    assert eh.conclude(case, fake, channel).conclusion == eh.INVALID
+
+    # ③ 有截图/trace 但渲染文本为空（回放跑了但什么也没看到）
+    shot, trace = _real_artifacts()
+    blank = eh.BrowserEvidence(rendered_text="   ", screenshot_path=shot, trace_path=trace)
+    assert eh.conclude(case, blank, channel).conclusion == eh.INVALID
+
+
+def test_ws156_missing_second_channel_is_inconclusive():
+    """有浏览器证据但缺第二通道 → INCONCLUSIVE（缺对账，不得 PASS）。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    shot, trace = _real_artifacts()
+    browser = eh.BrowserEvidence(rendered_text="TBJ0059A 共 2 个",
+                                 screenshot_path=shot, trace_path=trace)
+    broken = eh.SecondChannel(source="api_chat", error="server 未起")
+    b = eh.conclude(case, browser, broken)
+    assert b.conclusion == eh.INCONCLUSIVE
+    assert b.reconciliation.performed is False
+
+
+def test_ws156_mismatch_is_fail_with_evidence_summary():
+    """浏览器看到的 与 第二通道对不上 → FAIL，证据摘要列出失配 + 附件。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    shot, trace = _real_artifacts()
+    # 第二通道有 TBJ0059A + 数字 2，但浏览器渲染丢了 SKU（用户没看到）→ 渲染丢数
+    browser = eh.BrowserEvidence(rendered_text="共 2 个 SKU（名单加载失败）",
+                                 screenshot_path=shot, trace_path=trace)
+    channel = eh.SecondChannel(source="api_chat", reply="TBJ0059A 等共 2 个",
+                               tools_used=["scope_overview"])
+    bundle = eh.conclude(case, browser, channel)
+    assert bundle.conclusion == eh.FAIL, bundle.reasons
+    assert bundle.reconciliation.mismatches, "必须列出具体失配"
+    summary = bundle.evidence_summary()
+    assert "TBJ0059A" in summary and "FAIL" in summary
+    assert set(bundle.attachments()) == {shot, trace}
+    assert bundle.to_dict()["mismatch_signature"]
+
+
+def test_ws156_hallucination_in_browser_render_is_fail():
+    """禁忌/幻觉词出现在用户看到的渲染里 → FAIL。"""
+    eh = _eh()
+    shot, trace = _real_artifacts()
+    case = eh.ExperienceCase(case_id="hallu", prompt="看销量", store="ksa",
+                             must_contain=[r"销量"], must_not_contain=[r"已为你导出"])
+    browser = eh.BrowserEvidence(rendered_text="近30天销量 100；已为你导出 Excel",
+                                 screenshot_path=shot, trace_path=trace)
+    channel = eh.SecondChannel(source="api_chat", reply="近30天销量 100", tools_used=[])
+    assert eh.conclude(case, browser, channel).conclusion == eh.FAIL
+
+
+def test_ws156_sync_experience_issue_creates_then_dedupes():
+    """FAIL → 创建带证据摘要 + 附件的体验问题 issue；同签名再现 → 去重追评论，不重复建卡。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    shot, trace = _real_artifacts()
+    browser = eh.BrowserEvidence(rendered_text="共 2 个（名单加载失败）",
+                                 screenshot_path=shot, trace_path=trace)
+    channel = eh.SecondChannel(source="api_chat", reply="TBJ0059A 等共 2 个",
+                               tools_used=["scope_overview"])
+    bundle = eh.conclude(case, browser, channel)
+    assert bundle.conclusion == eh.FAIL
+
+    runner = _FakeExperienceRunner()
+    first = eh.sync_experience_issue(bundle, state_issue="STATE-1", runner=runner)
+    assert first["action"] == "created" and first["deduped"] is False
+    assert len(runner.created) == 1
+    create_args = runner.created[0]["args"]
+    assert "--attachment" in create_args  # 截图/trace 作为附件
+    assert create_args.count("--attachment") == 2
+    title = create_args[create_args.index("--title") + 1]
+    assert "[体验问题]" in title and case.case_id in title
+
+    # 同一问题（同 mismatch signature）再次出现 → 去重，不再建卡，改为追评论
+    second = eh.sync_experience_issue(bundle, state_issue="STATE-1", runner=runner)
+    assert second["deduped"] is True and second["action"] == "commented"
+    assert len(runner.created) == 1  # 没有第二张卡
+    assert len(runner.comments) == 1
+
+    # 非 FAIL（如 INVALID）不落 issue
+    invalid = eh.conclude(case, eh.BrowserEvidence(error="无浏览器"), channel)
+    skipped = eh.sync_experience_issue(invalid, state_issue="STATE-1", runner=runner)
+    assert skipped.get("skipped") is True
+    assert len(runner.created) == 1
+
+
+def test_ws156_run_case_wires_drivers_into_gate():
+    """run_case 真把注入的 driver/fetcher 串进门——证明 harness 接线，不是孤立函数。"""
+    eh = _eh()
+    case = _complete_case(eh)
+    shot, trace = _real_artifacts()
+    text = "TBJ0059A 等共 2 个"
+    calls = {"browser": 0, "channel": 0}
+
+    def driver(c):
+        calls["browser"] += 1
+        return eh.BrowserEvidence(rendered_text=text, screenshot_path=shot, trace_path=trace)
+
+    def fetcher(c):
+        calls["channel"] += 1
+        return eh.SecondChannel(source="api_chat", reply=text, tools_used=[])
+
+    bundle = eh.run_case(case, driver, fetcher)
+    assert calls == {"browser": 1, "channel": 1}
+    assert bundle.conclusion == eh.PASS
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed, failed = 0, []
