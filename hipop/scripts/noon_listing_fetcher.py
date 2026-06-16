@@ -101,12 +101,15 @@ _NOON_LISTING_FIELD_MAP: dict[str, tuple] = {
                        "dest_country", "destCountry"),
     "store_name":     ("store_name", "storeName", "store", "shop_name", "shopName"),
     "noon_sku":       ("noon_sku", "noonSku", "noon_sku_code", "noonSkuCode",
+                       "zsku_child", "zskuChild", "catalog_sku", "catalogSku",
                        "psku", "pSku"),
     "partner_sku":    ("partner_sku", "partnerSku", "seller_sku", "sellerSku"),
-    "sku":            ("sku", "sku_code", "skuCode"),
+    "sku":            ("sku", "sku_code", "skuCode", "psku_code", "pskuCode",
+                       "csku_parent", "cskuParent", "offer_code", "offerCode"),
     "listing_status": ("listing_status", "listingStatus", "status", "offer_status",
                        "offerStatus", "state", "catalog_status", "catalogStatus"),
-    "is_listed":      ("is_listed", "isListed", "listed", "is_active", "isActive"),
+    "is_listed":      ("is_listed", "isListed", "listed", "is_active", "isActive",
+                       "live_status", "liveStatus"),
     "title":          ("title", "name", "product_title", "productTitle",
                        "item_title", "itemTitle"),
 }
@@ -126,6 +129,32 @@ def _pick(raw: dict, candidates: tuple):
     return None
 
 
+def _boolish(value):
+    """把 noon 接口里的 bool/0/1/true/false 收口成 bool；无法判断返回 None。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "y", "live", "active", "enabled"):
+            return True
+        if s in ("0", "false", "no", "n", "inactive", "disabled", "offline"):
+            return False
+    return None
+
+
+def _nested(raw: dict, *path):
+    cur = raw
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    if cur is None or (isinstance(cur, str) and cur.strip() == ""):
+        return None
+    return cur
+
+
 def to_contract_row(raw: dict) -> dict:
     """单条 noon listing 原始记录 → WS-183/S1 listing 行契约 dict。
 
@@ -141,6 +170,28 @@ def to_contract_row(raw: dict) -> dict:
         v = _pick(raw, candidates)
         if v is not None:
             row[key] = v
+    # 实测 catalog endpoint (`offer/list/noon`) 用 bool `live_status` 表示是否 Live，
+    # 没有单独 listingStatus 字段。这里把它收口成契约需要的生命周期状态。
+    has_live_key = "live_status" in raw or "liveStatus" in raw
+    has_seller_key = "seller_status" in raw or "sellerStatus" in raw
+    live = _boolish(raw.get("live_status") if "live_status" in raw else raw.get("liveStatus"))
+    if "listing_status" not in row:
+        if live is None:
+            live = _boolish(raw.get("seller_status") if "seller_status" in raw else raw.get("sellerStatus"))
+        if live is not None:
+            row["listing_status"] = "active" if live else "inactive"
+        elif has_live_key or has_seller_key:
+            # 实测 offer/list/noon 对部分非 live offer 返回 live_status/seller_status=null。
+            # 键存在说明接口结构没丢，只是该 offer 无 live 状态；按不在售收口为 inactive，
+            # 仍保留“完全缺状态字段”红灯。
+            row["listing_status"] = "inactive"
+    if "is_listed" not in row and (has_live_key or has_seller_key):
+        row["is_listed"] = bool(live) if live is not None else False
+    # 实测 title 在 content.title；保留顶层 title 优先，嵌套只作真实接口适配。
+    if "title" not in row:
+        title = _nested(raw, "content", "title") or _nested(raw, "content", "name")
+        if title is not None:
+            row["title"] = title
     return row
 
 
@@ -207,10 +258,17 @@ def assert_listing_status_known(row: dict, *, extra_allowed: Optional[Iterable[s
 # 改版 → blocked。catalog 落地页在 noon.partners 域，若 api_url 同域则可直接 fetch；本函数
 # 是本模块唯一碰真实 noon 页面/接口的地方（smoke 用 raw_listings_fn 注入替身绕过）。
 _LISTING_FETCH_JS = """
-async (url) => {
-  const r = await fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}});
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return await r.json();
+async ({url, method, body}) => {
+  const opts = {method: method || 'GET', credentials: 'include',
+    headers: {'Accept': 'application/json'}};
+  if ((opts.method || 'GET').toUpperCase() !== 'GET') {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body || {});
+  }
+  const r = await fetch(url, opts);
+  let json = null;
+  try { json = await r.json(); } catch (e) { json = null; }
+  return {status: r.status, json: json};
 }
 """
 
@@ -244,6 +302,103 @@ def _walk_records(raw, records_path: Optional[list]):
     return None
 
 
+def _walk_value(raw, path: Optional[list]):
+    if not path:
+        return None
+    cur = raw
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _records_total(raw, total_path: Optional[list]):
+    value = _walk_value(raw, total_path) if total_path else None
+    if value is None and isinstance(raw, dict):
+        value = raw.get("total")
+        if value is None and isinstance(raw.get("data"), dict):
+            value = raw["data"].get("total")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _goto_report_page(page, report_page_url: str) -> None:
+    last = None
+    for _ in range(2):
+        try:
+            page.goto(report_page_url, wait_until="domcontentloaded", timeout=45000)
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise LiveSourceUnavailable(
+        f"导航 noon listing/catalog 页 {report_page_url} 失败: {type(last).__name__}: {last}"
+        " —— 疑似登录态失效/紫鸟扩展拦截，blocked")
+
+
+def _listing_body(cfg: dict, page_no: int, per_page: int) -> dict:
+    body = dict(cfg.get("body") or cfg.get("request_body") or {})
+    body["page"] = int(page_no)
+    body["per_page"] = int(per_page)
+    if cfg.get("noon_store_code"):
+        body.setdefault("noon_store_code", cfg.get("noon_store_code"))
+    body.setdefault("filters", {})
+    body.setdefault("sort", "")
+    body.setdefault("direction", "")
+    return body
+
+
+def _evaluate_listing_page(page, api_url: str, *, method: str, body: Optional[dict],
+                           page_no: int, report_page: str, retries: int):
+    last = None
+    payload = {"url": api_url, "method": method, "body": body}
+    for attempt in range(int(retries) + 1):
+        try:
+            raw = page.evaluate(_LISTING_FETCH_JS, payload)
+            # Deterministic smokes use FakePage(payload) and return raw JSON directly.
+            if isinstance(raw, dict) and "status" in raw and "json" in raw:
+                status = int(raw.get("status") or 0)
+                if status < 200 or status >= 300:
+                    raise LiveSourceUnavailable(
+                        f"noon listing 接口 HTTP {status}（page={page_no}）—— blocked")
+                return raw.get("json")
+            return raw
+        except LiveSourceUnavailable:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < int(retries) and report_page:
+                try:
+                    _goto_report_page(page, report_page)
+                except LiveSourceUnavailable:
+                    pass
+    raise LiveSourceUnavailable(
+        f"noon listing 页取数失败（page.evaluate {method} {api_url} page={page_no}，"
+        f"已重试 {int(retries)} 次仍失败）: {type(last).__name__}: {last} —— 疑似登录态"
+        "失效/接口改版/页面导航毁上下文，blocked，请参照 refresh-dbuyerp-token 流程在本机"
+        "紫鸟重登该店一次") from last
+
+
+def _annotate_country(records: list, country_code: str) -> list:
+    cc = (country_code or "").strip().upper()
+    if not cc:
+        return records
+    out = []
+    for r in records:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+        if _pick(r, ("country_code", "countryCode", "country", "dest_country", "destCountry")) is not None:
+            out.append(r)
+            continue
+        rr = dict(r)
+        rr["country_code"] = cc
+        out.append(rr)
+    return out
+
+
 def _fetch_raw_listings(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
     """在真实已登录 page 上抓 noon listing 原始记录 list（唯一外部边界）。
 
@@ -261,19 +416,47 @@ def _fetch_raw_listings(page, *, store_key: str = DEFAULT_STORE_KEY) -> list:
         raise LiveSourceUnavailable(
             f"noon listing api_url 仍是未注入的 env 占位符 {api_url!r} —— blocked，"
             "请运营经 NOON_LISTINGS_API_URL 注入真实接口后再 live（绝不拿占位符当真实地址）")
-    try:
-        raw = page.evaluate(_LISTING_FETCH_JS, api_url)
-    except Exception as e:  # noqa: BLE001 — page 侧各类取数错都归 blocked
-        raise LiveSourceUnavailable(
-            f"noon listing 页取数失败（page.evaluate fetch {api_url}）: "
-            f"{type(e).__name__}: {e} —— 疑似登录态失效/接口改版，blocked，"
-            "请参照 refresh-dbuyerp-token 流程在本机紫鸟重登该店一次") from e
-    records = _walk_records(raw, cfg.get("records_path"))
+    method = (cfg.get("method") or "GET").strip().upper()
+    report_page = (cfg.get("report_page_url") or "").strip()
+    if report_page:
+        _goto_report_page(page, report_page)
+    _pr = cfg.get("page_retries")
+    page_retries = 3 if _pr is None else int(_pr)
+    if method == "POST":
+        per_page = int(cfg.get("per_page") or 100)
+        max_pages = int(cfg.get("max_pages") or 100)
+        all_records = []
+        total = None
+        for page_no in range(1, max_pages + 1):
+            body = _listing_body(cfg, page_no, per_page)
+            raw = _evaluate_listing_page(
+                page, api_url, method=method, body=body, page_no=page_no,
+                report_page=report_page, retries=page_retries)
+            records = _walk_records(raw, cfg.get("records_path"))
+            if not isinstance(records, list):
+                raise LiveSourceUnavailable(
+                    f"noon listing 接口返回结构非预期（期望 records 为 list，得 "
+                    f"{type(records).__name__}）—— 疑似页面/接口改版，blocked，不静默吞行/不返回空目录")
+            if total is None:
+                total = _records_total(raw, cfg.get("total_path"))
+            all_records.extend(records)
+            if not records:
+                break
+            if total is not None and len(all_records) >= total:
+                break
+            if len(records) < per_page:
+                break
+        records = all_records
+    else:
+        raw = _evaluate_listing_page(
+            page, api_url, method=method, body=None, page_no=1,
+            report_page=report_page, retries=page_retries)
+        records = _walk_records(raw, cfg.get("records_path"))
     if not isinstance(records, list):
         raise LiveSourceUnavailable(
             f"noon listing 接口返回结构非预期（期望 records 为 list，得 "
             f"{type(records).__name__}）—— 疑似页面/接口改版，blocked，不静默吞行/不返回空目录")
-    return records
+    return _annotate_country(records, cfg.get("country_code") or "")
 
 
 # ── session 获取（lazy import _platform_browser，避免无 playwright 环境 import 失败）──

@@ -79,6 +79,22 @@ class FakePage:
         self.goto_urls.append(url)
 
 
+class ApiPage:
+    """Fake real API wrapper: page.evaluate receives {url, method, body} and returns {status,json}."""
+    def __init__(self, pages):
+        self.pages = pages
+        self.evaluated = []
+        self.goto_urls = []
+
+    def evaluate(self, js, arg=None):
+        self.evaluated.append(arg)
+        page_no = int((arg or {}).get("body", {}).get("page") or 1)
+        return {"status": 200, "json": self.pages[page_no - 1]}
+
+    def goto(self, url, **kwargs):
+        self.goto_urls.append(url)
+
+
 def _expect_red(fn, must_contain, label):
     raised = False
     try:
@@ -115,6 +131,29 @@ def main():
                 f"映射 {ck} 错: {row0.get(ck)!r} != {LISTING_ROWS[0][ck]!r}"
         assert set(row0) <= set(C.ROW_CONTRACT[C.LISTINGS]["known"]), \
             f"to_contract_row 产出契约外字段: {set(row0) - set(C.ROW_CONTRACT[C.LISTINGS]['known'])}"
+        # 实测 noon catalog endpoint (`offer/list/noon`) 行形态：zsku_child/catalog_sku +
+        # partner_sku + live_status + content.title。必须能映射成契约行并把 live_status 收口为
+        # listing_status=active/inactive，否则真实 precheck 仍会红在字段层。
+        real_raw = {
+            "zsku_child": "ZREAL001-1", "catalog_sku": "ZREAL001-1",
+            "partner_sku": "PREAL001", "psku_code": "hash-real-001",
+            "live_status": True, "seller_status": True,
+            "content": {"title": "Real catalog title"},
+        }
+        real_row = F.to_contract_row({**real_raw, "country_code": "SA"})
+        assert real_row["noon_sku"] == "ZREAL001-1", real_row
+        assert real_row["partner_sku"] == "PREAL001", real_row
+        assert real_row["listing_status"] == "active", real_row
+        assert real_row["is_listed"] is True, real_row
+        assert real_row["title"] == "Real catalog title", real_row
+        C.validate_row(C.LISTINGS, real_row)
+        null_live = F.to_contract_row({
+            "zsku_child": "ZREALNULL-1", "partner_sku": "PREALNULL",
+            "live_status": None, "seller_status": None, "country_code": "SA",
+        })
+        assert null_live["listing_status"] == "inactive", null_live
+        assert null_live["is_listed"] is False, null_live
+        C.validate_row(C.LISTINGS, null_live)
         # 端到端 fetch_listing_rows（注入 raw_listings_fn）→ 全部行合契约
         rows = F.fetch_listing_rows(TENANT, page=object(), raw_listings_fn=lambda p: RAW_RECORDS)
         assert len(rows) == len(LISTING_ROWS), f"fetch 行数异常: {len(rows)}"
@@ -177,6 +216,36 @@ def main():
                 "api_url": "https://x/api", "records_path": ["data", "listings"]}
             nested = FakePage({"data": {"listings": RAW_RECORDS}})
             assert F._fetch_raw_listings(nested) == RAW_RECORDS, "records_path 逐层走 list 失败"
+            # 4f. 实测 POST endpoint：report_page_url 同源导航、body 带 page/per_page/noon_store_code，
+            # data.hits 分页汇总，并给无 country 字段的真实 raw 行补 cfg.country_code。
+            F._listings_cfg = lambda store_key=F.DEFAULT_STORE_KEY: {
+                "api_url": "https://noon-catalog.noon.partners/_vs/mp/mp-noon-catalog-api-rocket/offer/list/noon",
+                "method": "POST",
+                "report_page_url": "https://noon-catalog.noon.partners/en/catalog?project=PRJ44158&tab=noon",
+                "country_code": "SA",
+                "noon_store_code": "STR44158-NSA",
+                "per_page": 2,
+                "max_pages": 5,
+                "records_path": ["data", "hits"],
+                "total_path": ["data", "total"],
+            }
+            api_records = [
+                {"zsku_child": "ZREAL001-1", "partner_sku": "PREAL001", "live_status": True},
+                {"zsku_child": "ZREAL002-1", "partner_sku": "PREAL002", "live_status": False},
+                {"zsku_child": "ZREAL003-1", "partner_sku": "PREAL003", "live_status": True},
+            ]
+            api = ApiPage([
+                {"data": {"total": 3, "hits": api_records[:2]}},
+                {"data": {"total": 3, "hits": api_records[2:]}},
+            ])
+            got = F._fetch_raw_listings(api)
+            assert [a["body"]["page"] for a in api.evaluated] == [1, 2], api.evaluated
+            assert all(a["method"] == "POST" for a in api.evaluated), api.evaluated
+            assert all(a["body"]["noon_store_code"] == "STR44158-NSA" for a in api.evaluated), api.evaluated
+            assert api.goto_urls, "POST listing endpoint 取数前必须先导到 catalog report_page_url（同源）"
+            assert len(got) == 3 and all(r["country_code"] == "SA" for r in got), got
+            live_rows = F.fetch_listing_rows(TENANT, page=object(), raw_listings_fn=lambda p: got)
+            assert [r["listing_status"] for r in live_rows] == ["active", "inactive", "active"], live_rows
         finally:
             F._listings_cfg = _orig_cfg
         print("✓ 缺接口配置 / 占位符未注入 / 接口结构变 → blocked 红灯；正常结构 + records_path 取回 records")
