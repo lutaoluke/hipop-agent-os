@@ -8,6 +8,57 @@ import json
 import os
 import sys
 
+
+# ── WS-194: 端口护栏 — 非 official 服务禁止绑定生产端口 8765 ─────────────────────
+def _check_prod_port_guard():
+    """拒绝非正式服务绑定生产端口 8765。
+
+    判据：
+    - 绑定端口 == 8765（从 sys.argv --port 参数推断）
+    - XPC_SERVICE_NAME != 'com.hipop.workbench'（launchd 正式服务注入）
+    逃生门：HIPOP_ALLOW_PROD_PORT=1（仅运维应急，默认关闭）
+    """
+    if os.environ.get("HIPOP_ALLOW_PROD_PORT") == "1":
+        return
+
+    bound_port = None
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg == "--port" and i + 1 < len(argv):
+            try:
+                bound_port = int(argv[i + 1])
+            except ValueError:
+                pass
+            break
+        if arg.startswith("--port="):
+            try:
+                bound_port = int(arg[7:])
+            except ValueError:
+                pass
+            break
+
+    if bound_port != 8765:
+        return
+
+    xpc = os.environ.get("XPC_SERVICE_NAME", "")
+    if xpc == "com.hipop.workbench":
+        return
+
+    print(
+        "\n[FATAL] 端口 8765 是 HIPOP 生产端口，非正式服务禁止绑定。\n"
+        f"        当前 XPC_SERVICE_NAME={xpc!r}（正式服务应为 'com.hipop.workbench'）。\n"
+        "        临时/PR/agent 服务请用 8766+ ；正式上线走 hipop-prod-deploy.sh。\n"
+        "        如确需临时占用（仅运维），设 HIPOP_ALLOW_PROD_PORT=1 后再启动。",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(1)
+
+
+_check_prod_port_guard()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # WS-161 路线(B)：server 进程默认启用语义 fact-slot grounding judge（确定性 grounding，
 # 接进 _factslot_contract.apply）。单测 make test 不导入 main → 不设此 flag → judge 关、
 # 走确定性结构门 floor，保证单测可复现。运维可用 HIPOP_FACTSLOT_SEMANTIC=0 关。
