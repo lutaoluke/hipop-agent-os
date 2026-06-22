@@ -1227,9 +1227,11 @@ def _t04_must_contain_patterns(item: dict) -> list:
     so all metric patterns must use _UNAVAILABLE_RE instead of concrete values.
     """
     data_stale = item.get("data_stale")
+    if data_stale:
+        return [_STALE_TST001_STALE_RE]
 
     def _d(val):
-        return None if data_stale else val
+        return val
 
     return [
         _num_or_unavailable_re(_d(item.get("sales_30d"))),
@@ -1287,7 +1289,11 @@ def _prepare_dynamic_expectations(base_url: str,
         item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
         c = _find_case("T04 TBB0116A")
         if c and (item.get("found") or item.get("data_stale") or item.get("live_sales_failed")):
-            c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+            c.name = (
+                "T04 TBB0116A 30d 口径（动态：当前 fail-closed，不给旧值）"
+                if item.get("data_stale")
+                else "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
+            )
             c.must_contain = _t04_must_contain_patterns(item)
     except Exception:
         pass  # endpoint unavailable — T04 uses static DB expectations

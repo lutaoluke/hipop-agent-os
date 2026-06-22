@@ -138,12 +138,34 @@ def test_chat_sales_skip_topn_is_deterministic_with_stale_hint() -> None:
     print("    skip-refresh 最畅销 → deterministic list_products + stale hint, no provider")
 
 
+def test_fail_closed_topn_reply_carries_source_and_stale_warning() -> None:
+    """Live stale data must fail closed while still naming the data source and stale state."""
+    reply = _agent._format_product_sales_topn_reply("KSA", {
+        "fail_closed": True,
+        "message": (
+            "KSA 近30天销量 TopN 实时取数失败，缓存更新时间为 2026-06-18"
+            "（4 天前），超过 3 天，不能使用缓存数字。"
+        ),
+        "freshness_decision": {
+            "cache_fetched_at": "2026-06-18",
+            "cache_age_days": 4,
+        },
+        "references": [{"table": "wf2_sku", "as_of_date": "2026-06-18"}],
+    })
+    assert "来源" in reply and "wf2_sku.sales_30d" in reply, reply
+    assert "2026-06-18" in reply, reply
+    assert ("已过期" in reply or "偏旧" in reply or "不新鲜" in reply), reply
+    assert "不输出 TopN 数字" in reply, reply
+    print("    fail-closed TopN → source/time/stale warning present, no numbers emitted")
+
+
 def main() -> None:
     _setup_db()
     test_tool_limit_means_sales_30d_topn()
     test_chat_sales_topn_routes_to_list_products()
     test_chat_sales_skip_topn_is_deterministic_with_stale_hint()
-    print("\n3/3 passed (WS-148 list_products TopN)")
+    test_fail_closed_topn_reply_carries_source_and_stale_warning()
+    print("\n4/4 passed (WS-148 list_products TopN)")
 
 
 if __name__ == "__main__":
