@@ -60,7 +60,7 @@ fi
 
 CHAT_JSON=""
 if [ $# -eq 0 ]; then
-  CHAT_JSON="$(mktemp /tmp/hipop_chat_smoke.XXXXXX.json)"
+  CHAT_JSON="$(mktemp /tmp/hipop_chat_smoke.XXXXXX)"
   trap 'rm -f "$CHAT_JSON"' EXIT
   PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" tests/smoke_chat.py --url "$URL" --json-output "$CHAT_JSON"
 else

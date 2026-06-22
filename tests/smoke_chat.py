@@ -195,7 +195,7 @@ def _rate_re(rate: Optional[float]) -> str:
 
 _UNAVAILABLE_RE = (
     r"无法|暂无|不可用|未返回|未提供|实时.*(?:失败|拉不到|不可)|"
-    r"ERP.*(?:凭据|登录)|同上|过期|已过期"
+    r"ERP.*(?:凭据|登录)|同上|过期|已过期|已超期|查不到|不能使用缓存|超过.*天"
 )
 
 
@@ -342,6 +342,7 @@ _STALE_RE = (
     rf"|(?:{_STALE_DATA})(?:(?!{_STALE_OBJ}|旧).){{0,15}}?(?:{_STALE_DEG})?旧(?![的\s、]*(?:{_STALE_OBJ}))"
     # ③ 非"旧"族的陈旧 / 保守说法。
     r"|偏保守|过期|不新鲜|滞后|未更新"
+    r"|已超期|不能使用缓存|超过\s*\d+\s*天|缓存更新时间"
     # ④ 时效表达绑定数据名词：数据名词在前，时效词在后（中间 ≤12 字符，不允许换行）。
     #    三种等价表达均覆盖（LLM wording variation，T07-2 flaky 根因）：
     #      - "N 天前"  = 自然语言"几天前"
@@ -399,7 +400,14 @@ CASES: List[Case] = [
         name="WS-148 裸销量 TopN（无时间窗 → list_products 固定桶 + 证据）",
         question="KSA 销量最高的3个商品",
         must_use_tools=["list_products"],
-        must_contain=[r"近\s*30\s*天销量", r"来源", r"202\d-\d{2}-\d{2}", r"wf2_sku\.sales_30d"],
+        # Fresh path must show evidence; stale live fixtures may correctly fail closed
+        # with the cache-age message instead of rendering stale ranking numbers.
+        must_contain=[
+            r"近\s*30\s*天销量",
+            rf"来源|{_UNAVAILABLE_RE}",
+            rf"202\d-\d{{2}}-\d{{2}}|{_UNAVAILABLE_RE}",
+            rf"wf2_sku\.sales_30d|{_UNAVAILABLE_RE}",
+        ],
     ),
     # ─── 概览类 ───
     Case(
@@ -1267,11 +1275,18 @@ def _prepare_dynamic_expectations(base_url: str,
         c.name = f"店铺整体（动态在售 SKU {sku_count} + 红色告警）"
         c.must_contain = [_num_re(sku_count)]
 
+    c = _find_case("WS-148 裸销量 TopN")
+    if c:
+        has_fresh_sales_30d = any(r.get("sales_30d") is not None for r in rows)
+        if not has_fresh_sales_30d:
+            c.name = "WS-148 裸销量 TopN（动态：sales_30d 当前 fail-closed）"
+            c.must_contain = [r"近\s*30\s*天销量", _UNAVAILABLE_RE]
+
     try:
         metrics = _http_json(base_url, "/api/sku-metrics/KSA/TBB0116A", timeout=20, opener=opener)
         item = next((x for x in metrics.get("items", []) if x.get("sku") == "TBB0116A"), {})
         c = _find_case("T04 TBB0116A")
-        if c and item.get("found"):
+        if c and (item.get("found") or item.get("data_stale") or item.get("live_sales_failed")):
             c.name = "T04 TBB0116A 30d 口径（动态 tool_query_sku 口径）"
             c.must_contain = _t04_must_contain_patterns(item)
     except Exception:

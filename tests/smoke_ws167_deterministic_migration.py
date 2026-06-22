@@ -143,11 +143,12 @@ def test_reexport_contract():
             missing.append(f"{name}（定义模块={mod}，没真外移）")
     assert not missing, "再导出契约断裂：\n    " + "\n    ".join(missing)
 
-    # _current_workflow_task 是 chat 编排的 DB 辅助，应仍留在 agent.py（不属路由 / formatter）。
-    assert inspect.getmodule(agent._current_workflow_task).__name__.endswith("agent"), \
-        "_current_workflow_task 不应被外移（它是 chat 编排的 DB 辅助，不是确定性路由）"
+    # WS-169 thin shell：chat 编排 DB 辅助也已离开 agent.py；agent 只保留再导出契约。
+    from hipop.server import _chat_workflows
+    assert agent._current_workflow_task is _chat_workflows._current_workflow_task, \
+        "_current_workflow_task 应从 _chat_workflows 再导出（agent.py 不承载实现体）"
     print(f"  ✓ 再导出：{len(EXPECTED_ALL)} 个路由/formatter/辅助 agent.X is routes.X；"
-          f"_current_workflow_task 仍留 agent.py")
+          f"_current_workflow_task 从 _chat_workflows 再导出")
 
 
 def _chat_call_names():
