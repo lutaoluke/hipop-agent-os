@@ -445,6 +445,44 @@ _SPECIFIC_PRODUCT_INVENTORY_RE = re.compile(
 )
 
 
+# ── T26-ext 结构判别（WS-152 approach A）：替代逐句话术黑名单 ───────────────────────
+# 三个相互独立的结构信号，AND 组合后 fail-closed，不再枚举具体话术：
+#
+#   ① 助手声称查询意图（第一人称承诺 + "查" 动作）—— _SKU_QUERY_INTENT_RE
+#   ② 命中 SKU 编码样式 或 库存/物流/在途事实域 —— _SKU_CODE_RE | _SKU_FACT_DOMAIN_RE
+#   ③ 本轮没有真实 query_sku_live 工具调用证据
+#
+# 与旧 Rule C 的关键差异：意图与"SKU 域"解耦检测，不再要求句子里出现字面 "SKU"。
+# 因此 "我可以查 TBC0168A 的在途物流"（真实编码、无字面 SKU）也会被红灯，
+# 而旧黑名单只钉死字面 "SKU" 一直漏这一型。有真实工具证据时（③ 不成立）正常放行。
+
+# 第一人称查询承诺：必须有承诺/进行标记（可以/能/要/来/去/帮你/让我/正在/这就/马上）紧贴 "查"，
+# 这样 "核查"、"请你去工作台查看"（标记与"查"被实义词隔开）等不会误命中。
+_SKU_QUERY_INTENT_RE = re.compile(
+    r"(?:我\s*)?"
+    r"(?:可以|可|能|要|来|去|帮你?|帮您?|让我|正在|这就|马上|稍等[，,]?\s*我?)"
+    r"\s*(?:来|去)?\s*"
+    r"查(?:询|一下|看|查|证)?"
+)
+
+# SKU / 订单编码样式：连续大写字母打头、且**含至少一位数字**的编码，如 TBC0168A / PD2026001。
+# 要求含数字是为了把纯字母大写词（TRACKING / MERGEABLE 等英文单词）排除在编码之外，
+# 避免把它们误当成 SKU 编码。
+_SKU_CODE_RE = re.compile(r"\b(?=[A-Z0-9-]*[0-9])[A-Z]{2,}[A-Z0-9-]{3,}\b")
+
+# SKU 专属锚点：真实编码 或 字面 SKU/货号/商品编码。用于和「跟踪号」查询区分归属。
+_SKU_LITERAL_RE = re.compile(r"(?:SKU|sku|货号|商品编码)")
+
+# 库存/物流/在途事实域（不含跟踪号/运单，那归 Rule E 跟踪号负控）。
+_SKU_FACT_DOMAIN_RE = re.compile(
+    r"(?:SKU|sku|货号|商品编码"
+    r"|库存|在途|物流|发货|到货|出库|入库|仓库存量|实时.{0,4}状态)"
+)
+
+# 跟踪号/运单实体指称：当回复明确是「查跟踪号」且无 SKU 专属锚点时，让位给 Rule E。
+_TRACKING_ENTITY_RE = re.compile(r"(?:跟踪号?|运单|快递单号?|tracking)", re.IGNORECASE)
+
+
 def _claim_match(reply: str, keywords: str, gap: int = 15):
     return re.search(
         rf"{_QUERY_ACTION_RE}.{{0,{gap}}}(?P<object>{keywords})",
@@ -926,35 +964,29 @@ def sanitize_reply(reply: str, tools_used: List[str], tool_log: Optional[list] =
             "但回复未明确说明未找到，已自动补充负控提示（T26）"
         )
 
-    # ── T26-ext 物流负控扩展：SKU / 跟踪号 ────────────────────────────────────────
-    # Rule C: 没调 query_sku_live 却说"我来查/我可以查 SKU 物流/在途" — 假称在查，直接删句
-    # re.IGNORECASE 覆盖 sku/SKU/Sku 等大小写变体
-    # 覆盖黄项 A 原文："不要说'我可以查'然后不调 tool"（含'我来查'/'我可以查'两类话术）
-    pretend_sku_query = re.search(
-        r"(我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
-        r"|我可以查.{0,20}SKU"
-        r"|SKU.{0,20}我可以查"
-        r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
-        r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
-        r"|让我.{0,5}查.{0,10}SKU)",
-        reply,
-        re.IGNORECASE,
-    )
-    if pretend_sku_query and "query_sku_live" not in tools_used:
+    # ── T26-ext 物流负控扩展：SKU / 跟踪号（WS-152 approach A：结构判别，取代逐句黑名单）──
+    # 结构性 fail-closed：本轮回复同时满足以下三条 → 红灯并删句，绝不 warns=[]。
+    #   ① 助手声称查询意图（第一人称承诺 + "查"）         —— _SKU_QUERY_INTENT_RE
+    #   ② 命中 SKU 编码样式 或 库存/物流/在途事实域        —— _SKU_CODE_RE | _SKU_FACT_DOMAIN_RE
+    #   ③ 本轮没有真实 query_sku_live 工具调用证据
+    # 意图与 SKU 域解耦检测，不再要求字面 "SKU"，因此 "我可以查 TBC0168A 的在途物流"
+    # （真实编码、无字面 SKU）也被拦截 —— 这正是旧黑名单逐句补也补不住的漏网型。
+    # ③ 不成立（真调了 query_sku_live）时整段不触发，不误伤。
+    # 归属：若回复明确是「查跟踪号/运单」且没有 SKU 专属锚点（真实编码 / 字面 SKU），
+    # 让位给下方 Rule E（跟踪号负控），避免抢走它并丢掉「T26-ext 跟踪号」语义。
+    intent_hit = _SKU_QUERY_INTENT_RE.search(reply)
+    sku_specific = bool(_SKU_CODE_RE.search(reply)) or bool(_SKU_LITERAL_RE.search(reply))
+    domain_hit = sku_specific or bool(_SKU_FACT_DOMAIN_RE.search(reply))
+    defer_to_tracking_rule = bool(_TRACKING_ENTITY_RE.search(reply)) and not sku_specific
+    if intent_hit and domain_hit and not defer_to_tracking_rule and "query_sku_live" not in tools_used:
         warnings.append(
-            "⚠️ Agent 说'我来查/我可以查 SKU 物流/在途'但本轮没真调 query_sku_live — "
-            "禁止假称在查（T26-ext SKU 负控）"
+            "⚠️ Agent 声称要查/可查/正在查 SKU 物流/库存/在途，但本轮没真调 query_sku_live — "
+            "结构判别 fail-closed，禁止假称在查（T26-ext SKU 负控）"
         )
+        # 把含查询承诺的整句替换为拦截标记（句界：。\n ! ?）。仅删带意图的句子，
+        # 保留同回复里其它合法内容。
         sentence_pat_sku = re.compile(
-            r"[^。\n!?]*("
-            r"我.{0,6}来.{0,6}查.{0,15}SKU.{0,15}(物流|在途|实时|状态)"
-            r"|我可以查.{0,20}SKU"
-            r"|SKU.{0,20}我可以查"
-            r"|正在查.{0,10}SKU.{0,10}(状态|物流|实时|在途)"
-            r"|帮.{0,5}查.{0,15}SKU.{0,10}(物流|在途)"
-            r"|让我.{0,5}查.{0,10}SKU"
-            r")[^。\n!?]*[。!?]?",
-            re.IGNORECASE,
+            r"[^。\n!?]*?(?:" + _SKU_QUERY_INTENT_RE.pattern + r")[^。\n!?]*[。!?]?"
         )
         reply = sentence_pat_sku.sub(
             "[⚠️ 被 _safety 拦掉：未调 query_sku_live，不许假称正在查 SKU 物流] ",

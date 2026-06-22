@@ -80,6 +80,57 @@ def test_ws152_yellow_a_exact_phrase_我可以查_blocked():
         )
 
 
+def test_ws152_yellow_a_structural_both_leak_forms_blocked():
+    """WS-152 approach A 结构判别：两个历史漏网型在无工具时都必须红灯。
+
+    Luke 拍板的结构规则（fail closed）：
+      ① 助手声称查询意图（要查/可查/正在查/我来查）
+      ② 命中 SKU 编码样式（如 TBC0168A）或库存/物流/在途事实域
+      ③ 缺少真实 query_sku_live 工具调用证据
+    三条同时成立 → warns 非空，绝不 warns=[]。
+
+    必须同时钉死历史两个漏网型（均在无工具调用时）：
+      - 泛指话术 "我可以查这个 SKU…"
+      - 真实编码写法 "我可以查 TBC0168A…"（无字面 SKU，旧逐句黑名单漏掉）
+    补完任一条不得让另一条回退 → 两个探针在同一测试里一起断言。
+    """
+    from hipop.server._safety import sanitize_reply
+
+    probes = [
+        # 泛指话术（历史漏网型 1）
+        "我可以查这个 SKU 的在途物流，请稍等。",
+        # 真实 SKU 编码写法（历史漏网型 2，旧 Rule C 因无字面 SKU 而放过）
+        "我可以查 TBC0168A 的在途物流，请稍等。",
+        "我来查 TBC0168A 的当前库存，马上给你结果。",
+        "正在查 PD2026001 的实时在途状态。",
+    ]
+    for phrase in probes:
+        out, warns = sanitize_reply(phrase, tools_used=[], tool_log=[])
+        assert warns, (
+            f"结构判别必须红灯（fail closed），但 phrase={phrase!r} 返回 warns=[]"
+        )
+        assert any("T26-ext SKU" in w for w in warns), (
+            f"警告应含 T26-ext SKU（结构判别标记），phrase={phrase!r}, warns={warns}"
+        )
+        assert "被 _safety 拦掉" in out, (
+            f"承诺句应被替换为拦截标记，phrase={phrase!r}, out={out[:200]!r}"
+        )
+
+
+def test_ws152_yellow_a_structural_false_positive_absent_when_tool_called_real_code():
+    """正向验证：真调了 query_sku_live 时，即便回复含真实 SKU 编码也不误伤。"""
+    from hipop.server._safety import sanitize_reply
+
+    tool_log = [{"name": "query_sku_live", "args": {"sku": "TBC0168A"}, "result_error": None}]
+    reply = "我来查 TBC0168A 的在途物流，结果如下：当前有 3 个在途货单。"
+    out, warns = sanitize_reply(reply, tools_used=["query_sku_live"], tool_log=tool_log)
+
+    t26_warns = [w for w in warns if "T26-ext SKU" in w]
+    assert not t26_warns, (
+        f"已调 query_sku_live 时结构判别不应误报（含真实编码），实际警告: {t26_warns}"
+    )
+
+
 def test_ws152_yellow_a_false_positive_absent_when_tool_called():
     """正向验证：真调了工具时 Rule C 不应误报。"""
     from hipop.server._safety import sanitize_reply
@@ -184,6 +235,8 @@ def run():
     tests = [
         test_ws152_yellow_a_pretend_query_still_blocked_by_rule_c,
         test_ws152_yellow_a_exact_phrase_我可以查_blocked,
+        test_ws152_yellow_a_structural_both_leak_forms_blocked,
+        test_ws152_yellow_a_structural_false_positive_absent_when_tool_called_real_code,
         test_ws152_yellow_a_false_positive_absent_when_tool_called,
         test_ws152_yellow_b_gate1_query_sku_live_fails_closed_on_erp_failure,
         test_ws152_yellow_b_gate2_factslot_prepends_failure_template_on_login_failed,
