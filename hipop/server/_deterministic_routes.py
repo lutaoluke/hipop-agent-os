@@ -335,7 +335,21 @@ def _format_product_sales_topn_reply(store: str, tool_result: dict) -> str:
     if tool_result.get("error"):
         return f"{store} 近30天销量 TopN 暂时不可用：{tool_result.get('error')}"
     if tool_result.get("fail_closed"):
-        return tool_result.get("message") or f"{store} 近30天销量 TopN 数据超过 3 天，不能出数。请先刷新销量后重问。"
+        message = tool_result.get("message") or f"{store} 近30天销量 TopN 数据超过 3 天，不能出数。"
+        freshness = tool_result.get("freshness_decision") or {}
+        refs = tool_result.get("references") or []
+        cache_date = (
+            freshness.get("cache_fetched_at")
+            or (refs[0].get("as_of_date") if refs and isinstance(refs[0], dict) else "")
+            or ""
+        )
+        date_part = f"取数时间：{cache_date}。" if cache_date else ""
+        return (
+            f"{message}\n\n"
+            f"来源：wf2_sku.sales_30d；口径：{store} 近30天销量快照。"
+            f"{date_part}当前销量数据已过期/偏旧，本轮不输出 TopN 数字；"
+            "请先刷新销量后重问。"
+        )
     items = tool_result.get("items") or []
     if not items:
         return f"{store} 暂无可排序的近30天销量商品数据。"
