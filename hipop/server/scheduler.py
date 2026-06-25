@@ -22,9 +22,17 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _list_active_tenants() -> list[dict]:
-    """读所有 tenants（tenants 表不开 RLS）。"""
+    """只取真实在跑的生产租户跑 daily refresh。
+
+    历史 bug：这里曾 `SELECT id, name FROM tenants` 不带过滤，把 5/9 onboarding/调试
+    残留的占位租户（AcmeCo / AlphaCo / 点购 / smoke / 重复 HIPOP / luke）也一并扇出，
+    每天每个都去开 noon、验登录、空转失败 —— 表现为“紫鸟反复重启、noon 反复验登录”。
+    现按 plan 收敛到生产租户；将来上线新的真实租户记得把它的 plan 纳入下面白名单。
+    """
     from . import data as _data
-    rows = _data._fetch("SELECT id, name FROM tenants ORDER BY id")
+    rows = _data._fetch(
+        "SELECT id, name FROM tenants WHERE plan = 'enterprise' ORDER BY id"
+    )
     return rows or []
 
 
